@@ -203,7 +203,7 @@ app.use((req, res, next) => {
   );
   res.setHeader(
     "Content-Security-Policy",
-    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
   );
   if (new URL(PUBLIC_BASE_URL).protocol === "https:") {
     res.setHeader("Strict-Transport-Security", "max-age=31536000");
@@ -343,6 +343,7 @@ app.post("/oauth/register", registrationRateLimit, async (req, res) => {
 });
 
 app.get("/oauth/authorize", authorizePageRateLimit, async (req, res) => {
+  const requestId = logOAuthResponse("/oauth/authorize", req, res);
   await reloadAuthStoreIfChanged();
 
   const parsed = authorizeRequestSchema.safeParse(req.query);
@@ -390,6 +391,9 @@ app.get("/oauth/authorize", authorizePageRateLimit, async (req, res) => {
     `  Expires in: ${Math.round(AUTH_TRANSACTION_TTL_MS / 60000)} minutes\n` +
     `========================================\n`,
   );
+  console.log(
+    `[oauth/authorize] ${requestId} rendered consent for transaction ${transactionId.slice(0, 12)}...`,
+  );
 
   return res
     .type("html")
@@ -397,6 +401,7 @@ app.get("/oauth/authorize", authorizePageRateLimit, async (req, res) => {
 });
 
 app.post("/oauth/authorize", authorizeSubmitRateLimit, async (req, res) => {
+  const requestId = logOAuthResponse("/oauth/authorize", req, res);
   await reloadAuthStoreIfChanged();
 
   const parsed = consentSubmissionSchema.safeParse(req.body);
@@ -426,10 +431,10 @@ app.post("/oauth/authorize", authorizeSubmitRateLimit, async (req, res) => {
   }
 
   // If this transaction was already successfully processed (double-click),
-  // re-issue the same redirect instead of showing an error.
+  // render the same completion page instead of showing an error.
   if (transaction.redirectedTo) {
-    console.log("[oauth/authorize POST] Duplicate submission detected; re-redirecting.");
-    return res.redirect(302, transaction.redirectedTo);
+    console.log("[oauth/authorize POST] Duplicate submission detected; re-rendering callback completion.");
+    return sendAuthorizationCallback(res, transaction.redirectedTo);
   }
 
   const client = clients.get(transaction.clientId);
@@ -490,11 +495,14 @@ app.post("/oauth/authorize", authorizeSubmitRateLimit, async (req, res) => {
   transaction.redirectedTo = redirectUrl.toString();
   transaction.expiresAt = Date.now() + 60_000;
 
-  console.log("[oauth/authorize POST] Authorization granted; redirecting to callback.");
-  return res.redirect(302, redirectUrl.toString());
+  console.log(
+    `[oauth/authorize] ${requestId} approved transaction ${transaction.transactionId.slice(0, 12)}...; rendering callback completion.`,
+  );
+  return sendAuthorizationCallback(res, redirectUrl.toString());
 });
 
 app.post("/oauth/token", tokenRateLimit, async (req, res) => {
+  logOAuthResponse("/oauth/token", req, res);
   await reloadAuthStoreIfChanged();
 
   const parsed = tokenRequestSchema.safeParse(req.body);
@@ -1924,20 +1932,10 @@ function renderConsentPage(
         ${pinField}
         <p></p>
         <div class="actions">
-          <button type="submit" name="action" value="authorize" id="btn-authorize">Authorize</button>
+          <button type="submit" name="action" value="authorize">Authorize</button>
           <button class="deny" type="submit" name="action" value="deny" formnovalidate>Deny</button>
         </div>
       </form>
-      <script>
-        document.querySelector('form').addEventListener('submit', function(e) {
-          var btn = document.getElementById('btn-authorize');
-          if (btn.disabled) { e.preventDefault(); return; }
-          setTimeout(function() {
-            btn.disabled = true;
-            btn.textContent = 'Authorizing\u2026';
-          }, 0);
-        });
-      </script>
     </main>
   </body>
 </html>`;
@@ -1945,6 +1943,77 @@ function renderConsentPage(
 
 function renderErrorPage(message: string) {
   return `<!doctype html><html><body><h1>OAuth Error</h1><p>${escapeHtml(message)}</p></body></html>`;
+}
+
+function sendAuthorizationCallback(res: Response, callbackUrl: string) {
+  // Some embedded OAuth browsers do not act on an HTTP redirect after the
+  // consent form POST. OAuth permits other user-agent redirect mechanisms;
+  // this page uses navigation, a meta-refresh fallback, and a visible link.
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'",
+  );
+  return res
+    .status(200)
+    .type("html")
+    .send(renderAuthorizationCallbackPage(callbackUrl));
+}
+
+function renderAuthorizationCallbackPage(callbackUrl: string) {
+  const escapedUrl = escapeHtml(callbackUrl);
+  const callbackJson = JSON.stringify(callbackUrl)
+    .replaceAll("<", "\\u003c")
+    .replaceAll(">", "\\u003e")
+    .replaceAll("&", "\\u0026")
+    .replaceAll("\u2028", "\\u2028")
+    .replaceAll("\u2029", "\\u2029");
+
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="refresh" content="0;url=${escapedUrl}" />
+    <title>Completing authorization</title>
+    <style>
+      body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background: #f6f7f9; color: #16181d; }
+      main { max-width: 560px; margin: 10vh auto; padding: 32px; background: white; border: 1px solid #d8dce3; border-radius: 8px; }
+      h1 { margin: 0 0 16px; font-size: 24px; }
+      p { line-height: 1.5; }
+      a { display: inline-block; border-radius: 6px; background: #1f6feb; color: white; padding: 10px 16px; font-weight: 650; text-decoration: none; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Authorization approved</h1>
+      <p>Returning to ChatGPT…</p>
+      <p><a href="${escapedUrl}" rel="noreferrer">Continue to ChatGPT</a></p>
+    </main>
+    <script>window.location.replace(${callbackJson});</script>
+  </body>
+</html>`;
+}
+
+function logOAuthResponse(pathname: string, req: Request, res: Response) {
+  const requestId = `oauth_${randomId(6)}`;
+  const startedAt = Date.now();
+  let finished = false;
+
+  res.once("finish", () => {
+    finished = true;
+    console.log(
+      `[${pathname}] ${requestId} ${req.method} completed with ${res.statusCode} in ${Date.now() - startedAt}ms.`,
+    );
+  });
+  res.once("close", () => {
+    if (!finished) {
+      console.warn(
+        `[${pathname}] ${requestId} ${req.method} connection closed before a response completed.`,
+      );
+    }
+  });
+
+  return requestId;
 }
 
 function boundedIntegerEnv(

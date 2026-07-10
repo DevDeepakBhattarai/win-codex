@@ -70,9 +70,15 @@ async function authorizeClient(client) {
     }),
     redirect: "manual",
   });
-  await expectStatus(authorization, 302, "authorization approval");
-  const location = authorization.headers.get("location");
-  if (!location) throw new Error("Authorization response did not contain a redirect.");
+  await expectStatus(authorization, 200, "authorization approval");
+  const completionPage = await authorization.text();
+  const callbackJson = completionPage.match(
+    /window\.location\.replace\(("(?:[^"\\]|\\.)*")\);<\/script>/u,
+  )?.[1];
+  if (!callbackJson) {
+    throw new Error("Authorization response did not contain a callback navigation.");
+  }
+  const location = JSON.parse(callbackJson);
   const code = new URL(location).searchParams.get("code");
   if (!code) throw new Error("Authorization response did not contain a code.");
 
