@@ -130,6 +130,7 @@ type AuthorizationTransaction = {
   clientId: string;
   consentPin: string;
   expiresAt: number;
+  redirectedTo?: string;
 };
 
 type OAuthGrant = {
@@ -202,7 +203,7 @@ app.use((req, res, next) => {
   );
   res.setHeader(
     "Content-Security-Policy",
-    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
   );
   if (new URL(PUBLIC_BASE_URL).protocol === "https:") {
     res.setHeader("Strict-Transport-Security", "max-age=31536000");
@@ -401,6 +402,7 @@ app.post("/oauth/authorize", authorizeSubmitRateLimit, async (req, res) => {
   const parsed = consentSubmissionSchema.safeParse(req.body);
 
   if (!parsed.success) {
+    console.warn("[oauth/authorize POST] Invalid form body:", parsed.error.message);
     return res
       .status(400)
       .send(renderErrorPage("Invalid authorization submission"));
@@ -408,11 +410,26 @@ app.post("/oauth/authorize", authorizeSubmitRateLimit, async (req, res) => {
 
   const transaction = authorizationTransactions.get(parsed.data.auth_tx);
 
-  if (!transaction || transaction.expiresAt < Date.now()) {
-    if (transaction) authorizationTransactions.delete(transaction.transactionId);
+  if (!transaction) {
+    console.warn("[oauth/authorize POST] Transaction not found:", parsed.data.auth_tx.slice(0, 12) + "...");
     return res
       .status(400)
       .send(renderErrorPage("Authorization request expired. Start the connection again."));
+  }
+
+  if (transaction.expiresAt < Date.now()) {
+    console.warn("[oauth/authorize POST] Transaction expired:", transaction.transactionId.slice(0, 12) + "...");
+    authorizationTransactions.delete(transaction.transactionId);
+    return res
+      .status(400)
+      .send(renderErrorPage("Authorization request expired. Start the connection again."));
+  }
+
+  // If this transaction was already successfully processed (double-click),
+  // re-issue the same redirect instead of showing an error.
+  if (transaction.redirectedTo) {
+    console.log("[oauth/authorize POST] Duplicate submission detected; re-redirecting.");
+    return res.redirect(302, transaction.redirectedTo);
   }
 
   const client = clients.get(transaction.clientId);
@@ -436,6 +453,7 @@ app.post("/oauth/authorize", authorizeSubmitRateLimit, async (req, res) => {
   }
 
   if (!verifyConsentPin(parsed.data.consent_pin, transaction.consentPin)) {
+    console.warn("[oauth/authorize POST] Invalid consent PIN entered.");
     return res
       .status(403)
       .type("html")
@@ -448,8 +466,6 @@ app.post("/oauth/authorize", authorizeSubmitRateLimit, async (req, res) => {
         ),
       );
   }
-
-  authorizationTransactions.delete(transaction.transactionId);
 
   const scope = normalizeScope(request.scope ?? client.scope ?? REQUIRED_SCOPE);
   const code = randomId(32);
@@ -469,6 +485,12 @@ app.post("/oauth/authorize", authorizeSubmitRateLimit, async (req, res) => {
   redirectUrl.searchParams.set("code", code);
   if (request.state) redirectUrl.searchParams.set("state", request.state);
 
+  // Keep the transaction around briefly so duplicate POSTs re-redirect
+  // instead of showing "expired". It will be cleaned up by cleanupEphemeralState.
+  transaction.redirectedTo = redirectUrl.toString();
+  transaction.expiresAt = Date.now() + 60_000;
+
+  console.log("[oauth/authorize POST] Authorization granted; redirecting to callback.");
   return res.redirect(302, redirectUrl.toString());
 });
 
@@ -1902,10 +1924,20 @@ function renderConsentPage(
         ${pinField}
         <p></p>
         <div class="actions">
-          <button type="submit" name="action" value="authorize">Authorize</button>
+          <button type="submit" name="action" value="authorize" id="btn-authorize">Authorize</button>
           <button class="deny" type="submit" name="action" value="deny" formnovalidate>Deny</button>
         </div>
       </form>
+      <script>
+        document.querySelector('form').addEventListener('submit', function(e) {
+          var btn = document.getElementById('btn-authorize');
+          if (btn.disabled) { e.preventDefault(); return; }
+          setTimeout(function() {
+            btn.disabled = true;
+            btn.textContent = 'Authorizing\u2026';
+          }, 0);
+        });
+      </script>
     </main>
   </body>
 </html>`;
