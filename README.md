@@ -1,195 +1,235 @@
-# Local Windows Control MCP
+# Local Windows Control MCP Server
 
-A hardened Streamable HTTP MCP server that lets an approved ChatGPT connection control a Windows machine through PowerShell, filesystem, directory, and process tools.
+A hardened, production-ready **Model Context Protocol (MCP) server** that enables an authorized ChatGPT session to act as a **local "Codex" environment**, allowing it to securely control a Windows machine through PowerShell, filesystem operations, and process management.
 
-The server is deliberately powerful. An approved client receives the permissions of the Windows account running the server. The security model therefore focuses on ensuring that only an explicitly approved ChatGPT OAuth grant can reach the tools, that stolen access tokens expire quickly, and that grants remain revocable without repeatedly reconnecting ChatGPT.
+The server is designed with a defense-in-depth security model to ensure that powerful local capabilities (which run with the permissions of the host Windows user) are only accessible to an explicitly approved, authenticated, and revocable ChatGPT connection.
 
-## Endpoints
+```mermaid
+graph TD
+    classDef external fill:#f9f9f9,stroke:#333,stroke-width:2px;
+    classDef secure fill:#e1f5fe,stroke:#0288d1,stroke-width:2px;
+    classDef local fill:#efebe9,stroke:#5d4037,stroke-width:2px;
 
-The default local address is `http://localhost:6000`:
+    GPT[ChatGPT Cloud Service]:::external
+    Tunnel[Secure HTTPS Tunnel <br/> ngrok / Cloudflare]:::external
+    
+    subgraph Windows Host Machine
+        Server[Local MCP Server <br/> Node.js / Express]:::secure
+        Store[(Encrypted OAuth Store <br/> oauth-store.json)]:::secure
+        Console[Server Terminal Console]:::secure
+        
+        PS[PowerShell Core / Desktop]:::local
+        FS[Windows Filesystem]:::local
+        Proc[Windows OS Processes]:::local
+    end
 
-- MCP: `/mcp`
-- Health: `/health`
-- Protected-resource metadata: `/.well-known/oauth-protected-resource`
-- Authorization-server metadata: `/.well-known/oauth-authorization-server`
-- Dynamic client registration: `/oauth/register`
-- Authorization: `/oauth/authorize`
-- Token: `/oauth/token`
-- Revocation: `/oauth/revoke`
-- JWKS: `/oauth/jwks`
-
-## Installation
-
-This repository uses pnpm and Node.js 22.
-
-```powershell
-pnpm install --frozen-lockfile
-pnpm run check
-pnpm run build
-pnpm run harden
-pnpm start
+    GPT <-->|HTTPS Protocol| Tunnel
+    Tunnel <-->|Loopback HTTP| Server
+    Server <-->|Read/Write Grants| Store
+    Server -.->|Logs Consent PIN| Console
+    
+    Server -->|Runs commands| PS
+    Server -->|Reads/Writes files| FS
+    Server -->|Starts/Kills| Proc
 ```
 
-`pnpm run harden` removes inherited Windows permissions from `.env` and `.data` and grants access only to the current Windows account, SYSTEM, and Administrators. Run it again after moving the project or changing the service account.
+---
 
-Development mode remains available:
+## 🔑 How It Works: The OAuth + MCP Flow
 
+ChatGPT uses **OAuth 2.0 with PKCE (Proof Key for Code Exchange)** to securely authenticate and maintain connection persistence. The flow behaves as follows:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Developer / Windows User
+    participant GPT as ChatGPT Cloud Service
+    participant Tun as HTTPS Tunnel (e.g. ngrok)
+    participant Server as Local MCP Server (Express)
+
+    Note over GPT, Server: 1. Dynamic Client Registration
+    GPT->>Tun: POST /oauth/register
+    Tun->>Server: POST /oauth/register
+    Note over Server: Register ChatGPT Client & Issue Client ID
+    Server-->>GPT: client_id, metadata
+
+    Note over GPT, Server: 2. PKCE Authorization Redirect
+    User->>GPT: Connect to Custom Action URL
+    GPT-->>User: Redirect to Server's Auth Page (with PKCE Challenge)
+    User->>Server: GET /oauth/authorize (via Local/Tunnel URL)
+    Note over Server: Server prints 6-digit Consent PIN in local console terminal
+    Server-->>User: Render PIN Consent Form
+
+    Note over User, Server: 3. Dynamic PIN Verification
+    User->>User: Copy 6-digit PIN from server's terminal logs
+    User->>Server: POST /oauth/authorize (Submit PIN & Approve)
+    Server-->>User: Redirect back to ChatGPT callback with Authorization Code
+
+    Note over GPT, Server: 4. Token Exchange & Rotation
+    GPT->>Server: POST /oauth/token (Exchange Code + PKCE Verifier)
+    Note over Server: Verify PKCE, Save Grant, Generate JWT & Refresh Token
+    Server-->>GPT: JWT Access Token (10m TTL) + Rotatable Refresh Token
+
+    Note over GPT, Server: 5. Stateless Tool Execution (Codex Mode)
+    GPT->>Server: POST /mcp (with Authorization: Bearer <JWT>)
+    Note over Server: Parse JWT, verify signature/expiration, execute task
+    Server-->>GPT: Tool Execution Output (JSON)
+```
+
+### 1. Registration & Setup
+The server exposes an RFC 7591 compliant dynamic client registration endpoint (`/oauth/register`). ChatGPT registers itself, obtaining a unique client ID.
+
+### 2. Authorization & The Local PIN Gate
+To connect, ChatGPT redirects your browser to the authorization endpoint (`/oauth/authorize`). Instead of using static credentials, the server **dynamically generates a random 6-digit Consent PIN** and prints it to the local terminal. You must enter this PIN in the browser form to approve the connection. This ensures only someone with access to the host machine's terminal can grant access.
+
+### 3. JWT-Based Stateless Tool Execution
+Once authorized, ChatGPT obtains a short-lived JSON Web Token (JWT) access token (10-minute lifetime by default). Every MCP tool call is transmitted via stateless HTTP POST request to the `/mcp` endpoint and must include a valid bearer token.
+
+### 4. Refresh Token Rotation (RTR)
+When the access token expires, ChatGPT automatically uses the refresh token to request a new set of tokens. The server rotates refresh tokens upon use and supports **bounded parallel branch rotation** (up to 64 active keys per grant), ensuring concurrent ChatGPT queries do not accidentally invalidate each other.
+
+---
+
+## 🛠️ Included Tools
+
+Once connected, ChatGPT can call the following tools to inspect, modify, and build local code:
+
+*   **`powershell`**: Run an arbitrary Windows PowerShell command.
+    *   *Features*: Bounded output stream, automatic timeout after 60 seconds, and recursive process termination (`taskkill /T /F`) if the command times out.
+*   **`read_text_file`**: Read up to 5 MiB of a UTF-8 file.
+    *   *Features*: Bounded disk I/O to prevent memory exhaustion from loading large files.
+*   **`write_text_file`**: Create or overwrite up to 5 MiB of UTF-8 text.
+*   **`list_directory`**: List up to 1,000 directory entries.
+    *   *Features*: Bounded concurrent filesystem calls for listing directory metadata.
+*   **`start_process`**: Start an executable with strict argument-array semantics (no shell interpolation), optionally waiting for completion.
+
+---
+
+## 📦 Installation & Setup
+
+### Prerequisites
+*   **Node.js**: `v22.0.0` or higher (under `v23`).
+*   **pnpm**: Version 9 or higher.
+*   **A Public Tunnel**: `ngrok`, `cloudflared`, or similar.
+
+### Step 1: Install Dependencies
+```powershell
+pnpm install --frozen-lockfile
+```
+
+### Step 2: Configure Environment Variables
+Create a `.env` file in the root directory. You can copy the template from `.env.example`:
+```powershell
+copy .env.example .env
+```
+
+Edit your `.env` file to match your setup:
+```env
+PORT=6000
+HOST=localhost
+
+# Set these to your public HTTPS tunnel domain (e.g. ngrok or cloudflare tunnel)
+PUBLIC_BASE_URL=https://mcp.yourtunnel.ngrok-free.app
+MCP_PUBLIC_URL=https://mcp.yourtunnel.ngrok-free.app/mcp
+AUTH_ISSUER=https://mcp.yourtunnel.ngrok-free.app
+
+# Lockdown callback URIs to match ChatGPT (obtain this from your Custom Action registration page)
+ALLOWED_REDIRECT_URIS=https://chatgpt.com/connector/oauth/your-unique-connector-id
+REQUIRE_EXACT_REDIRECT_URIS=true
+
+# Security defaults
+ALLOW_NON_LOOPBACK_BIND=false
+ACCESS_TOKEN_TTL_SECONDS=600
+REFRESH_ROTATION_GRACE_SECONDS=60
+MAX_REFRESH_TOKENS_PER_GRANT=64
+POWERSHELL_EXECUTABLE=powershell.exe
+```
+
+> [!IMPORTANT]  
+> Because ChatGPT is a cloud-based service, it **cannot** talk to `localhost` directly. You must configure a tunnel (e.g. `ngrok http 6000`) and set the `PUBLIC_BASE_URL`, `MCP_PUBLIC_URL`, and `AUTH_ISSUER` variables to the tunnel's HTTPS URL.
+
+### Step 3: Harden File Permissions
+Run the hardening script to restrict read/write access to the `.env` configuration file and `.data/` directory. This removes inherited permissions and grants access only to the current user account, `SYSTEM`, and local `Administrators`:
+```powershell
+pnpm run harden
+```
+
+### Step 4: Build and Start the Server
+Build the TypeScript source and run the production server:
+```powershell
+pnpm run build
+pnpm start
+```
+Alternatively, for development mode:
 ```powershell
 pnpm dev
 ```
 
-Production mode runs compiled JavaScript from `dist/` and does not use the TypeScript runtime loader.
+---
 
-## ChatGPT connection
+## 🔗 Connecting ChatGPT
 
-Keep the Node server bound to loopback and expose it through an HTTPS tunnel. A typical configuration is:
+1.  Create a new **Custom GPT** or **Custom Action** in ChatGPT.
+2.  Add the MCP Schema metadata or set the import URL to:
+    ```text
+    https://your-tunnel-domain.ngrok-free.app/mcp
+    ```
+3.  Choose **OAuth** as the authentication type.
+4.  Configure the OAuth details:
+    *   **Client ID**: (Will be created dynamically during registration, or copy the values if using static options)
+    *   **Authorization URL**: `https://your-tunnel-domain.ngrok-free.app/oauth/authorize`
+    *   **Token URL**: `https://your-tunnel-domain.ngrok-free.app/oauth/token`
+    *   **Scope**: `mcp:control`
+5.  Trigger the auth flow in ChatGPT. Look at your local terminal console where the server is running to get your **6-digit Consent PIN**, input it on the webpage, and approve!
 
-```env
-HOST=localhost
-PORT=6000
-PUBLIC_BASE_URL=https://mcp.example.com
-MCP_PUBLIC_URL=https://mcp.example.com/mcp
-AUTH_ISSUER=https://mcp.example.com
-OAUTH_CONSENT_PIN=use-a-random-value-with-at-least-20-characters
-ALLOWED_REDIRECT_URIS=https://chatgpt.com/connector/oauth/your-existing-callback-id
-REQUIRE_EXACT_REDIRECT_URIS=true
-ALLOWED_REDIRECT_ORIGINS=https://chatgpt.com
-CORS_ALLOWED_ORIGINS=https://chatgpt.com,https://chat.openai.com
-```
+---
 
-Add this connector URL in ChatGPT:
+## 🛡️ Security Hardening Details
 
-```text
-https://mcp.example.com/mcp
-```
+*   **🔒 Strict Binds**: The server binds to loopback (`localhost`) by default, preventing local network exposure unless `ALLOW_NON_LOOPBACK_BIND=true` is set.
+*   **🔐 ACL Isolation**: Built-in Windows ACL hardening via `pnpm run harden` prevents non-privileged processes from reading signing keys or token caches.
+*   **🙅 Open Redirect Protection**: The server blocks dynamic client registrations from attempting open redirection. Redirect URIs must match exact registered patterns.
+*   **⏳ Short-Lived JWTs**: Access tokens expire in 10 minutes. Token validity is checked against a cryptographic signature (RS256) on every MCP request.
+*   **🌀 Hash-based Token Storage**: Refresh tokens are stored in the database as SHA-256 hashes rather than plaintext.
+*   **🚫 Sandboxed Child Processes**: Launched commands and child processes do not inherit sensitive environment variables like authorization credentials.
+*   **📈 Rate Limiting**: Protection against brute-force attempts on critical endpoints (token exchange, authorization code creation, and client registration).
 
-The consent PIN is requested only during initial authorization. After approval:
+---
 
-- The OAuth grant and refresh token survive server restarts.
-- Access tokens expire after 10 minutes by default.
-- ChatGPT refreshes them automatically.
-- Refresh tokens rotate on use.
-- Restarting the server with the same `.data/oauth-store.json` does not require reconnecting ChatGPT.
+## 🧹 Managing and Revoking Access
 
-Existing grants created by older versions are migrated in place. Their old non-expiring access token is rejected after the hardened server starts, after which ChatGPT should use its persisted refresh token automatically.
-
-## Security controls
-
-The server now applies the following controls by default:
-
-- Non-loopback public URLs must use HTTPS.
-- The Node listener must remain on loopback unless `ALLOW_NON_LOOPBACK_BIND=true` is explicitly configured.
-- A consent PIN of at least 20 characters is mandatory for non-loopback deployments.
-- Public deployments are locked to the exact ChatGPT callback URI already associated with this connector; a broad origin allowlist is only a bootstrap fallback. Loopback HTTP callbacks remain available for local tests.
-- `javascript:`, `data:`, `file:`, URL fragments, and URLs containing user information are rejected.
-- Invalid clients and unregistered redirect URIs return a local error and cannot use the authorization endpoint as an open redirect.
-- Consent submissions use short-lived, random, server-side authorization transactions rather than trusting hidden OAuth parameters.
-- Authorization, registration, token, revocation, and MCP ingress endpoints are rate-limited.
-- CORS uses an exact allowlist instead of reflecting arbitrary origins.
-- OAuth and consent responses use no-store caching and restrictive browser security headers.
-- JWT access tokens use RS256, issuer and audience validation, a required expiration, maximum token age, grant binding, and scope binding.
-- Refresh-token lookup is indexed, refresh tokens are stored as SHA-256 hashes, and rotation supports bounded parallel branches so concurrent ChatGPT threads do not invalidate each other.
-- The MCP endpoint uses stateless Streamable HTTP and does not issue `Mcp-Session-Id` values or retain per-client MCP session state.
-- Every MCP POST is independently authenticated with OAuth; revoking a grant blocks its next request immediately.
-- OAuth-store writes are serialized, protected with a cross-process lock, and replaced atomically.
-- The OAuth store is schema-validated before use.
-- Child processes do not inherit `OAUTH_CONSENT_PIN`.
-- Command output uses bounded buffers instead of repeated whole-string copies.
-- File reading performs bounded disk I/O rather than loading an entire file before truncation.
-- Directory enumeration stops after the requested entry limit and limits concurrent metadata calls.
-- Failed detached process launches return `started: false` rather than crashing Node.
-- Timed-out Windows processes are terminated with `taskkill /T /F` to include descendants.
-- Large structured MCP results are not duplicated in full as text.
-
-### Default lifetimes and limits
-
-```env
-ACCESS_TOKEN_TTL_SECONDS=600
-REFRESH_ROTATION_GRACE_SECONDS=60
-MAX_REFRESH_TOKENS_PER_GRANT=64
-MAX_OAUTH_CLIENTS=20
-```
-
-The MCP transport itself is stateless, so repeated ChatGPT tool calls cannot accumulate server-side MCP sessions. OAuth grants remain persistent, and concurrent refreshes of one grant can branch up to `MAX_REFRESH_TOKENS_PER_GRANT`.
-
-## Important trust boundary
-
-OAuth prevents someone who merely discovers the URL from running tools. It does not sandbox an approved tool call.
-
-After approval, the `powershell` and `start_process` tools can perform anything permitted to the Windows account running this service. No command parser can reliably make arbitrary PowerShell safe while preserving arbitrary PowerShell functionality.
-
-For stronger containment without changing the ChatGPT experience, run this server as a dedicated, non-administrator Windows account that has access only to the development directories and applications it must control. Do not run it elevated. The OAuth files should remain owned by that account and protected with `pnpm run harden`.
-
-True protection of OAuth signing material from an already authorized arbitrary-PowerShell client requires separating the OAuth control plane and command executor into different Windows security principals. That is an operating-system deployment boundary rather than an HTTP or OAuth code change.
-
-## Tools
-
-- `powershell`: execute a Windows PowerShell command, with a maximum waited duration of 60 seconds and bounded output.
-- `read_text_file`: read up to 5 MiB of a UTF-8 file using bounded I/O.
-- `write_text_file`: create or replace up to 5 MiB of UTF-8 text.
-- `list_directory`: list up to 1,000 directory entries.
-- `start_process`: launch an executable with argument-array semantics, optionally waiting for completion.
-
-## Revocation
-
-List clients and grants:
+To audit, list, or revoke registered clients and active OAuth grants:
 
 ```powershell
+# Interactive list of clients and grants
 pnpm revoke
-```
 
-Revoke one client's grants:
-
-```powershell
+# Revoke all grants for a specific client
 pnpm revoke -- -ClientId local_example
-```
 
-Revoke all grants:
-
-```powershell
+# Revoke all grants and logouts
 pnpm revoke -- -All
+
+# Remove client registrations alongside grants
+pnpm revoke -- -All -RemoveClients
 ```
 
-Add `-RemoveClients` to remove registrations as well. The revoke utility uses the same OAuth-store lock and atomic replacement strategy as the server.
+---
 
-## Verification
+## 🧪 Testing & Verification
 
-With a server running:
-
+### Smoke Test
+Verify PKCE authentication, client registration, access token expiration, token rotation, and tools behavior on a running instance:
 ```powershell
 pnpm smoke
 ```
 
-The smoke test verifies:
-
-- Dynamic registration and PKCE authorization.
-- Server-side consent transactions.
-- Expiring access tokens.
-- Refresh-token rotation.
-- MCP initialization and tool listing.
-- PowerShell execution.
-- Safe handling of nonexistent executables.
-- Bounded file reads.
-- Refresh and access revocation.
-
-Run the isolated security regression suite. It starts a temporary loopback server and does not use your live OAuth store:
-
+### Security Regression Suite
+Ensure the server maintains security boundaries, prevents open redirects, respects CORS boundaries, and properly authenticates request payloads:
 ```powershell
 pnpm security-test
 ```
 
-It verifies open-redirect prevention, dangerous redirect rejection, untrusted CORS denial, OAuth enforcement on MCP requests, stateless transport behavior, and revocation enforcement.
+## 📄 License
+This project is licensed under the [MIT License](LICENSE).
 
-## Configuration reference
-
-See `.env.example` for all supported settings. The most security-sensitive values are:
-
-- `OAUTH_CONSENT_PIN`
-- `OAUTH_STORE_PATH`
-- `ALLOWED_REDIRECT_URIS`
-- `REQUIRE_EXACT_REDIRECT_URIS`
-- `ALLOWED_REDIRECT_ORIGINS`
-- `CORS_ALLOWED_ORIGINS`
-- `ALLOW_NON_LOOPBACK_BIND`
-
-Keep `.env` and `.data` out of source control. Both are ignored by `.gitignore`.
