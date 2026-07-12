@@ -1,5 +1,5 @@
 {
-    "name":  "local-windows-control-mcp",
+    "name":  "win-codex",
     "version":  "1.1.0",
     "description":  "Hardened local Streamable HTTP MCP server with Windows PowerShell, file, and process tools protected by OAuth.",
     "main":  "dist/server.js",

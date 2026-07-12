@@ -51,7 +51,7 @@ const REQUIRED_SCOPE = process.env.REQUIRED_SCOPE ?? "mcp:control";
 const POWERSHELL_EXECUTABLE =
   process.env.POWERSHELL_EXECUTABLE ?? "powershell.exe";
 const CONSENT_PIN_LENGTH = 6;
-const SERVER_NAME = "local-windows-control-mcp";
+const SERVER_NAME = "win-codex";
 const DATA_DIR = process.env.DATA_DIR ?? path.join(process.cwd(), ".data");
 const OAUTH_STORE_PATH = path.resolve(
   process.env.OAUTH_STORE_PATH ?? path.join(DATA_DIR, "oauth-store.json"),
