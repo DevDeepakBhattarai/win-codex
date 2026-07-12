@@ -16,7 +16,7 @@
                     "smoke":  "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-test.ps1",
                     "revoke":  "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/revoke-access.ps1",
                     "harden":  "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/harden-acl.ps1",
-                    "security-test":  "node scripts/security-test.mjs"
+                    "security-test":  "pnpm build && node scripts/security-test.mjs"
                 },
     "keywords":  [
                      "mcp",

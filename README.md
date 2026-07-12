@@ -88,9 +88,9 @@ The server now applies the following controls by default:
 - CORS uses an exact allowlist instead of reflecting arbitrary origins.
 - OAuth and consent responses use no-store caching and restrictive browser security headers.
 - JWT access tokens use RS256, issuer and audience validation, a required expiration, maximum token age, grant binding, and scope binding.
-- Refresh-token lookup is indexed, refresh tokens are stored as SHA-256 hashes, and rotation includes a short retry grace period.
-- MCP sessions are owned by the client and grant that created them, with idle, absolute, and total-count limits.
-- Revoking a grant immediately closes all of its active MCP sessions.
+- Refresh-token lookup is indexed, refresh tokens are stored as SHA-256 hashes, and rotation supports bounded parallel branches so concurrent ChatGPT threads do not invalidate each other.
+- The MCP endpoint uses stateless Streamable HTTP and does not issue `Mcp-Session-Id` values or retain per-client MCP session state.
+- Every MCP POST is independently authenticated with OAuth; revoking a grant blocks its next request immediately.
 - OAuth-store writes are serialized, protected with a cross-process lock, and replaced atomically.
 - The OAuth store is schema-validated before use.
 - Child processes do not inherit `OAUTH_CONSENT_PIN`.
@@ -106,13 +106,11 @@ The server now applies the following controls by default:
 ```env
 ACCESS_TOKEN_TTL_SECONDS=600
 REFRESH_ROTATION_GRACE_SECONDS=60
-SESSION_IDLE_TTL_MINUTES=60
-SESSION_ABSOLUTE_TTL_HOURS=24
-MAX_SESSIONS=64
+MAX_REFRESH_TOKENS_PER_GRANT=64
 MAX_OAUTH_CLIENTS=20
 ```
 
-These limits do not require repeated user authorization. A new MCP session can be initialized automatically under the same persistent OAuth grant.
+The MCP transport itself is stateless, so repeated ChatGPT tool calls cannot accumulate server-side MCP sessions. OAuth grants remain persistent, and concurrent refreshes of one grant can branch up to `MAX_REFRESH_TOKENS_PER_GRANT`.
 
 ## Important trust boundary
 
@@ -174,14 +172,13 @@ The smoke test verifies:
 - Bounded file reads.
 - Refresh and access revocation.
 
-Run the additional security regression suite:
+Run the isolated security regression suite. It starts a temporary loopback server and does not use your live OAuth store:
 
 ```powershell
-$env:MCP_SECURITY_TEST_CONSENT_PIN = $env:OAUTH_CONSENT_PIN
 pnpm security-test
 ```
 
-It verifies open-redirect prevention, dangerous redirect rejection, untrusted CORS denial, and cross-grant MCP session isolation.
+It verifies open-redirect prevention, dangerous redirect rejection, untrusted CORS denial, OAuth enforcement on MCP requests, stateless transport behavior, and revocation enforcement.
 
 ## Configuration reference
 

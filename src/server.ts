@@ -8,7 +8,6 @@ import express, {
 } from "express";
 import {
   randomBytes,
-  randomUUID,
   createHash,
   timingSafeEqual,
 } from "node:crypto";
@@ -38,7 +37,6 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 
 const PORT = Number(process.env.PORT ?? 6000);
 const HOST = process.env.HOST ?? "localhost";
@@ -73,19 +71,16 @@ const REFRESH_ROTATION_GRACE_SECONDS = boundedIntegerEnv(
   10,
   5 * 60,
 );
-const SESSION_IDLE_TTL_MS = boundedIntegerEnv(
-  "SESSION_IDLE_TTL_MINUTES",
-  60,
-  5,
-  24 * 60,
-) * 60 * 1000;
-const SESSION_ABSOLUTE_TTL_MS = boundedIntegerEnv(
-  "SESSION_ABSOLUTE_TTL_HOURS",
-  24,
-  1,
-  7 * 24,
-) * 60 * 60 * 1000;
-const MAX_SESSIONS = boundedIntegerEnv("MAX_SESSIONS", 64, 1, 1000);
+const MAX_REFRESH_TOKENS_PER_GRANT = boundedIntegerEnv(
+  "MAX_REFRESH_TOKENS_PER_GRANT",
+  64,
+  2,
+  256,
+);
+const MAX_USED_REFRESH_TOKENS_PER_GRANT = Math.max(
+  64,
+  MAX_REFRESH_TOKENS_PER_GRANT * 4,
+);
 const MAX_OAUTH_CLIENTS = boundedIntegerEnv("MAX_OAUTH_CLIENTS", 20, 1, 1000);
 const ALLOWED_REDIRECT_ORIGINS = new Set(
   parseCsvEnv("ALLOWED_REDIRECT_ORIGINS", ["https://chatgpt.com"]),
@@ -133,6 +128,11 @@ type AuthorizationTransaction = {
   redirectedTo?: string;
 };
 
+type UsedRefreshToken = {
+  hash: string;
+  validUntil: number;
+};
+
 type OAuthGrant = {
   grantId: string;
   clientId: string;
@@ -141,6 +141,9 @@ type OAuthGrant = {
   sub: string;
   issuedAt: number;
   refreshTokenHash: string;
+  parallelRefreshTokenHashes?: string[];
+  usedRefreshTokens?: UsedRefreshToken[];
+  // Legacy fields retained so existing version-1 stores migrate without reconnecting.
   previousRefreshTokenHash?: string;
   previousRefreshTokenValidUntil?: number;
   lastUsedAt?: number;
@@ -167,27 +170,18 @@ type AuthedRequest = Request & {
   authContext?: AuthContext;
 };
 
-type Session = {
-  server: McpServer;
-  transport: StreamableHTTPServerTransport;
-  clientId: string;
-  grantId: string;
-  createdAt: number;
-  lastUsedAt: number;
-};
-
 const clients = new Map<string, OAuthClient>();
 const codes = new Map<string, AuthorizationCode>();
 const authorizationTransactions = new Map<string, AuthorizationTransaction>();
 const grants = new Map<string, OAuthGrant>();
 const refreshTokenIndex = new Map<string, string>();
-const sessions = new Map<string, Session>();
 let signingKey: JWK;
 let publicJwks: { keys: JWK[] };
 let localJwks: ReturnType<typeof createLocalJWKSet>;
 let authStoreMtimeMs = 0;
 let lastAuthStoreCheckAt = 0;
 let authStoreWriteQueue: Promise<void> = Promise.resolve();
+let refreshTokenQueue: Promise<void> = Promise.resolve();
 
 const app = express();
 
@@ -223,8 +217,13 @@ app.use(
       }
       callback(null, false);
     },
-    exposedHeaders: ["Mcp-Session-Id", "WWW-Authenticate"],
-    allowedHeaders: ["Content-Type", "Authorization", "Mcp-Session-Id"],
+    exposedHeaders: ["WWW-Authenticate"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "Mcp-Protocol-Version",
+      "Mcp-Session-Id",
+    ],
     methods: ["GET", "POST", "DELETE", "OPTIONS"],
     maxAge: 600,
   }),
@@ -256,6 +255,8 @@ app.get("/health", (_req, res) => {
     name: SERVER_NAME,
     mcp: MCP_PUBLIC_URL,
     issuer: AUTH_ISSUER,
+    transportMode: "stateless",
+    authentication: "oauth2-bearer",
   });
 });
 
@@ -515,55 +516,71 @@ app.post("/oauth/token", tokenRateLimit, async (req, res) => {
   }
 
   if (parsed.data.grant_type === "refresh_token") {
-    const lookup = findGrantByRefreshToken(parsed.data.refresh_token);
-    const grant = lookup?.grant;
-    const client = clients.get(parsed.data.client_id);
-    const resource = parsed.data.resource ?? grant?.resource;
-    const requestedScope = parsed.data.scope
-      ? normalizeScope(parsed.data.scope)
-      : grant?.scope;
-    const now = Math.floor(Date.now() / 1000);
+    const refreshRequest = parsed.data;
+    return withRefreshTokenLock(async () => {
+      const lookup = findGrantByRefreshToken(refreshRequest.refresh_token);
+      const grant = lookup?.grant;
+      const client = clients.get(refreshRequest.client_id);
+      const resource = refreshRequest.resource ?? grant?.resource;
+      const requestedScope = refreshRequest.scope
+        ? normalizeScope(refreshRequest.scope)
+        : grant?.scope;
+      const now = Math.floor(Date.now() / 1000);
 
-    if (
-      !lookup ||
-      !grant ||
-      !client ||
-      !isGrantUsable(grant) ||
-      grant.clientId !== client.clientId ||
-      resource !== grant.resource ||
-      resource !== MCP_PUBLIC_URL ||
-      requestedScope !== grant.scope
-    ) {
-      return res.status(400).json({
-        error: "invalid_grant",
-        error_description: "Refresh token is invalid or revoked.",
-      });
-    }
+      if (
+        !lookup ||
+        !grant ||
+        !client ||
+        !isGrantUsable(grant) ||
+        grant.clientId !== client.clientId ||
+        resource !== grant.resource ||
+        resource !== MCP_PUBLIC_URL ||
+        requestedScope !== grant.scope
+      ) {
+        return res.status(400).json({
+          error: "invalid_grant",
+          error_description: "Refresh token is invalid or revoked.",
+        });
+      }
 
-    if (
-      lookup.match === "previous" &&
-      (grant.previousRefreshTokenValidUntil ?? 0) < now
-    ) {
-      grant.revokedAt = now;
+      if (lookup.match === "used" && lookup.validUntil < now) {
+        grant.revokedAt = now;
+        await persistAuthStore();
+        return res.status(400).json({
+          error: "invalid_grant",
+          error_description: "Refresh token reuse was detected; reconnect this client.",
+        });
+      }
+
+      if (
+        lookup.match === "used" &&
+        activeRefreshTokenCount(grant) >= MAX_REFRESH_TOKENS_PER_GRANT
+      ) {
+        return res.status(429).json({
+          error: "temporarily_unavailable",
+          error_description:
+            "Too many parallel refresh-token branches are active for this grant.",
+        });
+      }
+
+      const refreshToken = `lrt_${randomId(48)}`;
+      rotateRefreshToken(
+        grant,
+        lookup.hash,
+        lookup.match,
+        refreshToken,
+        now,
+      );
+      grant.lastUsedAt = now;
       await persistAuthStore();
-      closeSessionsForGrant(grant.grantId);
-      return res.status(400).json({
-        error: "invalid_grant",
-        error_description: "Refresh token reuse was detected; reconnect this client.",
+
+      return res.json({
+        access_token: await issueAccessToken(client, grant),
+        token_type: "Bearer",
+        expires_in: ACCESS_TOKEN_TTL_SECONDS,
+        refresh_token: refreshToken,
+        scope: grant.scope,
       });
-    }
-
-    const refreshToken = `lrt_${randomId(48)}`;
-    rotateRefreshToken(grant, refreshToken, now);
-    grant.lastUsedAt = now;
-    await persistAuthStore();
-
-    return res.json({
-      access_token: await issueAccessToken(client, grant),
-      token_type: "Bearer",
-      expires_in: ACCESS_TOKEN_TTL_SECONDS,
-      refresh_token: refreshToken,
-      scope: grant.scope,
     });
   }
 
@@ -638,84 +655,44 @@ app.post("/oauth/revoke", revokeRateLimit, async (req, res) => {
 });
 
 app.post("/mcp", requireOAuth, async (req: AuthedRequest, res: Response) => {
-  cleanupExpiredSessions();
+  const server = createMcpServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+  });
 
-  const authContext = req.authContext;
-  if (!authContext) return unauthorized(res);
+  let cleanupStarted = false;
+  const cleanup = () => {
+    if (cleanupStarted) return;
+    cleanupStarted = true;
+    void Promise.allSettled([transport.close(), server.close()]);
+  };
 
-  const sessionId = req.header("mcp-session-id");
-  let session = sessionId ? sessions.get(sessionId) : undefined;
+  res.once("finish", cleanup);
+  res.once("close", cleanup);
 
-  if (session && !isSessionOwnedBy(session, authContext)) {
-    return res.status(403).json({
-      jsonrpc: "2.0",
-      error: { code: -32001, message: "MCP session belongs to another grant." },
-      id: null,
-    });
-  }
-
-  if (!session) {
-    if (!isInitializeRequest(req.body)) {
-      return res.status(400).json({
-        jsonrpc: "2.0",
-        error: {
-          code: -32000,
-          message: "Missing or invalid MCP session.",
-        },
-        id: null,
-      });
-    }
-
-    if (sessions.size >= MAX_SESSIONS) {
-      return res.status(429).json({
-        jsonrpc: "2.0",
-        error: { code: -32002, message: "MCP session limit reached." },
-        id: null,
-      });
-    }
-
-    const now = Date.now();
-    const server = createMcpServer();
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      onsessioninitialized: (newSessionId) => {
-        sessions.set(newSessionId, {
-          server,
-          transport,
-          clientId: authContext.clientId,
-          grantId: authContext.grantId,
-          createdAt: now,
-          lastUsedAt: Date.now(),
-        });
-      },
-    });
-
-    transport.onclose = () => {
-      if (transport.sessionId) sessions.delete(transport.sessionId);
-    };
-
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
-    return;
-  }
-
-  session.lastUsedAt = Date.now();
-  await session.transport.handleRequest(req, res, req.body);
+  await server.connect(transport);
+  await transport.handleRequest(req, res, req.body);
 });
 
-app.get("/mcp", requireOAuth, async (req: AuthedRequest, res: Response) => {
-  const session = getSessionFromRequest(req, res);
-  if (!session) return;
-  session.lastUsedAt = Date.now();
-  await session.transport.handleRequest(req, res);
+app.get("/mcp", requireOAuth, (_req: AuthedRequest, res: Response) => {
+  return methodNotAllowed(res);
 });
 
-app.delete("/mcp", requireOAuth, async (req: AuthedRequest, res: Response) => {
-  const session = getSessionFromRequest(req, res);
-  if (!session) return;
-  session.lastUsedAt = Date.now();
-  await session.transport.handleRequest(req, res);
+app.delete("/mcp", requireOAuth, (_req: AuthedRequest, res: Response) => {
+  return methodNotAllowed(res);
 });
+
+function methodNotAllowed(res: Response) {
+  res.setHeader("Allow", "POST");
+  return res.status(405).json({
+    jsonrpc: "2.0",
+    error: {
+      code: -32000,
+      message: "Method not allowed. This MCP endpoint uses authenticated stateless POST requests.",
+    },
+    id: null,
+  });
+}
 
 app.use(
   (
@@ -824,6 +801,19 @@ const oauthGrantStoreSchema = z.object({
   sub: z.string().min(1),
   issuedAt: z.number().int().nonnegative(),
   refreshTokenHash: z.string().regex(/^[a-f0-9]{64}$/),
+  parallelRefreshTokenHashes: z
+    .array(z.string().regex(/^[a-f0-9]{64}$/))
+    .max(256)
+    .optional(),
+  usedRefreshTokens: z
+    .array(
+      z.object({
+        hash: z.string().regex(/^[a-f0-9]{64}$/),
+        validUntil: z.number().int().nonnegative(),
+      }),
+    )
+    .max(1024)
+    .optional(),
   previousRefreshTokenHash: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   previousRefreshTokenValidUntil: z.number().int().nonnegative().optional(),
   lastUsedAt: z.number().int().nonnegative().optional(),
@@ -894,11 +884,9 @@ async function loadAuthStoreUnlocked() {
   }
 
   for (const grant of store.grants ?? []) {
+    normalizeGrantRefreshTokens(grant);
     grants.set(grant.grantId, grant);
-    refreshTokenIndex.set(grant.refreshTokenHash, grant.grantId);
-    if (grant.previousRefreshTokenHash) {
-      refreshTokenIndex.set(grant.previousRefreshTokenHash, grant.grantId);
-    }
+    indexGrantRefreshTokens(grant);
   }
 
   signingKey = store.privateJwk;
@@ -1009,29 +997,151 @@ function findGrantByRefreshToken(refreshToken: string) {
   const grant = grants.get(grantId);
   if (!grant) return undefined;
 
+  normalizeGrantRefreshTokens(grant);
+
   if (grant.refreshTokenHash === refreshTokenHash) {
-    return { grant, match: "current" as const };
+    return {
+      grant,
+      hash: refreshTokenHash,
+      match: "primary" as const,
+    };
   }
 
-  if (grant.previousRefreshTokenHash === refreshTokenHash) {
-    return { grant, match: "previous" as const };
+  if (grant.parallelRefreshTokenHashes?.includes(refreshTokenHash)) {
+    return {
+      grant,
+      hash: refreshTokenHash,
+      match: "parallel" as const,
+    };
+  }
+
+  const usedToken = grant.usedRefreshTokens?.find(
+    (candidate) => candidate.hash === refreshTokenHash,
+  );
+  if (usedToken) {
+    return {
+      grant,
+      hash: refreshTokenHash,
+      match: "used" as const,
+      validUntil: usedToken.validUntil,
+    };
   }
 
   return undefined;
 }
 
-function rotateRefreshToken(grant: OAuthGrant, refreshToken: string, now: number) {
-  if (grant.previousRefreshTokenHash) {
-    refreshTokenIndex.delete(grant.previousRefreshTokenHash);
+function rotateRefreshToken(
+  grant: OAuthGrant,
+  presentedHash: string,
+  match: "primary" | "parallel" | "used",
+  refreshToken: string,
+  now: number,
+) {
+  normalizeGrantRefreshTokens(grant);
+
+  const nextHash = tokenHash(refreshToken);
+  if (match === "primary") {
+    grant.refreshTokenHash = nextHash;
+    rememberUsedRefreshToken(grant, presentedHash, now);
+  } else if (match === "parallel") {
+    const parallelTokens = grant.parallelRefreshTokenHashes ?? [];
+    const tokenIndex = parallelTokens.indexOf(presentedHash);
+    if (tokenIndex < 0) {
+      throw new Error("Parallel refresh token disappeared during rotation.");
+    }
+    parallelTokens[tokenIndex] = nextHash;
+    grant.parallelRefreshTokenHashes = parallelTokens;
+    rememberUsedRefreshToken(grant, presentedHash, now);
+  } else {
+    grant.parallelRefreshTokenHashes = [
+      ...(grant.parallelRefreshTokenHashes ?? []),
+      nextHash,
+    ];
   }
 
-  const oldCurrentHash = grant.refreshTokenHash;
-  grant.previousRefreshTokenHash = oldCurrentHash;
-  grant.previousRefreshTokenValidUntil = now + REFRESH_ROTATION_GRACE_SECONDS;
-  grant.refreshTokenHash = tokenHash(refreshToken);
+  refreshTokenIndex.set(nextHash, grant.grantId);
+}
 
-  refreshTokenIndex.set(oldCurrentHash, grant.grantId);
+function normalizeGrantRefreshTokens(grant: OAuthGrant) {
+  const parallelTokens = new Set(
+    (grant.parallelRefreshTokenHashes ?? []).filter(
+      (hash) => hash !== grant.refreshTokenHash,
+    ),
+  );
+  grant.parallelRefreshTokenHashes = [...parallelTokens];
+
+  const usedTokens = new Map<string, UsedRefreshToken>();
+  for (const token of grant.usedRefreshTokens ?? []) {
+    const existing = usedTokens.get(token.hash);
+    if (!existing || token.validUntil > existing.validUntil) {
+      usedTokens.set(token.hash, token);
+    }
+  }
+
+  if (grant.previousRefreshTokenHash) {
+    const legacyToken = {
+      hash: grant.previousRefreshTokenHash,
+      validUntil: grant.previousRefreshTokenValidUntil ?? 0,
+    };
+    const existing = usedTokens.get(legacyToken.hash);
+    if (!existing || legacyToken.validUntil > existing.validUntil) {
+      usedTokens.set(legacyToken.hash, legacyToken);
+    }
+    delete grant.previousRefreshTokenHash;
+    delete grant.previousRefreshTokenValidUntil;
+  }
+
+  grant.usedRefreshTokens = [...usedTokens.values()]
+    .sort((left, right) => right.validUntil - left.validUntil)
+    .slice(0, MAX_USED_REFRESH_TOKENS_PER_GRANT);
+}
+
+function rememberUsedRefreshToken(
+  grant: OAuthGrant,
+  refreshTokenHash: string,
+  now: number,
+) {
+  const usedTokens = (grant.usedRefreshTokens ?? []).filter(
+    (token) => token.hash !== refreshTokenHash,
+  );
+  usedTokens.unshift({
+    hash: refreshTokenHash,
+    validUntil: now + REFRESH_ROTATION_GRACE_SECONDS,
+  });
+
+  const droppedTokens = usedTokens.slice(MAX_USED_REFRESH_TOKENS_PER_GRANT);
+  for (const token of droppedTokens) {
+    refreshTokenIndex.delete(token.hash);
+  }
+
+  grant.usedRefreshTokens = usedTokens.slice(
+    0,
+    MAX_USED_REFRESH_TOKENS_PER_GRANT,
+  );
+  refreshTokenIndex.set(refreshTokenHash, grant.grantId);
+}
+
+function activeRefreshTokenCount(grant: OAuthGrant) {
+  return 1 + (grant.parallelRefreshTokenHashes?.length ?? 0);
+}
+
+function indexGrantRefreshTokens(grant: OAuthGrant) {
   refreshTokenIndex.set(grant.refreshTokenHash, grant.grantId);
+  for (const hash of grant.parallelRefreshTokenHashes ?? []) {
+    refreshTokenIndex.set(hash, grant.grantId);
+  }
+  for (const token of grant.usedRefreshTokens ?? []) {
+    refreshTokenIndex.set(token.hash, grant.grantId);
+  }
+}
+
+function withRefreshTokenLock<T>(action: () => Promise<T>) {
+  const run = refreshTokenQueue.then(action, action);
+  refreshTokenQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
 }
 
 function isGrantUsable(grant: OAuthGrant) {
@@ -1078,7 +1188,6 @@ async function revokeToken(token: string, clientId?: string) {
 
   grant.revokedAt = Math.floor(Date.now() / 1000);
   await persistAuthStore();
-  closeSessionsForGrant(grant.grantId);
 }
 
 async function requireOAuth(
@@ -1756,61 +1865,6 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
-function getSessionFromRequest(req: AuthedRequest, res: Response) {
-  cleanupExpiredSessions();
-
-  const sessionId = req.header("mcp-session-id");
-
-  if (!sessionId) {
-    res.status(400).send("Missing Mcp-Session-Id");
-    return undefined;
-  }
-
-  const session = sessions.get(sessionId);
-
-  if (!session) {
-    res.status(404).send("Unknown MCP session");
-    return undefined;
-  }
-
-  if (!req.authContext || !isSessionOwnedBy(session, req.authContext)) {
-    res.status(403).send("MCP session belongs to another grant");
-    return undefined;
-  }
-
-  return session;
-}
-
-function isSessionOwnedBy(session: Session, authContext: AuthContext) {
-  return (
-    session.clientId === authContext.clientId &&
-    session.grantId === authContext.grantId
-  );
-}
-
-function cleanupExpiredSessions() {
-  const now = Date.now();
-
-  for (const [sessionId, session] of sessions) {
-    const idleExpired = now - session.lastUsedAt > SESSION_IDLE_TTL_MS;
-    const absoluteExpired = now - session.createdAt > SESSION_ABSOLUTE_TTL_MS;
-
-    if (idleExpired || absoluteExpired) {
-      sessions.delete(sessionId);
-      void session.transport.close().catch(() => undefined);
-    }
-  }
-}
-
-function closeSessionsForGrant(grantId: string) {
-  for (const [sessionId, session] of sessions) {
-    if (session.grantId === grantId) {
-      sessions.delete(sessionId);
-      void session.transport.close().catch(() => undefined);
-    }
-  }
-}
-
 function protectedResourceMetadata() {
   return {
     resource: MCP_PUBLIC_URL,
@@ -2137,7 +2191,6 @@ function cleanupEphemeralState() {
     if (entry.resetAt < now) rateLimitEntries.delete(key);
   }
 
-  cleanupExpiredSessions();
 }
 
 function validateConfiguration() {
@@ -2213,6 +2266,10 @@ const httpServer = app.listen(PORT, HOST, () => {
   console.log(`OAuth issuer: ${AUTH_ISSUER}`);
   console.log(`OAuth store: ${OAUTH_STORE_PATH}`);
   console.log(`Required scope: ${REQUIRED_SCOPE}`);
+  console.log("MCP transport mode: stateless (OAuth required on every request)");
+  console.log(
+    `Maximum parallel refresh tokens per grant: ${MAX_REFRESH_TOKENS_PER_GRANT}`,
+  );
   console.log(`PowerShell executable: ${POWERSHELL_EXECUTABLE}`);
   console.log(
     `OAuth consent PIN: dynamically generated per request (${CONSENT_PIN_LENGTH}-digit)`,
@@ -2223,23 +2280,37 @@ let shutdownStarted = false;
 async function shutdown(signal: string) {
   if (shutdownStarted) return;
   shutdownStarted = true;
-  console.log(`Received ${signal}; closing MCP sessions and HTTP server.`);
+  console.log(`Received ${signal}; closing HTTP server.`);
 
   const forcedExit = setTimeout(() => process.exit(1), 10_000);
   forcedExit.unref();
-
-  await Promise.allSettled(
-    [...sessions.values()].map((session) => session.transport.close()),
-  );
 
   httpServer.close((error) => {
     clearTimeout(forcedExit);
     if (error) {
       console.error("HTTP shutdown failed:", error);
-      process.exitCode = 1;
+      process.exit(1);
+    } else {
+      process.exit(0);
     }
   });
 }
 
 process.once("SIGINT", () => void shutdown("SIGINT"));
 process.once("SIGTERM", () => void shutdown("SIGTERM"));
+
+const parentPid = process.ppid;
+if (parentPid && parentPid !== 1) {
+  const parentMonitorInterval = setInterval(() => {
+    try {
+      process.kill(parentPid, 0);
+    } catch (e: any) {
+      if (e.code === "ESRCH") {
+        console.log(`Parent process ${parentPid} exited. Shutting down server.`);
+        clearInterval(parentMonitorInterval);
+        void shutdown("parent_exit");
+      }
+    }
+  }, 2000);
+  parentMonitorInterval.unref();
+}

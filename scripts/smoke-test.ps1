@@ -210,8 +210,10 @@ $InitializeResponse = Invoke-WebRequest `
   -Body $InitializeBody
 
 $RawSessionId = $InitializeResponse.Headers['mcp-session-id']
-$SessionId = if ($RawSessionId -is [array]) { [string] $RawSessionId[0] } else { [string] $RawSessionId }
-$Headers['Mcp-Session-Id'] = $SessionId
+if ($RawSessionId) {
+  throw 'Stateless MCP unexpectedly returned an Mcp-Session-Id header.'
+}
+$Headers['Mcp-Protocol-Version'] = '2025-06-18'
 
 $InitializedBody = @{
   jsonrpc = '2.0'
@@ -315,8 +317,6 @@ if (-not $HealthAfterRuntimeErrors.ok) {
   throw 'Server was unhealthy after runtime error tests.'
 }
 
-Invoke-WebRequest -UseBasicParsing -Method Delete -Uri $McpRequestUrl -Headers $Headers | Out-Null
-
 Invoke-RestMethod `
   -Method Post `
   -Uri "$Base/oauth/revoke" `
@@ -375,7 +375,8 @@ if (-not $AccessRevoked) {
   accessRevoked = $AccessRevoked
   scope = $Token.scope
   mcpResource = $McpResource
-  sessionId = $SessionId
+  transportMode = 'stateless'
+  sessionIdIssued = [bool] $RawSessionId
   tools = $Tools.result.tools.name
   powershellResult = ($Call.result.content[0].text | ConvertFrom-Json)
   nonexistentProcessHandled = -not $BadProcessResult.started
