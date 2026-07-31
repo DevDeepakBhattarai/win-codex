@@ -48,8 +48,10 @@ const AUTH_ISSUER = stripTrailingSlash(
   process.env.AUTH_ISSUER ?? PUBLIC_BASE_URL,
 );
 const REQUIRED_SCOPE = process.env.REQUIRED_SCOPE ?? "mcp:control";
-const POWERSHELL_EXECUTABLE =
-  process.env.POWERSHELL_EXECUTABLE ?? "powershell.exe";
+const POWERSHELL_EXECUTABLE = resolvePowerShellExecutable(
+  process.platform,
+  process.env.POWERSHELL_EXECUTABLE,
+);
 const CONSENT_PIN_LENGTH = 6;
 const SERVER_NAME = "win-codex";
 const DATA_DIR = process.env.DATA_DIR ?? path.join(process.cwd(), ".data");
@@ -1355,7 +1357,7 @@ function createMcpServer() {
     {
       title: "Run PowerShell",
       description:
-        "Run a Windows PowerShell command on the local machine that hosts this MCP server.",
+        "Run a PowerShell command on the local machine that hosts this MCP server.",
       inputSchema: {
         command: z.string().min(1).describe("PowerShell command to execute."),
         cwd: z
@@ -1405,7 +1407,7 @@ function createMcpServer() {
     "read_text_file",
     {
       title: "Read Text File",
-      description: "Read a UTF-8 text file from the local Windows machine.",
+      description: "Read a UTF-8 text file from the local machine.",
       inputSchema: {
         path: z.string().min(1).describe("Absolute or relative file path."),
         maxBytes: z
@@ -1464,7 +1466,7 @@ function createMcpServer() {
     {
       title: "Write Text File",
       description:
-        "Create or replace a UTF-8 text file on the local Windows machine.",
+        "Create or replace a UTF-8 text file on the local machine.",
       inputSchema: {
         path: z.string().min(1).describe("Absolute or relative file path."),
         content: z
@@ -1508,7 +1510,7 @@ function createMcpServer() {
     "list_directory",
     {
       title: "List Directory",
-      description: "List files and folders in a local Windows directory.",
+      description: "List files and folders in a local directory.",
       inputSchema: {
         path: z
           .string()
@@ -1586,7 +1588,7 @@ function createMcpServer() {
     {
       title: "Start Process",
       description:
-        "Start a local Windows process, optionally waiting for completion.",
+        "Start a local process, optionally waiting for completion.",
       inputSchema: {
         command: z.string().min(1).describe("Executable to run."),
         args: z.array(z.string()).default([]).describe("Command arguments."),
@@ -1713,8 +1715,9 @@ function runPowerShell(input: {
         "-NoLogo",
         "-NoProfile",
         "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
+        ...(process.platform === "win32"
+          ? ["-ExecutionPolicy", "Bypass"]
+          : []),
         "-Command",
         input.command,
       ],
@@ -1871,7 +1874,7 @@ function protectedResourceMetadata() {
     authorization_servers: [AUTH_ISSUER],
     scopes_supported: [REQUIRED_SCOPE],
     bearer_methods_supported: ["header"],
-    resource_name: "Local Windows Control MCP",
+    resource_name: "Local Computer Control MCP",
   };
 }
 
@@ -1956,7 +1959,7 @@ function renderConsentPage(
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Authorize Local Windows Control MCP</title>
+    <title>Authorize Local Computer Control MCP</title>
     <style>
       body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background: #f6f7f9; color: #16181d; }
       main { max-width: 680px; margin: 10vh auto; padding: 32px; background: white; border: 1px solid #d8dce3; border-radius: 8px; }
@@ -1975,7 +1978,7 @@ function renderConsentPage(
   </head>
   <body>
     <main>
-      <h1>Authorize Local Windows Control MCP</h1>
+      <h1>Authorize Local Computer Control MCP</h1>
       <p><strong>${escapeHtml(client.clientName ?? request.client_id)}</strong> is requesting access to <code>${escapeHtml(request.resource ?? MCP_PUBLIC_URL)}</code>.</p>
       <p>Redirect destination: <code>${escapeHtml(new URL(request.redirect_uri).origin)}</code></p>
       <p class="danger">This grants access to tools that can run PowerShell commands, read/write files, and start processes on this computer. Only approve this request if you started it from ChatGPT.</p>
@@ -2070,6 +2073,21 @@ function logOAuthResponse(pathname: string, req: Request, res: Response) {
   return requestId;
 }
 
+function resolvePowerShellExecutable(
+  platform: NodeJS.Platform,
+  configuredExecutable: string | undefined,
+) {
+  const configured = configuredExecutable?.trim();
+
+  if (
+    configured &&
+    !(platform !== "win32" && configured.toLowerCase() === "powershell.exe")
+  ) {
+    return configured;
+  }
+
+  return platform === "win32" ? "powershell.exe" : "pwsh";
+}
 function boundedIntegerEnv(
   name: string,
   defaultValue: number,
@@ -2304,8 +2322,8 @@ if (parentPid && parentPid !== 1) {
   const parentMonitorInterval = setInterval(() => {
     try {
       process.kill(parentPid, 0);
-    } catch (e: any) {
-      if (e.code === "ESRCH") {
+    } catch (error: unknown) {
+      if (isNodeError(error, "ESRCH")) {
         console.log(`Parent process ${parentPid} exited. Shutting down server.`);
         clearInterval(parentMonitorInterval);
         void shutdown("parent_exit");

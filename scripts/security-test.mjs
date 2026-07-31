@@ -4,7 +4,12 @@ import { rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import path from "node:path";
 
+import { resolvePowerShellExecutable } from "./run-powershell.mjs";
+
 const cwd = process.cwd();
+if (resolvePowerShellExecutable("darwin", "powershell.exe") !== "pwsh") {
+  throw new Error("macOS must use pwsh instead of powershell.exe.");
+}
 const portProbe = createServer();
 await new Promise((resolve, reject) => {
   portProbe.once("error", reject);
@@ -272,6 +277,29 @@ try {
     throw new Error(`Stateless tools/list unexpectedly returned Mcp-Session-Id: ${toolsList.sessionId}`);
   }
 
+  const powerShellCall = await postMcp(
+    {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
+        name: "powershell",
+        arguments: {
+          command: "Write-Output 'mcp-platform-ok'",
+          timeoutMs: 10000,
+        },
+      },
+    },
+    token.access_token,
+    protocolHeaders,
+  );
+  if (
+    powerShellCall.status !== 200 ||
+    !powerShellCall.responseText.includes("mcp-platform-ok")
+  ) {
+    throw new Error(`PowerShell tool execution failed: ${JSON.stringify(powerShellCall)}`);
+  }
+
   const requestCount = 300;
   let succeeded = 0;
   for (let offset = 0; offset < requestCount; offset += 25) {
@@ -319,6 +347,8 @@ try {
     authenticatedInitializeSucceeded: initialized.status === 200,
     sessionIdIssued: initialized.sessionId !== null,
     authenticatedToolsListSucceeded: toolsList.status === 200,
+    powerShellExecutableSelection: true,
+    powerShellCommandSucceeded: powerShellCall.status === 200,
     statelessRequestsSucceeded: succeeded,
     revokedGrantRejected: afterRevocation.status === 401,
   }, null, 2));

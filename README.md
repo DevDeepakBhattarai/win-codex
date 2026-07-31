@@ -1,8 +1,8 @@
-# Local Windows Control MCP Server
+# Local Computer Control MCP Server
 
-A hardened, production-ready **Model Context Protocol (MCP) server** that enables an authorized ChatGPT session to act as a **local "Codex" environment**, allowing it to securely control a Windows machine through PowerShell, filesystem operations, and process management.
+A hardened, production-ready **Model Context Protocol (MCP) server** that enables an authorized ChatGPT session to act as a **local "Codex" environment**, allowing it to securely control a Windows or macOS machine through PowerShell, filesystem operations, and process management.
 
-The server is designed with a defense-in-depth security model to ensure that powerful local capabilities (which run with the permissions of the host Windows user) are only accessible to an explicitly approved, authenticated, and revocable ChatGPT connection.
+The server is designed with a defense-in-depth security model to ensure that powerful local capabilities (which run with the permissions of the host user) are only accessible to an explicitly approved, authenticated, and revocable ChatGPT connection.
 
 ```mermaid
 graph TD
@@ -13,14 +13,14 @@ graph TD
     GPT[ChatGPT Cloud Service]:::external
     Tunnel[Secure HTTPS Tunnel <br/> ngrok / Cloudflare]:::external
     
-    subgraph Windows Host Machine
+    subgraph Host Machine
         Server[Local MCP Server <br/> Node.js / Express]:::secure
         Store[(Encrypted OAuth Store <br/> oauth-store.json)]:::secure
         Console[Server Terminal Console]:::secure
         
         PS[PowerShell Core / Desktop]:::local
-        FS[Windows Filesystem]:::local
-        Proc[Windows OS Processes]:::local
+        FS[Local Filesystem]:::local
+        Proc[Operating System Processes]:::local
     end
 
     GPT <-->|HTTPS Protocol| Tunnel
@@ -42,7 +42,7 @@ ChatGPT uses **OAuth 2.0 with PKCE (Proof Key for Code Exchange)** to securely a
 ```mermaid
 sequenceDiagram
     autonumber
-    actor User as Developer / Windows User
+    actor User as Developer / Local User
     participant GPT as ChatGPT Cloud Service
     participant Tun as HTTPS Tunnel (e.g. ngrok)
     participant Server as Local MCP Server (Express)
@@ -94,8 +94,8 @@ When the access token expires, ChatGPT automatically uses the refresh token to r
 
 Once connected, ChatGPT can call the following tools to inspect, modify, and build local code:
 
-*   **`powershell`**: Run an arbitrary Windows PowerShell command.
-    *   *Features*: Bounded output stream, automatic timeout after 60 seconds, and recursive process termination (`taskkill /T /F`) if the command times out.
+*   **`powershell`**: Run an arbitrary PowerShell command.
+    *   *Features*: Bounded output stream, automatic timeout after 60 seconds, and platform-aware process termination if the command times out.
 *   **`read_text_file`**: Read up to 5 MiB of a UTF-8 file.
     *   *Features*: Bounded disk I/O to prevent memory exhaustion from loading large files.
 *   **`write_text_file`**: Create or overwrite up to 5 MiB of UTF-8 text.
@@ -110,6 +110,7 @@ Once connected, ChatGPT can call the following tools to inspect, modify, and bui
 ### Prerequisites
 *   **Node.js**: `v22.0.0` or higher (under `v23`).
 *   **pnpm**: Version 9 or higher.
+*   **PowerShell**: Windows PowerShell on Windows, or PowerShell 7 (`pwsh`) on macOS.
 *   **A Public Tunnel**: `ngrok`, `cloudflared`, or similar.
 
 ### Step 1: Install Dependencies
@@ -120,7 +121,7 @@ pnpm install --frozen-lockfile
 ### Step 2: Configure Environment Variables
 Create a `.env` file in the root directory. You can copy the template from `.env.example`:
 ```powershell
-copy .env.example .env
+Copy-Item .env.example .env
 ```
 
 Edit your `.env` file to match your setup:
@@ -142,14 +143,15 @@ ALLOW_NON_LOOPBACK_BIND=false
 ACCESS_TOKEN_TTL_SECONDS=600
 REFRESH_ROTATION_GRACE_SECONDS=60
 MAX_REFRESH_TOKENS_PER_GRANT=64
-POWERSHELL_EXECUTABLE=powershell.exe
+# Optional override; normally leave unset.
+# POWERSHELL_EXECUTABLE=pwsh
 ```
 
 > [!IMPORTANT]  
 > Because ChatGPT is a cloud-based service, it **cannot** talk to `localhost` directly. You must configure a tunnel (e.g. `ngrok http 6000`) and set the `PUBLIC_BASE_URL`, `MCP_PUBLIC_URL`, and `AUTH_ISSUER` variables to the tunnel's HTTPS URL.
 
 ### Step 3: Harden File Permissions
-Run the hardening script to restrict read/write access to the `.env` configuration file and `.data/` directory. This removes inherited permissions and grants access only to the current user account, `SYSTEM`, and local `Administrators`:
+Run the hardening script to restrict access to the `.env` configuration file and `.data/` directory. On Windows it applies ACLs; on macOS it removes group and other permissions:
 ```powershell
 pnpm run harden
 ```
@@ -187,7 +189,7 @@ pnpm dev
 ## 🛡️ Security Hardening Details
 
 *   **🔒 Strict Binds**: The server binds to loopback (`localhost`) by default, preventing local network exposure unless `ALLOW_NON_LOOPBACK_BIND=true` is set.
-*   **🔐 ACL Isolation**: Built-in Windows ACL hardening via `pnpm run harden` prevents non-privileged processes from reading signing keys or token caches.
+*   **🔐 File Permission Isolation**: `pnpm run harden` applies Windows ACLs or macOS permissions to protect signing keys and token caches.
 *   **🙅 Open Redirect Protection**: The server blocks dynamic client registrations from attempting open redirection. Redirect URIs must match exact registered patterns.
 *   **⏳ Short-Lived JWTs**: Access tokens expire in 10 minutes. Token validity is checked against a cryptographic signature (RS256) on every MCP request.
 *   **🌀 Hash-based Token Storage**: Refresh tokens are stored in the database as SHA-256 hashes rather than plaintext.

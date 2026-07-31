@@ -1,7 +1,7 @@
 {
     "name":  "win-codex",
     "version":  "1.1.0",
-    "description":  "Hardened local Streamable HTTP MCP server with Windows PowerShell, file, and process tools protected by OAuth.",
+    "description":  "Hardened local Streamable HTTP MCP server with PowerShell, file, and process tools protected by OAuth on Windows and macOS.",
     "main":  "dist/server.js",
     "type":  "module",
     "packageManager":  "pnpm@11.8.0",
@@ -12,15 +12,18 @@
                     "dev":  "tsx src/server.ts",
                     "build":  "tsc -p tsconfig.build.json",
                     "start":  "node dist/server.js",
-                    "check":  "tsc --noEmit",
-                    "smoke":  "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-test.ps1",
-                    "revoke":  "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/revoke-access.ps1",
-                    "harden":  "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/harden-acl.ps1",
+                    "type":  "tsc --noEmit",
+                    "check":  "pnpm type",
+                    "smoke":  "node scripts/run-powershell.mjs scripts/smoke-test.ps1",
+                    "revoke":  "node scripts/run-powershell.mjs scripts/revoke-access.ps1",
+                    "harden":  "node scripts/run-powershell.mjs scripts/harden-acl.ps1",
                     "security-test":  "pnpm build && node scripts/security-test.mjs"
                 },
     "keywords":  [
                      "mcp",
                      "windows",
+                     "macos",
+                     "powershell",
                      "oauth"
                  ],
     "author":  "",
