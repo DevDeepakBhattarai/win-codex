@@ -4,11 +4,42 @@ import { rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import path from "node:path";
 
+import {
+  createTerminalInvocation,
+  formatPlatformName,
+} from "../dist/terminal.js";
 import { resolvePowerShellExecutable } from "./run-powershell.mjs";
 
 const cwd = process.cwd();
 if (resolvePowerShellExecutable("darwin", "powershell.exe") !== "pwsh") {
-  throw new Error("macOS must use pwsh instead of powershell.exe.");
+  throw new Error("macOS management scripts must use pwsh instead of powershell.exe.");
+}
+
+const macTerminalInvocation = createTerminalInvocation({
+  platform: "darwin",
+  command: "printf mac-terminal-ok",
+  configuredExecutable: undefined,
+  powerShellExecutable: "pwsh",
+});
+if (
+  macTerminalInvocation.executable !== "/bin/bash" ||
+  macTerminalInvocation.args[0] !== "-lc" ||
+  macTerminalInvocation.args[1] !== "printf mac-terminal-ok"
+) {
+  throw new Error("macOS terminal commands must run through /bin/bash -lc.");
+}
+
+const windowsTerminalInvocation = createTerminalInvocation({
+  platform: "win32",
+  command: "Write-Output windows-terminal-ok",
+  configuredExecutable: undefined,
+  powerShellExecutable: "powershell.exe",
+});
+if (
+  windowsTerminalInvocation.executable !== "powershell.exe" ||
+  !windowsTerminalInvocation.args.includes("Write-Output windows-terminal-ok")
+) {
+  throw new Error("Windows terminal commands must run through PowerShell.");
 }
 const portProbe = createServer();
 await new Promise((resolve, reject) => {
@@ -119,7 +150,9 @@ try {
   if (
     healthResponse.status !== 200 ||
     health.transportMode !== "stateless" ||
-    health.authentication !== "oauth2-bearer"
+    health.authentication !== "oauth2-bearer" ||
+    health.platform !== process.platform ||
+    health.platformName !== formatPlatformName(process.platform)
   ) {
     throw new Error(`Unexpected health response: ${JSON.stringify(health)}`);
   }
@@ -270,22 +303,26 @@ try {
   };
   const protocolHeaders = { "mcp-protocol-version": "2025-06-18" };
   const toolsList = await postMcp(toolsListBody, token.access_token, protocolHeaders);
-  if (toolsList.status !== 200 || !toolsList.responseText.includes("list_directory")) {
+  if (
+    toolsList.status !== 200 ||
+    !toolsList.responseText.includes("list_directory") ||
+    !toolsList.responseText.includes("terminal")
+  ) {
     throw new Error(`Authenticated tools/list failed: ${JSON.stringify(toolsList)}`);
   }
   if (toolsList.sessionId !== null) {
     throw new Error(`Stateless tools/list unexpectedly returned Mcp-Session-Id: ${toolsList.sessionId}`);
   }
 
-  const powerShellCall = await postMcp(
+  const terminalCall = await postMcp(
     {
       jsonrpc: "2.0",
       id: 3,
       method: "tools/call",
       params: {
-        name: "powershell",
+        name: "terminal",
         arguments: {
-          command: "Write-Output 'mcp-platform-ok'",
+          command: "node -e \"console.log('mcp-terminal-ok')\"",
           timeoutMs: 10000,
         },
       },
@@ -294,10 +331,10 @@ try {
     protocolHeaders,
   );
   if (
-    powerShellCall.status !== 200 ||
-    !powerShellCall.responseText.includes("mcp-platform-ok")
+    terminalCall.status !== 200 ||
+    !terminalCall.responseText.includes("mcp-terminal-ok")
   ) {
-    throw new Error(`PowerShell tool execution failed: ${JSON.stringify(powerShellCall)}`);
+    throw new Error(`Terminal tool execution failed: ${JSON.stringify(terminalCall)}`);
   }
 
   const requestCount = 300;
@@ -347,8 +384,11 @@ try {
     authenticatedInitializeSucceeded: initialized.status === 200,
     sessionIdIssued: initialized.sessionId !== null,
     authenticatedToolsListSucceeded: toolsList.status === 200,
-    powerShellExecutableSelection: true,
-    powerShellCommandSucceeded: powerShellCall.status === 200,
+    hostPlatformAdvertised: health.platform === process.platform,
+    terminalToolAdvertised: toolsList.responseText.includes("terminal"),
+    macTerminalUsesBash: macTerminalInvocation.executable === "/bin/bash",
+    windowsTerminalUsesPowerShell: windowsTerminalInvocation.executable === "powershell.exe",
+    terminalCommandSucceeded: terminalCall.status === 200,
     statelessRequestsSucceeded: succeeded,
     revokedGrantRejected: afterRevocation.status === 401,
   }, null, 2));

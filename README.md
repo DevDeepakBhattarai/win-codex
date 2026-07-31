@@ -1,6 +1,6 @@
 # Local Computer Control MCP Server
 
-A hardened, production-ready **Model Context Protocol (MCP) server** that enables an authorized ChatGPT session to act as a **local "Codex" environment**, allowing it to securely control a Windows or macOS machine through PowerShell, filesystem operations, and process management.
+A hardened, production-ready **Model Context Protocol (MCP) server** that enables an authorized ChatGPT session to act as a **local "Codex" environment**, allowing it to securely control a Windows or macOS machine through terminal commands, filesystem operations, and process management.
 
 The server is designed with a defense-in-depth security model to ensure that powerful local capabilities (which run with the permissions of the host user) are only accessible to an explicitly approved, authenticated, and revocable ChatGPT connection.
 
@@ -18,7 +18,7 @@ graph TD
         Store[(Encrypted OAuth Store <br/> oauth-store.json)]:::secure
         Console[Server Terminal Console]:::secure
         
-        PS[PowerShell Core / Desktop]:::local
+        Terminal[PowerShell / Bash]:::local
         FS[Local Filesystem]:::local
         Proc[Operating System Processes]:::local
     end
@@ -28,7 +28,7 @@ graph TD
     Server <-->|Read/Write Grants| Store
     Server -.->|Logs Consent PIN| Console
     
-    Server -->|Runs commands| PS
+    Server -->|Runs commands| Terminal
     Server -->|Reads/Writes files| FS
     Server -->|Starts/Kills| Proc
 ```
@@ -94,8 +94,8 @@ When the access token expires, ChatGPT automatically uses the refresh token to r
 
 Once connected, ChatGPT can call the following tools to inspect, modify, and build local code:
 
-*   **`powershell`**: Run an arbitrary PowerShell command.
-    *   *Features*: Bounded output stream, automatic timeout after 60 seconds, and platform-aware process termination if the command times out.
+*   **`terminal`**: Run terminal commands using PowerShell on Windows, `/bin/bash` on macOS, and `/bin/sh` on Linux.
+    *   *Features*: Bounded output, a 60-second maximum timeout, and platform-aware process termination.
 *   **`read_text_file`**: Read up to 5 MiB of a UTF-8 file.
     *   *Features*: Bounded disk I/O to prevent memory exhaustion from loading large files.
 *   **`write_text_file`**: Create or overwrite up to 5 MiB of UTF-8 text.
@@ -110,7 +110,7 @@ Once connected, ChatGPT can call the following tools to inspect, modify, and bui
 ### Prerequisites
 *   **Node.js**: `v22.0.0` or higher (under `v23`).
 *   **pnpm**: Version 9 or higher.
-*   **PowerShell**: Windows PowerShell on Windows, or PowerShell 7 (`pwsh`) on macOS.
+*   **PowerShell**: Windows PowerShell on Windows, or PowerShell 7 (`pwsh`) on macOS, for the included management scripts. MCP terminal commands use Bash on macOS.
 *   **A Public Tunnel**: `ngrok`, `cloudflared`, or similar.
 
 ### Step 1: Install Dependencies
@@ -143,8 +143,11 @@ ALLOW_NON_LOOPBACK_BIND=false
 ACCESS_TOKEN_TTL_SECONDS=600
 REFRESH_ROTATION_GRACE_SECONDS=60
 MAX_REFRESH_TOKENS_PER_GRANT=64
-# Optional override; normally leave unset.
+# Optional management-script override; normally leave unset.
 # POWERSHELL_EXECUTABLE=pwsh
+
+# Optional MCP terminal override. macOS defaults to /bin/bash.
+# TERMINAL_EXECUTABLE=/bin/bash
 ```
 
 > [!IMPORTANT]  

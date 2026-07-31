@@ -38,6 +38,11 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 
+import {
+  createTerminalInvocation,
+  formatPlatformName,
+} from "./terminal.js";
+
 const PORT = Number(process.env.PORT ?? 6000);
 const HOST = process.env.HOST ?? "localhost";
 const PUBLIC_BASE_URL = stripTrailingSlash(
@@ -48,12 +53,21 @@ const AUTH_ISSUER = stripTrailingSlash(
   process.env.AUTH_ISSUER ?? PUBLIC_BASE_URL,
 );
 const REQUIRED_SCOPE = process.env.REQUIRED_SCOPE ?? "mcp:control";
+const HOST_PLATFORM = process.platform;
+const HOST_PLATFORM_NAME = formatPlatformName(HOST_PLATFORM);
 const POWERSHELL_EXECUTABLE = resolvePowerShellExecutable(
-  process.platform,
+  HOST_PLATFORM,
   process.env.POWERSHELL_EXECUTABLE,
 );
+const TERMINAL_EXECUTABLE = process.env.TERMINAL_EXECUTABLE;
+const TERMINAL_SHELL = createTerminalInvocation({
+  platform: HOST_PLATFORM,
+  command: "",
+  configuredExecutable: TERMINAL_EXECUTABLE,
+  powerShellExecutable: POWERSHELL_EXECUTABLE,
+}).shell;
 const CONSENT_PIN_LENGTH = 6;
-const SERVER_NAME = "win-codex";
+const SERVER_NAME = "local-codex";
 const DATA_DIR = process.env.DATA_DIR ?? path.join(process.cwd(), ".data");
 const OAUTH_STORE_PATH = path.resolve(
   process.env.OAUTH_STORE_PATH ?? path.join(DATA_DIR, "oauth-store.json"),
@@ -259,6 +273,9 @@ app.get("/health", (_req, res) => {
     issuer: AUTH_ISSUER,
     transportMode: "stateless",
     authentication: "oauth2-bearer",
+    platform: HOST_PLATFORM,
+    platformName: HOST_PLATFORM_NAME,
+    terminalShell: TERMINAL_SHELL,
   });
 });
 
@@ -1293,6 +1310,12 @@ const commandResultOutputSchema = {
   stderr: z.string(),
 };
 
+const terminalResultOutputSchema = {
+  ...commandResultOutputSchema,
+  shell: z.string(),
+  platform: z.string(),
+};
+
 const textFileOutputSchema = {
   path: z.string(),
   bytesRead: z.number().int().nonnegative(),
@@ -1353,13 +1376,16 @@ function createMcpServer() {
   });
 
   server.registerTool(
-    "powershell",
+    "terminal",
     {
-      title: "Run PowerShell",
+      title: "Run Terminal Command",
       description:
-        "Run a PowerShell command on the local machine that hosts this MCP server.",
+        `Run a shell command directly on this ${HOST_PLATFORM_NAME} computer using ${TERMINAL_SHELL}. Use this for all terminal and shell commands. On macOS, commands run through bash; cmd.exe and Windows-only commands are unavailable.`,
       inputSchema: {
-        command: z.string().min(1).describe("PowerShell command to execute."),
+        command: z
+          .string()
+          .min(1)
+          .describe(`Terminal command to execute on ${HOST_PLATFORM_NAME}.`),
         cwd: z
           .string()
           .optional()
@@ -1372,7 +1398,7 @@ function createMcpServer() {
           .default(10000)
           .describe("Timeout in milliseconds. Maximum is 60000."),
       },
-      outputSchema: commandResultOutputSchema,
+      outputSchema: terminalResultOutputSchema,
       annotations: {
         readOnlyHint: false,
         destructiveHint: true,
@@ -1380,15 +1406,13 @@ function createMcpServer() {
       },
     },
     async ({ command, cwd, timeoutMs }) => {
-      const result = await runPowerShell({
-        command,
-        cwd,
-        timeoutMs,
-      });
+      const result = await runTerminal({ command, cwd, timeoutMs });
 
       const structuredContent = {
         command,
         cwd: cwd ? path.resolve(cwd) : process.cwd(),
+        shell: result.shell,
+        platform: result.platformName,
         exitCode: result.exitCode,
         signal: result.signal,
         timedOut: result.timedOut,
@@ -1402,7 +1426,6 @@ function createMcpServer() {
       };
     },
   );
-
   server.registerTool(
     "read_text_file",
     {
@@ -1588,7 +1611,7 @@ function createMcpServer() {
     {
       title: "Start Process",
       description:
-        "Start a local process, optionally waiting for completion.",
+        `Start a specific executable directly on this ${HOST_PLATFORM_NAME} computer, optionally waiting for completion. Use terminal for shell commands. Do not use cmd.exe on macOS.`,
       inputSchema: {
         command: z.string().min(1).describe("Executable to run."),
         args: z.array(z.string()).default([]).describe("Command arguments."),
@@ -1696,38 +1719,34 @@ function terminateProcessTree(child: ReturnType<typeof spawn>) {
   escalation.unref();
 }
 
-function runPowerShell(input: {
+function runTerminal(input: {
   command: string;
   cwd?: string;
   timeoutMs: number;
 }) {
+  const invocation = createTerminalInvocation({
+    platform: HOST_PLATFORM,
+    command: input.command,
+    configuredExecutable: TERMINAL_EXECUTABLE,
+    powerShellExecutable: POWERSHELL_EXECUTABLE,
+  });
+
   return new Promise<{
     stdout: string;
     stderr: string;
     exitCode: number | null;
     signal: NodeJS.Signals | null;
     timedOut: boolean;
+    shell: string;
+    platformName: string;
   }>((resolve) => {
     const cwd = input.cwd ? path.resolve(input.cwd) : process.cwd();
-    const child = spawn(
-      POWERSHELL_EXECUTABLE,
-      [
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        ...(process.platform === "win32"
-          ? ["-ExecutionPolicy", "Bypass"]
-          : []),
-        "-Command",
-        input.command,
-      ],
-      {
-        cwd,
-        env: childEnvironment(),
-        shell: false,
-        windowsHide: true,
-      },
-    );
+    const child = spawn(invocation.executable, invocation.args, {
+      cwd,
+      env: childEnvironment(),
+      shell: false,
+      windowsHide: true,
+    });
 
     const stdout = new BoundedOutput(1024 * 1024);
     const stderr = new BoundedOutput(1024 * 1024);
@@ -1751,11 +1770,12 @@ function runPowerShell(input: {
         exitCode,
         signal,
         timedOut,
+        shell: invocation.shell,
+        platformName: invocation.platformName,
       });
     });
   });
 }
-
 function startProcess(input: {
   command: string;
   args: string[];
@@ -1981,7 +2001,7 @@ function renderConsentPage(
       <h1>Authorize Local Computer Control MCP</h1>
       <p><strong>${escapeHtml(client.clientName ?? request.client_id)}</strong> is requesting access to <code>${escapeHtml(request.resource ?? MCP_PUBLIC_URL)}</code>.</p>
       <p>Redirect destination: <code>${escapeHtml(new URL(request.redirect_uri).origin)}</code></p>
-      <p class="danger">This grants access to tools that can run PowerShell commands, read/write files, and start processes on this computer. Only approve this request if you started it from ChatGPT.</p>
+      <p class="danger">This grants access to tools that can run terminal commands, read/write files, and start processes on this computer. Only approve this request if you started it from ChatGPT.</p>
       <p>Scope: <code>${escapeHtml(request.scope ?? REQUIRED_SCOPE)}</code></p>
       ${error}
       <form method="post" action="/oauth/authorize">
@@ -2288,7 +2308,8 @@ const httpServer = app.listen(PORT, HOST, () => {
   console.log(
     `Maximum parallel refresh tokens per grant: ${MAX_REFRESH_TOKENS_PER_GRANT}`,
   );
-  console.log(`PowerShell executable: ${POWERSHELL_EXECUTABLE}`);
+  console.log(`Host platform: ${HOST_PLATFORM_NAME} (${HOST_PLATFORM})`);
+  console.log(`Terminal shell: ${TERMINAL_SHELL}`);
   console.log(
     `OAuth consent PIN: dynamically generated per request (${CONSENT_PIN_LENGTH}-digit)`,
   );

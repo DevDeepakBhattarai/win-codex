@@ -103,7 +103,7 @@ $Registration = Invoke-RestMethod `
   -Uri "$Base/oauth/register" `
   -ContentType 'application/json' `
   -Body (@{
-    client_name = 'PowerShell Smoke Test'
+    client_name = 'Terminal Smoke Test'
     redirect_uris = @($Redirect)
     scope = 'mcp:control'
     token_endpoint_auth_method = 'none'
@@ -195,7 +195,7 @@ $InitializeBody = @{
     protocolVersion = '2025-06-18'
     capabilities = @{}
     clientInfo = @{
-      name = 'powershell-smoke-test'
+      name = 'terminal-smoke-test'
       version = '0.1.0'
     }
   }
@@ -249,9 +249,9 @@ $CallBody = @{
   id = 3
   method = 'tools/call'
   params = @{
-    name = 'powershell'
+    name = 'terminal'
     arguments = @{
-      command = "'mcp-ok'; Get-Location | Select-Object -ExpandProperty Path"
+      command = 'node --version'mcp-terminal-ok\')"'
       timeoutMs = 10000
     }
   }
@@ -378,7 +378,7 @@ if (-not $AccessRevoked) {
   transportMode = 'stateless'
   sessionIdIssued = [bool] $RawSessionId
   tools = $Tools.result.tools.name
-  powershellResult = ($Call.result.content[0].text | ConvertFrom-Json)
+  terminalResult = ($Call.result.content[0].text | ConvertFrom-Json)
   nonexistentProcessHandled = -not $BadProcessResult.started
   boundedReadBytes = $ReadResult.bytesRead
   healthyAfterRuntimeErrors = $HealthAfterRuntimeErrors.ok
