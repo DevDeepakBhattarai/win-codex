@@ -10,27 +10,7 @@ $ProtectedResource = Invoke-RestMethod -Uri "$Base/.well-known/oauth-protected-r
 $McpResource = $ProtectedResource.resource
 $Redirect = 'http://127.0.0.1/callback'
 
-function Get-DotEnvValue([string] $Name) {
-  $EnvPath = Join-Path (Get-Location) '.env'
-  if (-not (Test-Path -LiteralPath $EnvPath)) {
-    return $null
-  }
-
-  $Line = Get-Content -LiteralPath $EnvPath |
-    Where-Object { $_ -match "^\s*$([regex]::Escape($Name))=" } |
-    Select-Object -First 1
-
-  if (-not $Line) {
-    return $null
-  }
-
-  ($Line -replace "^\s*$([regex]::Escape($Name))=", '').Trim()
-}
-
 $ConsentPin = $env:MCP_SMOKE_CONSENT_PIN
-if (-not $ConsentPin) {
-  $ConsentPin = Get-DotEnvValue 'OAUTH_CONSENT_PIN'
-}
 
 function ConvertTo-Base64Url([byte[]] $Bytes) {
   [Convert]::ToBase64String($Bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
@@ -132,12 +112,17 @@ if (-not $AuthTxMatch.Success) {
   throw 'Authorization transaction was not rendered.'
 }
 
+if (-not $ConsentPin) {
+  $ConsentPin = Read-Host 'Enter the 6-digit OAUTH CONSENT PIN shown in the server terminal'
+}
+if ($ConsentPin -notmatch '^\d{6}$') {
+  throw 'MCP smoke consent PIN must contain exactly 6 digits.'
+}
+
 $AuthorizeForm = @{
   auth_tx = [Net.WebUtility]::HtmlDecode($AuthTxMatch.Groups[1].Value)
   action = 'authorize'
-}
-if ($ConsentPin) {
-  $AuthorizeForm.consent_pin = $ConsentPin
+  consent_pin = $ConsentPin
 }
 
 $Authorize = Invoke-PostFormNoRedirect "$Base/oauth/authorize" $AuthorizeForm
@@ -251,7 +236,7 @@ $CallBody = @{
   params = @{
     name = 'terminal'
     arguments = @{
-      command = 'node --version'mcp-terminal-ok\')"'
+      command = 'node -e "console.log(''mcp-terminal-ok'')"'
       timeoutMs = 10000
     }
   }
@@ -265,6 +250,10 @@ $CallResponse = Invoke-WebRequest `
   -ContentType 'application/json' `
   -Body $CallBody
 $Call = ConvertFrom-SseJson $CallResponse.Content
+$TerminalResult = $Call.result.content[0].text | ConvertFrom-Json
+if ($TerminalResult.stdout -notmatch 'mcp-terminal-ok') {
+  throw 'Terminal tool did not return the expected smoke-test output.'
+}
 
 $BadProcessBody = @{
   jsonrpc = '2.0'
@@ -287,7 +276,7 @@ if ($BadProcessResult.started) {
   throw 'A nonexistent process was reported as started.'
 }
 
-$LargeFile = Join-Path $env:TEMP "mcp-bounded-read-$([Guid]::NewGuid().ToString('N')).txt"
+$LargeFile = Join-Path ([IO.Path]::GetTempPath()) "mcp-bounded-read-$([Guid]::NewGuid().ToString('N')).txt"
 try {
   [IO.File]::WriteAllBytes($LargeFile, (New-Object byte[] (2 * 1024 * 1024)))
   $ReadBody = @{
@@ -378,7 +367,7 @@ if (-not $AccessRevoked) {
   transportMode = 'stateless'
   sessionIdIssued = [bool] $RawSessionId
   tools = $Tools.result.tools.name
-  terminalResult = ($Call.result.content[0].text | ConvertFrom-Json)
+  terminalResult = $TerminalResult
   nonexistentProcessHandled = -not $BadProcessResult.started
   boundedReadBytes = $ReadResult.bytesRead
   healthyAfterRuntimeErrors = $HealthAfterRuntimeErrors.ok

@@ -12,6 +12,14 @@ export function formatPlatformName(platform: NodeJS.Platform) {
   return platform;
 }
 
+export function shouldCreateTerminalProcessGroup(platform: NodeJS.Platform) {
+  return platform !== "win32";
+}
+
+export function terminalSignalTarget(platform: NodeJS.Platform, pid: number) {
+  return shouldCreateTerminalProcessGroup(platform) ? -pid : pid;
+}
+
 export function createTerminalInvocation(input: {
   platform: NodeJS.Platform;
   command: string;

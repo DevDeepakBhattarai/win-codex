@@ -7,12 +7,48 @@ import path from "node:path";
 import {
   createTerminalInvocation,
   formatPlatformName,
+  shouldCreateTerminalProcessGroup,
+  terminalSignalTarget,
 } from "../dist/terminal.js";
-import { resolvePowerShellExecutable } from "./run-powershell.mjs";
+import {
+  createPowerShellStartupArguments,
+  resolvePowerShellExecutable,
+} from "./run-powershell.mjs";
 
 const cwd = process.cwd();
 if (resolvePowerShellExecutable("darwin", "powershell.exe") !== "pwsh") {
   throw new Error("macOS management scripts must use pwsh instead of powershell.exe.");
+}
+if (
+  createPowerShellStartupArguments("darwin", true).includes("-NonInteractive")
+) {
+  throw new Error("The interactive smoke test must permit consent PIN input.");
+}
+if (
+  !shouldCreateTerminalProcessGroup("darwin") ||
+  shouldCreateTerminalProcessGroup("win32") ||
+  terminalSignalTarget("darwin", 1234) !== -1234
+) {
+  throw new Error("POSIX terminal commands must run in a signalable process group.");
+}
+
+const smokeTestPath = path.join(cwd, "scripts", "smoke-test.ps1");
+const escapedSmokeTestPath = smokeTestPath.replaceAll("'", "''");
+const smokeParseCommand = [
+  "$tokens = $null",
+  "$errors = $null",
+  `[System.Management.Automation.Language.Parser]::ParseFile('${escapedSmokeTestPath}', [ref]$tokens, [ref]$errors) | Out-Null`,
+  "if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error ($_.ToString()) }; exit 1 }",
+].join("; ");
+const smokeParse = spawnSync(
+  resolvePowerShellExecutable(),
+  ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", smokeParseCommand],
+  { cwd, encoding: "utf8", windowsHide: true },
+);
+if (smokeParse.error || smokeParse.status !== 0) {
+  throw new Error(
+    `PowerShell smoke test has syntax errors: ${smokeParse.error?.message ?? smokeParse.stderr}`,
+  );
 }
 
 const macTerminalInvocation = createTerminalInvocation({
@@ -387,6 +423,8 @@ try {
     hostPlatformAdvertised: health.platform === process.platform,
     terminalToolAdvertised: toolsList.responseText.includes("terminal"),
     macTerminalUsesBash: macTerminalInvocation.executable === "/bin/bash",
+    macTerminalUsesProcessGroup: shouldCreateTerminalProcessGroup("darwin"),
+    smokeTestSyntaxValid: smokeParse.status === 0,
     windowsTerminalUsesPowerShell: windowsTerminalInvocation.executable === "powershell.exe",
     terminalCommandSucceeded: terminalCall.status === 200,
     statelessRequestsSucceeded: succeeded,

@@ -224,7 +224,7 @@ pnpm revoke -- -All -RemoveClients
 ## 🧪 Testing & Verification
 
 ### Smoke Test
-Verify PKCE authentication, client registration, access token expiration, token rotation, and tools behavior on a running instance:
+Verify PKCE authentication, client registration, access token expiration, token rotation, and tools behavior on a running instance. The script prompts for the per-request consent PIN printed by the running server:
 ```powershell
 pnpm smoke
 ```

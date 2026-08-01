@@ -41,6 +41,8 @@ import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import {
   createTerminalInvocation,
   formatPlatformName,
+  shouldCreateTerminalProcessGroup,
+  terminalSignalTarget,
 } from "./terminal.js";
 
 const PORT = Number(process.env.PORT ?? 6000);
@@ -1698,25 +1700,34 @@ function childEnvironment() {
 }
 
 function terminateProcessTree(child: ReturnType<typeof spawn>) {
-  if (!child.pid) return;
+  const pid = child.pid;
+  if (!pid) return;
 
   if (process.platform === "win32") {
     const killer = spawn(
       "taskkill.exe",
-      ["/PID", String(child.pid), "/T", "/F"],
+      ["/PID", String(pid), "/T", "/F"],
       { stdio: "ignore", windowsHide: true },
     );
     killer.on("error", () => undefined);
     return;
   }
 
-  child.kill("SIGTERM");
+  signalPosixProcessGroup(pid, "SIGTERM");
   const escalation = setTimeout(() => {
-    if (child.exitCode === null && child.signalCode === null) {
-      child.kill("SIGKILL");
-    }
+    signalPosixProcessGroup(pid, "SIGKILL");
   }, 1000);
   escalation.unref();
+}
+
+function signalPosixProcessGroup(pid: number, signal: NodeJS.Signals) {
+  try {
+    process.kill(terminalSignalTarget(process.platform, pid), signal);
+  } catch (error: unknown) {
+    if (!isNodeError(error, "ESRCH")) {
+      console.warn(`Could not send ${signal} to process group ${pid}:`, error);
+    }
+  }
 }
 
 function runTerminal(input: {
@@ -1745,6 +1756,7 @@ function runTerminal(input: {
       cwd,
       env: childEnvironment(),
       shell: false,
+      detached: shouldCreateTerminalProcessGroup(HOST_PLATFORM),
       windowsHide: true,
     });
 

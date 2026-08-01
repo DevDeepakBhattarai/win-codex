@@ -19,6 +19,20 @@ export function resolvePowerShellExecutable(
   return platform === "win32" ? "powershell.exe" : "pwsh";
 }
 
+export function createPowerShellStartupArguments(
+  platform = process.platform,
+  interactive = false,
+) {
+  const startupArguments = ["-NoLogo", "-NoProfile"];
+  if (!interactive) {
+    startupArguments.push("-NonInteractive");
+  }
+  if (platform === "win32") {
+    startupArguments.push("-ExecutionPolicy", "Bypass");
+  }
+  return startupArguments;
+}
+
 function run() {
   const forwardedArguments = process.argv.slice(2);
   const separatorIndex = forwardedArguments.indexOf("--");
@@ -34,10 +48,11 @@ function run() {
   }
 
   const executable = resolvePowerShellExecutable();
-  const startupArguments = ["-NoLogo", "-NoProfile", "-NonInteractive"];
-  if (process.platform === "win32") {
-    startupArguments.push("-ExecutionPolicy", "Bypass");
-  }
+  const interactive = path.basename(scriptPath).toLowerCase() === "smoke-test.ps1";
+  const startupArguments = createPowerShellStartupArguments(
+    process.platform,
+    interactive,
+  );
 
   const child = spawn(
     executable,
