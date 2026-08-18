@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { rm } from "node:fs/promises";
+import { rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import path from "node:path";
 
@@ -342,7 +342,8 @@ try {
   if (
     toolsList.status !== 200 ||
     !toolsList.responseText.includes("list_directory") ||
-    !toolsList.responseText.includes("terminal")
+    !toolsList.responseText.includes("terminal") ||
+    !toolsList.responseText.includes("analyze_image")
   ) {
     throw new Error(`Authenticated tools/list failed: ${JSON.stringify(toolsList)}`);
   }
@@ -371,6 +372,31 @@ try {
     !terminalCall.responseText.includes("mcp-terminal-ok")
   ) {
     throw new Error(`Terminal tool execution failed: ${JSON.stringify(terminalCall)}`);
+  }
+
+  const tinyPngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl02QAAAABJRU5ErkJggg==";
+  const testImagePath = path.join(dataDir, "analyze-image-test.png");
+  await writeFile(testImagePath, Buffer.from(tinyPngBase64, "base64"));
+  const imageCall = await postMcp(
+    {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: {
+        name: "analyze_image",
+        arguments: { path: testImagePath },
+      },
+    },
+    token.access_token,
+    protocolHeaders,
+  );
+  if (
+    imageCall.status !== 200 ||
+    !imageCall.responseText.includes('"type":"image"') ||
+    !imageCall.responseText.includes('"mimeType":"image/png"') ||
+    !imageCall.responseText.includes(tinyPngBase64)
+  ) {
+    throw new Error(`Image tool did not return MCP image content: ${JSON.stringify(imageCall)}`);
   }
 
   const requestCount = 300;
@@ -422,11 +448,13 @@ try {
     authenticatedToolsListSucceeded: toolsList.status === 200,
     hostPlatformAdvertised: health.platform === process.platform,
     terminalToolAdvertised: toolsList.responseText.includes("terminal"),
+    imageToolAdvertised: toolsList.responseText.includes("analyze_image"),
     macTerminalUsesBash: macTerminalInvocation.executable === "/bin/bash",
     macTerminalUsesProcessGroup: shouldCreateTerminalProcessGroup("darwin"),
     smokeTestSyntaxValid: smokeParse.status === 0,
     windowsTerminalUsesPowerShell: windowsTerminalInvocation.executable === "powershell.exe",
     terminalCommandSucceeded: terminalCall.status === 200,
+    imageToolReturnedMcpImageContent: imageCall.status === 200,
     statelessRequestsSucceeded: succeeded,
     revokedGrantRejected: afterRevocation.status === 401,
   }, null, 2));

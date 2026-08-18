@@ -229,6 +229,10 @@ $ToolsResponse = Invoke-WebRequest `
   -Body $ToolsBody
 $Tools = ConvertFrom-SseJson $ToolsResponse.Content
 
+if (-not ($Tools.result.tools.name -contains 'analyze_image')) {
+  throw 'analyze_image tool was not advertised by tools/list.'
+}
+
 $CallBody = @{
   jsonrpc = '2.0'
   id = 3
@@ -301,6 +305,33 @@ try {
   Remove-Item -LiteralPath $LargeFile -Force -ErrorAction SilentlyContinue
 }
 
+$ImageFile = Join-Path ([IO.Path]::GetTempPath()) "mcp-image-$([Guid]::NewGuid().ToString('N')).png"
+$TinyPngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl02QAAAABJRU5ErkJggg=='
+try {
+  [IO.File]::WriteAllBytes($ImageFile, [Convert]::FromBase64String($TinyPngBase64))
+  $ImageBody = @{
+    jsonrpc = '2.0'
+    id = 6
+    method = 'tools/call'
+    params = @{
+      name = 'analyze_image'
+      arguments = @{
+        path = $ImageFile
+      }
+    }
+  } | ConvertTo-Json -Depth 10
+  $ImageResponse = Invoke-WebRequest -UseBasicParsing -Method Post -Uri $McpRequestUrl -Headers $Headers -ContentType 'application/json' -Body $ImageBody
+  $ImageCall = ConvertFrom-SseJson $ImageResponse.Content
+  $ImageContent = $ImageCall.result.content | Where-Object { $_.type -eq 'image' } | Select-Object -First 1
+  if (-not $ImageContent -or $ImageContent.mimeType -ne 'image/png') {
+    throw 'analyze_image did not return PNG MCP image content.'
+  }
+  if ($ImageContent.data -ne $TinyPngBase64) {
+    throw 'analyze_image changed the image bytes.'
+  }
+} finally {
+  Remove-Item -LiteralPath $ImageFile -Force -ErrorAction SilentlyContinue
+}
 $HealthAfterRuntimeErrors = Invoke-RestMethod -Uri "$Base/health"
 if (-not $HealthAfterRuntimeErrors.ok) {
   throw 'Server was unhealthy after runtime error tests.'
@@ -370,5 +401,6 @@ if (-not $AccessRevoked) {
   terminalResult = $TerminalResult
   nonexistentProcessHandled = -not $BadProcessResult.started
   boundedReadBytes = $ReadResult.bytesRead
+  imageToolMimeType = $ImageContent.mimeType
   healthyAfterRuntimeErrors = $HealthAfterRuntimeErrors.ok
 } | ConvertTo-Json -Depth 10

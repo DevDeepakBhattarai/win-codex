@@ -98,6 +98,10 @@ Once connected, ChatGPT can call the following tools to inspect, modify, and bui
     *   *Features*: Bounded output, a 60-second maximum timeout, and platform-aware process termination.
 *   **`read_text_file`**: Read up to 5 MiB of a UTF-8 file.
     *   *Features*: Bounded disk I/O to prevent memory exhaustion from loading large files.
+*   **`analyze_image`**: Load a local PNG, JPEG, WebP, or GIF and return it as native MCP image content so ChatGPT can visually inspect it.
+    *   *Features*: Detects the image type from file bytes rather than trusting the extension and rejects images larger than 20 MiB.
+*   **`save_chatgpt_file`**: Save a file already present in the ChatGPT conversation (including a ChatGPT-generated image) directly to a local path.
+    *   *Features*: Uses ChatGPT `openai/fileParams`, bounded HTTPS downloads, redirect limits, optional parent-directory creation, and overwrite control.
 *   **`write_text_file`**: Create or overwrite up to 5 MiB of UTF-8 text.
 *   **`list_directory`**: List up to 1,000 directory entries.
     *   *Features*: Bounded concurrent filesystem calls for listing directory metadata.

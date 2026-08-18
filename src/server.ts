@@ -69,6 +69,20 @@ const TERMINAL_SHELL = createTerminalInvocation({
   powerShellExecutable: POWERSHELL_EXECUTABLE,
 }).shell;
 const CONSENT_PIN_LENGTH = 6;
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_CHATGPT_FILE_BYTES = boundedIntegerEnv(
+  "MAX_CHATGPT_FILE_BYTES",
+  100 * 1024 * 1024,
+  1024,
+  1024 * 1024 * 1024,
+);
+const CHATGPT_FILE_DOWNLOAD_TIMEOUT_MS = boundedIntegerEnv(
+  "CHATGPT_FILE_DOWNLOAD_TIMEOUT_MS",
+  60_000,
+  1_000,
+  10 * 60_000,
+);
+const MAX_CHATGPT_FILE_REDIRECTS = 5;
 const SERVER_NAME = "local-codex";
 const DATA_DIR = process.env.DATA_DIR ?? path.join(process.cwd(), ".data");
 const OAUTH_STORE_PATH = path.resolve(
@@ -1325,6 +1339,29 @@ const textFileOutputSchema = {
   content: z.string(),
 };
 
+const analyzeImageOutputSchema = {
+  path: z.string(),
+  bytesRead: z.number().int().nonnegative(),
+  mimeType: z.enum(["image/png", "image/jpeg", "image/webp", "image/gif"]),
+};
+
+const chatGptFileInputSchema = z
+  .object({
+    download_url: z.string().url(),
+    file_id: z.string().min(1),
+    mime_type: z.string().min(1).optional(),
+    file_name: z.string().min(1).optional(),
+  })
+  .strict();
+
+const saveChatGptFileOutputSchema = {
+  path: z.string(),
+  bytesWritten: z.number().int().nonnegative(),
+  fileId: z.string(),
+  fileName: z.string().optional(),
+  mimeType: z.string().optional(),
+};
+
 const writeTextFileOutputSchema = {
   path: z.string(),
   bytesWritten: z.number().int().nonnegative(),
@@ -1369,6 +1406,152 @@ function textContentFromStructuredContent(structuredContent: Record<string, unkn
         });
 
   return [{ type: "text" as const, text }];
+}
+
+function validateChatGptDownloadUrl(value: string) {
+  const url = new URL(value);
+
+  if (url.protocol !== "https:") {
+    throw new Error("ChatGPT file download URLs must use HTTPS.");
+  }
+  if (url.username || url.password) {
+    throw new Error("ChatGPT file download URLs must not contain credentials.");
+  }
+
+  const hostname = url.hostname.toLowerCase();
+  if (
+    hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
+    hostname === "0.0.0.0" ||
+    hostname === "127.0.0.1" ||
+    hostname === "::1"
+  ) {
+    throw new Error("Refusing to download a ChatGPT file from a local address.");
+  }
+
+  return url;
+}
+
+async function downloadChatGptFile(downloadUrl: string) {
+  let currentUrl = validateChatGptDownloadUrl(downloadUrl);
+
+  for (
+    let redirectCount = 0;
+    redirectCount <= MAX_CHATGPT_FILE_REDIRECTS;
+    redirectCount += 1
+  ) {
+    const response = await fetch(currentUrl, {
+      redirect: "manual",
+      signal: AbortSignal.timeout(CHATGPT_FILE_DOWNLOAD_TIMEOUT_MS),
+    });
+
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get("location");
+      if (!location) {
+        throw new Error(
+          `ChatGPT file download redirected with HTTP ${response.status} but did not include a Location header.`,
+        );
+      }
+      if (redirectCount === MAX_CHATGPT_FILE_REDIRECTS) {
+        throw new Error(
+          `ChatGPT file download exceeded ${MAX_CHATGPT_FILE_REDIRECTS} redirects.`,
+        );
+      }
+
+      currentUrl = validateChatGptDownloadUrl(
+        new URL(location, currentUrl).toString(),
+      );
+      continue;
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        `ChatGPT file download failed with HTTP ${response.status} ${response.statusText}.`,
+      );
+    }
+
+    const contentLength = response.headers.get("content-length");
+    if (contentLength) {
+      const declaredBytes = Number(contentLength);
+      if (
+        Number.isFinite(declaredBytes) &&
+        declaredBytes > MAX_CHATGPT_FILE_BYTES
+      ) {
+        throw new Error(
+          `ChatGPT file is ${declaredBytes} bytes; maximum supported size is ${MAX_CHATGPT_FILE_BYTES} bytes.`,
+        );
+      }
+    }
+
+    if (!response.body) {
+      throw new Error("ChatGPT file download returned an empty response body.");
+    }
+
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    const reader = response.body.getReader();
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        totalBytes += value.byteLength;
+        if (totalBytes > MAX_CHATGPT_FILE_BYTES) {
+          await reader.cancel();
+          throw new Error(
+            `ChatGPT file exceeded the maximum supported size of ${MAX_CHATGPT_FILE_BYTES} bytes while downloading.`,
+          );
+        }
+
+        chunks.push(Buffer.from(value));
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    return Buffer.concat(chunks, totalBytes);
+  }
+
+  throw new Error("ChatGPT file download failed unexpectedly.");
+}
+
+function detectSupportedImageMimeType(buffer: Buffer) {
+  if (
+    buffer.length >= 8 &&
+    buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+  ) {
+    return "image/png" as const;
+  }
+
+  if (
+    buffer.length >= 3 &&
+    buffer[0] === 0xff &&
+    buffer[1] === 0xd8 &&
+    buffer[2] === 0xff
+  ) {
+    return "image/jpeg" as const;
+  }
+
+  if (
+    buffer.length >= 12 &&
+    buffer.toString("ascii", 0, 4) === "RIFF" &&
+    buffer.toString("ascii", 8, 12) === "WEBP"
+  ) {
+    return "image/webp" as const;
+  }
+
+  if (
+    buffer.length >= 6 &&
+    (buffer.toString("ascii", 0, 6) === "GIF87a" ||
+      buffer.toString("ascii", 0, 6) === "GIF89a")
+  ) {
+    return "image/gif" as const;
+  }
+
+  return undefined;
 }
 
 function createMcpServer() {
@@ -1477,6 +1660,133 @@ function createMcpServer() {
         bytesRead,
         truncated,
         content,
+      };
+
+      return {
+        content: textContentFromStructuredContent(structuredContent),
+        structuredContent,
+      };
+    },
+  );
+
+  server.registerTool(
+    "analyze_image",
+    {
+      title: "Analyze Local Image",
+      description:
+        "Read a local PNG, JPEG, WebP, or GIF image and return its pixels as MCP image content so the AI client can inspect it visually. Use this when the user provides a local image path and asks you to analyze, describe, or inspect the image.",
+      inputSchema: {
+        path: z.string().min(1).describe("Absolute or relative image file path."),
+      },
+      outputSchema: analyzeImageOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ path: filePath }) => {
+      const resolved = path.resolve(filePath);
+      const handle = await open(resolved, "r");
+      let image: Buffer;
+      let bytesRead: number;
+
+      try {
+        const fileStat = await handle.stat();
+        if (!fileStat.isFile()) {
+          throw new Error(`Image path is not a regular file: ${resolved}`);
+        }
+        if (fileStat.size > MAX_IMAGE_BYTES) {
+          throw new Error(
+            `Image is ${fileStat.size} bytes; maximum supported size is ${MAX_IMAGE_BYTES} bytes.`,
+          );
+        }
+
+        image = await handle.readFile();
+        bytesRead = image.byteLength;
+      } finally {
+        await handle.close();
+      }
+
+      const mimeType = detectSupportedImageMimeType(image);
+      if (!mimeType) {
+        throw new Error(
+          "Unsupported image format. Supported formats are PNG, JPEG, WebP, and GIF.",
+        );
+      }
+
+      const structuredContent = {
+        path: resolved,
+        bytesRead,
+        mimeType,
+      };
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Local image loaded from ${resolved}. Inspect the attached image content directly.`,
+          },
+          {
+            type: "image" as const,
+            data: image.toString("base64"),
+            mimeType,
+          },
+        ],
+        structuredContent,
+      };
+    },
+  );
+
+  server.registerTool(
+    "save_chatgpt_file",
+    {
+      title: "Save ChatGPT File",
+      description:
+        "Save a file from the current ChatGPT conversation directly to the local computer. This accepts ChatGPT file attachments, including images generated by ChatGPT, through the ChatGPT file-parameter bridge. Use it when the user asks to save, copy, or download an existing chat file to a local path. This tool does not generate the file itself.",
+      inputSchema: {
+        file: chatGptFileInputSchema.describe(
+          "File supplied by ChatGPT. ChatGPT populates this parameter from a file in the conversation.",
+        ),
+        path: z
+          .string()
+          .min(1)
+          .describe("Destination file path on the local computer."),
+        createDirs: z
+          .boolean()
+          .default(true)
+          .describe("Create parent directories when they do not exist."),
+        overwrite: z
+          .boolean()
+          .default(true)
+          .describe("Replace an existing destination file. Defaults to true."),
+      },
+      outputSchema: saveChatGptFileOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: true,
+      },
+      _meta: {
+        "openai/fileParams": ["file"],
+      },
+    },
+    async ({ file, path: filePath, createDirs, overwrite }) => {
+      const resolved = path.resolve(filePath);
+      const bytes = await downloadChatGptFile(file.download_url);
+
+      if (createDirs) {
+        await mkdir(path.dirname(resolved), { recursive: true });
+      }
+
+      await writeFile(resolved, bytes, { flag: overwrite ? "w" : "wx" });
+
+      const structuredContent = {
+        path: resolved,
+        bytesWritten: bytes.byteLength,
+        fileId: file.file_id,
+        ...(file.file_name ? { fileName: file.file_name } : {}),
+        ...(file.mime_type ? { mimeType: file.mime_type } : {}),
       };
 
       return {
