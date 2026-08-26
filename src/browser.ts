@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 
 import { getPlaywrightInstallExpression } from "./browser-playwright.js";
+import { launchChrome } from "./browser-launch.js";
 
 const BRIDGE_PROTOCOL_VERSION = 1;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
@@ -19,6 +20,7 @@ const MAX_CLIPBOARD_BYTES = 8 * 1024 * 1024;
 const MAX_UPLOAD_FILES = 20;
 const CLAIM_LISTING_TTL_MS = 60_000;
 const CONTROL_OVERLAY_MOVE_DELAY_MS = 180;
+const BROWSER_CONNECT_TIMEOUT_MS = 15_000;
 
 export type BrowserTab = {
   id: number;
@@ -336,7 +338,7 @@ class BrowserBridge {
   async request<T>(method: string, params: Record<string, unknown> = {}, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
     const socket = this.socket;
     if (!socket || socket.readyState !== WebSocket.OPEN || !this.hello) {
-      throw new Error("Chrome browser bridge is not connected. Load the generated unpacked extension and make sure Chrome is running.");
+      throw new Error("Chrome browser bridge disconnected during the operation. Retry the browser tool to reconnect.");
     }
 
     const id = `browser_${++this.sequence}_${Date.now().toString(36)}`;
@@ -449,6 +451,8 @@ class BrowserBridge {
 }
 
 export class BrowserService {
+  private starting: Promise<void> | undefined;
+  private closed = false;
   private readonly states = new Map<number, BrowserTabState>();
   private readonly locks = new Map<number, Promise<void>>();
   private readonly claimListings = new Map<number, { title?: string; url?: string; listedAt: number }>();
@@ -459,6 +463,7 @@ export class BrowserService {
   private constructor(
     private readonly bridge: BrowserBridge,
     private readonly extensionDirectory: string,
+    private readonly launchBrowser: () => Promise<void>,
   ) {
     this.bridge.onEvent((event) => this.handleBridgeEvent(event));
   }
@@ -467,6 +472,7 @@ export class BrowserService {
     dataDirectory: string;
     host?: string;
     port: number;
+    launchBrowser?: () => Promise<void>;
   }) {
     const host = input.host ?? "127.0.0.1";
     const token = await loadOrCreateBridgeToken(input.dataDirectory);
@@ -476,14 +482,49 @@ export class BrowserService {
       token,
     );
     const bridge = await BrowserBridge.listen(host, input.port, token);
-    return new BrowserService(bridge, extensionDirectory);
+    return new BrowserService(bridge, extensionDirectory, input.launchBrowser ?? launchChrome);
   }
 
   status() {
     return this.bridge.status(this.extensionDirectory);
   }
 
+  private async ensureConnected() {
+    if (this.closed) throw new Error("Browser service is shutting down.");
+    if (this.status().connected) return;
+    if (!this.starting) {
+      this.starting = this.startBrowser().finally(() => {
+        this.starting = undefined;
+      });
+    }
+    await this.starting;
+  }
+
+  private async startBrowser() {
+    // Give an already-running extension a moment to reconnect before launching.
+    if (await this.waitForConnection(750)) return;
+    await this.launchBrowser();
+    if (await this.waitForConnection(BROWSER_CONNECT_TIMEOUT_MS)) return;
+    throw new Error(
+      `Chrome was started, but its extension did not connect within 15 seconds. ` +
+      `Load or enable the unpacked extension at ${this.extensionDirectory} in chrome://extensions. ` +
+      `If it is installed in another profile, set BROWSER_PROFILE_DIRECTORY to that profile's directory name.`,
+    );
+  }
+
+  private async waitForConnection(timeoutMs: number) {
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+      if (this.closed) throw new Error("Browser service is shutting down.");
+      if (this.status().connected) return true;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return false;
+      await sleep(Math.min(100, remaining));
+    }
+  }
+
   async close() {
+    this.closed = true;
     for (const pending of this.fileChooserWaiters.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error("Browser service is shutting down."));
@@ -501,6 +542,7 @@ export class BrowserService {
   }
 
   async listTabs() {
+    await this.ensureConnected();
     const tabs = await this.bridge.request<BrowserTab[]>("tabs.list");
     this.claimListings.clear();
     const listedAt = Date.now();
@@ -514,6 +556,7 @@ export class BrowserService {
 
   async open(input: { url?: string; active?: boolean; newWindow?: boolean }) {
     if (input.url) validateNavigationUrl(input.url);
+    await this.ensureConnected();
     const tab = await this.bridge.request<BrowserTab>("tabs.open", {
       ...(input.url ? { url: input.url } : {}),
       active: input.active !== false,
@@ -623,6 +666,7 @@ export class BrowserService {
   }
 
   async manageTab(input: BrowserOwnershipActionInput) {
+    await this.ensureConnected();
     if (input.action === "cleanup") return await this.cleanupTabs();
     const tabId = await this.resolveTabId(input.tabId);
 
@@ -701,6 +745,7 @@ export class BrowserService {
   }
 
   async download(input: BrowserDownloadInput) {
+    await this.ensureConnected();
     const timeoutMs = clampTimeout(input.timeoutMs);
     if (input.action === "list") {
       const downloads = await this.bridge.request<BrowserDownload[]>("downloads.list");
@@ -741,6 +786,7 @@ export class BrowserService {
   }
 
   async clipboard(input: BrowserClipboardInput) {
+    await this.ensureConnected();
     if (input.action === "read_text") {
       return await this.bridge.request<{ text: string }>("clipboard.readText");
     }
@@ -752,6 +798,7 @@ export class BrowserService {
   }
 
   private async resolveTabId(tabId?: number) {
+    await this.ensureConnected();
     if (tabId !== undefined) {
       if (!Number.isInteger(tabId) || tabId < 0) throw new Error("tabId must be a non-negative integer.");
       await this.bridge.request<BrowserTab>("tabs.get", { tabId });
@@ -1612,6 +1659,7 @@ export async function createBrowserService(input: {
   dataDirectory: string;
   port: number;
   host?: string;
+  launchBrowser?: () => Promise<void>;
 }) {
   return await BrowserService.create(input);
 }
@@ -1638,6 +1686,8 @@ async function prepareBrowserExtension(dataDirectory: string, bridgeUrl: string,
     copyFile(path.join(sourceDirectory, "manifest.json"), path.join(extensionDirectory, "manifest.json")),
     copyFile(path.join(sourceDirectory, "service-worker.js"), path.join(extensionDirectory, "service-worker.js")),
     copyFile(path.join(sourceDirectory, "content-script.js"), path.join(extensionDirectory, "content-script.js")),
+    copyFile(path.join(sourceDirectory, "cursor.svg"), path.join(extensionDirectory, "cursor.svg")),
+    copyFile(path.join(sourceDirectory, "empty.svg"), path.join(extensionDirectory, "empty.svg")),
     copyFile(path.join(sourceDirectory, "offscreen.html"), path.join(extensionDirectory, "offscreen.html")),
     copyFile(path.join(sourceDirectory, "offscreen.js"), path.join(extensionDirectory, "offscreen.js")),
   ]);

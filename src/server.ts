@@ -1592,6 +1592,15 @@ function createMcpServer() {
   const server = new McpServer({
     name: SERVER_NAME,
     version: "0.1.0",
+  }, {
+    ...(BROWSER_BRIDGE_ENABLED ? {
+      instructions: [
+        "Call browser_open with the desired URL to begin browsing. Browser tools start Chrome when disconnected and wait for its installed extension to connect; browser_status only reports connection state.",
+        "Use browser_snapshot before interacting and use fresh element refs. Existing user tabs require browser_tabs followed by browser_tab claim with the listed title and URL.",
+        "tabId is optional. Omit it to use the active tab in the last-focused window, or pass it to target a specific tab. Separate tabs can run concurrently, and tasks may switch or share tabs. Use browser_open active=false to open a background tab.",
+        "All tasks share one browser profile and controlled-tab list. Cleanup affects all controlled tabs and consumes preservation marks. Close or release individual tabs when other tasks are still using the browser.",
+      ].join("\n"),
+    } : {}),
   });
 
   server.registerTool(
@@ -2007,7 +2016,7 @@ function createMcpServer() {
       {
         title: "Browser Bridge Status",
         description:
-          "Check whether the local Chrome browser bridge extension is connected and get the generated unpacked-extension directory when setup is needed.",
+          "Report the Chrome extension connection and generated extension directory without launching Chrome. Call a browser operation directly to start Chrome automatically when disconnected.",
         inputSchema: {},
         annotations: {
           readOnlyHint: true,
@@ -2029,10 +2038,10 @@ function createMcpServer() {
       {
         title: "List Chrome Tabs",
         description:
-          "List tabs in the user's real Chrome profile with ownership state. Before controlling a user-owned tab, pass its exact tabId, title, and URL to browser_tab action=claim. The claim fails closed if the tab changes after this listing.",
+          "List tabs in the user's real Chrome profile, starting Chrome if disconnected. Tabs are shared across tasks. Before controlling a user tab, call browser_tab action=claim with its listed title and URL; tabId selects a specific tab and may be omitted for the active tab. The claim fails if the tab changes after listing.",
         inputSchema: {},
         annotations: {
-          readOnlyHint: true,
+          readOnlyHint: false,
           destructiveHint: false,
           openWorldHint: true,
         },
@@ -2051,7 +2060,7 @@ function createMcpServer() {
       {
         title: "Manage Chrome Tab Ownership",
         description:
-          "Claim or release a user tab, mark a controlled tab as a deliverable or handoff, or clean up the current browser session. Claim requires exact tabId, title, and URL from the latest browser_tabs result. Cleanup closes unmarked agent-created tabs, releases unmarked claimed user tabs without closing them, preserves marked tabs, and consumes their marks.",
+          "Claim or release a user tab, mark a controlled tab as a deliverable or handoff, or clean up all controlled tabs across tasks. Starts Chrome if disconnected. Claim requires the exact title and URL from browser_tabs. tabId is optional and defaults to the active tab. Cleanup closes unmarked agent tabs, releases unmarked user tabs, and preserves marked tabs for one cleanup only.",
         inputSchema: {
           action: z.enum(["claim", "release", "mark_deliverable", "mark_handoff", "cleanup"]),
           tabId: z.number().int().nonnegative().optional(),
@@ -2078,7 +2087,7 @@ function createMcpServer() {
       {
         title: "Open Chrome Tab",
         description:
-          "Open a tab in the user's real Chrome profile and attach browser automation. Returns a semantic page snapshot. Use browser_snapshot when a screenshot is needed.",
+          "Open a tab at the desired URL in the user's real Chrome profile. Automatically start Chrome if disconnected and wait for its installed extension; call this directly without a process-launch or status prerequisite. Returns a controlled tabId and semantic snapshot. Tabs can be used concurrently. Set active=false to open in the background. Use browser_snapshot for a screenshot.",
         inputSchema: {
           url: z.string().url().optional().describe("Optional http:// or https:// URL to open."),
           active: z.boolean().default(true).describe("Whether the new tab should become active."),
@@ -2098,13 +2107,13 @@ function createMcpServer() {
       {
         title: "Inspect Chrome Page",
         description:
-          "Inspect a Chrome tab before interacting. Returns visible text, fresh interactive element refs, a compact accessibility tree, console/network diagnostics, recent browser actions, and by default a PNG screenshot. Element refs are intentionally valid only for the latest snapshot and become stale after page changes.",
+          "Inspect a controlled Chrome tab before interacting, starting Chrome if disconnected. tabId is optional and defaults to the active tab. Returns visible text, fresh element refs, accessibility tree, diagnostics, recent actions, and by default a PNG screenshot. Refs are valid only for the latest snapshot and become stale after page changes.",
         inputSchema: {
           tabId: z.number().int().nonnegative().optional().describe("Chrome tab ID. Omit to inspect the active tab in the last-focused window."),
           includeScreenshot: z.boolean().default(true).describe("Attach a viewport PNG screenshot to the MCP result."),
         },
         annotations: {
-          readOnlyHint: true,
+          readOnlyHint: false,
           destructiveHint: false,
           openWorldHint: true,
         },
@@ -2118,7 +2127,7 @@ function createMcpServer() {
       {
         title: "Act In Chrome",
         description:
-          "Perform one browser action in a controlled Chrome tab, then return a fresh semantic snapshot. Existing user tabs must first be claimed with browser_tab. Actions include navigate, back, forward, reload, click, dblclick, type, press, scroll, wait, activate, and close. Prefer fresh element refs from browser_snapshot over selector strings or coordinates.",
+          "Perform one action in a controlled Chrome tab, starting Chrome if disconnected, then return a fresh snapshot. tabId is optional: omit it for the active tab or pass it for a specific tab, including a background tab. Tasks may switch or share tabs. Existing user tabs require browser_tab claim. Prefer fresh element refs from browser_snapshot over selectors or coordinates.",
         inputSchema: {
           tabId: z.number().int().nonnegative().optional().describe("Chrome tab ID. Omit to use the active tab in the last-focused window."),
           action: z.enum(["navigate", "back", "forward", "reload", "click", "dblclick", "type", "press", "scroll", "wait", "activate", "close"]),
@@ -2156,7 +2165,7 @@ function createMcpServer() {
       {
         title: "Upload Files In Chrome",
         description:
-          "Arm Chrome's file chooser interception, click a fresh element ref or selector, and set absolute local file paths without exposing a native picker. The target tab must be controlled. Use a fresh ref from browser_snapshot when possible.",
+          "Upload absolute local file paths through a file input or intercepted chooser. Starts Chrome if disconnected. The target tab must be controlled; omit tabId for the active tab. Use a fresh ref from browser_snapshot when possible.",
         inputSchema: {
           tabId: z.number().int().nonnegative().optional(),
           ref: z.string().optional(),
@@ -2184,7 +2193,7 @@ function createMcpServer() {
       {
         title: "Manage Chrome Downloads",
         description:
-          "List downloads from controlled tabs, trigger a download by clicking a fresh ref or selector, wait for a known download to finish, or cancel it. Trigger arms the download listener before clicking so fast downloads are not missed.",
+          "List downloads from controlled tabs, trigger one with a fresh ref or selector, wait for a known download, or cancel it. Starts Chrome if disconnected. Trigger uses the active tab when tabId is omitted and arms its listener before clicking. Downloads are shared across tasks.",
         inputSchema: {
           action: z.enum(["list", "trigger", "wait", "cancel"]),
           tabId: z.number().int().nonnegative().optional(),
@@ -2214,7 +2223,7 @@ function createMcpServer() {
       {
         title: "Use Browser Clipboard",
         description:
-          "Read or write up to 8 MiB of plain text through Chrome's extension-safe offscreen clipboard document.",
+          "Read or write up to 8 MiB of plain text through Chrome's offscreen clipboard document, starting Chrome if disconnected. The clipboard is shared across all tabs and tasks.",
         inputSchema: {
           action: z.enum(["read_text", "write_text"]),
           text: z.string().optional(),
@@ -2242,7 +2251,7 @@ function createMcpServer() {
       {
         title: "Evaluate JavaScript In Chrome",
         description:
-          "Evaluate JavaScript in a controlled Chrome tab through CDP Runtime.evaluate. Prefer browser_snapshot and browser_action for normal interaction. Use this for development/debugging tasks when structured browser actions are insufficient.",
+          "Evaluate JavaScript in a controlled Chrome tab through CDP Runtime.evaluate, starting Chrome if disconnected. Omit tabId for the active tab. Prefer browser_snapshot and browser_action for normal interaction; use this for development/debugging when structured actions are insufficient.",
         inputSchema: {
           tabId: z.number().int().nonnegative().optional().describe("Chrome tab ID. Omit to use the active tab."),
           expression: z.string().min(1).max(100000).describe("JavaScript expression to evaluate in the page."),

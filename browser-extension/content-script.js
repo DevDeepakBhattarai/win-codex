@@ -1,13 +1,81 @@
 const MESSAGE_TARGET = "local-codex-control-overlay";
 const HOST_ID = "__local-codex-control-overlay";
+const CONTROL_FAVICON = chrome.runtime.getURL("cursor.svg");
+const EMPTY_FAVICON = chrome.runtime.getURL("empty.svg");
+const FAVICON_ATTRIBUTES = { href: CONTROL_FAVICON, type: "image/svg+xml", sizes: "any" };
+const originalFavicons = new Map();
+let controlFavicon;
+const faviconObserver = new MutationObserver(updateFavicon);
 
 let host;
 let pointer;
 let pulse;
 let clickCount = 0;
 
+function updateFavicon() {
+  faviconObserver.disconnect();
+  if (document.head) {
+    for (const link of document.querySelectorAll('link[rel~="icon"]')) {
+      if (link === controlFavicon) continue;
+      const original = originalFavicons.get(link) ?? {};
+      for (const [attribute, value] of Object.entries(FAVICON_ATTRIBUTES)) {
+        const current = link.getAttribute(attribute);
+        if (!(attribute in original) || current !== value) original[attribute] = current;
+        if (current !== value) link.setAttribute(attribute, value);
+      }
+      originalFavicons.set(link, original);
+    }
+    if (!controlFavicon) {
+      controlFavicon = document.createElement("link");
+      controlFavicon.rel = "icon";
+    }
+    for (const [attribute, value] of Object.entries(FAVICON_ATTRIBUTES)) {
+      if (controlFavicon.getAttribute(attribute) !== value) controlFavicon.setAttribute(attribute, value);
+    }
+    if (document.head.lastElementChild !== controlFavicon) document.head.append(controlFavicon);
+  }
+  faviconObserver.observe(document, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["rel", ...Object.keys(FAVICON_ATTRIBUTES)],
+  });
+}
+
+function restoreFavicon() {
+  // Capture site changes that have not reached the observer yet.
+  updateFavicon();
+  faviconObserver.disconnect();
+  controlFavicon?.remove();
+  for (const [link, original] of originalFavicons) {
+    for (const [attribute, value] of Object.entries(original)) {
+      if (value === null) link.removeAttribute(attribute);
+      else link.setAttribute(attribute, value);
+    }
+  }
+  originalFavicons.clear();
+  if (controlFavicon && !document.querySelector('link[rel~="icon"]')) {
+    // Removing the only icon link leaves Chrome showing its last cached icon.
+    const fallback = controlFavicon;
+    fallback.href = EMPTY_FAVICON;
+    document.head?.append(fallback);
+    const defaultIcon = new Image();
+    defaultIcon.onload = () => {
+      if (fallback.isConnected && fallback.getAttribute("href") === EMPTY_FAVICON) {
+        fallback.href = defaultIcon.src;
+        fallback.removeAttribute("type");
+        fallback.removeAttribute("sizes");
+      }
+    };
+    defaultIcon.src = new URL("/favicon.ico", location.href).href;
+  }
+  controlFavicon = undefined;
+}
+
 function mount() {
   if (host?.isConnected) return;
+
+  updateFavicon();
 
   host = document.createElement("div");
   host.id = HOST_ID;
@@ -35,30 +103,6 @@ function mount() {
         position: fixed;
         animation: codex-aura 2.4s ease-in-out infinite;
       }
-      .badge {
-        align-items: center;
-        background: rgba(21, 25, 35, 0.92);
-        border: 1px solid rgba(125, 174, 255, 0.72);
-        border-radius: 999px;
-        box-shadow: 0 5px 18px rgba(26, 79, 170, 0.3);
-        color: #fff;
-        display: flex;
-        font: 600 12px/1 system-ui, -apple-system, "Segoe UI", sans-serif;
-        gap: 7px;
-        left: 50%;
-        letter-spacing: 0.01em;
-        padding: 7px 11px;
-        position: fixed;
-        top: 10px;
-        transform: translateX(-50%);
-      }
-      .badge-dot {
-        background: #73a7ff;
-        border-radius: 50%;
-        box-shadow: 0 0 8px #73a7ff;
-        height: 7px;
-        width: 7px;
-      }
       .pointer {
         filter: drop-shadow(0 2px 5px rgba(9, 40, 95, 0.6));
         height: 26px;
@@ -70,7 +114,7 @@ function mount() {
         width: 22px;
         will-change: transform;
       }
-      .pointer svg {
+      .pointer img {
         display: block;
         height: 100%;
         overflow: visible;
@@ -96,11 +140,8 @@ function mount() {
       }
     </style>
     <div class="aura"></div>
-    <div class="badge"><span class="badge-dot"></span>Codex is controlling this tab</div>
     <div class="pointer">
-      <svg viewBox="0 0 22 26" aria-hidden="true">
-        <path d="M2 1.5v19.2l5.2-4.7 3.4 8.1 4.1-1.8-3.4-7.8h7.1L2 1.5Z" fill="#fff" stroke="#2f70dc" stroke-width="1.8" stroke-linejoin="round" />
-      </svg>
+      <img src="${CONTROL_FAVICON}" alt="">
       <div class="pulse"></div>
     </div>
   `;
@@ -110,6 +151,7 @@ function mount() {
 }
 
 function unmount() {
+  if (host || controlFavicon) restoreFavicon();
   host?.remove();
   host = undefined;
   pointer = undefined;

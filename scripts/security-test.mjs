@@ -97,6 +97,9 @@ const dataDir = path.join(
   ".audit-backup",
   `authenticated-stateless-data-${port}`,
 );
+if (path.dirname(dataDir) !== path.join(cwd, ".audit-backup")) {
+  throw new Error("Security test data must stay inside .audit-backup.");
+}
 await rm(dataDir, { recursive: true, force: true });
 
 const child = spawn(process.execPath, ["dist/server.js"], {
@@ -109,6 +112,7 @@ const child = spawn(process.execPath, ["dist/server.js"], {
     MCP_PUBLIC_URL: mcpUrl,
     AUTH_ISSUER: baseUrl,
     DATA_DIR: dataDir,
+    BROWSER_EXECUTABLE_PATH: path.join(dataDir, "missing-chrome"),
     OAUTH_STORE_PATH: path.join(dataDir, "oauth-store.json"),
     ALLOWED_REDIRECT_URIS: "",
     REQUIRE_EXACT_REDIRECT_URIS: "false",
@@ -330,6 +334,9 @@ try {
   if (initialized.sessionId !== null) {
     throw new Error(`Stateless initialize unexpectedly returned Mcp-Session-Id: ${initialized.sessionId}`);
   }
+  if (!initialized.responseText.includes("tabId is optional") || !initialized.responseText.includes("Browser tools start Chrome")) {
+    throw new Error("Initialize did not deliver the browser startup and tab instructions.");
+  }
 
   const toolsListBody = {
     jsonrpc: "2.0",
@@ -355,6 +362,16 @@ try {
   }
   if (toolsList.sessionId !== null) {
     throw new Error(`Stateless tools/list unexpectedly returned Mcp-Session-Id: ${toolsList.sessionId}`);
+  }
+
+  const browserOpen = await postMcp({
+    jsonrpc: "2.0",
+    id: "browser-startup",
+    method: "tools/call",
+    params: { name: "browser_open", arguments: { url: "https://example.com" } },
+  }, token.access_token, protocolHeaders);
+  if (browserOpen.status !== 200 || !browserOpen.responseText.includes("Could not start Chrome")) {
+    throw new Error(`Browser startup failure did not reach the MCP caller: ${browserOpen.responseText}`);
   }
 
   const terminalCall = await postMcp(
