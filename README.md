@@ -106,6 +106,16 @@ Once connected, ChatGPT can call the following tools to inspect, modify, and bui
 *   **`list_directory`**: List up to 1,000 directory entries.
     *   *Features*: Bounded concurrent filesystem calls for listing directory metadata.
 *   **`start_process`**: Start an executable with strict argument-array semantics (no shell interpolation), optionally waiting for completion.
+*   **`browser_status`**: Check whether the local Chrome extension bridge is connected and get the generated extension directory.
+*   **`browser_tabs`**: List tabs from the user's real Chrome profile with ownership state.
+*   **`browser_tab`**: Claim or release user tabs, mark handoffs or deliverables, and clean up agent-created tabs.
+*   **`browser_open`**: Open an agent-owned Chrome tab or window and attach automation.
+*   **`browser_snapshot`**: Inspect a tab with visible text, fresh element refs, related popups, a compact accessibility tree, console/network diagnostics, and an optional PNG screenshot.
+*   **`browser_action`**: Navigate, go back or forward, reload, click, double-click, type, press keys, scroll, wait, activate, or close a tab. Every action returns a fresh semantic snapshot.
+*   **`browser_upload`**: Upload local files through a file input or intercepted browser file chooser.
+*   **`browser_download`**: Trigger, list, wait for, or cancel downloads and report their local file paths.
+*   **`browser_clipboard`**: Read or write plain text through Chrome.
+*   **`browser_evaluate`**: Run JavaScript through CDP for development/debugging cases that structured browser actions cannot cover.
 
 ---
 
@@ -132,6 +142,10 @@ Edit your `.env` file to match your setup:
 ```env
 PORT=6000
 HOST=localhost
+
+# Chrome bridge stays loopback-only and is not sent through the public tunnel.
+BROWSER_BRIDGE_ENABLED=true
+# BROWSER_BRIDGE_PORT=6001 # defaults to PORT + 1
 
 # Set these to your public HTTPS tunnel domain (e.g. ngrok or cloudflare tunnel)
 PUBLIC_BASE_URL=https://mcp.yourtunnel.ngrok-free.app
@@ -174,6 +188,17 @@ Alternatively, for development mode:
 pnpm dev
 ```
 
+### Step 5: Load the Chrome bridge extension
+
+The server creates a private unpacked extension at `.data/browser-extension` and prints the exact path at startup. The generated folder contains a loopback WebSocket address and a random 256-bit bridge token stored under `.data`; it is intentionally excluded from Git.
+
+1. Open `chrome://extensions` in the Chrome profile you want ChatGPT to control.
+2. Enable **Developer mode**.
+3. Click **Load unpacked** and choose the generated `.data/browser-extension` directory.
+4. The extension badge shows **ON** when it is connected to the local MCP server.
+
+This is a one-time setup for that Chrome profile. The bridge talks only to `127.0.0.1`; the public HTTPS tunnel is used only for ChatGPT-to-MCP traffic.
+
 ---
 
 ## 🔗 Connecting ChatGPT
@@ -202,6 +227,11 @@ pnpm dev
 *   **🌀 Hash-based Token Storage**: Refresh tokens are stored in the database as SHA-256 hashes rather than plaintext.
 *   **🚫 Sandboxed Child Processes**: Launched commands and child processes do not inherit sensitive environment variables like authorization credentials.
 *   **📈 Rate Limiting**: Protection against brute-force attempts on critical endpoints (token exchange, authorization code creation, and client registration).
+*   **Browser Bridge Isolation**: Chrome connects only to a loopback WebSocket protected by a random token stored in `.data`. The extension never connects to the public MCP tunnel.
+*   **Visible Browser Control**: Controlled tabs show a blue viewport aura and an animated click pointer. The overlay cannot receive input and disappears when control is released.
+*   **Stale Element Protection**: Browser element refs are scoped to the latest snapshot and page epoch. Navigation or document changes invalidate old refs instead of clicking a recycled target.
+*   **Semantic Browser State**: Automation prefers Playwright locator semantics plus Chrome's accessibility tree. Coordinates are only a fallback for visual/canvas targets.
+*   **Tab Ownership**: Existing user tabs require a fresh title-and-URL-checked claim. Popups inherit agent ownership from their opener. Cleanup closes unmarked agent tabs and releases unmarked user tabs without closing them.
 
 ---
 
@@ -241,4 +271,3 @@ pnpm security-test
 
 ## 📄 License
 This project is licensed under the [MIT License](LICENSE).
-

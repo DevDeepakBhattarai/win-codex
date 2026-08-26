@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Local Codex Browser Bridge",
+  "version": "0.3.1",
+  "description": "Connects the local Codex MCP server to this Chrome profile for reliable browser automation.",
+  "minimum_chrome_version": "118",
+  "permissions": [
+    "alarms",
+    "clipboardRead",
+    "clipboardWrite",
+    "debugger",
+    "downloads",
+    "offscreen",
+    "tabs"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content-script.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_title": "Local Codex Browser Bridge"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' ws://127.0.0.1:*"
+  }
+}

@@ -343,7 +343,13 @@ try {
     toolsList.status !== 200 ||
     !toolsList.responseText.includes("list_directory") ||
     !toolsList.responseText.includes("terminal") ||
-    !toolsList.responseText.includes("analyze_image")
+    !toolsList.responseText.includes("analyze_image") ||
+    !toolsList.responseText.includes("browser_snapshot") ||
+    !toolsList.responseText.includes("browser_action") ||
+    !toolsList.responseText.includes("browser_tab") ||
+    !toolsList.responseText.includes("browser_upload") ||
+    !toolsList.responseText.includes("browser_download") ||
+    !toolsList.responseText.includes("browser_clipboard")
   ) {
     throw new Error(`Authenticated tools/list failed: ${JSON.stringify(toolsList)}`);
   }
@@ -449,6 +455,13 @@ try {
     hostPlatformAdvertised: health.platform === process.platform,
     terminalToolAdvertised: toolsList.responseText.includes("terminal"),
     imageToolAdvertised: toolsList.responseText.includes("analyze_image"),
+    browserToolsAdvertised:
+      toolsList.responseText.includes("browser_snapshot") &&
+      toolsList.responseText.includes("browser_action") &&
+      toolsList.responseText.includes("browser_tab") &&
+      toolsList.responseText.includes("browser_upload") &&
+      toolsList.responseText.includes("browser_download") &&
+      toolsList.responseText.includes("browser_clipboard"),
     macTerminalUsesBash: macTerminalInvocation.executable === "/bin/bash",
     macTerminalUsesProcessGroup: shouldCreateTerminalProcessGroup("darwin"),
     smokeTestSyntaxValid: smokeParse.status === 0,

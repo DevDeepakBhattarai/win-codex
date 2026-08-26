@@ -44,6 +44,13 @@ import {
   shouldCreateTerminalProcessGroup,
   terminalSignalTarget,
 } from "./terminal.js";
+import {
+  createBrowserService,
+  type BrowserActionInput,
+  type BrowserClipboardInput,
+  type BrowserDownloadInput,
+  type BrowserOwnershipActionInput,
+} from "./browser.js";
 
 const PORT = Number(process.env.PORT ?? 6000);
 const HOST = process.env.HOST ?? "localhost";
@@ -85,6 +92,13 @@ const CHATGPT_FILE_DOWNLOAD_TIMEOUT_MS = boundedIntegerEnv(
 const MAX_CHATGPT_FILE_REDIRECTS = 5;
 const SERVER_NAME = "local-codex";
 const DATA_DIR = process.env.DATA_DIR ?? path.join(process.cwd(), ".data");
+const BROWSER_BRIDGE_ENABLED = process.env.BROWSER_BRIDGE_ENABLED !== "false";
+const BROWSER_BRIDGE_PORT = boundedIntegerEnv(
+  "BROWSER_BRIDGE_PORT",
+  PORT + 1,
+  1,
+  65535,
+);
 const OAUTH_STORE_PATH = path.resolve(
   process.env.OAUTH_STORE_PATH ?? path.join(DATA_DIR, "oauth-store.json"),
 );
@@ -1408,6 +1422,26 @@ function textContentFromStructuredContent(structuredContent: Record<string, unkn
   return [{ type: "text" as const, text }];
 }
 
+function browserSnapshotToolResponse(result: Awaited<ReturnType<NonNullable<typeof browserService>["snapshot"]>>) {
+  const content: Array<
+    | { type: "text"; text: string }
+    | { type: "image"; data: string; mimeType: "image/png" }
+  > = [...textContentFromStructuredContent(result.snapshot)];
+
+  if (result.screenshotData) {
+    content.push({
+      type: "image",
+      data: result.screenshotData,
+      mimeType: "image/png",
+    });
+  }
+
+  return {
+    content,
+    structuredContent: result.snapshot,
+  };
+}
+
 function validateChatGptDownloadUrl(value: string) {
   const url = new URL(value);
 
@@ -1965,6 +1999,270 @@ function createMcpServer() {
       };
     },
   );
+
+
+  if (browserService) {
+    server.registerTool(
+      "browser_status",
+      {
+        title: "Browser Bridge Status",
+        description:
+          "Check whether the local Chrome browser bridge extension is connected and get the generated unpacked-extension directory when setup is needed.",
+        inputSchema: {},
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          openWorldHint: false,
+        },
+      },
+      async () => {
+        const structuredContent = browserService.status();
+        return {
+          content: textContentFromStructuredContent(structuredContent),
+          structuredContent,
+        };
+      },
+    );
+
+    server.registerTool(
+      "browser_tabs",
+      {
+        title: "List Chrome Tabs",
+        description:
+          "List tabs in the user's real Chrome profile with ownership state. Before controlling a user-owned tab, pass its exact tabId, title, and URL to browser_tab action=claim. The claim fails closed if the tab changes after this listing.",
+        inputSchema: {},
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          openWorldHint: true,
+        },
+      },
+      async () => {
+        const structuredContent = { tabs: await browserService.listTabs() };
+        return {
+          content: textContentFromStructuredContent(structuredContent),
+          structuredContent,
+        };
+      },
+    );
+
+    server.registerTool(
+      "browser_tab",
+      {
+        title: "Manage Chrome Tab Ownership",
+        description:
+          "Claim or release a user tab, mark a controlled tab as a deliverable or handoff, or clean up the current browser session. Claim requires exact tabId, title, and URL from the latest browser_tabs result. Cleanup closes unmarked agent-created tabs, releases unmarked claimed user tabs without closing them, preserves marked tabs, and consumes their marks.",
+        inputSchema: {
+          action: z.enum(["claim", "release", "mark_deliverable", "mark_handoff", "cleanup"]),
+          tabId: z.number().int().nonnegative().optional(),
+          title: z.string().optional().describe("Exact title from browser_tabs, required for claim."),
+          url: z.string().optional().describe("Exact URL from browser_tabs, required for claim."),
+        },
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          openWorldHint: false,
+        },
+      },
+      async (input) => {
+        const structuredContent = await browserService.manageTab(input as BrowserOwnershipActionInput);
+        return {
+          content: textContentFromStructuredContent(structuredContent),
+          structuredContent,
+        };
+      },
+    );
+
+    server.registerTool(
+      "browser_open",
+      {
+        title: "Open Chrome Tab",
+        description:
+          "Open a tab in the user's real Chrome profile and attach browser automation. Returns a semantic page snapshot. Use browser_snapshot when a screenshot is needed.",
+        inputSchema: {
+          url: z.string().url().optional().describe("Optional http:// or https:// URL to open."),
+          active: z.boolean().default(true).describe("Whether the new tab should become active."),
+          newWindow: z.boolean().default(false).describe("Open a new Chrome window instead of a tab in the current window."),
+        },
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          openWorldHint: true,
+        },
+      },
+      async ({ url, active, newWindow }) => browserSnapshotToolResponse(await browserService.open({ url, active, newWindow })),
+    );
+
+    server.registerTool(
+      "browser_snapshot",
+      {
+        title: "Inspect Chrome Page",
+        description:
+          "Inspect a Chrome tab before interacting. Returns visible text, fresh interactive element refs, a compact accessibility tree, console/network diagnostics, recent browser actions, and by default a PNG screenshot. Element refs are intentionally valid only for the latest snapshot and become stale after page changes.",
+        inputSchema: {
+          tabId: z.number().int().nonnegative().optional().describe("Chrome tab ID. Omit to inspect the active tab in the last-focused window."),
+          includeScreenshot: z.boolean().default(true).describe("Attach a viewport PNG screenshot to the MCP result."),
+        },
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          openWorldHint: true,
+        },
+      },
+      async ({ tabId, includeScreenshot }) =>
+        browserSnapshotToolResponse(await browserService.snapshot(tabId, includeScreenshot)),
+    );
+
+    server.registerTool(
+      "browser_action",
+      {
+        title: "Act In Chrome",
+        description:
+          "Perform one browser action in a controlled Chrome tab, then return a fresh semantic snapshot. Existing user tabs must first be claimed with browser_tab. Actions include navigate, back, forward, reload, click, dblclick, type, press, scroll, wait, activate, and close. Prefer fresh element refs from browser_snapshot over selector strings or coordinates.",
+        inputSchema: {
+          tabId: z.number().int().nonnegative().optional().describe("Chrome tab ID. Omit to use the active tab in the last-focused window."),
+          action: z.enum(["navigate", "back", "forward", "reload", "click", "dblclick", "type", "press", "scroll", "wait", "activate", "close"]),
+          url: z.string().optional().describe("Destination for navigate."),
+          ref: z.string().optional().describe("Fresh element ref from the latest browser snapshot, such as e3."),
+          locator: z.string().optional().describe("Playwright-style locator, for example css=#save or text=Continue."),
+          x: z.number().finite().optional().describe("Viewport x coordinate for coordinate click fallback."),
+          y: z.number().finite().optional().describe("Viewport y coordinate for coordinate click fallback."),
+          button: z.enum(["left", "middle", "right"]).default("left").describe("Mouse button for click or dblclick."),
+          text: z.string().optional().describe("Text for the type action. Empty text is valid when clear=true."),
+          clear: z.boolean().default(false).describe("Replace existing editable text before typing."),
+          key: z.string().optional().describe("Key for press, such as Enter, Escape, Tab, ArrowDown, a, or 1."),
+          modifiers: z.array(z.enum(["Alt", "Control", "Meta", "Shift"])).default([]).describe("Keyboard modifiers for press."),
+          deltaX: z.number().finite().default(0).describe("Horizontal scroll delta in CSS pixels."),
+          deltaY: z.number().finite().default(0).describe("Vertical scroll delta in CSS pixels."),
+          waitForText: z.string().optional().describe("Visible page text substring required by wait."),
+          waitForUrlIncludes: z.string().optional().describe("URL substring required by wait."),
+          timeoutMs: z.number().int().min(100).max(30000).default(5000).describe("Action or wait timeout. Maximum 30 seconds."),
+          bypassCache: z.boolean().default(false).describe("Bypass the cache for reload."),
+        },
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          openWorldHint: true,
+        },
+      },
+      async (input) =>
+        browserSnapshotToolResponse(
+          await browserService.action(input as BrowserActionInput),
+        ),
+    );
+
+    server.registerTool(
+      "browser_upload",
+      {
+        title: "Upload Files In Chrome",
+        description:
+          "Arm Chrome's file chooser interception, click a fresh element ref or selector, and set absolute local file paths without exposing a native picker. The target tab must be controlled. Use a fresh ref from browser_snapshot when possible.",
+        inputSchema: {
+          tabId: z.number().int().nonnegative().optional(),
+          ref: z.string().optional(),
+          locator: z.string().optional().describe("Playwright selector string used when no fresh ref is available."),
+          files: z.array(z.string().min(1)).min(1).max(20).describe("Absolute paths to local files."),
+          timeoutMs: z.number().int().min(100).max(30000).default(5000),
+        },
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          openWorldHint: true,
+        },
+      },
+      async (input) => {
+        const structuredContent = await browserService.upload(input);
+        return {
+          content: textContentFromStructuredContent(structuredContent),
+          structuredContent,
+        };
+      },
+    );
+
+    server.registerTool(
+      "browser_download",
+      {
+        title: "Manage Chrome Downloads",
+        description:
+          "List downloads from controlled tabs, trigger a download by clicking a fresh ref or selector, wait for a known download to finish, or cancel it. Trigger arms the download listener before clicking so fast downloads are not missed.",
+        inputSchema: {
+          action: z.enum(["list", "trigger", "wait", "cancel"]),
+          tabId: z.number().int().nonnegative().optional(),
+          downloadId: z.number().int().nonnegative().optional(),
+          ref: z.string().optional(),
+          locator: z.string().optional().describe("Playwright selector string used when no fresh ref is available."),
+          timeoutMs: z.number().int().min(100).max(30000).default(30000),
+          waitForCompletion: z.boolean().default(true),
+        },
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          openWorldHint: true,
+        },
+      },
+      async (input) => {
+        const structuredContent = await browserService.download(input as BrowserDownloadInput);
+        return {
+          content: textContentFromStructuredContent(structuredContent),
+          structuredContent,
+        };
+      },
+    );
+
+    server.registerTool(
+      "browser_clipboard",
+      {
+        title: "Use Browser Clipboard",
+        description:
+          "Read or write up to 8 MiB of plain text through Chrome's extension-safe offscreen clipboard document.",
+        inputSchema: {
+          action: z.enum(["read_text", "write_text"]),
+          text: z.string().optional(),
+        },
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ action, text }) => {
+        const input: BrowserClipboardInput = action === "write_text"
+          ? { action, text: text ?? "" }
+          : { action };
+        const structuredContent = await browserService.clipboard(input);
+        return {
+          content: textContentFromStructuredContent(structuredContent),
+          structuredContent,
+        };
+      },
+    );
+
+    server.registerTool(
+      "browser_evaluate",
+      {
+        title: "Evaluate JavaScript In Chrome",
+        description:
+          "Evaluate JavaScript in a controlled Chrome tab through CDP Runtime.evaluate. Prefer browser_snapshot and browser_action for normal interaction. Use this for development/debugging tasks when structured browser actions are insufficient.",
+        inputSchema: {
+          tabId: z.number().int().nonnegative().optional().describe("Chrome tab ID. Omit to use the active tab."),
+          expression: z.string().min(1).max(100000).describe("JavaScript expression to evaluate in the page."),
+          awaitPromise: z.boolean().default(true).describe("Await a returned Promise before returning the result."),
+        },
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          openWorldHint: true,
+        },
+      },
+      async ({ tabId, expression, awaitPromise }) => {
+        const structuredContent = await browserService.evaluate(tabId, expression, awaitPromise);
+        return {
+          content: textContentFromStructuredContent(structuredContent),
+          structuredContent,
+        };
+      },
+    );
+  }
 
   return server;
 }
@@ -2617,6 +2915,13 @@ function stripTrailingSlash(value: string) {
 validateConfiguration();
 await initializeAuthStore();
 
+const browserService = BROWSER_BRIDGE_ENABLED
+  ? await createBrowserService({
+      dataDirectory: DATA_DIR,
+      port: BROWSER_BRIDGE_PORT,
+    })
+  : undefined;
+
 const cleanupTimer = setInterval(cleanupEphemeralState, 60 * 1000);
 cleanupTimer.unref();
 
@@ -2635,6 +2940,13 @@ const httpServer = app.listen(PORT, HOST, () => {
   console.log(
     `OAuth consent PIN: dynamically generated per request (${CONSENT_PIN_LENGTH}-digit)`,
   );
+  if (browserService) {
+    const browserStatus = browserService.status();
+    console.log(`Browser bridge: ${browserStatus.bridgeUrl}`);
+    console.log(`Browser extension: ${browserStatus.extensionDirectory}`);
+  } else {
+    console.log("Browser bridge: disabled");
+  }
 });
 
 let shutdownStarted = false;
@@ -2645,6 +2957,10 @@ async function shutdown(signal: string) {
 
   const forcedExit = setTimeout(() => process.exit(1), 10_000);
   forcedExit.unref();
+
+  void browserService?.close().catch((error) =>
+    console.error("Browser bridge shutdown failed:", error),
+  );
 
   httpServer.close((error) => {
     clearTimeout(forcedExit);
