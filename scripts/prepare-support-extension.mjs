@@ -8,5 +8,5 @@ const sync = await prepareThreadSync(
   Number(process.env.THREAD_SYNC_PORT ?? 6002),
 );
 console.log(`Load unpacked extension: ${sync.extensionDirectory}`);
-console.log(`Thread sync endpoint: ${sync.bindUrl}`);
-console.log("Prepared extension files only. No server or browser was started.");
+console.log(`Local Codex support endpoint: ${sync.bindUrl.replace("/thread-sync/bind", "")}`);
+console.log("Prepared the Local Codex Support extension only. No server or browser was started.");

@@ -1,10 +1,12 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { copyFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Request, RequestHandler, Response } from "express";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { parseConversationUrl } from "./chatgpt-support.js";
+export { parseConversationUrl } from "./chatgpt-support.js";
 
 export const THREAD_SYNC_WIDGET_URI = "ui://local-codex/thread-sync-v2.html";
 export const THREAD_SYNC_AGENT_INSTRUCTION = "When the user asks for the current ChatGPT thread URL, conversation URL, or thread ID, always use this exact sequence: first call sync_current_thread, then call get_current_thread_url. Run sync_current_thread first even if the thread may already be synced; it is idempotent. get_current_thread_url is the only source of the URL. Do not infer, construct, or obtain the current thread URL with browser tools or any other tool.";
@@ -23,6 +25,7 @@ const identitySchema = z.object({ ownerId: z.string(), sessionId: z.string().min
 const ticketSchema = identitySchema.extend({
   token: tokenSchema,
   expiresAt: z.number(),
+  consumed: z.boolean().optional(),
 });
 const bindingSchema = identitySchema.extend({
   threadId: z.string(),
@@ -36,23 +39,6 @@ const storeSchema = z.object({
 });
 type Identity = z.infer<typeof identitySchema>;
 type Store = z.infer<typeof storeSchema>;
-
-export function parseConversationUrl(value: string) {
-  const url = new URL(value);
-  const match = url.pathname.match(/^(?:\/g\/([A-Za-z0-9_-]+))?\/c\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/?$/i);
-  if (url.origin !== "https://chatgpt.com" || url.username || url.password || !match) {
-    throw new Error("Expected a saved https://chatgpt.com conversation URL.");
-  }
-  const projectId = match[1];
-  const threadId = match[2].toLowerCase();
-  return {
-    threadId,
-    ...(projectId ? { projectId } : {}),
-    conversationUrl: projectId
-      ? `https://chatgpt.com/g/${projectId}/c/${threadId}`
-      : `https://chatgpt.com/c/${threadId}`,
-  };
-}
 
 /** One queue owns both token issuance and binding, including the atomic file write. */
 export class ThreadSyncRegistry {
@@ -76,14 +62,25 @@ export class ThreadSyncRegistry {
     identitySchema.parse(identity);
     return this.update((state) => {
       const binding = state.bindings.find((entry) => sameIdentity(entry, identity));
-      if (binding) return { status: "connected" as const, ...publicBinding(binding) };
       let ticket = state.tickets.find((entry) => sameIdentity(entry, identity));
+      if (binding && ticket?.consumed !== false) {
+        state.tickets = state.tickets.filter((entry) => !sameIdentity(entry, identity));
+        ticket = undefined;
+      }
       if (!ticket) {
         if (state.tickets.length >= MAX_RECORDS) throw new Error("Too many pending thread registrations.");
-        ticket = { ...identity, token: randomBytes(32).toString("base64url"), expiresAt: Date.now() + TICKET_TTL_MS };
+        ticket = {
+          ...identity,
+          token: randomBytes(32).toString("base64url"),
+          expiresAt: Date.now() + TICKET_TTL_MS,
+          consumed: false,
+        };
         state.tickets.push(ticket);
       }
-      return { status: "syncing" as const, ticket: { token: ticket.token, expiresAt: ticket.expiresAt } };
+      const publicTicket = { token: ticket.token, expiresAt: ticket.expiresAt };
+      return binding
+        ? { status: "connected" as const, ...publicBinding(binding), ticket: publicTicket }
+        : { status: "syncing" as const, ticket: publicTicket };
     });
   }
 
@@ -93,11 +90,14 @@ export class ThreadSyncRegistry {
     return this.update((state) => {
       const ticket = state.tickets.find((entry) => entry.token === token);
       if (!ticket) throw new Error("Binding token is unknown or expired.");
+      ticket.consumed = true;
       const existing = state.bindings.find((entry) => sameIdentity(entry, ticket));
       if (existing) {
         if (existing.threadId !== conversation.threadId) {
           throw new Error("This session is already bound to a different conversation. Refusing to rebind.");
         }
+        existing.conversationUrl = conversation.conversationUrl;
+        existing.boundAt = new Date().toISOString();
         return publicBinding(existing);
       }
       if (state.bindings.some((entry) => entry.ownerId === ticket.ownerId && entry.threadId === conversation.threadId)) {
@@ -122,12 +122,20 @@ export class ThreadSyncRegistry {
     return binding ? publicBinding(binding) : undefined;
   }
 
+  async allBindings() {
+    await this.queue;
+    return this.state.bindings.map(publicBinding);
+  }
+
   async waitForBinding(identity: Identity, timeoutMs = 8000) {
     identitySchema.parse(identity);
     const deadline = Date.now() + timeoutMs;
     do {
-      const binding = await this.binding(identity);
-      if (binding) return binding;
+      await this.queue;
+      const binding = this.state.bindings.find((entry) => sameIdentity(entry, identity));
+      const ticket = this.state.tickets.find((entry) => sameIdentity(entry, identity));
+      const refreshPending = Boolean(ticket && ticket.expiresAt > Date.now() && ticket.consumed === false);
+      if (binding && !refreshPending) return publicBinding(binding);
       await new Promise((resolve) => setTimeout(resolve, 50));
     } while (Date.now() < deadline);
     return undefined;
@@ -172,23 +180,32 @@ export function threadSyncBindUrl(port = 6002) {
 export async function prepareThreadSync(dataDirectory: string, port = 6002) {
   const bindUrl = threadSyncBindUrl(port);
   const registry = await ThreadSyncRegistry.open(dataDirectory);
-  const tokenPath = path.join(dataDirectory, "thread-sync-extension-token");
+  const tokenPath = path.join(dataDirectory, "support-extension-token");
+  const legacyTokenPath = path.join(dataDirectory, "thread-sync-extension-token");
   let extensionToken: string;
   try {
     extensionToken = tokenSchema.parse((await readFile(tokenPath, "utf8")).trim());
   } catch (error) {
     if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-    extensionToken = randomBytes(32).toString("base64url");
-    await writeFile(tokenPath, `${extensionToken}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    try {
+      extensionToken = tokenSchema.parse((await readFile(legacyTokenPath, "utf8")).trim());
+      await rename(legacyTokenPath, tokenPath);
+    } catch (legacyError) {
+      if (!(legacyError instanceof Error && "code" in legacyError && legacyError.code === "ENOENT")) throw legacyError;
+      extensionToken = randomBytes(32).toString("base64url");
+      await writeFile(tokenPath, `${extensionToken}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    }
   }
-  const sourceDirectory = fileURLToPath(new URL("../thread-sync-extension/", import.meta.url));
-  const extensionDirectory = path.resolve(dataDirectory, "thread-sync-extension");
+  const sourceDirectory = fileURLToPath(new URL("../support-extension/", import.meta.url));
+  const extensionDirectory = path.resolve(dataDirectory, "support-extension");
+  const legacyExtensionDirectory = path.resolve(dataDirectory, "thread-sync-extension");
+  await rm(legacyExtensionDirectory, { recursive: true, force: true });
   await mkdir(extensionDirectory, { recursive: true });
-  await Promise.all(["manifest.json", "content-script.js", "service-worker.js"].map((file) =>
+  await Promise.all(["manifest.json", "content-script.js", "service-worker.js", "popup.html", "popup.js", "popup.css"].map((file) =>
     copyFile(path.join(sourceDirectory, file), path.join(extensionDirectory, file)),
   ));
   await writeFile(path.join(extensionDirectory, "config.js"),
-    `globalThis.LOCAL_CODEX_THREAD_SYNC = ${JSON.stringify({ bindUrl, extensionToken })};\n`,
+    `globalThis.LOCAL_CODEX_THREAD_SYNC = ${JSON.stringify({ bindUrl, commandClaimUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/commands/claim"), commandResultUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/commands/result"), extensionToken })};\n`,
     { encoding: "utf8", mode: 0o600 },
   );
   const widgetHtml = await readFile(new URL("../thread-sync-widget/widget.html", import.meta.url), "utf8");
@@ -211,7 +228,11 @@ function authenticateExtension(req: Request, res: Response, extensionToken: stri
   return true;
 }
 
-export function threadSyncBindHandler(registry: ThreadSyncRegistry, extensionToken: string): RequestHandler {
+export function threadSyncBindHandler(
+  registry: ThreadSyncRegistry,
+  extensionToken: string,
+  onBound?: (binding: { threadId: string; conversationUrl: string; boundAt: string }) => void | Promise<void>,
+): RequestHandler {
   return async (req, res) => {
     // The extension credential grants only binding, never MCP/browser/terminal access.
     if (!authenticateExtension(req, res, extensionToken)) return;
@@ -222,6 +243,7 @@ export function threadSyncBindHandler(registry: ThreadSyncRegistry, extensionTok
     }
     try {
       const binding = await registry.bind(parsed.data.token, parsed.data.conversationUrl);
+      await onBound?.(binding);
       console.log(`[thread-sync] bound conversation=${JSON.stringify(binding.conversationUrl)}`);
       res.setHeader("Cache-Control", "no-store");
       res.json({ status: "bound" });
@@ -269,8 +291,9 @@ export function registerThreadSync(
     if (context.status === "connected") {
       const structuredContent = { status: "synced" as const };
       return {
-        content: [{ type: "text", text: "The current thread is already synced." }],
+        content: [{ type: "text", text: "Refreshing the current thread binding. Now call get_current_thread_url." }],
         structuredContent,
+        _meta: { "local-codex/thread-binding": context.ticket },
       };
     }
     const structuredContent = { status: context.status };

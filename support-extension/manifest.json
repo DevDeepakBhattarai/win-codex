@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "Local Codex Thread Sync",
-  "version": "0.4.2",
-  "description": "Reports the exact containing ChatGPT conversation URL to Local Codex when Thread Sync is requested.",
-  "permissions": ["scripting"],
+  "name": "Local Codex Support",
+  "version": "1.0.0",
+  "description": "Supports ChatGPT thread sync, RALF monitoring, and agent-started thread messages for Local Codex.",
+  "permissions": ["scripting", "storage", "tabs"],
   "host_permissions": ["https://chatgpt.com/*", "http://127.0.0.1/*"],
   "background": { "service_worker": "service-worker.js" },
   "content_scripts": [{
@@ -11,6 +11,10 @@
     "js": ["content-script.js"],
     "run_at": "document_start"
   }],
+  "action": {
+    "default_title": "Local Codex Support",
+    "default_popup": "popup.html"
+  },
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:*"
   }

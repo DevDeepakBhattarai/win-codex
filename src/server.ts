@@ -58,6 +58,14 @@ import {
   THREAD_SYNC_AGENT_INSTRUCTION,
   threadSyncBindHandler,
 } from "./thread-sync.js";
+import {
+  RalfController,
+  RalfRegistry,
+  registerChatGptMessaging,
+  SupportCommandBus,
+  supportCommandClaimHandler,
+  supportCommandResultHandler,
+} from "./chatgpt-support.js";
 
 const PORT = Number(process.env.PORT ?? 6000);
 const HOST = process.env.HOST ?? "localhost";
@@ -102,6 +110,7 @@ const DATA_DIR = process.env.DATA_DIR ?? path.join(process.cwd(), ".data");
 const BROWSER_BRIDGE_ENABLED = process.env.BROWSER_BRIDGE_ENABLED !== "false";
 const THREAD_SYNC_ENABLED = process.env.THREAD_SYNC_ENABLED !== "false";
 const THREAD_SYNC_PORT = boundedIntegerEnv("THREAD_SYNC_PORT", 6002, 1, 65535);
+const RALF_MODEL = process.env.RALF_MODEL ?? "gpt-5.6-terra";
 const BROWSER_BRIDGE_PORT = boundedIntegerEnv(
   "BROWSER_BRIDGE_PORT",
   PORT + 1,
@@ -1616,6 +1625,7 @@ function createMcpServer(ownerId: string) {
   }, instructions.length > 0 ? { instructions: instructions.join("\n") } : {});
 
   if (threadSync) registerThreadSync(server, threadSync, ownerId);
+  if (supportCommands && ralfRegistry) registerChatGptMessaging(server, supportCommands, ralfRegistry);
 
   server.registerTool(
     "terminal",
@@ -2948,6 +2958,20 @@ await initializeAuthStore();
 const threadSync = THREAD_SYNC_ENABLED
   ? await prepareThreadSync(DATA_DIR, THREAD_SYNC_PORT)
   : undefined;
+const supportCommands = threadSync ? new SupportCommandBus() : undefined;
+const ralfRegistry = threadSync ? await RalfRegistry.open(DATA_DIR) : undefined;
+if (threadSync && ralfRegistry) {
+  const existingBindings = await threadSync.registry.allBindings();
+  await ralfRegistry.registerMany(existingBindings.map((binding) => binding.conversationUrl));
+}
+const ralfController = supportCommands && ralfRegistry
+  ? new RalfController({
+      commands: supportCommands,
+      registry: ralfRegistry,
+      apiKey: process.env.OPENAI_API_KEY,
+      model: RALF_MODEL,
+    })
+  : undefined;
 
 const browserService = BROWSER_BRIDGE_ENABLED
   ? await createBrowserService({
@@ -2962,9 +2986,17 @@ const threadSyncHttpServer = threadSync
   ? await new Promise<Server>((resolve, reject) => {
       const syncApp = express();
       syncApp.disable("x-powered-by");
-      syncApp.use(express.json({ limit: "4kb" }));
+      syncApp.use(express.json({ limit: "5mb" }));
       syncApp.post("/thread-sync/bind", createRateLimiter("thread-sync", 60_000, 120),
-        threadSyncBindHandler(threadSync.registry, threadSync.extensionToken));
+        threadSyncBindHandler(threadSync.registry, threadSync.extensionToken, async (binding) => {
+          await ralfRegistry?.register(binding.conversationUrl);
+        }));
+      if (supportCommands) {
+        syncApp.post("/chatgpt-support/commands/claim",
+          supportCommandClaimHandler(supportCommands, threadSync.extensionToken));
+        syncApp.post("/chatgpt-support/commands/result",
+          supportCommandResultHandler(supportCommands, threadSync.extensionToken));
+      }
       const endpoint = new URL(threadSync.bindUrl);
       const listener = syncApp.listen(THREAD_SYNC_PORT, endpoint.hostname, () => resolve(listener));
       listener.once("error", reject);
@@ -2988,7 +3020,8 @@ const httpServer = app.listen(PORT, HOST, () => {
   console.log(`Terminal shell: ${TERMINAL_SHELL}`);
   if (threadSync) {
     console.log(`Thread sync endpoint: ${threadSync.bindUrl}`);
-    console.log(`Thread sync extension: ${threadSync.extensionDirectory}`);
+    console.log(`Local Codex support extension: ${threadSync.extensionDirectory}`);
+    console.log(`RALF model: ${RALF_MODEL}`);
     console.log(`Thread sync store: ${path.resolve(DATA_DIR, "thread-sync.json")}`);
   }
   console.log(
@@ -3015,6 +3048,8 @@ async function shutdown(signal: string) {
   void browserService?.close().catch((error) =>
     console.error("Browser bridge shutdown failed:", error),
   );
+  ralfController?.close();
+  supportCommands?.close();
 
   try {
     await Promise.all([httpServer, threadSyncHttpServer].filter(server => server !== undefined).map(server =>

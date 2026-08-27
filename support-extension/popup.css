@@ -1,0 +1,7 @@
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+body { margin: 0; min-width: 290px; }
+main { padding: 14px; }
+h1 { font-size: 15px; margin: 0 0 12px; }
+label { display: flex; align-items: center; gap: 8px; padding: 8px 0; font-size: 13px; }
+input { width: 16px; height: 16px; }
+p { margin: 10px 0 0; font-size: 11px; line-height: 1.4; opacity: .72; }

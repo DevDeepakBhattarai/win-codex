@@ -215,18 +215,15 @@ All tasks share the profile, clipboard, and controlled-tab list. `browser_tab` w
 
 Controlled pages show the viewport aura, animated mouse pointer, and a mouse favicon. The site favicon is restored when control is released. There is no control pill on the page. After an extension update, restart the server to refresh `.data/browser-extension`, reload the extension in `chrome://extensions`, and reload existing pages to replace their content scripts. Chrome's own debugger notification is separate from the page indicators.
 
-### ChatGPT thread sync
+### ChatGPT support extension
 
-The separate **Local Codex Thread Sync** extension pairs an `openai/session`
-with the exact URL of its ChatGPT conversation. Whenever the agent needs the
-current thread URL or ID, it must call `sync_current_thread` first and then
-`get_current_thread_url`. The sync call is idempotent. The lookup waits briefly
-for the visible Thread Sync UI handshake and is the only tool that returns the URL.
+The separate **Local Codex Support** extension handles three ChatGPT-specific features without using the browser-control extension: thread sync, RALF automation, and agent thread messaging. Thread sync keeps the existing `sync_current_thread` then `get_current_thread_url` flow and can stay enabled in both Chrome and Helium.
 
-Thread Sync reports only the current conversation URL. It does not read chat
-text, open tabs, mirror conversations, or control the browser. The extension injects
-its content script into already-open ChatGPT tabs when installed or started, so
-normal use does not require a page refresh.
+The extension popup has independent toggles for **Thread sync**, **RALF automation**, and **Agent thread messaging**. Enable the two automation features only in the browser you want Local Codex to drive. Commands are also claimed atomically by the server, so two enabled browser instances cannot execute the same command.
+
+Every manually synced conversation is registered for RALF. After 25 minutes, RALF opens the saved thread in the enabled browser, waits for ChatGPT to finish loading, returns immediately if the stop button says the thread is still running, and otherwise extracts all user messages plus only the final assistant message. The server then asks the OpenAI API for either `COMPLETE` or a short one or two sentence continuation instruction. Agent-started or agent-updated conversations are excluded from RALF.
+
+The `chatgpt_message` MCP tool uses the same support extension to either start a new normal/project thread or send a message to an existing conversation URL. It opens a background ChatGPT tab, waits for the composer, sends the message, captures the resulting saved conversation URL, and closes the automation tab.
 
 Four personal skills split the shipping workflow by responsibility. `implementer`
 changes, tests, and inspects code, `file-pr` publishes the verified state,
@@ -236,10 +233,7 @@ prompts through explicitly targeted Chrome tabs for at most five rounds. No
 skill merges the PR. The design record is in
 [`docs/adr/0001-explicit-chatgpt-url-binding.md`](docs/adr/0001-explicit-chatgpt-url-binding.md).
 
-Run `pnpm thread-sync:prepare` to generate `.data/thread-sync-extension` without
-starting a server or browser. Thread sync uses its own loopback HTTP listener on
-port 6002, configured with `THREAD_SYNC_PORT`; the MCP and Browser Bridge ports
-are unchanged. See the [installation and two-thread test](thread-sync-extension/README.md).
+Run `pnpm support:prepare` to generate `.data/support-extension` without starting a server or browser. On the first upgrade, remove the old **Local Codex Thread Sync** unpacked extension from Chrome/Helium before loading the new generated support extension. The support extension uses its own loopback HTTP listener on port 6002, configured with `THREAD_SYNC_PORT`; the MCP and Browser Bridge ports are unchanged. RALF also needs `OPENAI_API_KEY`. See [support-extension/README.md](support-extension/README.md) for installation and browser-toggle setup.
 
 ---
 

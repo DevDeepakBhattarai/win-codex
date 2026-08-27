@@ -20,7 +20,8 @@
                     "security-test":  "pnpm build && node scripts/security-test.mjs",
                     "browser-test":  "pnpm build && node scripts/browser-test.mjs",
                     "thread-sync-test":  "pnpm build && node scripts/thread-sync-test.mjs",
-                    "thread-sync:prepare":  "pnpm build && node scripts/prepare-thread-sync.mjs"
+                    "support:prepare":  "pnpm build && node scripts/prepare-support-extension.mjs",
+                    "thread-sync:prepare":  "pnpm support:prepare"
                 },
     "keywords":  [
                      "mcp",

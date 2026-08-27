@@ -1,39 +1,60 @@
-# ADR 0001: explicit ChatGPT URL binding
+# ADR 0001: explicit ChatGPT URL binding and support automation
 
 ## Status
 
 Accepted on 2026-08-27. This replaces the earlier passive, project-scoped
-mirroring design.
+mirroring design and now includes the separate Local Codex Support automation
+features built on the same authenticated loopback extension.
 
 ## Context
 
 ChatGPT supplies Local Codex with an opaque `openai/session`, while the browser
 alone knows the conversation URL. Attaching sync UI to generic file or terminal
-tools is unpredictable and can render irrelevant iframes. Automatically opening
-or mirroring Chrome tabs gives a URL-binding feature responsibilities it does
-not need.
+tools is unpredictable and can render irrelevant iframes. General browser
+control is also a poor fit for narrow ChatGPT-specific operations that need a
+known conversation URL, such as checking whether a thread is still running or
+sending a message into a specific thread.
 
 ## Decision
 
-Thread Sync exposes two narrow tools:
+Thread Sync keeps two narrow MCP tools:
 
 - `sync_current_thread` attaches the visible MCP Apps component and initiates the
   extension handshake for the calling session.
 - `get_current_thread_url` has no UI and returns only an existing binding. It
   never starts synchronization.
 
-The extension validates that the component belongs to the current ChatGPT route
-and sends only the canonical conversation URL to the loopback binding endpoint.
-It injects into existing ChatGPT tabs on installation, reload, and browser startup. It
-reads only the matching ChatGPT tab URL needed for binding and does not read chat
-content, mirror conversations, or perform browser automation.
+The Local Codex Support extension validates that the component belongs to the
+current ChatGPT route and sends only the canonical conversation URL to the
+loopback binding endpoint. Existing bindings are persisted and reused, while a
+new observation of the same thread refreshes its stored ChatGPT route.
 
-Code that needs to interact with a bound conversation must obtain its URL and
-then use the existing browser tools explicitly.
+The same extension also owns two explicit automation features behind independent
+browser toggles:
+
+- RALF opens a registered conversation in a background tab, waits for the page
+  and conversation content to settle, treats the stop button as authoritative
+  evidence that the thread is running, and otherwise returns the user messages
+  plus the final assistant response for the server-side continuation decision.
+- `chatgpt_message` opens an explicitly supplied ChatGPT target, verifies that
+  ChatGPT did not redirect the automation tab elsewhere, sends the requested
+  message, captures the saved conversation URL, and closes the automation tab.
+
+Automation commands are claimed by one enabled browser instance through the
+authenticated loopback command bus. Thread sync may remain enabled in multiple
+browsers because its binding request is idempotent, while the automation toggles
+should normally be enabled only in the browser intended to execute those tasks.
+The general browser-control extension remains separate.
 
 ## Consequences
 
-The agent has a clear two-step protocol and generic tool calls never mount Thread
-Sync UI. Exact URL lookup is fast and deterministic after binding. The initial
-sync still requires an MCP client that renders the attached Apps component and a
-locally installed Thread Sync extension.
+Current-thread lookup still has a deterministic two-step protocol and generic
+MCP tool calls never mount Thread Sync UI. The support extension now intentionally
+reads ChatGPT conversation content only for RALF inspection and performs narrowly
+scoped ChatGPT tab automation only for RALF and `chatgpt_message`.
+
+Existing persisted thread bindings are seeded into RALF during startup so an
+upgrade does not silently omit previously synced conversations. Conversations
+created or updated through `chatgpt_message` are excluded from the RALF loop.
+The initial thread sync still requires an MCP client that renders the attached
+Apps component and a locally installed Local Codex Support extension.
