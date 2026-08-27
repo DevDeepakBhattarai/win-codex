@@ -415,6 +415,7 @@ try {
   assert.ok(!resource.contents[0].text.includes(sync.extensionToken));
 
   await testContentScript(a.ticket.token, b.ticket.token);
+  await testSendWaitsForSettlementAndRetriesIgnoredClick();
   await testRunningHydrationDetection();
   await testWorkedDurationDetection();
   await testWorker(sync, a.ticket.token, request);
@@ -486,6 +487,96 @@ async function testContentScript(tokenA, tokenB) {
   resolveDelivery({ status: "bound", conversationUrl: urlB });
   await delayed;
   assert.equal(replies.length, previousReplies, "delayed acknowledgement is not applied after navigation");
+}
+
+async function testSendWaitsForSettlementAndRetriesIgnoredClick() {
+  let automationListener;
+  let now = 0;
+  let userCount = 0;
+  const clickTimes = [];
+  const location = new URL("https://chatgpt.com/");
+  const editor = {
+    textContent: "",
+    focus() {},
+    getAttribute(key) { return key === "contenteditable" ? "true" : null; },
+  };
+  const sendButton = {
+    get disabled() { return now < 5_000; },
+    getAttribute() { return null; },
+    click() {
+      clickTimes.push(now);
+      if (clickTimes.length === 2) {
+        editor.textContent = "";
+        userCount = 1;
+        location.href = urlA;
+      }
+    },
+  };
+  const composer = {
+    getAttribute() { return null; },
+    querySelector(selector) {
+      if (selector === '#prompt-textarea[contenteditable="true"]') return editor;
+      if (selector === 'button[data-testid="stop-button"]') return null;
+      return null;
+    },
+  };
+  const document = {
+    readyState: "complete",
+    querySelector(selector) {
+      if (selector === 'form[data-type="unified-composer"]') return composer;
+      if (selector === '#composer-submit-button' || selector === 'button[aria-label="Send prompt"]') return sendButton;
+      if (selector === 'form[data-type="unified-composer"] button[data-testid="stop-button"]' ||
+          selector === 'button[data-testid="stop-button"]') return null;
+      return null;
+    },
+    querySelectorAll(selector) {
+      if (selector === 'section[data-turn="user"]') return Array.from({ length: userCount }, () => ({}));
+      return [];
+    },
+    createRange() { return { selectNodeContents() {} }; },
+    execCommand(command, _showUi, value) {
+      assert.equal(command, "insertText");
+      editor.textContent = value;
+      return true;
+    },
+  };
+  const browser = {
+    runtime: {
+      sendMessage: async () => ({ status: "bound" }),
+      onMessage: { addListener: fn => { automationListener = fn; } },
+    },
+  };
+  const fakeSetTimeout = (callback, ms) => {
+    now += ms;
+    callback();
+    return 1;
+  };
+  const window = {
+    addEventListener() {},
+    getSelection() {
+      return { removeAllRanges() {}, addRange() {} };
+    },
+  };
+
+  vm.runInNewContext(await readFile("support-extension/content-script.js", "utf8"), {
+    window, location, document, browser,
+    Date: { now: () => now },
+    setTimeout: fakeSetTimeout,
+  });
+
+  const response = await new Promise(resolve => {
+    const keepChannelOpen = automationListener({
+      type: "local-codex-support/automation-v1",
+      command: { kind: "send_message", message: "hello" },
+    }, {}, resolve);
+    assert.equal(keepChannelOpen, true);
+  });
+
+  assert.equal(response.ok, true, response.error);
+  assert.equal(response.result.status, "sent");
+  assert.equal(response.result.conversationUrl, urlA);
+  assert.equal(clickTimes.length, 2, "an ignored first click is retried once");
+  assert.ok(clickTimes[1] >= 30_000, "the retry does not start until the first 30-second send attempt has timed out");
 }
 
 async function testRunningHydrationDetection() {
@@ -577,9 +668,11 @@ async function testWorkedDurationDetection() {
   };
   const assistantTurn = {
     dataset: { turn: "assistant", turnId: "a1" },
-    textContent: `${assistantMessage.textContent} ${durationButton.textContent}`,
+    get textContent() {
+      return now >= 3_000 ? `${assistantMessage.textContent} ${durationButton.textContent}` : assistantMessage.textContent;
+    },
     querySelectorAll(selector) {
-      if (selector === "button") return [durationButton];
+      if (selector === "button") return now >= 3_000 ? [durationButton] : [];
       if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
       return [];
     },
@@ -643,7 +736,8 @@ async function testWorkedDurationDetection() {
   assert.equal(response.ok, true);
   assert.equal(response.result.status, "idle");
   assert.equal(response.result.workedSeconds, 26 * 60 + 15,
-    "RALF inspection must parse the latest assistant Worked for label into seconds");
+    "RALF inspection must parse a Worked for label that appears late during hydration");
+  assert.ok(now >= 8_000, "RALF waits for the hydrated assistant turn to remain settled before reading duration");
 }
 
 async function testAutomationRedirectGuard(sync) {

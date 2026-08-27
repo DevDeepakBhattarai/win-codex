@@ -14,6 +14,12 @@
   let route = location.pathname;
   let generation = 0;
 
+  const SEND_ATTEMPT_TIMEOUT_MS = 30_000;
+  const SEND_PAGE_SETTLE_MS = 3_000;
+  const SEND_BUTTON_SETTLE_MS = 750;
+  const THREAD_ASSISTANT_SETTLE_MS = 5_000;
+  const THREAD_UNCERTAIN_SETTLE_MS = 15_000;
+
   function conversationUrl() {
     const match = location.pathname.match(/^(?:\/g\/([A-Za-z0-9_-]+))?\/c\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/?$/i);
     if (!match) return null;
@@ -95,7 +101,8 @@
     const stopButton = ready.composer.querySelector('button[data-testid="stop-button"]');
     if (stopButton) return { status: "running" };
 
-    await waitForStableTurns();
+    const settled = await waitForStableTurns();
+    if (!settled) return { status: "loading" };
     if (isRunning()) return { status: "running" };
     const workedSeconds = getWorkedDurationSeconds();
     const turns = [...document.querySelectorAll("section[data-turn]")];
@@ -165,28 +172,103 @@
 
   async function sendMessage(message) {
     if (typeof message !== "string" || !message.trim()) throw new Error("A non-empty ChatGPT message is required.");
-    const ready = await waitForComposer(5 * 60_000);
-    if (!ready) throw new Error("ChatGPT composer did not finish loading.");
 
-    const previousUserCount = document.querySelectorAll('section[data-turn="user"]').length;
-    insertMessage(ready.editor, message);
+    const baseline = {
+      previousUserCount: document.querySelectorAll('section[data-turn="user"]').length,
+      previousConversationUrl: conversationUrl(),
+      message,
+    };
+    let clicked = false;
 
-    const sendButton = await waitFor(() => {
-      const button = document.querySelector("#composer-submit-button") ?? document.querySelector('button[aria-label="Send prompt"]');
-      return button && !button.disabled ? button : null;
-    }, 60_000);
-    if (!sendButton) throw new Error("ChatGPT send button did not become available.");
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const attemptStartedAt = Date.now();
+      const remaining = () => Math.max(0, SEND_ATTEMPT_TIMEOUT_MS - (Date.now() - attemptStartedAt));
+      const ready = await waitForSendReady(remaining());
+      if (!ready) {
+        if (attempt === 0) continue;
+        throw new Error("ChatGPT composer did not settle after the 30-second retry window.");
+      }
 
-    sendButton.click();
-    const submitted = await waitFor(() => {
-      const currentUserCount = document.querySelectorAll('section[data-turn="user"]').length;
-      return currentUserCount > previousUserCount || document.querySelector('button[data-testid="stop-button"]') ? true : null;
-    }, 60_000);
-    if (!submitted) throw new Error("ChatGPT did not acknowledge the submitted message.");
+      if (!editorMatchesMessage(ready.editor, message)) {
+        if (clicked) {
+          const acknowledged = await waitForSubmissionAcknowledged(baseline, remaining());
+          if (acknowledged) return await sentResult(remaining());
+          throw new Error("ChatGPT changed the composer after submission; refusing an unsafe duplicate retry.");
+        }
+        insertMessage(ready.editor, message);
+      }
 
-    const savedUrl = await waitFor(() => conversationUrl(), 2 * 60_000);
+      const current = await waitForStableSendButton(message, remaining());
+      if (!current) {
+        if (attempt === 0 && !clicked) continue;
+        throw new Error("ChatGPT send button did not become stably available within 30 seconds.");
+      }
+
+      current.button.click();
+      clicked = true;
+      const submitted = await waitForSubmissionAcknowledged(baseline, remaining());
+      if (submitted) return await sentResult(remaining());
+
+      // Retry only when the exact submitted text is still present and the conversation
+      // has not advanced. That is the case where the first click was genuinely ignored.
+      const latest = getComposer();
+      const safeToRetry = attempt === 0 && latest &&
+        editorMatchesMessage(latest.editor, message) &&
+        document.querySelectorAll('section[data-turn="user"]').length === baseline.previousUserCount &&
+        !isRunning();
+      if (!safeToRetry) {
+        throw new Error("ChatGPT did not acknowledge the submitted message; refusing an unsafe duplicate retry.");
+      }
+    }
+
+    throw new Error("ChatGPT did not acknowledge the submitted message after retrying.");
+  }
+
+  async function sentResult(timeoutMs) {
+    const existingUrl = conversationUrl();
+    const savedUrl = existingUrl ?? await waitFor(() => conversationUrl(), timeoutMs);
     if (!savedUrl) throw new Error("ChatGPT did not expose the saved conversation URL after sending.");
     return { status: "sent", conversationUrl: savedUrl };
+  }
+
+  async function waitForSendReady(timeoutMs) {
+    return await waitForAllSettled(() => {
+      const ready = getComposer();
+      if (!ready || document.readyState === "loading" || isRunning()) return null;
+      return {
+        value: ready,
+        signature: composerSettledSignature(ready),
+        quietMs: SEND_PAGE_SETTLE_MS,
+      };
+    }, timeoutMs);
+  }
+
+  async function waitForStableSendButton(message, timeoutMs) {
+    return await waitForAllSettled(() => {
+      const ready = getComposer();
+      if (!ready || document.readyState === "loading" || !editorMatchesMessage(ready.editor, message)) return null;
+      const button = getSendButton();
+      if (!isActionableButton(button)) return null;
+      return {
+        value: { ...ready, button },
+        signature: [composerSettledSignature(ready), readEditorText(ready.editor), "send-ready"].join("|"),
+        quietMs: SEND_BUTTON_SETTLE_MS,
+      };
+    }, timeoutMs);
+  }
+
+  async function waitForSubmissionAcknowledged(baseline, timeoutMs) {
+    return Boolean(await waitFor(() => {
+      const currentUserCount = document.querySelectorAll('section[data-turn="user"]').length;
+      if (currentUserCount > baseline.previousUserCount || isRunning()) return true;
+
+      const currentUrl = conversationUrl();
+      if (!baseline.previousConversationUrl && currentUrl) return true;
+
+      const current = getComposer();
+      if (current && !editorMatchesMessage(current.editor, baseline.message)) return true;
+      return null;
+    }, timeoutMs));
   }
 
   function insertMessage(editor, message) {
@@ -200,13 +282,47 @@
     if (!inserted) throw new Error("Could not insert the ChatGPT message.");
   }
 
+  function getComposer() {
+    const composer = document.querySelector('form[data-type="unified-composer"]');
+    const editor = composer?.querySelector('#prompt-textarea[contenteditable="true"]') ??
+      composer?.querySelector('textarea[name="prompt-textarea"]');
+    return composer && editor ? { composer, editor } : null;
+  }
+
+  function getSendButton() {
+    return document.querySelector("#composer-submit-button") ??
+      document.querySelector('button[aria-label="Send prompt"]');
+  }
+
+  function isActionableButton(button) {
+    return Boolean(button && !button.disabled && button.getAttribute?.("aria-disabled") !== "true");
+  }
+
+  function readEditorText(editor) {
+    if (!editor) return "";
+    const value = typeof editor.value === "string" ? editor.value : editor.textContent ?? "";
+    return value.replace(/\u00a0/g, " ").replace(/\r\n?/g, "\n").trim();
+  }
+
+  function editorMatchesMessage(editor, message) {
+    return readEditorText(editor) === message.replace(/\u00a0/g, " ").replace(/\r\n?/g, "\n").trim();
+  }
+
+  function composerSettledSignature(ready) {
+    const sendButton = getSendButton();
+    const stopButton = ready.composer.querySelector('button[data-testid="stop-button"]');
+    return [
+      location.pathname,
+      stopButton ? "stop" : "idle",
+      sendButton ? (isActionableButton(sendButton) ? "send-enabled" : "send-disabled") : "send-missing",
+      ready.editor.getAttribute?.("contenteditable") ?? "",
+      ready.editor.getAttribute?.("aria-busy") ?? "",
+      ready.composer.getAttribute?.("aria-busy") ?? "",
+    ].join("|");
+  }
+
   async function waitForComposer(timeoutMs) {
-    return await waitFor(() => {
-      const composer = document.querySelector('form[data-type="unified-composer"]');
-      const editor = composer?.querySelector('#prompt-textarea[contenteditable="true"]') ??
-        composer?.querySelector('textarea[name="prompt-textarea"]');
-      return composer && editor ? { composer, editor } : null;
-    }, timeoutMs);
+    return await waitFor(() => getComposer(), timeoutMs);
   }
 
   async function waitForConversationReady(timeoutMs) {
@@ -214,6 +330,10 @@
     while (Date.now() < deadline) {
       const ready = await waitForComposer(Math.min(1_000, deadline - Date.now()));
       if (!ready) continue;
+      if (document.readyState === "loading") {
+        await sleep(100);
+        continue;
+      }
       if (ready.composer.querySelector('button[data-testid="stop-button"]')) return ready;
       if (document.querySelector('section[data-turn="user"]')) return ready;
       await sleep(100);
@@ -222,28 +342,47 @@
   }
 
   async function waitForStableTurns() {
-    let previousSignature = "";
-    let stableSince = Date.now();
-    const deadline = Date.now() + 60_000;
-    while (Date.now() < deadline) {
-      if (document.querySelector('button[data-testid="stop-button"]')) return;
+    const settled = await waitForAllSettled(() => {
+      if (isRunning()) return { value: true, signature: "running", quietMs: 0 };
+
       const turns = [...document.querySelectorAll("section[data-turn]")];
       const lastUserIndex = turns.findLastIndex((turn) => turn.dataset.turn === "user");
+      if (lastUserIndex < 0) return null;
       const hasAssistantAfterLastUser = turns.slice(lastUserIndex + 1).some((turn) => turn.dataset.turn === "assistant");
-      const stableForMs = hasAssistantAfterLastUser ? 2_000 : 10_000;
       const signature = turns.map((turn) => [
         turn.dataset.turn,
         turn.dataset.turnId ?? "",
         turn.textContent ?? "",
       ].join(":")).join("|");
-      if (signature !== previousSignature) {
-        previousSignature = signature;
+      return {
+        value: true,
+        signature,
+        quietMs: hasAssistantAfterLastUser ? THREAD_ASSISTANT_SETTLE_MS : THREAD_UNCERTAIN_SETTLE_MS,
+      };
+    }, 60_000);
+    return Boolean(settled);
+  }
+
+  async function waitForAllSettled(sample, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    let previousSignature = null;
+    let stableSince = 0;
+    while (Date.now() < deadline) {
+      const state = sample();
+      if (!state) {
+        previousSignature = null;
+        stableSince = 0;
+      } else if (state.quietMs <= 0) {
+        return state.value;
+      } else if (state.signature !== previousSignature) {
+        previousSignature = state.signature;
         stableSince = Date.now();
-      } else if (Date.now() - stableSince >= stableForMs) {
-        return;
+      } else if (Date.now() - stableSince >= state.quietMs) {
+        return state.value;
       }
       await sleep(100);
     }
+    return null;
   }
 
   function isRunning() {

@@ -26,7 +26,7 @@ Keep `.data` private. It contains the support extension credential, thread bindi
 
 A successful manual thread sync registers that conversation in `.data/ralf.json`. The first check is scheduled 25 minutes later.
 
-When due, the server asks the enabled RALF browser to open the saved conversation in a background tab. The content script waits for the ChatGPT composer and conversation turns to settle. If `button[data-testid="stop-button"]` exists, the thread is treated as running and nothing else is read. If the page is still loading, the check is retried later. Once idle, the content script reads the latest assistant turn's `Worked for ...` label. RALF calls OpenAI only when the parsed duration is greater than 19 minutes; shorter or missing durations end the RALF entry without an API call.
+When due, the server asks the enabled RALF browser to open the saved conversation in a background tab. The content script waits for the ChatGPT composer and conversation DOM to become stable instead of trusting the browser load event alone. Running threads are detected by `button[data-testid="stop-button"]`; idle assistant turns must remain stable for 5 seconds, while an uncertain user-only state is given 15 seconds for late hydration before it can be treated as stopped. Once idle, the content script reads the latest assistant turn's `Worked for ...` label. RALF calls OpenAI only when the parsed duration is greater than 19 minutes; shorter or missing durations end the RALF entry without an API call.
 
 For an idle thread, the extension returns every user message and only the final `[data-message-author-role="assistant"]` message. Tool cards, thinking UI, and other assistant-turn chrome are ignored. If there is no final assistant message, the extension returns a synthetic stopped message.
 
@@ -42,7 +42,7 @@ The `chatgpt_message` tool accepts a `targetUrl` and `message`. Supported target
 - A ChatGPT project `/g/.../project` URL for a new project thread.
 - An exact `/c/<conversation-id>` URL to update an existing thread.
 
-The selected browser opens the target in a background tab, waits for the composer, inserts the message with the same contenteditable path ChatGPT uses, clicks `#composer-submit-button`, waits for the send to be acknowledged, captures the saved conversation URL, reports it to Local Codex, and closes the automation tab.
+The selected browser opens the target in a background tab and waits for the composer state to remain settled before inserting anything. After insertion it also requires an enabled send control to remain stable before clicking. Each send attempt is capped at 30 seconds; one retry is allowed only when the exact message is still in the composer and the conversation has not advanced, which avoids duplicating a send that may actually have reached ChatGPT. The extension then captures the saved conversation URL, reports it to Local Codex, and closes the automation tab.
 
 ## Checks
 
