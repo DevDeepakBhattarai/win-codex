@@ -192,7 +192,7 @@ try {
   assert.equal(getDefinition._meta?.ui, undefined, "URL lookup must not mount UI");
   assert.match(getDefinition.description, /Required step 2/);
   assert.match(getDefinition.description, /Call sync_current_thread first/);
-  assert.match(messageDefinition.description, /Start a new ChatGPT project thread or send a message/);
+  assert.match(messageDefinition.description, /Start a new ChatGPT thread or send a message/);
   const syncCall = sessionId => client.callTool({ name: "sync_current_thread", arguments: {}, _meta: { "openai/session": sessionId } });
   const getCall = sessionId => client.callTool({ name: "get_current_thread_url", arguments: {}, _meta: { "openai/session": sessionId } });
   const [mcpA, mcpB] = await Promise.all([syncCall("mcp-A"), syncCall("mcp-B")]);

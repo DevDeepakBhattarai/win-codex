@@ -700,7 +700,7 @@ export function registerChatGptMessaging(
 ) {
   server.registerTool("chatgpt_message", {
     title: "Send ChatGPT Message",
-    description: "Start a new ChatGPT project thread or send a message to an existing ChatGPT thread through the Local Codex Support extension. Omit targetUrl to start a new sub-agent in the project configured in the extension popup. Provide an existing /c/... conversation URL to message that thread instead.",
+    description: "Start a new ChatGPT thread or send a message to an existing ChatGPT thread through the Local Codex Support extension. Omit targetUrl to start a new sub-agent in the project configured in the extension popup. Provide an existing /c/... conversation URL to message that thread instead.",
     inputSchema: {
       targetUrl: z.string().url().optional().describe("Optional ChatGPT project new-chat URL or existing conversation URL. Omit this to use the extension's configured Sub-agent project."),
       message: z.string().min(1).max(200_000).describe("Message to send."),
