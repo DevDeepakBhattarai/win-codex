@@ -16,7 +16,6 @@ const MAX_AX_NODES = 250;
 const MAX_VISIBLE_TEXT = 25_000;
 const MAX_DIAGNOSTIC_ENTRIES = 40;
 const MAX_ACTION_TIMELINE = 30;
-const MAX_CLIPBOARD_BYTES = 8 * 1024 * 1024;
 const MAX_UPLOAD_FILES = 20;
 const CLAIM_LISTING_TTL_MS = 60_000;
 const CONTROL_OVERLAY_MOVE_DELAY_MS = 180;
@@ -169,10 +168,6 @@ export type BrowserDownloadInput = {
   timeoutMs?: number;
   waitForCompletion?: boolean;
 };
-
-export type BrowserClipboardInput =
-  | { action: "read_text" }
-  | { action: "write_text"; text: string };
 
 export type BrowserServiceStatus = {
   connected: boolean;
@@ -783,18 +778,6 @@ export class BrowserService {
       createdWaiter.cancel();
       throw error;
     }
-  }
-
-  async clipboard(input: BrowserClipboardInput) {
-    await this.ensureConnected();
-    if (input.action === "read_text") {
-      return await this.bridge.request<{ text: string }>("clipboard.readText");
-    }
-    if (Buffer.byteLength(input.text, "utf8") > MAX_CLIPBOARD_BYTES) {
-      throw new Error(`Clipboard text exceeds ${MAX_CLIPBOARD_BYTES} bytes.`);
-    }
-    await this.bridge.request("clipboard.writeText", { text: input.text });
-    return { written: true };
   }
 
   private async resolveTabId(tabId?: number) {
@@ -1688,8 +1671,6 @@ async function prepareBrowserExtension(dataDirectory: string, bridgeUrl: string,
     copyFile(path.join(sourceDirectory, "content-script.js"), path.join(extensionDirectory, "content-script.js")),
     copyFile(path.join(sourceDirectory, "cursor.svg"), path.join(extensionDirectory, "cursor.svg")),
     copyFile(path.join(sourceDirectory, "empty.svg"), path.join(extensionDirectory, "empty.svg")),
-    copyFile(path.join(sourceDirectory, "offscreen.html"), path.join(extensionDirectory, "offscreen.html")),
-    copyFile(path.join(sourceDirectory, "offscreen.js"), path.join(extensionDirectory, "offscreen.js")),
   ]);
   const config = `globalThis.LOCAL_CODEX_BROWSER_CONFIG = ${JSON.stringify({ bridgeUrl, token })};\n`;
   await writeFile(path.join(extensionDirectory, "config.js"), config, { encoding: "utf8", mode: 0o600 });

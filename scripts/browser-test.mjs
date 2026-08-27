@@ -78,7 +78,6 @@ const testServer = http.createServer((request, response) => {
 
 let service;
 let context;
-let originalClipboard;
 try {
   const pagePort = await listen(testServer);
   const bridgePort = await availablePort();
@@ -247,10 +246,6 @@ try {
   assert.ok(downloadResult.download.filename);
   await access(downloadResult.download.filename);
 
-  originalClipboard = (await service.clipboard({ action: "read_text" })).text;
-  await service.clipboard({ action: "write_text", text: "browser clipboard test" });
-  assert.equal((await service.clipboard({ action: "read_text" })).text, "browser clipboard test");
-
   const tabsBeforeClaim = await service.listTabs();
   const listedUserTab = tabsBeforeClaim.find((tab) => tab.url === `${baseUrl}/user` && !tab.controlled);
   assert.ok(listedUserTab);
@@ -324,9 +319,6 @@ try {
 
   console.log("browser integration test passed");
 } finally {
-  if (originalClipboard !== undefined && service?.status().connected) {
-    await service.clipboard({ action: "write_text", text: originalClipboard }).catch(() => undefined);
-  }
   await context?.close().catch(() => undefined);
   await service?.close().catch(() => undefined);
   await new Promise((resolve) => testServer.close(() => resolve()));

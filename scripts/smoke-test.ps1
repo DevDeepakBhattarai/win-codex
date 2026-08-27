@@ -280,31 +280,6 @@ if ($BadProcessResult.started) {
   throw 'A nonexistent process was reported as started.'
 }
 
-$LargeFile = Join-Path ([IO.Path]::GetTempPath()) "mcp-bounded-read-$([Guid]::NewGuid().ToString('N')).txt"
-try {
-  [IO.File]::WriteAllBytes($LargeFile, (New-Object byte[] (2 * 1024 * 1024)))
-  $ReadBody = @{
-    jsonrpc = '2.0'
-    id = 5
-    method = 'tools/call'
-    params = @{
-      name = 'read_text_file'
-      arguments = @{
-        path = $LargeFile
-        maxBytes = 1024
-      }
-    }
-  } | ConvertTo-Json -Depth 10
-  $ReadResponse = Invoke-WebRequest -UseBasicParsing -Method Post -Uri $McpRequestUrl -Headers $Headers -ContentType 'application/json' -Body $ReadBody
-  $ReadCall = ConvertFrom-SseJson $ReadResponse.Content
-  $ReadResult = $ReadCall.result.content[0].text | ConvertFrom-Json
-  if (-not $ReadResult.truncated -or $ReadResult.bytesRead -ne 1024) {
-    throw 'Bounded file reading did not enforce maxBytes.'
-  }
-} finally {
-  Remove-Item -LiteralPath $LargeFile -Force -ErrorAction SilentlyContinue
-}
-
 $ImageFile = Join-Path ([IO.Path]::GetTempPath()) "mcp-image-$([Guid]::NewGuid().ToString('N')).png"
 $TinyPngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl02QAAAABJRU5ErkJggg=='
 try {

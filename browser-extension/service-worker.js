@@ -9,7 +9,6 @@ const PROTOCOL_VERSION = 1;
 const KEEPALIVE_MS = 20_000;
 const MAX_RECONNECT_MS = 10_000;
 const RECONNECT_ALARM = "browser-bridge-reconnect";
-const OFFSCREEN_DOCUMENT = "offscreen.html";
 const OVERLAY_MESSAGE_TARGET = "local-codex-control-overlay";
 
 let socket = null;
@@ -177,27 +176,6 @@ async function ensureAttached(tabId) {
   attachedTabs.add(tabId);
 }
 
-async function ensureOffscreenDocument() {
-  const documentUrl = chrome.runtime.getURL(OFFSCREEN_DOCUMENT);
-  const contexts = await chrome.runtime.getContexts({
-    contextTypes: ["OFFSCREEN_DOCUMENT"],
-    documentUrls: [documentUrl],
-  });
-  if (contexts.length > 0) return;
-  await chrome.offscreen.createDocument({
-    url: OFFSCREEN_DOCUMENT,
-    reasons: ["CLIPBOARD"],
-    justification: "Read and write the browser clipboard for an explicit MCP browser tool call.",
-  });
-}
-
-async function callOffscreen(method, params) {
-  await ensureOffscreenDocument();
-  const response = await chrome.runtime.sendMessage({ target: "offscreen", method, params });
-  if (!response?.ok) throw new Error(response?.error ?? "Offscreen clipboard request failed.");
-  return response.result;
-}
-
 async function sendOverlayCommand(tabId, command, params = {}) {
   try {
     const response = await chrome.tabs.sendMessage(tabId, {
@@ -339,9 +317,6 @@ async function dispatchRequest(method, params) {
       const downloads = await chrome.downloads.search({ id: params.id });
       return downloads[0] ? downloadSummary(downloads[0]) : null;
     }
-    case "clipboard.readText":
-    case "clipboard.writeText":
-      return await callOffscreen(method, params);
     default:
       throw new Error(`Unsupported browser bridge method: ${method}`);
   }

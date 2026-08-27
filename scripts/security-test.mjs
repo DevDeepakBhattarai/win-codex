@@ -349,17 +349,20 @@ try {
   const toolsList = await postMcp(toolsListBody, token.access_token, protocolHeaders);
   if (
     toolsList.status !== 200 ||
-    !toolsList.responseText.includes("list_directory") ||
     !toolsList.responseText.includes("terminal") ||
     !toolsList.responseText.includes("analyze_image") ||
     !toolsList.responseText.includes("browser_snapshot") ||
     !toolsList.responseText.includes("browser_action") ||
     !toolsList.responseText.includes("browser_tab") ||
     !toolsList.responseText.includes("browser_upload") ||
-    !toolsList.responseText.includes("browser_download") ||
-    !toolsList.responseText.includes("browser_clipboard")
+    !toolsList.responseText.includes("browser_download")
   ) {
     throw new Error(`Authenticated tools/list failed: ${JSON.stringify(toolsList)}`);
+  }
+  for (const removedTool of ["read_text_file", "write_text_file", "list_directory", "browser_status", "browser_clipboard"]) {
+    if (toolsList.responseText.includes(`"name":"${removedTool}"`)) {
+      throw new Error(`Removed tool is still advertised: ${removedTool}`);
+    }
   }
   if (toolsList.sessionId !== null) {
     throw new Error(`Stateless tools/list unexpectedly returned Mcp-Session-Id: ${toolsList.sessionId}`);
@@ -478,8 +481,7 @@ try {
       toolsList.responseText.includes("browser_action") &&
       toolsList.responseText.includes("browser_tab") &&
       toolsList.responseText.includes("browser_upload") &&
-      toolsList.responseText.includes("browser_download") &&
-      toolsList.responseText.includes("browser_clipboard"),
+      toolsList.responseText.includes("browser_download"),
     macTerminalUsesBash: macTerminalInvocation.executable === "/bin/bash",
     macTerminalUsesProcessGroup: shouldCreateTerminalProcessGroup("darwin"),
     smokeTestSyntaxValid: smokeParse.status === 0,

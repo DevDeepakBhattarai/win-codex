@@ -94,19 +94,13 @@ When the access token expires, ChatGPT automatically uses the refresh token to r
 
 Once connected, ChatGPT can call the following tools to inspect, modify, and build local code:
 
-*   **`terminal`**: Run terminal commands using PowerShell on Windows, `/bin/bash` on macOS, and `/bin/sh` on Linux.
+*   **`terminal`**: Run shell and filesystem operations using PowerShell on Windows, `/bin/bash` on macOS, and `/bin/sh` on Linux.
     *   *Features*: Bounded output, a 60-second maximum timeout, and platform-aware process termination.
-*   **`read_text_file`**: Read up to 5 MiB of a UTF-8 file.
-    *   *Features*: Bounded disk I/O to prevent memory exhaustion from loading large files.
 *   **`analyze_image`**: Load a local PNG, JPEG, WebP, or GIF and return it as native MCP image content so ChatGPT can visually inspect it.
     *   *Features*: Detects the image type from file bytes rather than trusting the extension and rejects images larger than 20 MiB.
 *   **`save_chatgpt_file`**: Save a file already present in the ChatGPT conversation (including a ChatGPT-generated image) directly to a local path.
     *   *Features*: Uses ChatGPT `openai/fileParams`, bounded HTTPS downloads, redirect limits, optional parent-directory creation, and overwrite control.
-*   **`write_text_file`**: Create or overwrite up to 5 MiB of UTF-8 text.
-*   **`list_directory`**: List up to 1,000 directory entries.
-    *   *Features*: Bounded concurrent filesystem calls for listing directory metadata.
 *   **`start_process`**: Start an executable with strict argument-array semantics (no shell interpolation), optionally waiting for completion.
-*   **`browser_status`**: Report whether the local Chrome extension bridge is connected without starting Chrome, and get the generated extension directory.
 *   **`browser_tabs`**: List tabs from the user's real Chrome profile with ownership state.
 *   **`browser_tab`**: Claim or release user tabs, mark handoffs or deliverables, and clean up agent-created tabs.
 *   **`browser_open`**: Start Chrome if needed, wait for its extension, and open an agent-owned tab or window with automation attached.
@@ -114,7 +108,6 @@ Once connected, ChatGPT can call the following tools to inspect, modify, and bui
 *   **`browser_action`**: Navigate, go back or forward, reload, click, double-click, type, press keys, scroll, wait, activate, or close a tab. Every action returns a fresh semantic snapshot.
 *   **`browser_upload`**: Upload local files through a file input or intercepted browser file chooser.
 *   **`browser_download`**: Trigger, list, wait for, or cancel downloads and report their local file paths.
-*   **`browser_clipboard`**: Read or write plain text through Chrome.
 *   **`browser_evaluate`**: Run JavaScript through CDP for development/debugging cases that structured browser actions cannot cover.
 
 ---
@@ -201,7 +194,7 @@ This is a one-time setup for that Chrome profile. The bridge talks only to `127.
 
 ### Automatic Chrome startup
 
-Call `browser_open` with the desired URL. Browser operations start Chrome when the bridge is disconnected and wait up to 15 seconds after launch for the extension to connect. Concurrent requests share one launch attempt. `browser_status` only reports state, so checking status will not open a window.
+Call `browser_open` with the desired URL. Browser operations start Chrome when the bridge is disconnected and wait up to 15 seconds after launch for the extension to connect. Concurrent requests share one launch attempt.
 
 Chrome must be installed and the generated extension must be loaded once. If the extension is disabled or missing, the tool returns its setup path. It does not install extensions or bypass Chrome's setup permissions. The server finds Chrome in standard Windows, macOS, and Linux locations. For a different installation, set `BROWSER_EXECUTABLE_PATH` in `.env`.
 
@@ -211,7 +204,7 @@ Chrome normally opens its default startup profile. If your extension is in anoth
 
 `tabId` remains optional. Omit it to use the active tab in the last-focused window, or pass a tab ID to target a specific tab. Different tabs can run concurrently, including background tabs opened with `active: false`. Tasks can switch tabs or share the same tab. Existing user tabs still require a title-and-URL-checked claim before control.
 
-All tasks share the profile, clipboard, and controlled-tab list. `browser_tab` with `action: "cleanup"` applies to all controlled tabs, not just one task's tabs. Close or release individual tabs when another task is still using the browser.
+All tasks share the profile and controlled-tab list. `browser_tab` with `action: "cleanup"` applies to all controlled tabs, not just one task's tabs. Close or release individual tabs when another task is still using the browser.
 
 Controlled pages show the viewport aura, animated mouse pointer, and a mouse favicon. The site favicon is restored when control is released. There is no control pill on the page. After an extension update, restart the server to refresh `.data/browser-extension`, reload the extension in `chrome://extensions`, and reload existing pages to replace their content scripts. Chrome's own debugger notification is separate from the page indicators.
 

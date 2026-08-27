@@ -16,7 +16,6 @@ import type { Server } from "node:http";
 import {
   mkdir,
   open,
-  opendir,
   readFile,
   rename,
   stat,
@@ -48,7 +47,6 @@ import {
 import {
   createBrowserService,
   type BrowserActionInput,
-  type BrowserClipboardInput,
   type BrowserDownloadInput,
   type BrowserOwnershipActionInput,
 } from "./browser.js";
@@ -1351,7 +1349,6 @@ function unauthorized(res: Response) {
   });
 }
 
-
 const commandResultOutputSchema = {
   command: z.string(),
   cwd: z.string(),
@@ -1366,13 +1363,6 @@ const terminalResultOutputSchema = {
   ...commandResultOutputSchema,
   shell: z.string(),
   platform: z.string(),
-};
-
-const textFileOutputSchema = {
-  path: z.string(),
-  bytesRead: z.number().int().nonnegative(),
-  truncated: z.boolean(),
-  content: z.string(),
 };
 
 const analyzeImageOutputSchema = {
@@ -1396,25 +1386,6 @@ const saveChatGptFileOutputSchema = {
   fileId: z.string(),
   fileName: z.string().optional(),
   mimeType: z.string().optional(),
-};
-
-const writeTextFileOutputSchema = {
-  path: z.string(),
-  bytesWritten: z.number().int().nonnegative(),
-};
-
-const directoryItemOutputSchema = z.object({
-  name: z.string(),
-  path: z.string(),
-  type: z.enum(["directory", "file", "other"]),
-  size: z.number().int().nonnegative(),
-  modifiedAt: z.string(),
-});
-
-const listDirectoryOutputSchema = {
-  path: z.string(),
-  truncated: z.boolean(),
-  items: z.array(directoryItemOutputSchema),
 };
 
 const startProcessOutputSchema = {
@@ -1616,7 +1587,7 @@ function createMcpServer(ownerId: string) {
       THREAD_SYNC_AGENT_INSTRUCTION,
     ] : []),
     ...(BROWSER_BRIDGE_ENABLED ? [
-      "Call browser_open with the desired URL to begin browsing. Browser tools start Chrome when disconnected and wait for its installed extension to connect; browser_status only reports connection state.",
+      "Call browser_open with the desired URL to begin browsing. Browser tools start Chrome when disconnected and wait for its installed extension to connect.",
       "Use browser_snapshot before interacting and use fresh element refs. Existing user tabs require browser_tabs followed by browser_tab claim with the listed title and URL.",
       "tabId is optional. Omit it to use the active tab in the last-focused window, or pass it to target a specific tab. Separate tabs can run concurrently, and tasks may switch or share tabs. Use browser_open active=false to open a background tab.",
       "All tasks share one browser profile and controlled-tab list. When browser work is finished, release every controlled tab before ending the task unless the tab is intentionally preserved as a deliverable or handoff. Releasing a tab removes browser control without closing it. Cleanup affects all controlled tabs and consumes preservation marks; use individual release when other tasks may still be using the browser.",
@@ -1635,7 +1606,7 @@ function createMcpServer(ownerId: string) {
     {
       title: "Run Terminal Command",
       description:
-        `Run a shell command directly on this ${HOST_PLATFORM_NAME} computer using ${TERMINAL_SHELL}. Use this for all terminal and shell commands. On macOS, commands run through bash; cmd.exe and Windows-only commands are unavailable.`,
+        `Run a shell command directly on this ${HOST_PLATFORM_NAME} computer using ${TERMINAL_SHELL}. Use this for shell and filesystem operations, including reading, writing, and listing files. On macOS, commands run through bash; cmd.exe and Windows-only commands are unavailable.`,
       inputSchema: {
         command: z
           .string()
@@ -1681,64 +1652,6 @@ function createMcpServer(ownerId: string) {
       };
     },
   );
-  server.registerTool(
-    "read_text_file",
-    {
-      title: "Read Text File",
-      description: "Read a UTF-8 text file from the local machine.",
-      inputSchema: {
-        path: z.string().min(1).describe("Absolute or relative file path."),
-        maxBytes: z
-          .number()
-          .int()
-          .min(1)
-          .max(5 * 1024 * 1024)
-          .default(1024 * 1024)
-          .describe("Maximum bytes to return. Default 1 MiB, max 5 MiB."),
-      },
-      outputSchema: textFileOutputSchema,
-      annotations: {
-        readOnlyHint: true,
-        destructiveHint: false,
-        openWorldHint: false,
-      },
-    },
-    async ({ path: filePath, maxBytes }) => {
-      const resolved = path.resolve(filePath);
-      const handle = await open(resolved, "r");
-      let bytesRead = 0;
-      let truncated = false;
-      let content = "";
-
-      try {
-        const fileStat = await handle.stat();
-        const requestedBytes = Math.min(fileStat.size, maxBytes + 1);
-        const buffer = Buffer.allocUnsafe(requestedBytes);
-        const result = await handle.read(buffer, 0, requestedBytes, 0);
-        bytesRead = Math.min(result.bytesRead, maxBytes);
-        truncated = result.bytesRead > maxBytes || fileStat.size > maxBytes;
-        const decoder = new TextDecoder("utf-8", { fatal: false });
-        content = decoder.decode(buffer.subarray(0, bytesRead), {
-          stream: truncated,
-        });
-      } finally {
-        await handle.close();
-      }
-
-      const structuredContent = {
-        path: resolved,
-        bytesRead,
-        truncated,
-        content,
-      };
-
-      return {
-        content: textContentFromStructuredContent(structuredContent),
-        structuredContent,
-      };
-    },
-  );
-
   server.registerTool(
     "analyze_image",
     {
@@ -1867,128 +1780,6 @@ function createMcpServer(ownerId: string) {
   );
 
   server.registerTool(
-    "write_text_file",
-    {
-      title: "Write Text File",
-      description:
-        "Create or replace a UTF-8 text file on the local machine.",
-      inputSchema: {
-        path: z.string().min(1).describe("Absolute or relative file path."),
-        content: z
-          .string()
-          .max(5 * 1024 * 1024)
-          .describe("UTF-8 text content to write. Maximum 5 MiB."),
-        createDirs: z
-          .boolean()
-          .default(true)
-          .describe("Create parent directories when they do not exist."),
-      },
-      outputSchema: writeTextFileOutputSchema,
-      annotations: {
-        readOnlyHint: false,
-        destructiveHint: true,
-        openWorldHint: false,
-      },
-    },
-    async ({ path: filePath, content, createDirs }) => {
-      const resolved = path.resolve(filePath);
-
-      if (createDirs) {
-        await mkdir(path.dirname(resolved), { recursive: true });
-      }
-
-      await writeFile(resolved, content, "utf8");
-
-      const structuredContent = {
-        path: resolved,
-        bytesWritten: Buffer.byteLength(content, "utf8"),
-      };
-
-      return {
-        content: textContentFromStructuredContent(structuredContent),
-        structuredContent,
-      };
-    },
-  );
-
-  server.registerTool(
-    "list_directory",
-    {
-      title: "List Directory",
-      description: "List files and folders in a local directory.",
-      inputSchema: {
-        path: z
-          .string()
-          .optional()
-          .describe("Directory path. Defaults to the server process cwd."),
-        maxEntries: z
-          .number()
-          .int()
-          .min(1)
-          .max(1000)
-          .default(200)
-          .describe("Maximum entries to return."),
-      },
-      outputSchema: listDirectoryOutputSchema,
-      annotations: {
-        readOnlyHint: true,
-        destructiveHint: false,
-        openWorldHint: false,
-      },
-    },
-    async ({ path: directoryPath, maxEntries }) => {
-      const resolved = path.resolve(directoryPath ?? process.cwd());
-      const directory = await opendir(resolved);
-      const selected = [];
-
-      try {
-        for await (const entry of directory) {
-          selected.push(entry);
-          if (selected.length > maxEntries) break;
-        }
-      } finally {
-        await directory.close().catch(() => undefined);
-      }
-
-      const truncated = selected.length > maxEntries;
-      if (truncated) selected.pop();
-
-      const maybeItems = await mapWithConcurrency(selected, 32, async (entry) => {
-        const itemPath = path.join(resolved, entry.name);
-        try {
-          const itemStat = await stat(itemPath);
-          return {
-            name: entry.name,
-            path: itemPath,
-            type: entry.isDirectory()
-              ? ("directory" as const)
-              : entry.isFile()
-                ? ("file" as const)
-                : ("other" as const),
-            size: itemStat.size,
-            modifiedAt: itemStat.mtime.toISOString(),
-          };
-        } catch (error) {
-          if (isNodeError(error, "ENOENT")) return undefined;
-          throw error;
-        }
-      });
-      const items = maybeItems.filter((item) => item !== undefined);
-
-      const structuredContent = {
-        path: resolved,
-        truncated,
-        items,
-      };
-
-      return {
-        content: textContentFromStructuredContent(structuredContent),
-        structuredContent,
-      };
-    },
-  );
-
-  server.registerTool(
     "start_process",
     {
       title: "Start Process",
@@ -2036,30 +1827,7 @@ function createMcpServer(ownerId: string) {
     },
   );
 
-
   if (browserService) {
-    server.registerTool(
-      "browser_status",
-      {
-        title: "Browser Bridge Status",
-        description:
-          "Report the Chrome extension connection and generated extension directory without launching Chrome. Call a browser operation directly to start Chrome automatically when disconnected.",
-        inputSchema: {},
-        annotations: {
-          readOnlyHint: true,
-          destructiveHint: false,
-          openWorldHint: false,
-        },
-      },
-      async () => {
-        const structuredContent = browserService.status();
-        return {
-          content: textContentFromStructuredContent(structuredContent),
-          structuredContent,
-        };
-      },
-    );
-
     server.registerTool(
       "browser_tabs",
       {
@@ -2238,34 +2006,6 @@ function createMcpServer(ownerId: string) {
       },
       async (input) => {
         const structuredContent = await browserService.download(input as BrowserDownloadInput);
-        return {
-          content: textContentFromStructuredContent(structuredContent),
-          structuredContent,
-        };
-      },
-    );
-
-    server.registerTool(
-      "browser_clipboard",
-      {
-        title: "Use Browser Clipboard",
-        description:
-          "Read or write up to 8 MiB of plain text through Chrome's offscreen clipboard document, starting Chrome if disconnected. The clipboard is shared across all tabs and tasks.",
-        inputSchema: {
-          action: z.enum(["read_text", "write_text"]),
-          text: z.string().optional(),
-        },
-        annotations: {
-          readOnlyHint: false,
-          destructiveHint: true,
-          openWorldHint: false,
-        },
-      },
-      async ({ action, text }) => {
-        const input: BrowserClipboardInput = action === "write_text"
-          ? { action, text: text ?? "" }
-          : { action };
-        const structuredContent = await browserService.clipboard(input);
         return {
           content: textContentFromStructuredContent(structuredContent),
           structuredContent,
@@ -2519,29 +2259,6 @@ function startProcess(input: {
       });
     });
   });
-}
-
-async function mapWithConcurrency<T, R>(
-  values: T[],
-  concurrency: number,
-  mapper: (value: T, index: number) => Promise<R>,
-) {
-  const results = new Array<R>(values.length);
-  let nextIndex = 0;
-
-  async function worker() {
-    while (true) {
-      const index = nextIndex;
-      nextIndex += 1;
-      if (index >= values.length) return;
-      results[index] = await mapper(values[index], index);
-    }
-  }
-
-  await Promise.all(
-    Array.from({ length: Math.min(concurrency, values.length) }, () => worker()),
-  );
-  return results;
 }
 
 function protectedResourceMetadata() {

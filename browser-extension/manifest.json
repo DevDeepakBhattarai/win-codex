@@ -6,11 +6,8 @@
   "minimum_chrome_version": "118",
   "permissions": [
     "alarms",
-    "clipboardRead",
-    "clipboardWrite",
     "debugger",
     "downloads",
-    "offscreen",
     "tabs"
   ],
   "host_permissions": ["<all_urls>"],
