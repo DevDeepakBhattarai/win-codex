@@ -12,6 +12,7 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { spawn } from "node:child_process";
+import type { Server } from "node:http";
 import {
   mkdir,
   open,
@@ -51,6 +52,12 @@ import {
   type BrowserDownloadInput,
   type BrowserOwnershipActionInput,
 } from "./browser.js";
+import {
+  prepareThreadSync,
+  registerThreadSync,
+  THREAD_SYNC_AGENT_INSTRUCTION,
+  threadSyncBindHandler,
+} from "./thread-sync.js";
 
 const PORT = Number(process.env.PORT ?? 6000);
 const HOST = process.env.HOST ?? "localhost";
@@ -93,6 +100,8 @@ const MAX_CHATGPT_FILE_REDIRECTS = 5;
 const SERVER_NAME = "local-codex";
 const DATA_DIR = process.env.DATA_DIR ?? path.join(process.cwd(), ".data");
 const BROWSER_BRIDGE_ENABLED = process.env.BROWSER_BRIDGE_ENABLED !== "false";
+const THREAD_SYNC_ENABLED = process.env.THREAD_SYNC_ENABLED !== "false";
+const THREAD_SYNC_PORT = boundedIntegerEnv("THREAD_SYNC_PORT", 6002, 1, 65535);
 const BROWSER_BRIDGE_PORT = boundedIntegerEnv(
   "BROWSER_BRIDGE_PORT",
   PORT + 1,
@@ -704,7 +713,8 @@ app.post("/oauth/revoke", revokeRateLimit, async (req, res) => {
 });
 
 app.post("/mcp", requireOAuth, async (req: AuthedRequest, res: Response) => {
-  const server = createMcpServer();
+  if (!req.authContext) return unauthorized(res);
+  const server = createMcpServer(req.authContext.grantId);
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
   });
@@ -1588,20 +1598,24 @@ function detectSupportedImageMimeType(buffer: Buffer) {
   return undefined;
 }
 
-function createMcpServer() {
+function createMcpServer(ownerId: string) {
+  const instructions = [
+    ...(threadSync ? [
+      THREAD_SYNC_AGENT_INSTRUCTION,
+    ] : []),
+    ...(BROWSER_BRIDGE_ENABLED ? [
+      "Call browser_open with the desired URL to begin browsing. Browser tools start Chrome when disconnected and wait for its installed extension to connect; browser_status only reports connection state.",
+      "Use browser_snapshot before interacting and use fresh element refs. Existing user tabs require browser_tabs followed by browser_tab claim with the listed title and URL.",
+      "tabId is optional. Omit it to use the active tab in the last-focused window, or pass it to target a specific tab. Separate tabs can run concurrently, and tasks may switch or share tabs. Use browser_open active=false to open a background tab.",
+      "All tasks share one browser profile and controlled-tab list. Cleanup affects all controlled tabs and consumes preservation marks. Close or release individual tabs when other tasks are still using the browser.",
+    ] : []),
+  ];
   const server = new McpServer({
     name: SERVER_NAME,
     version: "0.1.0",
-  }, {
-    ...(BROWSER_BRIDGE_ENABLED ? {
-      instructions: [
-        "Call browser_open with the desired URL to begin browsing. Browser tools start Chrome when disconnected and wait for its installed extension to connect; browser_status only reports connection state.",
-        "Use browser_snapshot before interacting and use fresh element refs. Existing user tabs require browser_tabs followed by browser_tab claim with the listed title and URL.",
-        "tabId is optional. Omit it to use the active tab in the last-focused window, or pass it to target a specific tab. Separate tabs can run concurrently, and tasks may switch or share tabs. Use browser_open active=false to open a background tab.",
-        "All tasks share one browser profile and controlled-tab list. Cleanup affects all controlled tabs and consumes preservation marks. Close or release individual tabs when other tasks are still using the browser.",
-      ].join("\n"),
-    } : {}),
-  });
+  }, instructions.length > 0 ? { instructions: instructions.join("\n") } : {});
+
+  if (threadSync) registerThreadSync(server, threadSync, ownerId);
 
   server.registerTool(
     "terminal",
@@ -2922,12 +2936,38 @@ function stripTrailingSlash(value: string) {
 }
 
 validateConfiguration();
+if (
+  THREAD_SYNC_ENABLED &&
+  (THREAD_SYNC_PORT === PORT ||
+    (BROWSER_BRIDGE_ENABLED && THREAD_SYNC_PORT === BROWSER_BRIDGE_PORT))
+) {
+  throw new Error("THREAD_SYNC_PORT must differ from PORT and BROWSER_BRIDGE_PORT.");
+}
 await initializeAuthStore();
+
+const threadSync = THREAD_SYNC_ENABLED
+  ? await prepareThreadSync(DATA_DIR, THREAD_SYNC_PORT)
+  : undefined;
 
 const browserService = BROWSER_BRIDGE_ENABLED
   ? await createBrowserService({
       dataDirectory: DATA_DIR,
       port: BROWSER_BRIDGE_PORT,
+    })
+  : undefined;
+
+// The extension needs a browser-safe port. Only its authenticated binding route
+// is available here; MCP and OAuth remain on the existing main listener.
+const threadSyncHttpServer = threadSync
+  ? await new Promise<Server>((resolve, reject) => {
+      const syncApp = express();
+      syncApp.disable("x-powered-by");
+      syncApp.use(express.json({ limit: "4kb" }));
+      syncApp.post("/thread-sync/bind", createRateLimiter("thread-sync", 60_000, 120),
+        threadSyncBindHandler(threadSync.registry, threadSync.extensionToken));
+      const endpoint = new URL(threadSync.bindUrl);
+      const listener = syncApp.listen(THREAD_SYNC_PORT, endpoint.hostname, () => resolve(listener));
+      listener.once("error", reject);
     })
   : undefined;
 
@@ -2946,6 +2986,11 @@ const httpServer = app.listen(PORT, HOST, () => {
   );
   console.log(`Host platform: ${HOST_PLATFORM_NAME} (${HOST_PLATFORM})`);
   console.log(`Terminal shell: ${TERMINAL_SHELL}`);
+  if (threadSync) {
+    console.log(`Thread sync endpoint: ${threadSync.bindUrl}`);
+    console.log(`Thread sync extension: ${threadSync.extensionDirectory}`);
+    console.log(`Thread sync store: ${path.resolve(DATA_DIR, "thread-sync.json")}`);
+  }
   console.log(
     `OAuth consent PIN: dynamically generated per request (${CONSENT_PIN_LENGTH}-digit)`,
   );
@@ -2971,15 +3016,17 @@ async function shutdown(signal: string) {
     console.error("Browser bridge shutdown failed:", error),
   );
 
-  httpServer.close((error) => {
+  try {
+    await Promise.all([httpServer, threadSyncHttpServer].filter(server => server !== undefined).map(server =>
+      new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())),
+    ));
     clearTimeout(forcedExit);
-    if (error) {
-      console.error("HTTP shutdown failed:", error);
-      process.exit(1);
-    } else {
-      process.exit(0);
-    }
-  });
+    process.exit(0);
+  } catch (error) {
+    clearTimeout(forcedExit);
+    console.error("HTTP shutdown failed:", error);
+    process.exit(1);
+  }
 }
 
 process.once("SIGINT", () => void shutdown("SIGINT"));

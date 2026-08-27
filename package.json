@@ -18,7 +18,9 @@
                     "revoke":  "node scripts/run-powershell.mjs scripts/revoke-access.ps1",
                     "harden":  "node scripts/run-powershell.mjs scripts/harden-acl.ps1",
                     "security-test":  "pnpm build && node scripts/security-test.mjs",
-                    "browser-test":  "pnpm build && node scripts/browser-test.mjs"
+                    "browser-test":  "pnpm build && node scripts/browser-test.mjs",
+                    "thread-sync-test":  "pnpm build && node scripts/thread-sync-test.mjs",
+                    "thread-sync:prepare":  "pnpm build && node scripts/prepare-thread-sync.mjs"
                 },
     "keywords":  [
                      "mcp",

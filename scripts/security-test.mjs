@@ -112,6 +112,7 @@ const child = spawn(process.execPath, ["dist/server.js"], {
     MCP_PUBLIC_URL: mcpUrl,
     AUTH_ISSUER: baseUrl,
     DATA_DIR: dataDir,
+    THREAD_SYNC_ENABLED: "false",
     BROWSER_EXECUTABLE_PATH: path.join(dataDir, "missing-chrome"),
     OAUTH_STORE_PATH: path.join(dataDir, "oauth-store.json"),
     ALLOWED_REDIRECT_URIS: "",
