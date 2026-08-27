@@ -61,6 +61,9 @@ import {
 import {
   RalfController,
   RalfRegistry,
+  ralfProjectsGetHandler,
+  ralfProjectsPutHandler,
+  ralfRegistrationHandler,
   registerChatGptMessaging,
   SupportCommandBus,
   supportCommandClaimHandler,
@@ -1625,7 +1628,7 @@ function createMcpServer(ownerId: string) {
   }, instructions.length > 0 ? { instructions: instructions.join("\n") } : {});
 
   if (threadSync) registerThreadSync(server, threadSync, ownerId);
-  if (supportCommands && ralfRegistry) registerChatGptMessaging(server, supportCommands, ralfRegistry);
+  if (supportCommands) registerChatGptMessaging(server, supportCommands);
 
   server.registerTool(
     "terminal",
@@ -2960,10 +2963,6 @@ const threadSync = THREAD_SYNC_ENABLED
   : undefined;
 const supportCommands = threadSync ? new SupportCommandBus() : undefined;
 const ralfRegistry = threadSync ? await RalfRegistry.open(DATA_DIR) : undefined;
-if (threadSync && ralfRegistry) {
-  const existingBindings = await threadSync.registry.allBindings();
-  await ralfRegistry.registerMany(existingBindings.map((binding) => binding.conversationUrl));
-}
 const ralfController = supportCommands && ralfRegistry
   ? new RalfController({
       commands: supportCommands,
@@ -2988,9 +2987,15 @@ const threadSyncHttpServer = threadSync
       syncApp.disable("x-powered-by");
       syncApp.use(express.json({ limit: "5mb" }));
       syncApp.post("/thread-sync/bind", createRateLimiter("thread-sync", 60_000, 120),
-        threadSyncBindHandler(threadSync.registry, threadSync.extensionToken, async (binding) => {
-          await ralfRegistry?.register(binding.conversationUrl);
-        }));
+        threadSyncBindHandler(threadSync.registry, threadSync.extensionToken));
+      if (ralfRegistry) {
+        syncApp.post("/chatgpt-support/ralf/register", createRateLimiter("ralf-register", 60_000, 240),
+          ralfRegistrationHandler(ralfRegistry, threadSync.extensionToken));
+        syncApp.get("/chatgpt-support/ralf/projects",
+          ralfProjectsGetHandler(ralfRegistry, threadSync.extensionToken));
+        syncApp.put("/chatgpt-support/ralf/projects",
+          ralfProjectsPutHandler(ralfRegistry, threadSync.extensionToken));
+      }
       if (supportCommands) {
         syncApp.post("/chatgpt-support/commands/claim",
           supportCommandClaimHandler(supportCommands, threadSync.extensionToken));

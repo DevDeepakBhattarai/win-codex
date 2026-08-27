@@ -7,6 +7,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 const MAX_RALF_THREADS = 2_000;
+const MAX_RALF_PROJECTS = 100;
 const DEFAULT_RALF_INTERVAL_MS = 25 * 60 * 1000;
 const LOADING_RETRY_MS = 60 * 1000;
 const FAILURE_RETRY_MS = 2 * 60 * 1000;
@@ -213,15 +214,19 @@ const ralfThreadSchema = z.object({
   lastContinuationAt: z.string().optional(),
   lastError: z.string().optional(),
 });
-const ralfExclusionSchema = z.object({
-  conversationUrl: z.string().url(),
-  threadId: z.string(),
-  excludedAt: z.string(),
-});
-const ralfStoreSchema = z.object({
+const ralfStoreV1Schema = z.object({
   version: z.literal(1),
   threads: z.array(ralfThreadSchema).max(MAX_RALF_THREADS),
-  exclusions: z.array(ralfExclusionSchema).max(MAX_RALF_THREADS),
+  exclusions: z.array(z.object({
+    conversationUrl: z.string().url(),
+    threadId: z.string(),
+    excludedAt: z.string(),
+  })).max(MAX_RALF_THREADS),
+});
+const ralfStoreSchema = z.object({
+  version: z.literal(2),
+  projects: z.array(z.string()).max(MAX_RALF_PROJECTS),
+  threads: z.array(ralfThreadSchema).max(MAX_RALF_THREADS),
 });
 type RalfStore = z.infer<typeof ralfStoreSchema>;
 
@@ -237,19 +242,52 @@ export class RalfRegistry {
   static async open(dataDirectory: string, intervalMs = DEFAULT_RALF_INTERVAL_MS) {
     await mkdir(dataDirectory, { recursive: true });
     const filePath = path.join(dataDirectory, "ralf.json");
-    let state: RalfStore = { version: 1, threads: [], exclusions: [] };
+    let state: RalfStore = { version: 2, projects: [], threads: [] };
+    let migrated = false;
     try {
-      state = ralfStoreSchema.parse(JSON.parse(await readFile(filePath, "utf8")));
+      const raw: unknown = JSON.parse(await readFile(filePath, "utf8"));
+      const current = ralfStoreSchema.safeParse(raw);
+      if (current.success) {
+        state = current.data;
+      } else if (ralfStoreV1Schema.safeParse(raw).success) {
+        // Version 1 registered every synced thread and permanently excluded agent-created
+        // threads. Neither behavior belongs in the project-scoped RALF model.
+        migrated = true;
+      } else {
+        state = ralfStoreSchema.parse(raw);
+      }
     } catch (error) {
       if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
     }
+    if (migrated) {
+      await writeFile(filePath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    }
     return new RalfRegistry(filePath, state, intervalMs);
+  }
+
+  async projects() {
+    await this.queue;
+    return [...this.state.projects];
+  }
+
+  async setProjects(values: string[]) {
+    const projects = [...new Set(values.map(parseRalfProjectId))];
+    if (projects.length > MAX_RALF_PROJECTS) throw new Error(`RALF supports at most ${MAX_RALF_PROJECTS} projects.`);
+    return this.update((state) => {
+      state.projects = projects;
+      const allowed = new Set(projects);
+      state.threads = state.threads.filter((thread) => {
+        const projectId = parseConversationUrl(thread.conversationUrl).projectId;
+        return projectId !== undefined && allowed.has(projectId);
+      });
+      return [...projects];
+    });
   }
 
   async register(conversationUrl: string) {
     const conversation = parseConversationUrl(conversationUrl);
     return this.update((state) => {
-      if (state.exclusions.some((entry) => entry.threadId === conversation.threadId)) return false;
+      if (!conversation.projectId || !state.projects.includes(conversation.projectId)) return false;
       const existing = state.threads.find((entry) => entry.threadId === conversation.threadId);
       if (existing) {
         if (existing.conversationUrl !== conversation.conversationUrl) {
@@ -266,48 +304,6 @@ export class RalfRegistry {
         state: "active",
       });
       return true;
-    });
-  }
-
-  async registerMany(conversationUrls: string[]) {
-    const conversations = conversationUrls.map(parseConversationUrl);
-    return this.update((state) => {
-      let added = 0;
-      for (const conversation of conversations) {
-        if (state.exclusions.some((entry) => entry.threadId === conversation.threadId)) continue;
-        const existing = state.threads.find((entry) => entry.threadId === conversation.threadId);
-        if (existing) {
-          if (existing.conversationUrl !== conversation.conversationUrl) {
-            existing.conversationUrl = conversation.conversationUrl;
-          }
-          continue;
-        }
-        if (state.threads.length >= MAX_RALF_THREADS) throw new Error("RALF thread registration limit reached.");
-        state.threads.push({
-          conversationUrl: conversation.conversationUrl,
-          threadId: conversation.threadId,
-          registeredAt: new Date().toISOString(),
-          nextCheckAt: Date.now() + this.intervalMs,
-          state: "active",
-        });
-        added += 1;
-      }
-      return added;
-    });
-  }
-
-  async exclude(conversationUrl: string) {
-    const conversation = parseConversationUrl(conversationUrl);
-    await this.update((state) => {
-      state.threads = state.threads.filter((entry) => entry.threadId !== conversation.threadId);
-      if (!state.exclusions.some((entry) => entry.threadId === conversation.threadId)) {
-        if (state.exclusions.length >= MAX_RALF_THREADS) throw new Error("RALF exclusion limit reached.");
-        state.exclusions.push({
-          conversationUrl: conversation.conversationUrl,
-          threadId: conversation.threadId,
-          excludedAt: new Date().toISOString(),
-        });
-      }
     });
   }
 
@@ -383,13 +379,36 @@ export class RalfRegistry {
   }
 }
 
+const canonicalProjectPattern = /^(g-p-[0-9a-f]{32})(?:-[A-Za-z0-9_-]+)?$/i;
+
+function canonicalProjectId(value: string) {
+  const known = value.match(canonicalProjectPattern);
+  if (known) return known[1].toLowerCase();
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error("Invalid ChatGPT project id.");
+  return value;
+}
+
+export function parseRalfProjectId(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error("RALF project entries cannot be empty.");
+  if (!trimmed.includes("://")) return canonicalProjectId(trimmed);
+
+  const url = new URL(trimmed);
+  if (url.origin !== "https://chatgpt.com" || url.username || url.password) {
+    throw new Error("RALF projects must use https://chatgpt.com.");
+  }
+  const match = url.pathname.match(/^\/g\/([^/]+)\/(?:project|c\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/?$/i);
+  if (!match) throw new Error("Expected a ChatGPT project home or project conversation URL.");
+  return canonicalProjectId(match[1]);
+}
+
 export function parseConversationUrl(value: string) {
   const url = new URL(value);
   const match = url.pathname.match(/^(?:\/g\/([A-Za-z0-9_-]+))?\/c\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/?$/i);
   if (url.origin !== "https://chatgpt.com" || url.username || url.password || !match) {
     throw new Error("Expected a saved https://chatgpt.com conversation URL.");
   }
-  const projectId = match[1];
+  const projectId = match[1] ? canonicalProjectId(match[1]) : undefined;
   const threadId = match[2].toLowerCase();
   return {
     threadId,
@@ -405,7 +424,10 @@ export function normalizeChatGptMessageTarget(value: string) {
   if (url.origin !== "https://chatgpt.com" || url.username || url.password) {
     throw new Error("ChatGPT message targets must use https://chatgpt.com.");
   }
-  if (url.pathname === "/" || /^\/g\/[A-Za-z0-9_-]+\/project\/?$/.test(url.pathname)) {
+  if (url.pathname === "/") {
+    throw new Error("New agent threads must target a ChatGPT project URL.");
+  }
+  if (/^\/g\/[A-Za-z0-9_-]+\/project\/?$/.test(url.pathname)) {
     return `${url.origin}${url.pathname}${url.search}`;
   }
   return parseConversationUrl(value).conversationUrl;
@@ -604,6 +626,54 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
   };
 }
 
+export function ralfRegistrationHandler(registry: RalfRegistry, extensionToken: string): RequestHandler {
+  const bodySchema = z.object({ conversationUrl: z.string().max(2048) }).strict();
+  return async (req, res) => {
+    if (!authenticateSupportExtension(req, res, extensionToken)) return;
+    const parsed = bodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Invalid RALF registration request." });
+      return;
+    }
+    try {
+      const registered = await registry.register(parsed.data.conversationUrl);
+      res.setHeader("Cache-Control", "no-store");
+      res.json({ status: registered ? "registered" : "ignored" });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : "RALF registration failed." });
+    }
+  };
+}
+
+export function ralfProjectsGetHandler(registry: RalfRegistry, extensionToken: string): RequestHandler {
+  return async (req, res) => {
+    if (!authenticateSupportExtension(req, res, extensionToken)) return;
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ projects: await registry.projects() });
+  };
+}
+
+export function ralfProjectsPutHandler(registry: RalfRegistry, extensionToken: string): RequestHandler {
+  const bodySchema = z.object({
+    projects: z.array(z.string().min(1).max(2048)).max(MAX_RALF_PROJECTS),
+  }).strict();
+  return async (req, res) => {
+    if (!authenticateSupportExtension(req, res, extensionToken)) return;
+    const parsed = bodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Invalid RALF projects request." });
+      return;
+    }
+    try {
+      const projects = await registry.setProjects(parsed.data.projects);
+      res.setHeader("Cache-Control", "no-store");
+      res.json({ projects });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : "Could not update RALF projects." });
+    }
+  };
+}
+
 export function supportCommandResultHandler(commands: SupportCommandBus, extensionToken: string): RequestHandler {
   return (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
@@ -620,13 +690,12 @@ export function supportCommandResultHandler(commands: SupportCommandBus, extensi
 export function registerChatGptMessaging(
   server: McpServer,
   commands: SupportCommandBus,
-  ralfRegistry: RalfRegistry,
 ) {
   server.registerTool("chatgpt_message", {
     title: "Send ChatGPT Message",
-    description: "Start a new ChatGPT thread or send a message to an existing ChatGPT thread through the Local Codex Support extension. targetUrl may be https://chatgpt.com/, a ChatGPT project new-chat URL, or an exact /c/... conversation URL. This automation is separate from browser-control tools.",
+    description: "Start a new ChatGPT project thread or send a message to an existing ChatGPT thread through the Local Codex Support extension. New threads must target a ChatGPT project /g/.../project URL; existing /c/... conversations may also be targeted. This automation is separate from browser-control tools.",
     inputSchema: {
-      targetUrl: z.string().url().describe("ChatGPT new-chat, project, or existing conversation URL."),
+      targetUrl: z.string().url().describe("ChatGPT project new-chat URL or existing conversation URL."),
       message: z.string().min(1).max(200_000).describe("Message to send."),
     },
     outputSchema: {
@@ -654,11 +723,6 @@ export function registerChatGptMessaging(
       if (!result.ok) throw new Error(result.error);
       if (result.kind !== "send_message") throw new Error("ChatGPT messaging received the wrong support command result.");
       const conversation = parseConversationUrl(result.result.conversationUrl);
-      try {
-        await ralfRegistry.exclude(conversation.conversationUrl);
-      } catch (error) {
-        console.error(`[chatgpt-message] sent ${JSON.stringify(conversation.conversationUrl)} but failed to persist the RALF exclusion:`, error);
-      }
       const structuredContent = { conversationUrl: conversation.conversationUrl };
       return {
         content: [{ type: "text", text: conversation.conversationUrl }],

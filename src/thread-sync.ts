@@ -205,7 +205,14 @@ export async function prepareThreadSync(dataDirectory: string, port = 6002) {
     copyFile(path.join(sourceDirectory, file), path.join(extensionDirectory, file)),
   ));
   await writeFile(path.join(extensionDirectory, "config.js"),
-    `globalThis.LOCAL_CODEX_THREAD_SYNC = ${JSON.stringify({ bindUrl, commandClaimUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/commands/claim"), commandResultUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/commands/result"), extensionToken })};\n`,
+    `globalThis.LOCAL_CODEX_THREAD_SYNC = ${JSON.stringify({
+      bindUrl,
+      commandClaimUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/commands/claim"),
+      commandResultUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/commands/result"),
+      ralfRegisterUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/ralf/register"),
+      ralfProjectsUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/ralf/projects"),
+      extensionToken,
+    })};\n`,
     { encoding: "utf8", mode: 0o600 },
   );
   const widgetHtml = await readFile(new URL("../thread-sync-widget/widget.html", import.meta.url), "utf8");
