@@ -215,6 +215,32 @@ All tasks share the profile, clipboard, and controlled-tab list. `browser_tab` w
 
 Controlled pages show the viewport aura, animated mouse pointer, and a mouse favicon. The site favicon is restored when control is released. There is no control pill on the page. After an extension update, restart the server to refresh `.data/browser-extension`, reload the extension in `chrome://extensions`, and reload existing pages to replace their content scripts. Chrome's own debugger notification is separate from the page indicators.
 
+### ChatGPT thread sync
+
+The separate **Local Codex Thread Sync** extension pairs an `openai/session`
+with the exact URL of its ChatGPT conversation. Whenever the agent needs the
+current thread URL or ID, it must call `sync_current_thread` first and then
+`get_current_thread_url`. The sync call is idempotent. The lookup waits briefly
+for the visible Thread Sync UI handshake and is the only tool that returns the URL.
+
+Thread Sync reports only the current conversation URL. It does not read chat
+text, open tabs, mirror conversations, or control the browser. The extension injects
+its content script into already-open ChatGPT tabs when installed or started, so
+normal use does not require a page refresh.
+
+Four personal skills split the shipping workflow by responsibility. `implementer`
+changes, tests, and inspects code, `file-pr` publishes the verified state,
+`babysit-pr` owns CI and cross-thread coordination, and `reviewer` submits
+the formal GitHub review. The two conversations exchange exact, versioned wakeup
+prompts through explicitly targeted Chrome tabs for at most five rounds. No
+skill merges the PR. The design record is in
+[`docs/adr/0001-explicit-chatgpt-url-binding.md`](docs/adr/0001-explicit-chatgpt-url-binding.md).
+
+Run `pnpm thread-sync:prepare` to generate `.data/thread-sync-extension` without
+starting a server or browser. Thread sync uses its own loopback HTTP listener on
+port 6002, configured with `THREAD_SYNC_PORT`; the MCP and Browser Bridge ports
+are unchanged. See the [installation and two-thread test](thread-sync-extension/README.md).
+
 ---
 
 ## 🔗 Connecting ChatGPT
