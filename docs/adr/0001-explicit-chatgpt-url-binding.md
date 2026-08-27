@@ -32,13 +32,18 @@ new observation of the same thread refreshes its stored ChatGPT route.
 The same extension also owns two explicit automation features behind independent
 browser toggles:
 
-- RALF opens a registered conversation in a background tab, waits for the page
-  and conversation content to settle, treats the stop button as authoritative
-  evidence that the thread is running, and otherwise returns the user messages
-  plus the final assistant response for the server-side continuation decision.
+- RALF owns a server-side allowlist of ChatGPT projects. The extension observes
+  top-level ChatGPT project-conversation navigation and reports the canonical
+  conversation URL to a dedicated RALF registration endpoint. Thread Sync is not
+  involved. RALF later opens registered conversations in a background tab, waits
+  for the page and conversation content to settle, treats the stop button as
+  authoritative evidence that the thread is running, and otherwise returns the
+  user messages plus the final assistant response for the server-side decision.
 - `chatgpt_message` opens an explicitly supplied ChatGPT target, verifies that
   ChatGPT did not redirect the automation tab elsewhere, sends the requested
   message, captures the saved conversation URL, and closes the automation tab.
+  New agent threads must target a ChatGPT project home URL; existing conversation
+  URLs remain valid targets.
 
 Automation commands are claimed by one enabled browser instance through the
 authenticated loopback command bus. Thread sync may remain enabled in multiple
@@ -53,8 +58,10 @@ MCP tool calls never mount Thread Sync UI. The support extension now intentional
 reads ChatGPT conversation content only for RALF inspection and performs narrowly
 scoped ChatGPT tab automation only for RALF and `chatgpt_message`.
 
-Existing persisted thread bindings are seeded into RALF during startup so an
-upgrade does not silently omit previously synced conversations. Conversations
-created or updated through `chatgpt_message` are excluded from the RALF loop.
+RALF registration is independent from current-thread lookup. Only conversations
+inside explicitly configured RALF projects are kept in the RALF registry. Named
+project-home paths are canonicalized to their stable project ID, and removing a
+project removes its registered RALF threads. Project threads created through
+`chatgpt_message` follow the same allowlist as manually created project threads.
 The initial thread sync still requires an MCP client that renders the attached
 Apps component and a locally installed Local Codex Support extension.

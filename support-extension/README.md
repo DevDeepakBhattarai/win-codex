@@ -17,14 +17,16 @@ The server atomically assigns each automation command to one enabled browser ins
 1. Run `pnpm support:prepare`. This builds the project and writes the generated extension to `.data/support-extension` with its private loopback token and endpoints. Preparation also removes the obsolete generated `.data/thread-sync-extension` directory and migrates its private token if this is an upgrade.
 2. Start or restart Local Codex. The support listener uses `http://127.0.0.1:6002` by default. `THREAD_SYNC_PORT` changes that port and `THREAD_SYNC_ENABLED=false` disables the support listener.
 3. If the old **Local Codex Thread Sync** unpacked extension is still installed, remove it first. Then open the browser extensions page, enable Developer mode, choose **Load unpacked**, and select `.data/support-extension`. Load the generated directory, not this source directory.
-4. Open the extension popup in each browser and choose which features that browser should handle. A typical setup is Thread sync on in both browsers, with RALF automation and Agent thread messaging on in only Chrome.
+4. Open the extension popup in each browser and choose which features that browser should handle. A typical setup is Thread sync on in both browsers, with RALF automation and Agent thread messaging on in only Chrome. Configure **RALF projects** from either browser; that list is stored by the Local Codex server and shared by every support-extension instance.
 5. Reload the generated extension after rerunning `pnpm support:prepare`. Existing ChatGPT tabs are reinjected automatically when the extension starts.
 
 Keep `.data` private. It contains the support extension credential, thread bindings, and RALF state.
 
 ## RALF behavior
 
-A successful manual thread sync registers that conversation in `.data/ralf.json`. The first check is scheduled 25 minutes later.
+RALF does not use Thread Sync for registration. The server keeps an explicit project allowlist in `.data/ralf.json`. Paste one project home URL or project ID per line into **RALF projects** in the extension popup. Project home URLs may include ChatGPT's display-name suffix, for example `/g/g-p-<id>-deepak/project`; Local Codex stores the stable `g-p-<id>` portion.
+
+When a ChatGPT tab navigates to `/g/<project-id>/c/<thread-id>`, the support extension reports that URL to the RALF registration endpoint. The server registers it only when the project is allowlisted. This works for normal ChatGPT navigation and for project threads spawned by `chatgpt_message`. Removing a project from the allowlist removes its registered RALF threads. The first check for a newly registered thread is scheduled 25 minutes later.
 
 When due, the server asks the enabled RALF browser to open the saved conversation in a background tab. The content script waits for the ChatGPT composer and conversation DOM to become stable instead of trusting the browser load event alone. Running threads are detected by `button[data-testid="stop-button"]`; idle assistant turns must remain stable for 5 seconds, while an uncertain user-only state is given 15 seconds for late hydration before it can be treated as stopped. Once idle, the content script reads the latest assistant turn's `Worked for ...` label. RALF calls OpenAI only when the parsed duration is greater than 19 minutes; shorter or missing durations end the RALF entry without an API call.
 
@@ -32,18 +34,17 @@ For an idle thread, the extension returns every user message and only the final 
 
 The server sends that compact transcript to the OpenAI Responses API using `RALF_MODEL`, which defaults to `gpt-5.6-terra`. Set `OPENAI_API_KEY` in the server environment. The model must answer exactly `COMPLETE` when the requested work is done, otherwise it returns a short one or two sentence next instruction. RALF sends that instruction back into the same thread and schedules the next check 25 minutes later.
 
-Threads created or updated through `chatgpt_message` are recorded as exclusions and are not registered into the RALF loop later.
-
 ## Agent messaging
 
 The `chatgpt_message` tool accepts a `targetUrl` and `message`. Supported targets are:
 
-- `https://chatgpt.com/` for a new normal thread.
-- A ChatGPT project `/g/.../project` URL for a new project thread.
+- A ChatGPT project `/g/.../project` URL for a new project thread. This is the only supported way to create a new agent thread.
 - An exact `/c/<conversation-id>` URL to update an existing thread.
+
+Bare `https://chatgpt.com/` new-thread targets are rejected so agent-created sub-agents cannot escape the project organization.
 
 The selected browser opens the target in a background tab and waits for the composer state to remain settled before inserting anything. After insertion it also requires an enabled send control to remain stable before clicking. Each send attempt is capped at 30 seconds; one retry is allowed only when the exact message is still in the composer and the conversation has not advanced, which avoids duplicating a send that may actually have reached ChatGPT. The extension then captures the saved conversation URL, reports it to Local Codex, and closes the automation tab.
 
 ## Checks
 
-`pnpm thread-sync-test` covers thread binding, generated support-extension configuration, browser-neutral WebExtension behavior, RALF registration/exclusion, and atomic command claiming without starting a browser or network listener.
+`pnpm thread-sync-test` covers thread binding, generated support-extension configuration, browser-neutral WebExtension behavior, project-scoped RALF registration, AI-created project-thread registration, duration gating, and atomic command claiming without starting a browser or network listener.

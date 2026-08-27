@@ -9,6 +9,7 @@ const config = globalThis.LOCAL_CODEX_THREAD_SYNC;
 const bindEndpoint = validateLoopbackEndpoint(config?.bindUrl, "/thread-sync/bind");
 const claimEndpoint = validateLoopbackEndpoint(config?.commandClaimUrl, "/chatgpt-support/commands/claim");
 const resultEndpoint = validateLoopbackEndpoint(config?.commandResultUrl, "/chatgpt-support/commands/result");
+const ralfRegisterEndpoint = validateLoopbackEndpoint(config?.ralfRegisterUrl, "/chatgpt-support/ralf/register");
 if (typeof config?.extensionToken !== "string" || config.extensionToken.length < 32) {
   throw new Error("Local Codex Support extension token is missing or invalid.");
 }
@@ -22,6 +23,7 @@ const AUTOMATION_MESSAGE = "local-codex-support/automation-v1";
 const SYNC_MESSAGE = "local-codex-thread-sync/bind-v1";
 let pollGeneration = 0;
 let pollController = null;
+const reportedRalfConversations = new Set();
 
 function validateLoopbackEndpoint(value, pathname) {
   const endpoint = new URL(value);
@@ -45,10 +47,26 @@ function conversationUrl(value) {
   }
 }
 
+function projectHomeId(value) {
+  try {
+    const url = new URL(value);
+    if (url.origin !== "https://chatgpt.com" || url.username || url.password) return null;
+    const match = url.pathname.match(/^\/g\/([^/]+)\/project\/?$/i);
+    if (!match) return null;
+    const canonical = match[1].match(/^(g-p-[0-9a-f]{32})(?:-[A-Za-z0-9_-]+)?$/i);
+    return canonical ? canonical[1].toLowerCase() : match[1];
+  } catch {
+    return null;
+  }
+}
+
 function automationTargetMatches(currentValue, targetValue) {
   try {
     const targetConversation = conversationUrl(targetValue);
     if (targetConversation) return conversationUrl(currentValue) === targetConversation;
+
+    const targetProject = projectHomeId(targetValue);
+    if (targetProject) return projectHomeId(currentValue) === targetProject;
 
     const current = new URL(currentValue);
     const target = new URL(targetValue);
@@ -67,6 +85,21 @@ async function getSettings() {
     ralf: stored.ralf === true,
     threadMessaging: stored.threadMessaging === true,
   };
+}
+
+async function registerRalfConversation(value) {
+  const currentUrl = conversationUrl(value);
+  if (!currentUrl || !currentUrl.startsWith("https://chatgpt.com/g/") || reportedRalfConversations.has(currentUrl)) return;
+  const response = await fetch(ralfRegisterEndpoint.href, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${config.extensionToken}` },
+    body: JSON.stringify({ conversationUrl: currentUrl }),
+    signal: AbortSignal.timeout(5000),
+    redirect: "error",
+  });
+  if (!response.ok) return;
+  const data = await response.json();
+  if (data.status === "registered" || data.status === "ignored") reportedRalfConversations.add(currentUrl);
 }
 
 async function getBrowserId() {
@@ -159,6 +192,9 @@ async function executeCommand(command, browserId) {
     }
     const response = await sendAutomationMessage(tab.id, command);
     if (!response?.ok) throw new Error(response?.error || "ChatGPT page automation failed.");
+    if (command.kind === "send_message") {
+      await registerRalfConversation(response.result?.conversationUrl).catch(() => undefined);
+    }
     await postResult({
       commandId: command.id,
       browserId,
@@ -239,25 +275,42 @@ extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === "local-codex-support/settings-changed") {
+    reportedRalfConversations.clear();
     restartPolling();
+    void scanExistingTabs();
     sendResponse({ ok: true });
   }
 });
 
-async function injectIntoExistingTabs() {
+async function scanExistingTabs() {
   const tabs = await extensionApi.tabs.query({ url: "https://chatgpt.com/*" });
-  await Promise.allSettled(tabs.filter((tab) => Number.isInteger(tab.id)).map((tab) =>
-    extensionApi.scripting.executeScript({ target: { tabId: tab.id }, files: ["content-script.js"] }),
-  ));
+  await Promise.allSettled(tabs.flatMap((tab) => {
+    const tasks = [];
+    if (Number.isInteger(tab.id)) {
+      tasks.push(extensionApi.scripting.executeScript({ target: { tabId: tab.id }, files: ["content-script.js"] }));
+    }
+    if (typeof tab.url === "string") tasks.push(registerRalfConversation(tab.url));
+    return tasks;
+  }));
 }
 
+extensionApi.tabs.onUpdated?.addListener((_tabId, changeInfo) => {
+  if (typeof changeInfo.url === "string") void registerRalfConversation(changeInfo.url).catch(() => undefined);
+});
+extensionApi.webNavigation?.onHistoryStateUpdated?.addListener((details) => {
+  if (details.frameId === 0) void registerRalfConversation(details.url).catch(() => undefined);
+});
+extensionApi.webNavigation?.onCommitted?.addListener((details) => {
+  if (details.frameId === 0) void registerRalfConversation(details.url).catch(() => undefined);
+});
+
 extensionApi.runtime.onInstalled.addListener(() => {
-  void injectIntoExistingTabs();
+  void scanExistingTabs();
   restartPolling();
 });
 extensionApi.runtime.onStartup.addListener(() => {
-  void injectIntoExistingTabs();
+  void scanExistingTabs();
   restartPolling();
 });
-void injectIntoExistingTabs();
+void scanExistingTabs();
 restartPolling();

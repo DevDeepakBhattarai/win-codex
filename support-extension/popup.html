@@ -13,7 +13,15 @@
     <label><input id="ralf" type="checkbox"> <span>RALF automation</span></label>
     <label><input id="threadMessaging" type="checkbox"> <span>Agent thread messaging</span></label>
     <p>Enable RALF and agent messaging only in the browser you want Local Codex to automate.</p>
+
+    <section>
+      <label for="ralfProjects">RALF projects</label>
+      <textarea id="ralfProjects" rows="6" placeholder="One project URL or project ID per line"></textarea>
+      <button id="saveRalfProjects" type="button">Save projects</button>
+      <p id="ralfProjectsStatus">Only threads inside these projects are registered for RALF.</p>
+    </section>
   </main>
+  <script src="config.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

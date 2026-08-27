@@ -8,10 +8,11 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { THREAD_SYNC_AGENT_INSTRUCTION, THREAD_SYNC_WIDGET_URI, ThreadSyncRegistry, parseConversationUrl, prepareThreadSync, registerThreadSync, threadSyncBindHandler, threadSyncBindUrl } from "../dist/thread-sync.js";
-import { RalfController, RalfRegistry, SupportCommandBus, normalizeChatGptMessageTarget, registerChatGptMessaging, supportCommandClaimHandler } from "../dist/chatgpt-support.js";
+import { RalfController, RalfRegistry, SupportCommandBus, normalizeChatGptMessageTarget, parseRalfProjectId, registerChatGptMessaging, supportCommandClaimHandler } from "../dist/chatgpt-support.js";
 
 const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "win-codex-thread-sync-test-"));
-const projectId = "g-project-test";
+const projectId = "g-p-6a87fafd6d948191ab3338e485c07c39";
+const namedProjectHome = `https://chatgpt.com/g/${projectId}-deepak/project`;
 const urlA = `https://chatgpt.com/g/${projectId}/c/11111111-1111-4111-8111-111111111111`;
 const urlB = `https://chatgpt.com/g/${projectId}/c/12345678-abcd-4321-abcd-123456789abc`;
 const idA = { ownerId: "grant-one", sessionId: "session-A" };
@@ -47,20 +48,28 @@ try {
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
   assert.equal(manifest.version, "1.0.0");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
-  assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs"]);
+  assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
   assert.equal(manifest.content_security_policy.extension_pages,
     "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:*");
+  const preparedPopup = await readFile(path.join(sync.extensionDirectory, "popup.html"), "utf8");
+  assert.match(preparedPopup, /RALF projects/);
+  assert.match(preparedPopup, /config\.js/);
   const preparedConfig = {};
   vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), preparedConfig);
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.commandClaimUrl, "http://127.0.0.1:6002/chatgpt-support/commands/claim");
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.commandResultUrl, "http://127.0.0.1:6002/chatgpt-support/commands/result");
-  assert.equal(normalizeChatGptMessageTarget("https://chatgpt.com/"), "https://chatgpt.com/");
-  assert.equal(normalizeChatGptMessageTarget("https://chatgpt.com/g/g-project-test/project"), "https://chatgpt.com/g/g-project-test/project");
+  assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralfRegisterUrl, "http://127.0.0.1:6002/chatgpt-support/ralf/register");
+  assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralfProjectsUrl, "http://127.0.0.1:6002/chatgpt-support/ralf/projects");
+  assert.throws(() => normalizeChatGptMessageTarget("https://chatgpt.com/"), /project URL/);
+  assert.equal(normalizeChatGptMessageTarget(namedProjectHome), namedProjectHome);
+  assert.equal(parseRalfProjectId(namedProjectHome), projectId);
+  assert.equal(parseRalfProjectId(urlA), projectId);
   assert.throws(() => normalizeChatGptMessageTarget("https://evil.example/"));
 
   const registry = sync.registry;
   ralfRegistry = await RalfRegistry.open(temporaryRoot, 20);
+  await ralfRegistry.setProjects([projectId]);
   supportCommands = new SupportCommandBus();
   const [a, b, againA] = await Promise.all([registry.context(idA), registry.context(idB), registry.context(idA)]);
   assert.equal(a.ticket.token, againA.ticket.token, "repeated sync calls reuse the pending ticket");
@@ -104,16 +113,42 @@ try {
   assert.equal(refreshedBinding.conversationUrl, urlA,
     "rebinding the same thread refreshes its exact ChatGPT route");
   assert.equal((await routeRefreshRegistry.binding(routeRefreshIdentity)).conversationUrl, urlA);
-  const migratedRalfRegistry = await RalfRegistry.open(routeRefreshRoot, 20);
-  assert.equal(await migratedRalfRegistry.registerMany(
-    (await routeRefreshRegistry.allBindings()).map(binding => binding.conversationUrl),
-  ), 1, "existing thread bindings can seed RALF during an upgrade");
+  const projectScopedRegistry = await RalfRegistry.open(routeRefreshRoot, 20);
+  assert.equal(await projectScopedRegistry.register(urlA), false,
+    "RALF ignores project threads until their project is explicitly configured");
+  assert.deepEqual(await projectScopedRegistry.setProjects([namedProjectHome, projectId]), [projectId],
+    "named project home URLs canonicalize to the stable project id");
+  assert.equal(await projectScopedRegistry.register(urlA), true);
   await new Promise(resolve => setTimeout(resolve, 25));
-  assert.equal((await migratedRalfRegistry.due()).some(thread => thread.conversationUrl === urlA), true);
+  assert.equal((await projectScopedRegistry.due()).some(thread => thread.conversationUrl === urlA), true);
+  await projectScopedRegistry.setProjects([]);
+  assert.equal((await projectScopedRegistry.due()).length, 0,
+    "removing a RALF project removes its registered threads");
 
-  const handler = threadSyncBindHandler(registry, sync.extensionToken, async (binding) => {
-    await ralfRegistry.register(binding.conversationUrl);
-  });
+  const legacyRalfRoot = path.join(temporaryRoot, "legacy-ralf");
+  await mkdir(legacyRalfRoot, { recursive: true });
+  await writeFile(path.join(legacyRalfRoot, "ralf.json"), JSON.stringify({
+    version: 1,
+    threads: [{
+      conversationUrl: urlA,
+      threadId: "11111111-1111-4111-8111-111111111111",
+      registeredAt: new Date(0).toISOString(),
+      nextCheckAt: 0,
+      state: "active",
+    }],
+    exclusions: [{
+      conversationUrl: urlB,
+      threadId: "12345678-abcd-4321-abcd-123456789abc",
+      excludedAt: new Date(0).toISOString(),
+    }],
+  }));
+  const migratedRalfRegistry = await RalfRegistry.open(legacyRalfRoot, 20);
+  assert.deepEqual(await migratedRalfRegistry.projects(), []);
+  assert.deepEqual(await migratedRalfRegistry.due(), [],
+    "legacy blanket RALF registrations do not survive the project-scoped migration");
+  assert.equal(JSON.parse(await readFile(path.join(legacyRalfRoot, "ralf.json"), "utf8")).version, 2);
+
+  const handler = threadSyncBindHandler(registry, sync.extensionToken);
   async function request(body, authorization = `Bearer ${sync.extensionToken}`, origin = "chrome-extension://" + "a".repeat(32)) {
     const result = { status: 200, body: undefined };
     const req = { body, get: key => ({ authorization, origin })[key] };
@@ -135,13 +170,13 @@ try {
   assert.deepEqual((await request({ token: a.ticket.token, conversationUrl: urlA }, `Bearer ${sync.extensionToken}`, "moz-extension://thread-sync-test")).body,
     { status: "bound" }, "standard non-Chrome WebExtension origins are accepted");
   await new Promise(resolve => setTimeout(resolve, 25));
-  assert.equal((await ralfRegistry.due()).some(thread => thread.conversationUrl === urlA), true,
-    "a manually synced thread is registered for the RALF loop");
+  assert.equal((await ralfRegistry.due()).some(thread => thread.conversationUrl === urlA), false,
+    "thread sync does not register conversations for RALF");
 
   // Exercise actual MCP metadata forwarding without opening an HTTP listener.
   server = new McpServer({ name: "thread-sync-test", version: "1" });
   registerThreadSync(server, sync, "mcp-grant");
-  registerChatGptMessaging(server, supportCommands, ralfRegistry);
+  registerChatGptMessaging(server, supportCommands);
   client = new Client({ name: "thread-sync-test", version: "1" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -156,7 +191,7 @@ try {
   assert.equal(getDefinition._meta?.ui, undefined, "URL lookup must not mount UI");
   assert.match(getDefinition.description, /Required step 2/);
   assert.match(getDefinition.description, /Call sync_current_thread first/);
-  assert.match(messageDefinition.description, /Start a new ChatGPT thread or send a message/);
+  assert.match(messageDefinition.description, /Start a new ChatGPT project thread or send a message/);
   const syncCall = sessionId => client.callTool({ name: "sync_current_thread", arguments: {}, _meta: { "openai/session": sessionId } });
   const getCall = sessionId => client.callTool({ name: "get_current_thread_url", arguments: {}, _meta: { "openai/session": sessionId } });
   const [mcpA, mcpB] = await Promise.all([syncCall("mcp-A"), syncCall("mcp-B")]);
@@ -201,34 +236,28 @@ try {
     result: { status: "sent", conversationUrl: urlB },
   });
   assert.equal((await commandResult).result.conversationUrl, urlB);
-  await ralfRegistry.exclude(urlB);
-  assert.equal(await ralfRegistry.register(urlB), false, "agent-created threads stay excluded from RALF");
+  const directNewThread = await client.callTool({
+    name: "chatgpt_message",
+    arguments: { targetUrl: "https://chatgpt.com/", message: "must use a project" },
+  });
+  assert.equal(directNewThread.isError, true, "agent-created new threads must be spawned inside a project");
 
-  const originalExclude = ralfRegistry.exclude;
-  const originalConsoleError = console.error;
-  ralfRegistry.exclude = async () => { throw new Error("simulated RALF persistence failure"); };
-  console.error = () => {};
-  try {
-    const messageCall = client.callTool({
-      name: "chatgpt_message",
-      arguments: { targetUrl: "https://chatgpt.com/", message: "bookkeeping failure test" },
-    });
-    const messageCommand = await supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
-    supportCommands.complete({
-      commandId: messageCommand.id,
-      browserId: "chrome-browser",
-      kind: "send_message",
-      ok: true,
-      result: { status: "sent", conversationUrl: urlA },
-    });
-    const messageResult = await messageCall;
-    assert.notEqual(messageResult.isError, true,
-      "a confirmed send stays successful when RALF exclusion persistence fails");
-    assert.equal(messageResult.structuredContent.conversationUrl, urlA);
-  } finally {
-    ralfRegistry.exclude = originalExclude;
-    console.error = originalConsoleError;
-  }
+  const messageCall = client.callTool({
+    name: "chatgpt_message",
+    arguments: { targetUrl: namedProjectHome, message: "project sub-agent test" },
+  });
+  const messageCommand = await supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
+  assert.equal(messageCommand.targetUrl, namedProjectHome);
+  supportCommands.complete({
+    commandId: messageCommand.id,
+    browserId: "chrome-browser",
+    kind: "send_message",
+    ok: true,
+    result: { status: "sent", conversationUrl: urlA },
+  });
+  const messageResult = await messageCall;
+  assert.notEqual(messageResult.isError, true);
+  assert.equal(messageResult.structuredContent.conversationUrl, urlA);
 
   const abandonedController = new AbortController();
   const abandonedClaim = supportCommands.claim("chrome-browser", ["ralf"], 1000, abandonedController.signal);
@@ -300,6 +329,7 @@ try {
 
   const ralfControllerRoot = path.join(temporaryRoot, "ralf-controller");
   const ralfControllerRegistry = await RalfRegistry.open(ralfControllerRoot, 20);
+  await ralfControllerRegistry.setProjects([projectId]);
   const ralfCommands = new SupportCommandBus();
   const originalFetch = globalThis.fetch;
   let apiRequest;
@@ -319,7 +349,7 @@ try {
     checkEveryMs: 60_000,
   });
   try {
-    const ralfUrl = "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222";
+    const ralfUrl = `https://chatgpt.com/g/${projectId}/c/22222222-2222-4222-8222-222222222222`;
     await ralfControllerRegistry.register(ralfUrl);
     await new Promise(resolve => setTimeout(resolve, 25));
     await ralfController.tick();
@@ -358,7 +388,7 @@ try {
     await new Promise(resolve => setTimeout(resolve, 10));
     await ralfControllerRegistry.recordComplete("22222222-2222-4222-8222-222222222222");
 
-    const shortRalfUrl = "https://chatgpt.com/c/33333333-3333-4333-8333-333333333333";
+    const shortRalfUrl = `https://chatgpt.com/g/${projectId}/c/33333333-3333-4333-8333-333333333333`;
     await ralfControllerRegistry.register(shortRalfUrl);
     await new Promise(resolve => setTimeout(resolve, 25));
     await ralfController.tick();
@@ -380,7 +410,7 @@ try {
     assert.equal(apiRequestCount, 1, "RALF must not call OpenAI for a task that took 19 minutes or less");
     assert.equal(await ralfCommands.claim("chrome-browser", ["ralf"], 0), undefined);
 
-    const unknownRalfUrl = "https://chatgpt.com/c/44444444-4444-4444-8444-444444444444";
+    const unknownRalfUrl = `https://chatgpt.com/g/${projectId}/c/44444444-4444-4444-8444-444444444444`;
     await ralfControllerRegistry.register(unknownRalfUrl);
     await new Promise(resolve => setTimeout(resolve, 25));
     await ralfController.tick();
@@ -418,6 +448,7 @@ try {
   await testSendWaitsForSettlementAndRetriesIgnoredClick();
   await testRunningHydrationDetection();
   await testWorkedDurationDetection();
+  await testRalfAutoRegistration(sync);
   await testWorker(sync, a.ticket.token, request);
   await testAutomationRedirectGuard(sync);
   await testWidget(sync.widgetHtml, c.ticket);
@@ -740,6 +771,101 @@ async function testWorkedDurationDetection() {
   assert.ok(now >= 8_000, "RALF waits for the hydrated assistant turn to remain settled before reading duration");
 }
 
+
+async function testRalfAutoRegistration(sync) {
+  const generatedConfig = {};
+  vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), generatedConfig);
+  const registrationBodies = [];
+  const commandResults = [];
+  let historyListener;
+  let updatedListener;
+  const storage = {};
+  const context = {
+    URL,
+    AbortSignal,
+    AbortController,
+    crypto: globalThis.crypto,
+    setTimeout,
+    clearTimeout,
+    console,
+    Response,
+    importScripts() {},
+    LOCAL_CODEX_THREAD_SYNC: generatedConfig.LOCAL_CODEX_THREAD_SYNC,
+    browser: {
+      runtime: {
+        id: "a".repeat(32),
+        onMessage: { addListener() {} },
+        onInstalled: { addListener() {} },
+        onStartup: { addListener() {} },
+      },
+      tabs: {
+        onUpdated: { addListener: fn => { updatedListener = fn; } },
+        query: async () => [],
+        create: async () => ({ id: 11 }),
+        get: async () => ({ id: 11, status: "complete", url: namedProjectHome }),
+        sendMessage: async () => ({ ok: true, result: { status: "sent", conversationUrl: urlB } }),
+        remove: async () => {},
+      },
+      webNavigation: {
+        onHistoryStateUpdated: { addListener: fn => { historyListener = fn; } },
+        onCommitted: { addListener() {} },
+      },
+      scripting: { executeScript: async () => {} },
+      storage: { local: {
+        async get(query) {
+          if (typeof query === "string") return { [query]: storage[query] };
+          return { ...query, ...storage };
+        },
+        async set(values) { Object.assign(storage, values); },
+      } },
+    },
+    fetch: async (endpoint, options) => {
+      if (endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.ralfRegisterUrl) {
+        registrationBodies.push(JSON.parse(options.body));
+        return new Response(JSON.stringify({ status: "registered" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.commandResultUrl) {
+        commandResults.push(JSON.parse(options.body));
+        return new Response("", { status: 200 });
+      }
+      throw new Error(`Unexpected support fetch: ${endpoint}`);
+    },
+  };
+
+  vm.runInNewContext(await readFile("support-extension/service-worker.js", "utf8"), context);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(typeof historyListener, "function");
+  assert.equal(typeof updatedListener, "function");
+
+  historyListener({ frameId: 0, url: urlA });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(registrationBodies, [{ conversationUrl: urlA }],
+    "a ChatGPT SPA navigation into a project conversation registers it without thread sync");
+
+  historyListener({ frameId: 0, url: urlA });
+  updatedListener(1, { url: urlA });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(registrationBodies.length, 1, "duplicate route observations are deduplicated in the extension");
+
+  historyListener({ frameId: 0, url: "https://chatgpt.com/c/55555555-5555-4555-8555-555555555555" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(registrationBodies.length, 1, "normal non-project conversations are never offered to RALF");
+
+  await context.executeCommand({
+    id: "agent-project-thread",
+    feature: "threadMessaging",
+    kind: "send_message",
+    targetUrl: namedProjectHome,
+    message: "spawn the project sub-agent",
+  }, "browser-a");
+  assert.deepEqual(registrationBodies.at(-1), { conversationUrl: urlB },
+    "an AI-created project thread is registered from its saved conversation URL");
+  assert.equal(commandResults.at(-1).ok, true);
+}
+
 async function testAutomationRedirectGuard(sync) {
   const generatedConfig = {};
   vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), generatedConfig);
@@ -793,6 +919,8 @@ async function testAutomationRedirectGuard(sync) {
   vm.runInNewContext(await readFile("support-extension/service-worker.js", "utf8"), context);
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(typeof context.executeCommand, "function");
+  assert.equal(context.automationTargetMatches(namedProjectHome, `https://chatgpt.com/g/${projectId}/project`), true,
+    "project display-name suffixes do not change the automation target identity");
   await context.executeCommand({
     id: "redirect-test",
     feature: "threadMessaging",
