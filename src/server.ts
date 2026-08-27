@@ -1607,7 +1607,7 @@ function createMcpServer(ownerId: string) {
       "Call browser_open with the desired URL to begin browsing. Browser tools start Chrome when disconnected and wait for its installed extension to connect; browser_status only reports connection state.",
       "Use browser_snapshot before interacting and use fresh element refs. Existing user tabs require browser_tabs followed by browser_tab claim with the listed title and URL.",
       "tabId is optional. Omit it to use the active tab in the last-focused window, or pass it to target a specific tab. Separate tabs can run concurrently, and tasks may switch or share tabs. Use browser_open active=false to open a background tab.",
-      "All tasks share one browser profile and controlled-tab list. Cleanup affects all controlled tabs and consumes preservation marks. Close or release individual tabs when other tasks are still using the browser.",
+      "All tasks share one browser profile and controlled-tab list. When browser work is finished, release every controlled tab before ending the task unless the tab is intentionally preserved as a deliverable or handoff. Releasing a tab removes browser control without closing it. Cleanup affects all controlled tabs and consumes preservation marks; use individual release when other tasks may still be using the browser.",
     ] : []),
   ];
   const server = new McpServer({
@@ -2074,7 +2074,7 @@ function createMcpServer(ownerId: string) {
       {
         title: "Manage Chrome Tab Ownership",
         description:
-          "Claim or release a user tab, mark a controlled tab as a deliverable or handoff, or clean up all controlled tabs across tasks. Starts Chrome if disconnected. Claim requires the exact title and URL from browser_tabs. tabId is optional and defaults to the active tab. Cleanup closes unmarked agent tabs, releases unmarked user tabs, and preserves marked tabs for one cleanup only.",
+          "Claim or release a user tab, mark a controlled tab as a deliverable or handoff, or clean up all controlled tabs across tasks. Starts Chrome if disconnected. Claim requires the exact title and URL from browser_tabs. tabId is optional and defaults to the active tab. Release is the normal final step for browser work: before ending the task, release every controlled tab that is not intentionally preserved as a deliverable or handoff. Releasing removes browser control without closing the tab. Cleanup closes unmarked agent tabs, releases unmarked user tabs, and preserves marked tabs for one cleanup only.",
         inputSchema: {
           action: z.enum(["claim", "release", "mark_deliverable", "mark_handoff", "cleanup"]),
           tabId: z.number().int().nonnegative().optional(),
