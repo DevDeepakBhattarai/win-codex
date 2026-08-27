@@ -26,7 +26,7 @@ Keep `.data` private. It contains the support extension credential, thread bindi
 
 A successful manual thread sync registers that conversation in `.data/ralf.json`. The first check is scheduled 25 minutes later.
 
-When due, the server asks the enabled RALF browser to open the saved conversation in a background tab. The content script waits for the ChatGPT composer and conversation turns to settle. If `button[data-testid="stop-button"]` exists, the thread is treated as running and nothing else is read. If the page is still loading, the check is retried later.
+When due, the server asks the enabled RALF browser to open the saved conversation in a background tab. The content script waits for the ChatGPT composer and conversation turns to settle. If `button[data-testid="stop-button"]` exists, the thread is treated as running and nothing else is read. If the page is still loading, the check is retried later. Once idle, the content script reads the latest assistant turn's `Worked for ...` label. RALF calls OpenAI only when the parsed duration is greater than 19 minutes; shorter or missing durations end the RALF entry without an API call.
 
 For an idle thread, the extension returns every user message and only the final `[data-message-author-role="assistant"]` message. Tool cards, thinking UI, and other assistant-turn chrome are ignored. If there is no final assistant message, the extension returns a synthetic stopped message.
 

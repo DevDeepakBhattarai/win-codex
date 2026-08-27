@@ -97,6 +97,7 @@
 
     await waitForStableTurns();
     if (isRunning()) return { status: "running" };
+    const workedSeconds = getWorkedDurationSeconds();
     const turns = [...document.querySelectorAll("section[data-turn]")];
     const users = [];
     let lastUserIndex = -1;
@@ -125,6 +126,7 @@
       if (isRunning()) return { status: "running" };
       return {
         status: "idle",
+        workedSeconds,
         users,
         assistant: {
           synthetic: true,
@@ -139,6 +141,7 @@
       if (isRunning()) return { status: "running" };
       return {
         status: "idle",
+        workedSeconds,
         users,
         assistant: {
           synthetic: true,
@@ -150,6 +153,7 @@
     if (isRunning()) return { status: "running" };
     return {
       status: "idle",
+      workedSeconds,
       users,
       assistant: {
         synthetic: false,
@@ -244,6 +248,23 @@
 
   function isRunning() {
     return Boolean(document.querySelector('form[data-type="unified-composer"] button[data-testid="stop-button"]'));
+  }
+
+  function getWorkedDurationSeconds() {
+    const assistantTurns = [...document.querySelectorAll('section[data-turn="assistant"]')];
+    const lastAssistantTurn = assistantTurns.at(-1);
+    if (!lastAssistantTurn) return null;
+
+    const durationButton = [...lastAssistantTurn.querySelectorAll("button")].find((button) =>
+      /^Worked for\s+/i.test(button.textContent?.trim() ?? ""));
+    if (!durationButton) return null;
+
+    const match = durationButton.textContent.trim().match(
+      /^Worked for\s+(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s)?$/i,
+    );
+    if (!match || (!match[1] && !match[2] && !match[3])) return null;
+
+    return Number(match[1] ?? 0) * 3600 + Number(match[2] ?? 0) * 60 + Number(match[3] ?? 0);
   }
 
   function extractText(element) {

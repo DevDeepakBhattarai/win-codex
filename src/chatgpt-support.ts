@@ -13,6 +13,7 @@ const FAILURE_RETRY_MS = 2 * 60 * 1000;
 const COMMAND_TIMEOUT_MS = 20 * 60 * 1000;
 const CLAIM_WAIT_MS = 20_000;
 const MAX_CONTINUATION_CHARS = 500;
+const MIN_RALF_WORKED_SECONDS = 19 * 60;
 
 export const supportFeatureSchema = z.enum(["ralf", "threadMessaging"]);
 export type SupportFeature = z.infer<typeof supportFeatureSchema>;
@@ -27,6 +28,7 @@ export const threadInspectionSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("running") }),
   z.object({
     status: z.literal("idle"),
+    workedSeconds: z.number().int().nonnegative().nullable(),
     users: z.array(threadMessageSchema),
     assistant: z.object({
       synthetic: z.boolean(),
@@ -456,6 +458,11 @@ export class RalfController {
       }
       if (inspection.status === "running") {
         await this.options.registry.recordRunning(thread.threadId);
+        return;
+      }
+
+      if (inspection.workedSeconds === null || inspection.workedSeconds <= MIN_RALF_WORKED_SECONDS) {
+        await this.options.registry.recordComplete(thread.threadId);
         return;
       }
 

@@ -303,7 +303,9 @@ try {
   const ralfCommands = new SupportCommandBus();
   const originalFetch = globalThis.fetch;
   let apiRequest;
+  let apiRequestCount = 0;
   globalThis.fetch = async (_url, options) => {
+    apiRequestCount += 1;
     apiRequest = JSON.parse(options.body);
     return new Response(JSON.stringify({
       output: [{ content: [{ type: "output_text", text: "Inspect the remaining CI failure and fix the specific blocker before stopping." }] }],
@@ -330,6 +332,7 @@ try {
       ok: true,
       result: {
         status: "idle",
+        workedSeconds: 19 * 60 + 1,
         users: [
           { id: "u1", text: "Fix the implementation end to end." },
           { id: "u2", text: "Do not stop until CI is handled." },
@@ -353,6 +356,51 @@ try {
       result: { status: "sent", conversationUrl: ralfUrl },
     });
     await new Promise(resolve => setTimeout(resolve, 10));
+    await ralfControllerRegistry.recordComplete("22222222-2222-4222-8222-222222222222");
+
+    const shortRalfUrl = "https://chatgpt.com/c/33333333-3333-4333-8333-333333333333";
+    await ralfControllerRegistry.register(shortRalfUrl);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    await ralfController.tick();
+    const shortInspectCommand = await ralfCommands.claim("chrome-browser", ["ralf"], 1000);
+    assert.equal(shortInspectCommand.kind, "inspect_thread");
+    ralfCommands.complete({
+      commandId: shortInspectCommand.id,
+      browserId: "chrome-browser",
+      kind: "inspect_thread",
+      ok: true,
+      result: {
+        status: "idle",
+        workedSeconds: 19 * 60,
+        users: [{ id: "u3", text: "Finish this small task." }],
+        assistant: { synthetic: false, id: "a2", text: "Done." },
+      },
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(apiRequestCount, 1, "RALF must not call OpenAI for a task that took 19 minutes or less");
+    assert.equal(await ralfCommands.claim("chrome-browser", ["ralf"], 0), undefined);
+
+    const unknownRalfUrl = "https://chatgpt.com/c/44444444-4444-4444-8444-444444444444";
+    await ralfControllerRegistry.register(unknownRalfUrl);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    await ralfController.tick();
+    const unknownInspectCommand = await ralfCommands.claim("chrome-browser", ["ralf"], 1000);
+    assert.equal(unknownInspectCommand.kind, "inspect_thread");
+    ralfCommands.complete({
+      commandId: unknownInspectCommand.id,
+      browserId: "chrome-browser",
+      kind: "inspect_thread",
+      ok: true,
+      result: {
+        status: "idle",
+        workedSeconds: null,
+        users: [{ id: "u4", text: "Do the task." }],
+        assistant: { synthetic: false, id: "a3", text: "Stopped thinking" },
+      },
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(apiRequestCount, 1, "RALF must not call OpenAI when the worked duration is unavailable");
+    assert.equal(await ralfCommands.claim("chrome-browser", ["ralf"], 0), undefined);
   } finally {
     ralfController.close();
     ralfCommands.close();
@@ -368,6 +416,7 @@ try {
 
   await testContentScript(a.ticket.token, b.ticket.token);
   await testRunningHydrationDetection();
+  await testWorkedDurationDetection();
   await testWorker(sync, a.ticket.token, request);
   await testAutomationRedirectGuard(sync);
   await testWidget(sync.widgetHtml, c.ticket);
@@ -505,6 +554,96 @@ async function testRunningHydrationDetection() {
   assert.equal(response.result.status, "running",
     "a still-hydrating running thread must not be classified as stopped before the stop button appears");
   assert.ok(now >= 2_500);
+}
+
+
+async function testWorkedDurationDetection() {
+  let automationListener;
+  let now = 0;
+
+  const textNode = text => ({
+    textContent: text,
+    getAttribute: key => key === "data-message-id" ? `${text.slice(0, 1)}1` : null,
+    querySelector: () => null,
+    cloneNode: () => ({ querySelectorAll: () => [], text }),
+  });
+  const userMessage = textNode("Fix this end to end.");
+  const assistantMessage = textNode("The implementation is complete.");
+  const durationButton = { textContent: "Worked for 26m 15s" };
+  const userTurn = {
+    dataset: { turn: "user", turnId: "u1" },
+    textContent: userMessage.textContent,
+    querySelector: selector => selector === '[data-message-author-role="user"]' ? userMessage : null,
+  };
+  const assistantTurn = {
+    dataset: { turn: "assistant", turnId: "a1" },
+    textContent: `${assistantMessage.textContent} ${durationButton.textContent}`,
+    querySelectorAll(selector) {
+      if (selector === "button") return [durationButton];
+      if (selector === '[data-message-author-role="assistant"]') return [assistantMessage];
+      return [];
+    },
+  };
+  const editor = {};
+  const composer = {
+    querySelector(selector) {
+      if (selector === '#prompt-textarea[contenteditable="true"]') return editor;
+      return null;
+    },
+  };
+  const document = {
+    body: { appendChild() {} },
+    querySelector(selector) {
+      if (selector === 'form[data-type="unified-composer"]') return composer;
+      if (selector === 'section[data-turn="user"]') return userTurn;
+      return null;
+    },
+    querySelectorAll(selector) {
+      if (selector === "section[data-turn]") return [userTurn, assistantTurn];
+      if (selector === 'section[data-turn="assistant"]') return [assistantTurn];
+      return [];
+    },
+    createElement() {
+      return {
+        style: {},
+        innerText: "",
+        appendChild(child) { this.innerText = child.text; },
+        remove() {},
+      };
+    },
+  };
+  const browser = {
+    runtime: {
+      sendMessage: async () => ({ status: "bound" }),
+      onMessage: { addListener: fn => { automationListener = fn; } },
+    },
+  };
+  const fakeSetTimeout = (callback, ms) => {
+    now += ms;
+    callback();
+    return 1;
+  };
+
+  vm.runInNewContext(await readFile("support-extension/content-script.js", "utf8"), {
+    window: { addEventListener() {} },
+    location: new URL(urlA),
+    document,
+    browser,
+    Date: { now: () => now },
+    setTimeout: fakeSetTimeout,
+  });
+
+  const response = await new Promise(resolve => {
+    const keepChannelOpen = automationListener({
+      type: "local-codex-support/automation-v1",
+      command: { kind: "inspect_thread" },
+    }, {}, resolve);
+    assert.equal(keepChannelOpen, true);
+  });
+  assert.equal(response.ok, true);
+  assert.equal(response.result.status, "idle");
+  assert.equal(response.result.workedSeconds, 26 * 60 + 15,
+    "RALF inspection must parse the latest assistant Worked for label into seconds");
 }
 
 async function testAutomationRedirectGuard(sync) {
