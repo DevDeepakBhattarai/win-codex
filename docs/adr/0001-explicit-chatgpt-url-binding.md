@@ -39,11 +39,11 @@ browser toggles:
   for the page and conversation content to settle, treats the stop button as
   authoritative evidence that the thread is running, and otherwise returns the
   user messages plus the final assistant response for the server-side decision.
-- `chatgpt_message` opens an explicitly supplied ChatGPT target, verifies that
-  ChatGPT did not redirect the automation tab elsewhere, sends the requested
-  message, captures the saved conversation URL, and closes the automation tab.
-  New agent threads must target a ChatGPT project home URL; existing conversation
-  URLs remain valid targets.
+- `chatgpt_message` opens either an explicitly supplied ChatGPT target or, for a
+  new sub-agent, the project URL configured in the enabled support extension. It
+  verifies that ChatGPT did not redirect the automation tab elsewhere, sends the
+  requested message, captures the saved conversation URL, and closes the
+  automation tab. Existing conversation URLs remain valid explicit targets.
 
 Automation commands are claimed by one enabled browser instance through the
 authenticated loopback command bus. Thread sync may remain enabled in multiple

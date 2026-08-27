@@ -15,6 +15,13 @@
     <p>Enable RALF and agent messaging only in the browser you want Local Codex to automate.</p>
 
     <section>
+      <label for="subagentProjectUrl">Sub-agent project URL</label>
+      <input id="subagentProjectUrl" type="url" placeholder="https://chatgpt.com/g/.../project">
+      <button id="saveSubagentProject" type="button">Save project</button>
+      <p id="subagentProjectStatus">New agent threads spawn inside this ChatGPT project.</p>
+    </section>
+
+    <section>
       <label for="ralfProjects">RALF projects</label>
       <textarea id="ralfProjects" rows="6" placeholder="One project URL or project ID per line"></textarea>
       <button id="saveRalfProjects" type="button">Save projects</button>

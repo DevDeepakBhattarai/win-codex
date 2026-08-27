@@ -53,6 +53,7 @@ try {
   assert.equal(manifest.content_security_policy.extension_pages,
     "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:*");
   const preparedPopup = await readFile(path.join(sync.extensionDirectory, "popup.html"), "utf8");
+  assert.match(preparedPopup, /Sub-agent project URL/);
   assert.match(preparedPopup, /RALF projects/);
   assert.match(preparedPopup, /config\.js/);
   const preparedConfig = {};
@@ -241,6 +242,22 @@ try {
     arguments: { targetUrl: "https://chatgpt.com/", message: "must use a project" },
   });
   assert.equal(directNewThread.isError, true, "agent-created new threads must be spawned inside a project");
+
+  const configuredProjectCall = client.callTool({
+    name: "chatgpt_message",
+    arguments: { message: "configured project sub-agent test" },
+  });
+  const configuredProjectCommand = await supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
+  assert.equal(configuredProjectCommand.targetUrl, undefined,
+    "new sub-agent commands defer their project target to the enabled extension");
+  supportCommands.complete({
+    commandId: configuredProjectCommand.id,
+    browserId: "chrome-browser",
+    kind: "send_message",
+    ok: true,
+    result: { status: "sent", conversationUrl: urlA },
+  });
+  assert.equal((await configuredProjectCall).structuredContent.conversationUrl, urlA);
 
   const messageCall = client.callTool({
     name: "chatgpt_message",
@@ -777,9 +794,10 @@ async function testRalfAutoRegistration(sync) {
   vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), generatedConfig);
   const registrationBodies = [];
   const commandResults = [];
+  const createdUrls = [];
   let historyListener;
   let updatedListener;
-  const storage = {};
+  const storage = { subagentProjectUrl: namedProjectHome };
   const context = {
     URL,
     AbortSignal,
@@ -801,7 +819,7 @@ async function testRalfAutoRegistration(sync) {
       tabs: {
         onUpdated: { addListener: fn => { updatedListener = fn; } },
         query: async () => [],
-        create: async () => ({ id: 11 }),
+        create: async ({ url }) => { createdUrls.push(url); return { id: 11 }; },
         get: async () => ({ id: 11, status: "complete", url: namedProjectHome }),
         sendMessage: async () => ({ ok: true, result: { status: "sent", conversationUrl: urlB } }),
         remove: async () => {},
@@ -858,9 +876,10 @@ async function testRalfAutoRegistration(sync) {
     id: "agent-project-thread",
     feature: "threadMessaging",
     kind: "send_message",
-    targetUrl: namedProjectHome,
     message: "spawn the project sub-agent",
   }, "browser-a");
+  assert.equal(createdUrls.at(-1), namedProjectHome,
+    "a target-less new-thread command opens the project saved in extension settings");
   assert.deepEqual(registrationBodies.at(-1), { conversationUrl: urlB },
     "an AI-created project thread is registered from its saved conversation URL");
   assert.equal(commandResults.at(-1).ok, true);

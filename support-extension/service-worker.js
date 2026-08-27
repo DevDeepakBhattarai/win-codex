@@ -18,6 +18,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   threadSync: true,
   ralf: false,
   threadMessaging: false,
+  subagentProjectUrl: "",
 });
 const AUTOMATION_MESSAGE = "local-codex-support/automation-v1";
 const SYNC_MESSAGE = "local-codex-thread-sync/bind-v1";
@@ -60,6 +61,17 @@ function projectHomeId(value) {
   }
 }
 
+function normalizedProjectHomeUrl(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const url = new URL(value.trim());
+    if (url.origin !== "https://chatgpt.com" || url.username || url.password || !projectHomeId(url.href)) return null;
+    return `https://chatgpt.com${url.pathname.replace(/\/$/, "")}`;
+  } catch {
+    return null;
+  }
+}
+
 function automationTargetMatches(currentValue, targetValue) {
   try {
     const targetConversation = conversationUrl(targetValue);
@@ -84,6 +96,7 @@ async function getSettings() {
     threadSync: stored.threadSync !== false,
     ralf: stored.ralf === true,
     threadMessaging: stored.threadMessaging === true,
+    subagentProjectUrl: typeof stored.subagentProjectUrl === "string" ? stored.subagentProjectUrl : "",
   };
 }
 
@@ -180,8 +193,34 @@ async function sendAutomationMessage(tabId, command) {
   }
 }
 
+async function commandTargetUrl(command) {
+  if (command.kind === "inspect_thread") return command.conversationUrl;
+  if (typeof command.targetUrl === "string" && command.targetUrl) return command.targetUrl;
+  if (command.feature !== "threadMessaging") throw new Error("ChatGPT support command is missing its target URL.");
+
+  const settings = await getSettings();
+  const projectUrl = normalizedProjectHomeUrl(settings.subagentProjectUrl);
+  if (!projectUrl) {
+    throw new Error("Set a Sub-agent project URL in the Local Codex Support extension popup before starting a new agent thread.");
+  }
+  return projectUrl;
+}
+
 async function executeCommand(command, browserId) {
-  const targetUrl = command.kind === "inspect_thread" ? command.conversationUrl : command.targetUrl;
+  let targetUrl;
+  try {
+    targetUrl = await commandTargetUrl(command);
+  } catch (error) {
+    await postResult({
+      commandId: command.id,
+      browserId,
+      kind: command.kind,
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    }).catch(() => undefined);
+    return;
+  }
+
   const tab = await extensionApi.tabs.create({ url: targetUrl, active: false });
   if (!Number.isInteger(tab.id)) throw new Error("ChatGPT automation tab did not receive an id.");
 

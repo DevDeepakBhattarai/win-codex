@@ -46,7 +46,7 @@ const sendMessageResultSchema = z.object({
 });
 export type SendMessageResult = z.infer<typeof sendMessageResultSchema>;
 
-const supportCommandSchema = z.discriminatedUnion("kind", [
+const supportCommandSchema = z.union([
   z.object({
     id: z.string(),
     feature: z.literal("ralf"),
@@ -55,9 +55,16 @@ const supportCommandSchema = z.discriminatedUnion("kind", [
   }),
   z.object({
     id: z.string(),
-    feature: z.union([z.literal("ralf"), z.literal("threadMessaging")]),
+    feature: z.literal("ralf"),
     kind: z.literal("send_message"),
     targetUrl: z.string().url(),
+    message: z.string(),
+  }),
+  z.object({
+    id: z.string(),
+    feature: z.literal("threadMessaging"),
+    kind: z.literal("send_message"),
+    targetUrl: z.string().url().optional(),
     message: z.string(),
   }),
 ]);
@@ -693,9 +700,9 @@ export function registerChatGptMessaging(
 ) {
   server.registerTool("chatgpt_message", {
     title: "Send ChatGPT Message",
-    description: "Start a new ChatGPT project thread or send a message to an existing ChatGPT thread through the Local Codex Support extension. New threads must target a ChatGPT project /g/.../project URL; existing /c/... conversations may also be targeted. This automation is separate from browser-control tools.",
+    description: "Start a new ChatGPT project thread or send a message to an existing ChatGPT thread through the Local Codex Support extension. Omit targetUrl to start a new sub-agent in the project configured in the extension popup. Provide an existing /c/... conversation URL to message that thread instead.",
     inputSchema: {
-      targetUrl: z.string().url().describe("ChatGPT project new-chat URL or existing conversation URL."),
+      targetUrl: z.string().url().optional().describe("Optional ChatGPT project new-chat URL or existing conversation URL. Omit this to use the extension's configured Sub-agent project."),
       message: z.string().min(1).max(200_000).describe("Message to send."),
     },
     outputSchema: {
@@ -703,9 +710,9 @@ export function registerChatGptMessaging(
     },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   }, async ({ targetUrl, message }) => {
-    let normalizedTarget: string;
+    let normalizedTarget: string | undefined;
     try {
-      normalizedTarget = normalizeChatGptMessageTarget(targetUrl);
+      normalizedTarget = targetUrl === undefined ? undefined : normalizeChatGptMessageTarget(targetUrl);
     } catch (error) {
       return {
         isError: true,
@@ -717,7 +724,7 @@ export function registerChatGptMessaging(
       const result = await commands.execute({
         feature: "threadMessaging",
         kind: "send_message",
-        targetUrl: normalizedTarget,
+        ...(normalizedTarget ? { targetUrl: normalizedTarget } : {}),
         message,
       });
       if (!result.ok) throw new Error(result.error);

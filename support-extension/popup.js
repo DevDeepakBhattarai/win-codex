@@ -5,6 +5,7 @@ const DEFAULT_SETTINGS = {
   ralf: false,
   threadMessaging: false,
 };
+const SUBAGENT_PROJECT_KEY = "subagentProjectUrl";
 
 function validateLoopbackEndpoint(value, pathname) {
   const endpoint = new URL(value);
@@ -18,10 +19,11 @@ function validateLoopbackEndpoint(value, pathname) {
 const ralfProjectsEndpoint = validateLoopbackEndpoint(config?.ralfProjectsUrl, "/chatgpt-support/ralf/projects");
 
 async function load() {
-  const settings = await extensionApi.storage.local.get(DEFAULT_SETTINGS);
+  const settings = await extensionApi.storage.local.get({ ...DEFAULT_SETTINGS, [SUBAGENT_PROJECT_KEY]: "" });
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     document.getElementById(key).checked = Boolean(settings[key]);
   }
+  document.getElementById(SUBAGENT_PROJECT_KEY).value = settings[SUBAGENT_PROJECT_KEY] ?? "";
   await loadRalfProjects();
 }
 
@@ -32,6 +34,33 @@ async function saveSettings() {
   }
   await extensionApi.storage.local.set(settings);
   await extensionApi.runtime.sendMessage({ type: "local-codex-support/settings-changed" }).catch(() => undefined);
+}
+
+function normalizeProjectUrl(value) {
+  const url = new URL(value.trim());
+  if (url.origin !== "https://chatgpt.com" || url.username || url.password ||
+      !/^\/g\/[A-Za-z0-9_-]+\/project\/?$/.test(url.pathname)) {
+    throw new Error("Use a ChatGPT project URL ending in /project.");
+  }
+  return `https://chatgpt.com${url.pathname.replace(/\/$/, "")}`;
+}
+
+async function saveSubagentProject() {
+  const button = document.getElementById("saveSubagentProject");
+  const input = document.getElementById(SUBAGENT_PROJECT_KEY);
+  const status = document.getElementById("subagentProjectStatus");
+  button.disabled = true;
+  try {
+    const projectUrl = normalizeProjectUrl(input.value);
+    await extensionApi.storage.local.set({ [SUBAGENT_PROJECT_KEY]: projectUrl });
+    input.value = projectUrl;
+    status.textContent = "Saved. New agent threads will spawn in this project.";
+    await extensionApi.runtime.sendMessage({ type: "local-codex-support/settings-changed" }).catch(() => undefined);
+  } catch (error) {
+    status.textContent = error instanceof Error ? error.message : "Could not save the sub-agent project.";
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function loadRalfProjects() {
@@ -85,5 +114,6 @@ async function saveRalfProjects() {
 for (const key of Object.keys(DEFAULT_SETTINGS)) {
   document.getElementById(key).addEventListener("change", () => void saveSettings());
 }
+document.getElementById("saveSubagentProject").addEventListener("click", () => void saveSubagentProject());
 document.getElementById("saveRalfProjects").addEventListener("click", () => void saveRalfProjects());
 void load();

@@ -17,7 +17,7 @@ The server atomically assigns each automation command to one enabled browser ins
 1. Run `pnpm support:prepare`. This builds the project and writes the generated extension to `.data/support-extension` with its private loopback token and endpoints. Preparation also removes the obsolete generated `.data/thread-sync-extension` directory and migrates its private token if this is an upgrade.
 2. Start or restart Local Codex. The support listener uses `http://127.0.0.1:6002` by default. `THREAD_SYNC_PORT` changes that port and `THREAD_SYNC_ENABLED=false` disables the support listener.
 3. If the old **Local Codex Thread Sync** unpacked extension is still installed, remove it first. Then open the browser extensions page, enable Developer mode, choose **Load unpacked**, and select `.data/support-extension`. Load the generated directory, not this source directory.
-4. Open the extension popup in each browser and choose which features that browser should handle. A typical setup is Thread sync on in both browsers, with RALF automation and Agent thread messaging on in only Chrome. Configure **RALF projects** from either browser; that list is stored by the Local Codex server and shared by every support-extension instance.
+4. Open the extension popup in each browser and choose which features that browser should handle. A typical setup is Thread sync on in both browsers, with RALF automation and Agent thread messaging on in only Chrome. Set **Sub-agent project** in the browser that handles Agent thread messaging. Configure **RALF projects** from either browser; that list is stored by the Local Codex server and shared by every support-extension instance.
 5. Reload the generated extension after rerunning `pnpm support:prepare`. Existing ChatGPT tabs are reinjected automatically when the extension starts.
 
 Keep `.data` private. It contains the support extension credential, thread bindings, and RALF state.
@@ -36,10 +36,7 @@ The server sends that compact transcript to the OpenAI Responses API using `RALF
 
 ## Agent messaging
 
-The `chatgpt_message` tool accepts a `targetUrl` and `message`. Supported targets are:
-
-- A ChatGPT project `/g/.../project` URL for a new project thread. This is the only supported way to create a new agent thread.
-- An exact `/c/<conversation-id>` URL to update an existing thread.
+The `chatgpt_message` tool always accepts a `message`. For a new sub-agent, omit `targetUrl`; the enabled browser opens the **Sub-agent project** configured in the extension popup. To update an existing thread, pass its exact `/c/<conversation-id>` URL as `targetUrl`. An explicit ChatGPT project `/g/.../project` URL is still accepted as an override.
 
 Bare `https://chatgpt.com/` new-thread targets are rejected so agent-created sub-agents cannot escape the project organization.
 
