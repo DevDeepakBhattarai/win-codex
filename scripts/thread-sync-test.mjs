@@ -46,7 +46,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.3.0");
+  assert.equal(manifest.version, "1.3.1");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -477,6 +477,7 @@ try {
     commands: ralfCommands,
     apiKey: "test-key",
     model: "gpt-5.6-terra",
+    auditLogPath: path.join(ralfControllerRoot, "ralf-openai.log"),
     checkEveryMs: 60_000,
   });
   try {
@@ -521,6 +522,16 @@ try {
       "the success audit log includes the exact OpenAI response body");
     assert.ok(ralfOpenAiLogs.every(line => !line.includes("test-key")),
       "RALF OpenAI audit logs must not expose the API key");
+    const persistedSuccessLogs = (await readFile(path.join(ralfControllerRoot, "ralf-openai.log"), "utf8"))
+      .trim().split("\n").map(line => JSON.parse(line));
+    assert.equal(persistedSuccessLogs.length, 2);
+    assert.equal(persistedSuccessLogs[0].event, "request_started");
+    assert.match(persistedSuccessLogs[0].timestamp, /^\d{4}-\d{2}-\d{2}T/);
+    assert.match(JSON.stringify(persistedSuccessLogs[0].request), /Fix the implementation end to end/);
+    assert.equal(persistedSuccessLogs[1].event, "request_succeeded");
+    assert.equal(persistedSuccessLogs[1].request_id, "req_ralf_success");
+    assert.equal(persistedSuccessLogs[1].response.usage.total_tokens, 140);
+    assert.ok(!JSON.stringify(persistedSuccessLogs).includes("test-key"));
     ralfCommands.complete({
       commandId: continueCommand.id,
       browserId: "chrome-browser",
@@ -602,9 +613,67 @@ try {
       "the failure audit log includes the exact OpenAI error response body");
     assert.match((await ralfControllerRegistry.threads()).find(thread => thread.conversationUrl === failedRalfUrl).lastError,
       /HTTP 429/, "an OpenAI failure remains visible in the RALF thread state");
+    const persistedLogs = (await readFile(path.join(ralfControllerRoot, "ralf-openai.log"), "utf8"))
+      .trim().split("\n").map(line => JSON.parse(line));
+    assert.deepEqual(persistedLogs.map(record => record.event), [
+      "request_started",
+      "request_succeeded",
+      "request_started",
+      "request_failed",
+    ]);
+    assert.equal(persistedLogs.at(-1).response.error.message, "Rate limit reached for test.");
   } finally {
     ralfController.close();
     ralfCommands.close();
+    globalThis.fetch = originalFetch;
+    console.log = originalConsoleLog;
+    console.error = originalConsoleError;
+  }
+
+  const blockedAuditRoot = path.join(temporaryRoot, "ralf-blocked-audit");
+  const blockedAuditRegistry = await RalfRegistry.open(blockedAuditRoot, 20);
+  await blockedAuditRegistry.setProjects([projectId]);
+  const blockedAuditCommands = new SupportCommandBus();
+  let blockedApiRequestCount = 0;
+  globalThis.fetch = async () => {
+    blockedApiRequestCount += 1;
+    throw new Error("OpenAI must not be called when the audit log cannot be written.");
+  };
+  console.log = (...values) => ralfOpenAiLogs.push(values.join(" "));
+  console.error = (...values) => ralfOpenAiLogs.push(values.join(" "));
+  const blockedAuditController = new RalfController({
+    registry: blockedAuditRegistry,
+    commands: blockedAuditCommands,
+    apiKey: "test-key",
+    model: "gpt-5.6-terra",
+    auditLogPath: blockedAuditRoot,
+    checkEveryMs: 60_000,
+  });
+  try {
+    const blockedAuditUrl = `https://chatgpt.com/g/${projectId}/c/66666666-6666-4666-8666-666666666666`;
+    await blockedAuditRegistry.register(blockedAuditUrl);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    await blockedAuditController.tick();
+    const blockedAuditInspect = await blockedAuditCommands.claim("chrome-browser", ["ralf"], 1000);
+    blockedAuditCommands.complete({
+      commandId: blockedAuditInspect.id,
+      browserId: "chrome-browser",
+      kind: "inspect_thread",
+      ok: true,
+      result: {
+        status: "idle",
+        workedSeconds: 20 * 60,
+        users: [{ id: "u6", text: "Finish this audited task." }],
+        assistant: { synthetic: false, id: "a5", text: "Work remains." },
+      },
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(blockedApiRequestCount, 0,
+      "RALF must not spend money when it cannot persist the request audit record");
+    assert.match((await blockedAuditRegistry.threads())[0].lastError, /Cannot persist the RALF OpenAI audit log/);
+  } finally {
+    blockedAuditController.close();
+    blockedAuditCommands.close();
     globalThis.fetch = originalFetch;
     console.log = originalConsoleLog;
     console.error = originalConsoleError;

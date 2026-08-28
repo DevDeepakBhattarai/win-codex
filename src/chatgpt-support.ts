@@ -1,5 +1,5 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import type { Request, RequestHandler, Response } from "express";
@@ -505,14 +505,48 @@ interface RalfControllerOptions {
   commands: SupportCommandBus;
   apiKey?: string;
   model: string;
+  auditLogPath: string;
   checkEveryMs?: number;
+}
+
+class RalfOpenAiAuditLog {
+  private queue: Promise<unknown> = Promise.resolve();
+
+  constructor(private readonly filePath: string) {}
+
+  async write(
+    event: string,
+    details: Record<string, unknown>,
+    level: "info" | "error" = "info",
+    required = false,
+  ) {
+    const record = JSON.stringify({ timestamp: new Date().toISOString(), event, ...details });
+    const terminalMessage = `[ralf/openai] ${record}`;
+    if (level === "error") console.error(terminalMessage);
+    else console.log(terminalMessage);
+
+    const pending = this.queue.then(() => appendFile(this.filePath, `${record}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    }));
+    this.queue = pending.catch(() => undefined);
+    try {
+      await pending;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[ralf/openai] audit_write_failed path=${JSON.stringify(this.filePath)} error=${JSON.stringify(message)}`);
+      if (required) throw new Error(`Cannot persist the RALF OpenAI audit log: ${message}`);
+    }
+  }
 }
 
 export class RalfController {
   private readonly inFlight = new Set<string>();
   private readonly timer: NodeJS.Timeout;
+  private readonly auditLog: RalfOpenAiAuditLog;
 
   constructor(private readonly options: RalfControllerOptions) {
+    this.auditLog = new RalfOpenAiAuditLog(options.auditLogPath);
     this.timer = setInterval(() => void this.tick(), options.checkEveryMs ?? RALF_SCHEDULER_TICK_MS);
     this.timer.unref();
   }
@@ -561,6 +595,7 @@ export class RalfController {
         this.options.apiKey,
         this.options.model,
         thread.conversationUrl,
+        this.auditLog,
       );
       if (decision.complete) {
         await this.options.registry.recordComplete(thread.threadId);
@@ -585,12 +620,6 @@ export class RalfController {
   }
 }
 
-function logRalfOpenAiEvent(event: string, details: Record<string, unknown>, level: "info" | "error" = "info") {
-  const message = `[ralf/openai] ${JSON.stringify({ event, ...details })}`;
-  if (level === "error") console.error(message);
-  else console.log(message);
-}
-
 function responseTokenUsage(value: unknown) {
   if (!value || typeof value !== "object") return {};
   const usage = Reflect.get(value, "usage");
@@ -611,6 +640,7 @@ async function decideRalfContinuation(
   apiKey: string | undefined,
   model: string,
   conversationUrl: string,
+  auditLog: RalfOpenAiAuditLog,
 ) {
   if (!apiKey) throw new Error("OPENAI_API_KEY is required for RALF continuation decisions.");
   const transcript = [
@@ -633,12 +663,12 @@ async function decideRalfContinuation(
   };
 
   const startedAt = Date.now();
-  logRalfOpenAiEvent("request_started", {
+  await auditLog.write("request_started", {
     thread: conversationUrl,
     model,
     worked_seconds: inspection.workedSeconds,
     request: requestBody,
-  });
+  }, "info", true);
 
   let response: globalThis.Response | undefined;
   let responseBody: unknown;
@@ -669,7 +699,7 @@ async function decideRalfContinuation(
     const decision = /^COMPLETE\.?$/i.test(text)
       ? { complete: true as const }
       : { complete: false as const, instruction: compactContinuation(text) };
-    logRalfOpenAiEvent("request_succeeded", {
+    await auditLog.write("request_succeeded", {
       thread: conversationUrl,
       model,
       request_id: requestId,
@@ -682,7 +712,7 @@ async function decideRalfContinuation(
     return decision;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    logRalfOpenAiEvent("request_failed", {
+    await auditLog.write("request_failed", {
       thread: conversationUrl,
       model,
       request_id: response?.headers.get("x-request-id"),

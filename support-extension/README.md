@@ -28,7 +28,7 @@ Keep `.data` private. It contains the support extension credential, thread bindi
 
 RALF does not use Thread Sync for registration. The server keeps an explicit project allowlist in `.data/ralf.json`. Paste one project home URL or project ID per line into **RALF projects** in the extension popup. Project home URLs may include ChatGPT's display-name suffix, for example `/g/g-p-<id>-deepak/project`; Local Codex stores the stable `g-p-<id>` portion.
 
-The **RALF threads** tab reads `/chatgpt-support/ralf/threads`, which reports both active and completed entries. A thread shows `retrying` when its last check failed, and the recorded error is displayed on the row. Use **Mark complete** on an active thread to stop future RALF checks manually. The popup asks for confirmation and keeps the thread in the completed list.
+The **RALF threads** tab reads `/chatgpt-support/ralf/threads` and has separate Active and Completed views. A thread shows `retrying` when its last check failed, and the recorded error appears on the row. Use **Mark complete** to stop future checks manually. Use **Mark active** on a completed thread to schedule a fresh check using the configured loop interval.
 
 When a ChatGPT tab navigates to `/g/<project-id>/c/<thread-id>`, the support extension reports that URL to the RALF registration endpoint. The server registers it only when the project is allowlisted. This works for normal ChatGPT navigation and for project threads spawned by `chatgpt_message`. Removing a project from the allowlist removes its registered RALF threads.
 
@@ -39,6 +39,8 @@ When due, the server asks the enabled RALF browser to open the saved conversatio
 For an idle thread, the extension returns every user message and only the final `[data-message-author-role="assistant"]` message. Tool cards, thinking UI, and other assistant-turn chrome are ignored. If there is no final assistant message, the extension returns a synthetic stopped message.
 
 The server sends that compact transcript to the OpenAI Responses API using `RALF_MODEL`, which defaults to `gpt-5.6-terra`. Set `OPENAI_API_KEY` in the server environment. The model must answer exactly `COMPLETE` when the requested work is done, otherwise it returns a short one or two sentence next instruction. RALF sends that instruction back into the same thread and schedules the next check using the configured loop interval.
+
+The server appends every classification request and result to `<DATA_DIR>/ralf-openai.log`, which defaults to `.data/ralf-openai.log`, as one JSON object per line. These records contain the full request and response text plus the OpenAI request ID, HTTP status, duration, token usage, and selected action. They do not contain the API key. Treat this log as private because it contains conversation text. RALF persists the request record before it calls OpenAI and skips the API call if the file cannot be written.
 
 ## Agent messaging
 

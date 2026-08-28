@@ -117,6 +117,7 @@ const BROWSER_BRIDGE_ENABLED = process.env.BROWSER_BRIDGE_ENABLED !== "false";
 const THREAD_SYNC_ENABLED = process.env.THREAD_SYNC_ENABLED !== "false";
 const THREAD_SYNC_PORT = boundedIntegerEnv("THREAD_SYNC_PORT", 6002, 1, 65535);
 const RALF_MODEL = process.env.RALF_MODEL ?? "gpt-5.6-terra";
+const RALF_OPENAI_AUDIT_LOG_PATH = path.resolve(DATA_DIR, "ralf-openai.log");
 const BROWSER_BRIDGE_PORT = boundedIntegerEnv(
   "BROWSER_BRIDGE_PORT",
   PORT + 1,
@@ -2691,6 +2692,7 @@ const ralfController = supportCommands && ralfRegistry
       registry: ralfRegistry,
       apiKey: process.env.OPENAI_API_KEY,
       model: RALF_MODEL,
+      auditLogPath: RALF_OPENAI_AUDIT_LOG_PATH,
     })
   : undefined;
 
@@ -2759,6 +2761,7 @@ const httpServer = app.listen(PORT, HOST, () => {
     console.log(`Thread sync endpoint: ${threadSync.bindUrl}`);
     console.log(`Local Codex support extension: ${threadSync.extensionDirectory}`);
     console.log(`RALF model: ${RALF_MODEL}`);
+    console.log(`RALF OpenAI audit log: ${RALF_OPENAI_AUDIT_LOG_PATH}`);
     console.log(`Thread sync store: ${path.resolve(DATA_DIR, "thread-sync.json")}`);
   }
   console.log(
