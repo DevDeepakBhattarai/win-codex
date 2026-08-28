@@ -4,7 +4,9 @@ This is the ChatGPT support extension for Local Codex. It is separate from `brow
 
 ## Features
 
-The popup exposes three independent toggles.
+The popup has two tabs. **RALF threads** lists every thread the server has registered for the loop, with its project, state, last continuation, and next scheduled check; each row opens the conversation in a new tab. **Settings** holds three independent toggles plus the sub-agent project, RALF timing, and RALF project allowlist.
+
+The thread list is read from the server, so it is identical in every browser running the extension.
 
 - **Thread sync** reports the exact ChatGPT conversation URL for the existing `sync_current_thread` and `get_current_thread_url` tools. It can be enabled in both Chrome and Helium.
 - **RALF automation** lets the background RALF loop open registered conversations, wait through ChatGPT loading, detect the stop button, and extract the user messages plus final assistant response. Enable it only in the browser you want RALF to automate.
@@ -25,6 +27,8 @@ Keep `.data` private. It contains the support extension credential, thread bindi
 ## RALF behavior
 
 RALF does not use Thread Sync for registration. The server keeps an explicit project allowlist in `.data/ralf.json`. Paste one project home URL or project ID per line into **RALF projects** in the extension popup. Project home URLs may include ChatGPT's display-name suffix, for example `/g/g-p-<id>-deepak/project`; Local Codex stores the stable `g-p-<id>` portion.
+
+The **RALF threads** tab reads `/chatgpt-support/ralf/threads`, which reports both active and completed entries. A thread shows `retrying` when its last check failed, and the recorded error is displayed on the row.
 
 When a ChatGPT tab navigates to `/g/<project-id>/c/<thread-id>`, the support extension reports that URL to the RALF registration endpoint. The server registers it only when the project is allowlisted. This works for normal ChatGPT navigation and for project threads spawned by `chatgpt_message`. Removing a project from the allowlist removes its registered RALF threads. The first check for a newly registered thread is scheduled 25 minutes later.
 

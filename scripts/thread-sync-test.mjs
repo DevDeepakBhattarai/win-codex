@@ -8,7 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { THREAD_SYNC_AGENT_INSTRUCTION, THREAD_SYNC_WIDGET_URI, ThreadSyncRegistry, parseConversationUrl, prepareThreadSync, registerThreadSync, threadSyncBindHandler, threadSyncBindUrl } from "../dist/thread-sync.js";
-import { RalfController, RalfRegistry, SupportCommandBus, normalizeChatGptMessageTarget, parseRalfProjectId, registerChatGptMessaging, supportCommandClaimHandler } from "../dist/chatgpt-support.js";
+import { RalfController, RalfRegistry, SupportCommandBus, normalizeChatGptMessageTarget, parseRalfProjectId, ralfThreadsGetHandler, registerChatGptMessaging, supportCommandClaimHandler } from "../dist/chatgpt-support.js";
 
 const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "win-codex-thread-sync-test-"));
 const projectId = "g-p-6a87fafd6d948191ab3338e485c07c39";
@@ -46,7 +46,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.0.0");
+  assert.equal(manifest.version, "1.1.0");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -54,7 +54,10 @@ try {
     "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:*");
   const preparedPopup = await readFile(path.join(sync.extensionDirectory, "popup.html"), "utf8");
   assert.match(preparedPopup, /Sub-agent project URL/);
+  assert.match(preparedPopup, /id="panel-threads"/, "the popup exposes the RALF threads tab");
+  assert.match(preparedPopup, /id="panel-settings"/, "the popup exposes the settings tab");
   assert.match(preparedPopup, /RALF projects/);
+  assert.match(preparedPopup, /RALF minimum worked time \(seconds\)/);
   assert.match(preparedPopup, /config\.js/);
   const preparedConfig = {};
   vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), preparedConfig);
@@ -62,6 +65,7 @@ try {
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.commandResultUrl, "http://127.0.0.1:6002/chatgpt-support/commands/result");
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralfRegisterUrl, "http://127.0.0.1:6002/chatgpt-support/ralf/register");
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralfProjectsUrl, "http://127.0.0.1:6002/chatgpt-support/ralf/projects");
+  assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralfThreadsUrl, "http://127.0.0.1:6002/chatgpt-support/ralf/threads");
   assert.throws(() => normalizeChatGptMessageTarget("https://chatgpt.com/"), /project URL/);
   assert.equal(normalizeChatGptMessageTarget(namedProjectHome), namedProjectHome);
   assert.equal(parseRalfProjectId(namedProjectHome), projectId);
@@ -122,9 +126,22 @@ try {
   assert.equal(await projectScopedRegistry.register(urlA), true);
   await new Promise(resolve => setTimeout(resolve, 25));
   assert.equal((await projectScopedRegistry.due()).some(thread => thread.conversationUrl === urlA), true);
+  assert.deepEqual((await projectScopedRegistry.threads()).map(thread => [thread.conversationUrl, thread.state]),
+    [[urlA, "active"]], "the popup thread list reports every registered thread");
+  const listThreads = (authorization = `Bearer ${sync.extensionToken}`) => new Promise(resolve => {
+    const response = { status(code) { response.code = code; return response; }, json(body) { resolve({ code: response.code ?? 200, body }); }, setHeader() {} };
+    ralfThreadsGetHandler(projectScopedRegistry, sync.extensionToken)({ get: name => (name === "authorization" ? authorization : undefined) }, response);
+  });
+  assert.equal((await listThreads("Bearer wrong")).code, 401, "the thread list requires the extension token");
+  assert.deepEqual((await listThreads()).body.threads.map(thread => thread.threadId), [parseConversationUrl(urlA).threadId]);
+  await projectScopedRegistry.recordComplete(parseConversationUrl(urlA).threadId);
+  assert.deepEqual((await projectScopedRegistry.threads()).map(thread => thread.state), ["complete"],
+    "completed threads stay listed for the popup after they stop being due");
+  assert.deepEqual(await projectScopedRegistry.due(), []);
   await projectScopedRegistry.setProjects([]);
   assert.equal((await projectScopedRegistry.due()).length, 0,
     "removing a RALF project removes its registered threads");
+  assert.deepEqual(await projectScopedRegistry.threads(), []);
 
   const legacyRalfRoot = path.join(temporaryRoot, "legacy-ralf");
   await mkdir(legacyRalfRoot, { recursive: true });
@@ -418,7 +435,7 @@ try {
       ok: true,
       result: {
         status: "idle",
-        workedSeconds: 19 * 60,
+        workedSeconds: null,
         users: [{ id: "u3", text: "Finish this small task." }],
         assistant: { synthetic: false, id: "a2", text: "Done." },
       },
@@ -699,6 +716,7 @@ async function testRunningHydrationDetection() {
 async function testWorkedDurationDetection() {
   let automationListener;
   let now = 0;
+  let ralfMinWorkedSeconds = 19 * 60;
 
   const textNode = text => ({
     textContent: text,
@@ -758,6 +776,11 @@ async function testWorkedDurationDetection() {
       sendMessage: async () => ({ status: "bound" }),
       onMessage: { addListener: fn => { automationListener = fn; } },
     },
+    storage: {
+      local: {
+        get: async defaults => ({ ...defaults, ralfMinWorkedSeconds }),
+      },
+    },
   };
   const fakeSetTimeout = (callback, ms) => {
     now += ms;
@@ -786,6 +809,29 @@ async function testWorkedDurationDetection() {
   assert.equal(response.result.workedSeconds, 26 * 60 + 15,
     "RALF inspection must parse a Worked for label that appears late during hydration");
   assert.ok(now >= 8_000, "RALF waits for the hydrated assistant turn to remain settled before reading duration");
+
+  durationButton.textContent = "Worked for 19m";
+  const shortResponse = await new Promise(resolve => {
+    automationListener({
+      type: "local-codex-support/automation-v1",
+      command: { kind: "inspect_thread" },
+    }, {}, resolve);
+  });
+  assert.equal(shortResponse.ok, true);
+  assert.equal(shortResponse.result.workedSeconds, null,
+    "content-script RALF cutoff filters durations at or below the configured threshold");
+
+  ralfMinWorkedSeconds = 0;
+  durationButton.textContent = "Worked for 1s";
+  const testModeResponse = await new Promise(resolve => {
+    automationListener({
+      type: "local-codex-support/automation-v1",
+      command: { kind: "inspect_thread" },
+    }, {}, resolve);
+  });
+  assert.equal(testModeResponse.ok, true);
+  assert.equal(testModeResponse.result.workedSeconds, 1,
+    "RALF inspection uses the popup-configured minimum worked time");
 }
 
 

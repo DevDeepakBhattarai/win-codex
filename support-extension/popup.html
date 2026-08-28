@@ -7,27 +7,90 @@
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-  <main>
-    <h1>Local Codex Support</h1>
-    <label><input id="threadSync" type="checkbox"> <span>Thread sync</span></label>
-    <label><input id="ralf" type="checkbox"> <span>RALF automation</span></label>
-    <label><input id="threadMessaging" type="checkbox"> <span>Agent thread messaging</span></label>
-    <p>Enable RALF and agent messaging only in the browser you want Local Codex to automate.</p>
+  <header class="masthead">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">LC</span>
+      <span class="brand-text">
+        <strong>Local Codex</strong>
+        <small>Support extension</small>
+      </span>
+    </div>
+    <span id="connection" class="connection" data-state="pending">
+      <i aria-hidden="true"></i><span id="connectionLabel">Connecting</span>
+    </span>
+  </header>
 
-    <section>
-      <label for="subagentProjectUrl">Sub-agent project URL</label>
-      <input id="subagentProjectUrl" type="url" placeholder="https://chatgpt.com/g/.../project">
-      <button id="saveSubagentProject" type="button">Save project</button>
-      <p id="subagentProjectStatus">New agent threads spawn inside this ChatGPT project.</p>
+  <nav class="tabs" role="tablist" aria-label="Sections">
+    <button id="tab-threads" class="tab" type="button" role="tab" data-panel="panel-threads"
+            aria-controls="panel-threads" aria-selected="true">
+      RALF threads<span id="threadCount" class="badge">0</span>
+    </button>
+    <button id="tab-settings" class="tab" type="button" role="tab" data-panel="panel-settings"
+            aria-controls="panel-settings" aria-selected="false" tabindex="-1">
+      Settings
+    </button>
+  </nav>
+
+  <main>
+    <section id="panel-threads" class="panel" role="tabpanel" aria-labelledby="tab-threads">
+      <div class="toolbar">
+        <div class="counts">
+          <span class="count" data-state="active"><i aria-hidden="true"></i><b id="activeCount">0</b> active</span>
+          <span class="count" data-state="complete"><i aria-hidden="true"></i><b id="completeCount">0</b> complete</span>
+        </div>
+        <button id="refreshThreads" class="button button-ghost" type="button">Refresh</button>
+      </div>
+      <ul id="threadList" class="threads"></ul>
+      <p id="threadsStatus" class="note"></p>
     </section>
 
-    <section>
-      <label for="ralfProjects">RALF projects</label>
-      <textarea id="ralfProjects" rows="6" placeholder="One project URL or project ID per line"></textarea>
-      <button id="saveRalfProjects" type="button">Save projects</button>
-      <p id="ralfProjectsStatus">Only threads inside these projects are registered for RALF.</p>
+    <section id="panel-settings" class="panel" role="tabpanel" aria-labelledby="tab-settings" hidden>
+      <div class="card">
+        <h2>Features</h2>
+        <label class="toggle">
+          <span class="toggle-text">Thread sync<small>Bind ChatGPT threads to Local Codex sessions.</small></span>
+          <span class="switch"><input id="threadSync" type="checkbox"><i aria-hidden="true"></i></span>
+        </label>
+        <label class="toggle">
+          <span class="toggle-text">RALF automation<small>Poll registered threads and continue stalled runs.</small></span>
+          <span class="switch"><input id="ralf" type="checkbox"><i aria-hidden="true"></i></span>
+        </label>
+        <label class="toggle">
+          <span class="toggle-text">Agent thread messaging<small>Let agents open and post to ChatGPT threads.</small></span>
+          <span class="switch"><input id="threadMessaging" type="checkbox"><i aria-hidden="true"></i></span>
+        </label>
+        <p class="note">Enable RALF and agent messaging only in the browser you want Local Codex to automate.</p>
+      </div>
+
+      <div class="card">
+        <h2><label for="subagentProjectUrl">Sub-agent project URL</label></h2>
+        <input id="subagentProjectUrl" type="url" placeholder="https://chatgpt.com/g/.../project">
+        <div class="card-footer">
+          <button id="saveSubagentProject" class="button" type="button">Save project</button>
+          <p id="subagentProjectStatus" class="note">New agent threads spawn inside this ChatGPT project.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2><label for="ralfMinWorkedSeconds">RALF minimum worked time (seconds)</label></h2>
+        <input id="ralfMinWorkedSeconds" type="number" min="0" max="86400" step="1" inputmode="numeric">
+        <div class="card-footer">
+          <button id="saveRalfTime" class="button" type="button">Save time</button>
+          <p id="ralfTimeStatus" class="note">Default is 1140 seconds (19 minutes). Set 0 for immediate duration-gate testing.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2><label for="ralfProjects">RALF projects</label></h2>
+        <textarea id="ralfProjects" rows="5" spellcheck="false" placeholder="One project URL or project ID per line"></textarea>
+        <div class="card-footer">
+          <button id="saveRalfProjects" class="button" type="button">Save projects</button>
+          <p id="ralfProjectsStatus" class="note">Only threads inside these projects are registered for RALF.</p>
+        </div>
+      </div>
     </section>
   </main>
+
   <script src="config.js"></script>
   <script src="popup.js"></script>
 </body>

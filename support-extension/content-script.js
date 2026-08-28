@@ -19,6 +19,8 @@
   const SEND_BUTTON_SETTLE_MS = 750;
   const THREAD_ASSISTANT_SETTLE_MS = 5_000;
   const THREAD_UNCERTAIN_SETTLE_MS = 15_000;
+  const RALF_MIN_WORKED_SECONDS_KEY = "ralfMinWorkedSeconds";
+  const DEFAULT_RALF_MIN_WORKED_SECONDS = 19 * 60;
 
   function conversationUrl() {
     const match = location.pathname.match(/^(?:\/g\/([A-Za-z0-9_-]+))?\/c\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/?$/i);
@@ -104,7 +106,7 @@
     const settled = await waitForStableTurns();
     if (!settled) return { status: "loading" };
     if (isRunning()) return { status: "running" };
-    const workedSeconds = getWorkedDurationSeconds();
+    const workedSeconds = getWorkedDurationSeconds(await getRalfMinWorkedSeconds());
     const turns = [...document.querySelectorAll("section[data-turn]")];
     const users = [];
     let lastUserIndex = -1;
@@ -389,7 +391,16 @@
     return Boolean(document.querySelector('form[data-type="unified-composer"] button[data-testid="stop-button"]'));
   }
 
-  function getWorkedDurationSeconds() {
+  async function getRalfMinWorkedSeconds() {
+    if (!extensionApi.storage?.local?.get) return DEFAULT_RALF_MIN_WORKED_SECONDS;
+    const stored = await extensionApi.storage.local.get({
+      [RALF_MIN_WORKED_SECONDS_KEY]: DEFAULT_RALF_MIN_WORKED_SECONDS,
+    });
+    const value = stored[RALF_MIN_WORKED_SECONDS_KEY];
+    return Number.isInteger(value) && value >= 0 ? value : DEFAULT_RALF_MIN_WORKED_SECONDS;
+  }
+
+  function getWorkedDurationSeconds(minWorkedSeconds) {
     const assistantTurns = [...document.querySelectorAll('section[data-turn="assistant"]')];
     const lastAssistantTurn = assistantTurns.at(-1);
     if (!lastAssistantTurn) return null;
@@ -403,7 +414,8 @@
     );
     if (!match || (!match[1] && !match[2] && !match[3])) return null;
 
-    return Number(match[1] ?? 0) * 3600 + Number(match[2] ?? 0) * 60 + Number(match[3] ?? 0);
+    const workedSeconds = Number(match[1] ?? 0) * 3600 + Number(match[2] ?? 0) * 60 + Number(match[3] ?? 0);
+    return workedSeconds > minWorkedSeconds ? workedSeconds : null;
   }
 
   function extractText(element) {

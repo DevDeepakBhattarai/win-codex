@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Local Codex Support",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Supports ChatGPT thread sync, RALF monitoring, and agent-started thread messages for Local Codex.",
   "permissions": ["scripting", "storage", "tabs", "webNavigation"],
   "host_permissions": ["https://chatgpt.com/*", "http://127.0.0.1/*"],

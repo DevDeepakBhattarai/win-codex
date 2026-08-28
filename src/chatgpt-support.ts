@@ -14,7 +14,6 @@ const FAILURE_RETRY_MS = 2 * 60 * 1000;
 const COMMAND_TIMEOUT_MS = 20 * 60 * 1000;
 const CLAIM_WAIT_MS = 20_000;
 const MAX_CONTINUATION_CHARS = 500;
-const MIN_RALF_WORKED_SECONDS = 19 * 60;
 
 export const supportFeatureSchema = z.enum(["ralf", "threadMessaging"]);
 export type SupportFeature = z.infer<typeof supportFeatureSchema>;
@@ -277,6 +276,11 @@ export class RalfRegistry {
     return [...this.state.projects];
   }
 
+  async threads() {
+    await this.queue;
+    return this.state.threads.map((entry) => ({ ...entry }));
+  }
+
   async setProjects(values: string[]) {
     const projects = [...new Set(values.map(parseRalfProjectId))];
     if (projects.length > MAX_RALF_PROJECTS) throw new Error(`RALF supports at most ${MAX_RALF_PROJECTS} projects.`);
@@ -490,7 +494,7 @@ export class RalfController {
         return;
       }
 
-      if (inspection.workedSeconds === null || inspection.workedSeconds <= MIN_RALF_WORKED_SECONDS) {
+      if (inspection.workedSeconds === null) {
         await this.options.registry.recordComplete(thread.threadId);
         return;
       }
@@ -657,6 +661,14 @@ export function ralfProjectsGetHandler(registry: RalfRegistry, extensionToken: s
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
     res.setHeader("Cache-Control", "no-store");
     res.json({ projects: await registry.projects() });
+  };
+}
+
+export function ralfThreadsGetHandler(registry: RalfRegistry, extensionToken: string): RequestHandler {
+  return async (req, res) => {
+    if (!authenticateSupportExtension(req, res, extensionToken)) return;
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ threads: await registry.threads() });
   };
 }
 
