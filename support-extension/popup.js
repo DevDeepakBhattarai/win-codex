@@ -86,6 +86,8 @@ for (const tab of document.querySelectorAll(".tab")) {
 
 const relativeTime = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
 const TIME_UNITS = [["day", 86_400], ["hour", 3_600], ["minute", 60], ["second", 1]];
+let threadFilter = "active";
+let loadedThreads = [];
 
 function formatRelative(timestamp) {
   const deltaSeconds = (timestamp - Date.now()) / 1000;
@@ -155,39 +157,39 @@ function renderThread(thread) {
   }
 
   card.append(link);
-  if (thread.state === "active") {
-    const actions = document.createElement("div");
-    actions.className = "thread-actions";
-    const completeButton = document.createElement("button");
-    completeButton.className = "button button-ghost";
-    completeButton.type = "button";
-    completeButton.textContent = "Mark complete";
-    completeButton.addEventListener("click", () => void markThreadComplete(thread, completeButton));
-    actions.append(completeButton);
-    card.append(actions);
-  }
+  const actions = document.createElement("div");
+  actions.className = "thread-actions";
+  const stateButton = document.createElement("button");
+  stateButton.className = "button button-ghost";
+  stateButton.type = "button";
+  stateButton.textContent = thread.state === "active" ? "Mark complete" : "Mark active";
+  stateButton.addEventListener("click", () => void setThreadState(thread, stateButton));
+  actions.append(stateButton);
+  card.append(actions);
 
   item.append(card);
   return item;
 }
 
-function threadCompleteEndpoint(threadId) {
+function threadStateEndpoint(threadId, state) {
   const endpoint = new URL(ralfThreadsEndpoint.href);
-  endpoint.pathname = `${endpoint.pathname}/${encodeURIComponent(threadId)}/complete`;
+  endpoint.pathname = `${endpoint.pathname}/${encodeURIComponent(threadId)}/${state}`;
   return endpoint;
 }
 
-async function markThreadComplete(thread, button) {
-  if (!globalThis.confirm(`Mark RALF thread ${thread.threadId.slice(0, 8)} as complete? Local Codex will stop checking it.`)) return;
+async function setThreadState(thread, button) {
+  const nextState = thread.state === "active" ? "complete" : "active";
+  if (nextState === "complete" &&
+      !globalThis.confirm(`Mark RALF thread ${thread.threadId.slice(0, 8)} as complete? Local Codex will stop checking it.`)) return;
   button.disabled = true;
-  button.textContent = "Marking...";
+  button.textContent = nextState === "active" ? "Activating..." : "Marking...";
   try {
-    await callServer(threadCompleteEndpoint(thread.threadId), { method: "PUT" });
+    await callServer(threadStateEndpoint(thread.threadId, nextState), { method: "PUT" });
     await loadThreads();
   } catch (error) {
     button.disabled = false;
-    button.textContent = "Mark complete";
-    setNote(element("threadsStatus"), errorMessage(error, "Could not mark the RALF thread complete."), "error");
+    button.textContent = nextState === "active" ? "Mark active" : "Mark complete";
+    setNote(element("threadsStatus"), errorMessage(error, `Could not mark the RALF thread ${nextState}.`), "error");
   }
 }
 
@@ -195,26 +197,39 @@ function renderEmptyState() {
   const item = document.createElement("li");
   const empty = document.createElement("div");
   empty.className = "empty";
-  empty.append(
-    Object.assign(document.createElement("strong"), { textContent: "No registered threads" }),
-    "Open a ChatGPT thread inside one of your RALF projects to register it for the loop.",
-  );
+  if (threadFilter === "active") {
+    empty.append(
+      Object.assign(document.createElement("strong"), { textContent: "No active threads" }),
+      "Completed threads remain available under Completed and can be marked active again.",
+    );
+  } else {
+    empty.append(
+      Object.assign(document.createElement("strong"), { textContent: "No completed threads" }),
+      "Threads you stop manually or RALF finishes will appear here.",
+    );
+  }
   item.append(empty);
   return item;
 }
 
-function renderThreads(threads) {
+function renderThreads() {
   const list = element("threadList");
   list.replaceChildren();
+  const threads = loadedThreads.filter((thread) => thread.state === threadFilter);
   if (threads.length === 0) {
     list.append(renderEmptyState());
     return;
   }
-  // Active threads first, then the soonest work at the top of each group.
-  const ordered = [...threads].sort((left, right) =>
-    Number(left.state === "complete") - Number(right.state === "complete") ||
-    left.nextCheckAt - right.nextCheckAt);
+  const ordered = [...threads].sort((left, right) => left.nextCheckAt - right.nextCheckAt);
   list.append(...ordered.map(renderThread));
+}
+
+function selectThreadFilter(filter) {
+  threadFilter = filter;
+  for (const button of document.querySelectorAll("[data-thread-filter]")) {
+    button.setAttribute("aria-pressed", String(button.dataset.threadFilter === filter));
+  }
+  renderThreads();
 }
 
 async function loadThreads() {
@@ -223,11 +238,12 @@ async function loadThreads() {
   button.disabled = true;
   try {
     const { threads } = await callServer(ralfThreadsEndpoint);
+    loadedThreads = threads;
     const active = threads.filter((thread) => thread.state === "active").length;
     element("activeCount").textContent = String(active);
     element("completeCount").textContent = String(threads.length - active);
     element("threadCount").textContent = String(threads.length);
-    renderThreads(threads);
+    renderThreads();
     setNote(status, "");
     setConnection("online", "Connected");
   } catch (error) {
@@ -396,4 +412,7 @@ element("saveRalfLoopInterval").addEventListener("click", () => void saveRalfLoo
 element("saveRalfTime").addEventListener("click", () => void saveRalfTime());
 element("saveRalfProjects").addEventListener("click", () => void saveRalfProjects());
 element("refreshThreads").addEventListener("click", () => void loadThreads());
+for (const button of document.querySelectorAll("[data-thread-filter]")) {
+  button.addEventListener("click", () => selectThreadFilter(button.dataset.threadFilter));
+}
 void load();

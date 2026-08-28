@@ -8,7 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { THREAD_SYNC_AGENT_INSTRUCTION, THREAD_SYNC_WIDGET_URI, ThreadSyncRegistry, parseConversationUrl, prepareThreadSync, registerThreadSync, threadSyncBindHandler, threadSyncBindUrl } from "../dist/thread-sync.js";
-import { RalfController, RalfRegistry, SupportCommandBus, normalizeChatGptMessageTarget, parseRalfProjectId, ralfSettingsGetHandler, ralfSettingsPutHandler, ralfThreadCompleteHandler, ralfThreadsGetHandler, registerChatGptMessaging, supportCommandClaimHandler } from "../dist/chatgpt-support.js";
+import { RalfController, RalfRegistry, SupportCommandBus, normalizeChatGptMessageTarget, parseRalfProjectId, ralfSettingsGetHandler, ralfSettingsPutHandler, ralfThreadActiveHandler, ralfThreadCompleteHandler, ralfThreadsGetHandler, registerChatGptMessaging, supportCommandClaimHandler } from "../dist/chatgpt-support.js";
 
 const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "win-codex-thread-sync-test-"));
 const projectId = "g-p-6a87fafd6d948191ab3338e485c07c39";
@@ -46,7 +46,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.2.0");
+  assert.equal(manifest.version, "1.3.0");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -60,8 +60,13 @@ try {
   assert.match(preparedPopup, /RALF loop interval \(seconds\)/);
   assert.match(preparedPopup, /RALF minimum worked time \(seconds\)/);
   assert.match(preparedPopup, /config\.js/);
-  assert.match(await readFile(path.join(sync.extensionDirectory, "popup.js"), "utf8"), /Mark complete/,
+  const preparedPopupScript = await readFile(path.join(sync.extensionDirectory, "popup.js"), "utf8");
+  assert.match(preparedPopupScript, /Mark complete/,
     "active RALF thread cards expose a manual completion action");
+  assert.match(preparedPopupScript, /Mark active/,
+    "completed RALF thread cards expose a manual reactivation action");
+  assert.match(preparedPopup, /data-thread-filter="active"/);
+  assert.match(preparedPopup, /data-thread-filter="complete"/);
   const preparedConfig = {};
   vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), preparedConfig);
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.commandClaimUrl, "http://127.0.0.1:6002/chatgpt-support/commands/claim");
@@ -158,6 +163,30 @@ try {
   assert.deepEqual((await projectScopedRegistry.threads()).map(thread => thread.state), ["complete"],
     "manually completed threads stay listed for the popup after they stop being due");
   assert.deepEqual(await projectScopedRegistry.due(), []);
+  await projectScopedRegistry.setLoopIntervalSeconds(1);
+  const activateThreadHandler = ralfThreadActiveHandler(projectScopedRegistry, sync.extensionToken);
+  const activateThread = (threadId, authorization = `Bearer ${sync.extensionToken}`) => new Promise(resolve => {
+    const response = {
+      status(code) { response.code = code; return response; },
+      json(body) { resolve({ code: response.code ?? 200, body }); },
+      setHeader() {},
+    };
+    activateThreadHandler({
+      params: { threadId },
+      get: name => (name === "authorization" ? authorization : undefined),
+    }, response);
+  });
+  assert.equal((await activateThread(parseConversationUrl(urlA).threadId, "Bearer wrong")).code, 401);
+  assert.equal((await activateThread("22222222-2222-4222-8222-222222222222")).code, 404);
+  const activatedAt = Date.now();
+  assert.deepEqual((await activateThread(parseConversationUrl(urlA).threadId)).body,
+    { threadId: parseConversationUrl(urlA).threadId, state: "active" });
+  assert.equal(await projectScopedRegistry.isActive(parseConversationUrl(urlA).threadId), true);
+  const [reactivatedThread] = await projectScopedRegistry.threads();
+  assert.ok(reactivatedThread.nextCheckAt >= activatedAt + 900 && reactivatedThread.nextCheckAt <= activatedAt + 1_100,
+    "reactivating a completed thread schedules a fresh loop check");
+  assert.deepEqual(await projectScopedRegistry.due(), [], "reactivation does not trigger an immediate stale check");
+  await completeThread(parseConversationUrl(urlA).threadId);
   await projectScopedRegistry.setProjects([]);
   assert.equal((await projectScopedRegistry.due()).length, 0,
     "removing a RALF project removes its registered threads");
@@ -417,14 +446,31 @@ try {
   await ralfControllerRegistry.setProjects([projectId]);
   const ralfCommands = new SupportCommandBus();
   const originalFetch = globalThis.fetch;
+  const originalConsoleLog = console.log;
+  const originalConsoleError = console.error;
+  const ralfOpenAiLogs = [];
   let apiRequest;
   let apiRequestCount = 0;
+  let failNextApiRequest = false;
+  console.log = (...values) => ralfOpenAiLogs.push(values.join(" "));
+  console.error = (...values) => ralfOpenAiLogs.push(values.join(" "));
   globalThis.fetch = async (_url, options) => {
     apiRequestCount += 1;
     apiRequest = JSON.parse(options.body);
+    if (failNextApiRequest) {
+      failNextApiRequest = false;
+      return new Response(JSON.stringify({ error: { message: "Rate limit reached for test." } }), {
+        status: 429,
+        headers: { "content-type": "application/json", "x-request-id": "req_ralf_failure" },
+      });
+    }
     return new Response(JSON.stringify({
       output: [{ content: [{ type: "output_text", text: "Inspect the remaining CI failure and fix the specific blocker before stopping." }] }],
-    }), { status: 200, headers: { "content-type": "application/json" } });
+      usage: { input_tokens: 123, output_tokens: 17, total_tokens: 140 },
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json", "x-request-id": "req_ralf_success" },
+    });
   };
   const ralfController = new RalfController({
     registry: ralfControllerRegistry,
@@ -463,6 +509,18 @@ try {
     assert.equal(apiRequest.max_output_tokens, 120);
     assert.match(JSON.stringify(apiRequest.input), /Fix the implementation end to end/);
     assert.match(JSON.stringify(apiRequest.input), /one CI failure remains/);
+    assert.ok(ralfOpenAiLogs.some(line => line.includes("[ralf/openai]") && line.includes('"event":"request_started"') &&
+      line.includes(`"thread":${JSON.stringify(ralfUrl)}`) && line.includes('"model":"gpt-5.6-terra"') &&
+      line.includes("Fix the implementation end to end") && line.includes("one CI failure remains")),
+      "the request audit log includes the exact RALF instruction and transcript sent to OpenAI");
+    assert.ok(ralfOpenAiLogs.some(line => line.includes('"event":"request_succeeded"') &&
+      line.includes('"request_id":"req_ralf_success"') && line.includes('"http_status":200') &&
+      line.includes('"input_tokens":123') && line.includes('"output_tokens":17') &&
+      line.includes('"total_tokens":140') && line.includes('"action":"continue"') &&
+      line.includes("Inspect the remaining CI failure and fix the specific blocker before stopping.")),
+      "the success audit log includes the exact OpenAI response body");
+    assert.ok(ralfOpenAiLogs.every(line => !line.includes("test-key")),
+      "RALF OpenAI audit logs must not expose the API key");
     ralfCommands.complete({
       commandId: continueCommand.id,
       browserId: "chrome-browser",
@@ -516,10 +574,40 @@ try {
     await new Promise(resolve => setTimeout(resolve, 20));
     assert.equal(apiRequestCount, 1, "RALF must not call OpenAI when the worked duration is unavailable");
     assert.equal(await ralfCommands.claim("chrome-browser", ["ralf"], 0), undefined);
+
+    const failedRalfUrl = `https://chatgpt.com/g/${projectId}/c/55555555-5555-4555-8555-555555555555`;
+    await ralfControllerRegistry.register(failedRalfUrl);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    failNextApiRequest = true;
+    await ralfController.tick();
+    const failedInspectCommand = await ralfCommands.claim("chrome-browser", ["ralf"], 1000);
+    assert.equal(failedInspectCommand.kind, "inspect_thread");
+    ralfCommands.complete({
+      commandId: failedInspectCommand.id,
+      browserId: "chrome-browser",
+      kind: "inspect_thread",
+      ok: true,
+      result: {
+        status: "idle",
+        workedSeconds: 20 * 60,
+        users: [{ id: "u5", text: "Finish the failing task." }],
+        assistant: { synthetic: false, id: "a4", text: "A blocker remains." },
+      },
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(apiRequestCount, 2);
+    assert.ok(ralfOpenAiLogs.some(line => line.includes('"event":"request_failed"') &&
+      line.includes('"request_id":"req_ralf_failure"') && line.includes('"http_status":429') &&
+      line.includes('"duration_ms":') && line.includes("Rate limit reached for test")),
+      "the failure audit log includes the exact OpenAI error response body");
+    assert.match((await ralfControllerRegistry.threads()).find(thread => thread.conversationUrl === failedRalfUrl).lastError,
+      /HTTP 429/, "an OpenAI failure remains visible in the RALF thread state");
   } finally {
     ralfController.close();
     ralfCommands.close();
     globalThis.fetch = originalFetch;
+    console.log = originalConsoleLog;
+    console.error = originalConsoleError;
   }
 
   const resource = await client.readResource({ uri: THREAD_SYNC_WIDGET_URI });

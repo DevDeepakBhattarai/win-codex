@@ -34,9 +34,13 @@
   <main>
     <section id="panel-threads" class="panel" role="tabpanel" aria-labelledby="tab-threads">
       <div class="toolbar">
-        <div class="counts">
-          <span class="count" data-state="active"><i aria-hidden="true"></i><b id="activeCount">0</b> active</span>
-          <span class="count" data-state="complete"><i aria-hidden="true"></i><b id="completeCount">0</b> complete</span>
+        <div class="counts" aria-label="Filter RALF threads by state">
+          <button class="count" type="button" data-thread-filter="active" data-state="active" aria-pressed="true">
+            <i aria-hidden="true"></i>Active <b id="activeCount">0</b>
+          </button>
+          <button class="count" type="button" data-thread-filter="complete" data-state="complete" aria-pressed="false">
+            <i aria-hidden="true"></i>Completed <b id="completeCount">0</b>
+          </button>
         </div>
         <button id="refreshThreads" class="button button-ghost" type="button">Refresh</button>
       </div>

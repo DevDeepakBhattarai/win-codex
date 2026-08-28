@@ -64,6 +64,7 @@ import {
   ralfRegistrationHandler,
   ralfSettingsGetHandler,
   ralfSettingsPutHandler,
+  ralfThreadActiveHandler,
   ralfThreadCompleteHandler,
   ralfThreadsGetHandler,
   registerChatGptMessaging,
@@ -2724,6 +2725,8 @@ const threadSyncHttpServer = threadSync
           ralfThreadsGetHandler(ralfRegistry, threadSync.extensionToken));
         syncApp.put("/chatgpt-support/ralf/threads/:threadId/complete",
           ralfThreadCompleteHandler(ralfRegistry, threadSync.extensionToken));
+        syncApp.put("/chatgpt-support/ralf/threads/:threadId/active",
+          ralfThreadActiveHandler(ralfRegistry, threadSync.extensionToken));
       }
       if (supportCommands) {
         syncApp.post("/chatgpt-support/commands/claim",

@@ -398,6 +398,17 @@ export class RalfRegistry {
     });
   }
 
+  async recordActive(threadId: string) {
+    return this.update((state) => {
+      const thread = state.threads.find((entry) => entry.threadId === threadId);
+      if (!thread) return false;
+      thread.state = "active";
+      thread.lastError = undefined;
+      thread.nextCheckAt = Date.now() + state.loopIntervalMs;
+      return true;
+    });
+  }
+
   async recordContinuation(threadId: string) {
     await this.update((state) => {
       const thread = state.threads.find((entry) => entry.threadId === threadId && entry.state === "active");
@@ -545,7 +556,12 @@ export class RalfController {
         return;
       }
 
-      const decision = await decideRalfContinuation(inspection, this.options.apiKey, this.options.model);
+      const decision = await decideRalfContinuation(
+        inspection,
+        this.options.apiKey,
+        this.options.model,
+        thread.conversationUrl,
+      );
       if (decision.complete) {
         await this.options.registry.recordComplete(thread.threadId);
         return;
@@ -569,7 +585,33 @@ export class RalfController {
   }
 }
 
-async function decideRalfContinuation(inspection: Extract<ThreadInspection, { status: "idle" }>, apiKey: string | undefined, model: string) {
+function logRalfOpenAiEvent(event: string, details: Record<string, unknown>, level: "info" | "error" = "info") {
+  const message = `[ralf/openai] ${JSON.stringify({ event, ...details })}`;
+  if (level === "error") console.error(message);
+  else console.log(message);
+}
+
+function responseTokenUsage(value: unknown) {
+  if (!value || typeof value !== "object") return {};
+  const usage = Reflect.get(value, "usage");
+  if (!usage || typeof usage !== "object") return {};
+  const tokenCount = (key: string) => {
+    const count = Reflect.get(usage, key);
+    return typeof count === "number" && Number.isInteger(count) && count >= 0 ? count : undefined;
+  };
+  return {
+    input_tokens: tokenCount("input_tokens"),
+    output_tokens: tokenCount("output_tokens"),
+    total_tokens: tokenCount("total_tokens"),
+  };
+}
+
+async function decideRalfContinuation(
+  inspection: Extract<ThreadInspection, { status: "idle" }>,
+  apiKey: string | undefined,
+  model: string,
+  conversationUrl: string,
+) {
   if (!apiKey) throw new Error("OPENAI_API_KEY is required for RALF continuation decisions.");
   const transcript = [
     ...inspection.users.map((message) => `USER:\n${message.text}`),
@@ -581,32 +623,76 @@ async function decideRalfContinuation(inspection: Extract<ThreadInspection, { st
     "If complete, reply with exactly COMPLETE.",
     "If incomplete, reply with only a very short one or two sentence instruction telling the agent what to do next. Do not say generic 'continue'. Do not explain your reasoning.",
   ].join(" ");
+  const requestBody = {
+    model,
+    max_output_tokens: 120,
+    input: [
+      { role: "system", content: [{ type: "input_text", text: instruction }] },
+      { role: "user", content: [{ type: "input_text", text: transcript }] },
+    ],
+  };
 
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${apiKey}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      max_output_tokens: 120,
-      input: [
-        { role: "system", content: [{ type: "input_text", text: instruction }] },
-        { role: "user", content: [{ type: "input_text", text: transcript }] },
-      ],
-    }),
-    signal: AbortSignal.timeout(60_000),
+  const startedAt = Date.now();
+  logRalfOpenAiEvent("request_started", {
+    thread: conversationUrl,
+    model,
+    worked_seconds: inspection.workedSeconds,
+    request: requestBody,
   });
-  if (!response.ok) {
-    const body = (await response.text()).slice(0, 1_000);
-    throw new Error(`OpenAI RALF decision failed with HTTP ${response.status}: ${body}`);
-  }
 
-  const text = extractResponsesText(await response.json()).trim();
-  if (!text) throw new Error("OpenAI RALF decision returned no text.");
-  if (/^COMPLETE\.?$/i.test(text)) return { complete: true as const };
-  return { complete: false as const, instruction: compactContinuation(text) };
+  let response: globalThis.Response | undefined;
+  let responseBody: unknown;
+  try {
+    response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${apiKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(requestBody),
+      signal: AbortSignal.timeout(60_000),
+    });
+    const requestId = response.headers.get("x-request-id");
+    if (!response.ok) {
+      const rawBody = await response.text();
+      try {
+        responseBody = JSON.parse(rawBody);
+      } catch {
+        responseBody = rawBody;
+      }
+      throw new Error(`OpenAI RALF decision failed with HTTP ${response.status}: ${rawBody.slice(0, 1_000)}`);
+    }
+
+    responseBody = await response.json();
+    const text = extractResponsesText(responseBody).trim();
+    if (!text) throw new Error("OpenAI RALF decision returned no text.");
+    const decision = /^COMPLETE\.?$/i.test(text)
+      ? { complete: true as const }
+      : { complete: false as const, instruction: compactContinuation(text) };
+    logRalfOpenAiEvent("request_succeeded", {
+      thread: conversationUrl,
+      model,
+      request_id: requestId,
+      http_status: response.status,
+      duration_ms: Date.now() - startedAt,
+      ...responseTokenUsage(responseBody),
+      action: decision.complete ? "complete" : "continue",
+      response: responseBody,
+    });
+    return decision;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logRalfOpenAiEvent("request_failed", {
+      thread: conversationUrl,
+      model,
+      request_id: response?.headers.get("x-request-id"),
+      http_status: response?.status,
+      duration_ms: Date.now() - startedAt,
+      error: message,
+      response: responseBody,
+    }, "error");
+    throw error;
+  }
 }
 
 function extractResponsesText(value: unknown) {
@@ -734,6 +820,24 @@ export function ralfThreadCompleteHandler(registry: RalfRegistry, extensionToken
     }
     res.setHeader("Cache-Control", "no-store");
     res.json({ threadId: parsed.data, state: "complete" });
+  };
+}
+
+export function ralfThreadActiveHandler(registry: RalfRegistry, extensionToken: string): RequestHandler {
+  return async (req, res) => {
+    if (!authenticateSupportExtension(req, res, extensionToken)) return;
+    const parsed = z.string().uuid().safeParse(req.params.threadId);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Invalid RALF thread id." });
+      return;
+    }
+    const activated = await registry.recordActive(parsed.data);
+    if (!activated) {
+      res.status(404).json({ error: "RALF thread not found." });
+      return;
+    }
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ threadId: parsed.data, state: "active" });
   };
 }
 
