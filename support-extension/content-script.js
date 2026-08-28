@@ -15,8 +15,10 @@
   let generation = 0;
 
   const SEND_ATTEMPT_TIMEOUT_MS = 30_000;
-  const SEND_PAGE_SETTLE_MS = 3_000;
+  const SEND_NEW_CHAT_SETTLE_MS = 3_000;
+  const SEND_CONVERSATION_SETTLE_MS = 5_000;
   const SEND_BUTTON_SETTLE_MS = 750;
+  const SEND_GENERATION_HEADROOM_MS = 2_000;
   const THREAD_ASSISTANT_SETTLE_MS = 5_000;
   const THREAD_UNCERTAIN_SETTLE_MS = 15_000;
   const RALF_MIN_WORKED_SECONDS_KEY = "ralfMinWorkedSeconds";
@@ -118,9 +120,11 @@
       const message = turn.querySelector('[data-message-author-role="user"]');
       if (!message) continue;
       const content = message.querySelector('[data-testid="collapsible-user-message-content"]') ?? message;
+      const text = extractText(content);
+      if (!text) throw new Error("Could not extract the text of a ChatGPT user message.");
       users.push({
         id: message.getAttribute("data-message-id") ?? turn.dataset.turnId ?? "",
-        text: extractText(content),
+        text,
       });
     }
 
@@ -160,6 +164,8 @@
     }
 
     if (isRunning()) return { status: "running" };
+    const text = extractText(finalMessage);
+    if (!text) throw new Error("Could not extract the text of the final ChatGPT assistant message.");
     return {
       status: "idle",
       workedSeconds,
@@ -167,7 +173,7 @@
       assistant: {
         synthetic: false,
         id: finalMessage.getAttribute("data-message-id"),
-        text: extractText(finalMessage),
+        text,
       },
     };
   }
@@ -227,6 +233,9 @@
   }
 
   async function sentResult(timeoutMs) {
+    const generationStarted = await waitFor(() => isRunning(), timeoutMs);
+    if (!generationStarted) throw new Error("ChatGPT did not start generating after the message was submitted.");
+    await sleep(SEND_GENERATION_HEADROOM_MS);
     const existingUrl = conversationUrl();
     const savedUrl = existingUrl ?? await waitFor(() => conversationUrl(), timeoutMs);
     if (!savedUrl) throw new Error("ChatGPT did not expose the saved conversation URL after sending.");
@@ -237,10 +246,14 @@
     return await waitForAllSettled(() => {
       const ready = getComposer();
       if (!ready || document.readyState === "loading" || isRunning()) return null;
+      const conversation = conversationUrl();
+      const turns = [...document.querySelectorAll("section[data-turn]")];
+      if (conversation &&
+          !document.querySelector('section[data-turn="user"] [data-message-author-role="user"]')) return null;
       return {
         value: ready,
-        signature: composerSettledSignature(ready),
-        quietMs: SEND_PAGE_SETTLE_MS,
+        signature: [composerSettledSignature(ready), turnsSettledSignature(turns)].join("|"),
+        quietMs: conversation ? SEND_CONVERSATION_SETTLE_MS : SEND_NEW_CHAT_SETTLE_MS,
       };
     }, timeoutMs);
   }
@@ -281,7 +294,16 @@
     selection.removeAllRanges();
     selection.addRange(range);
     const inserted = document.execCommand("insertText", false, message);
-    if (!inserted) throw new Error("Could not insert the ChatGPT message.");
+    if (!inserted || !editorMatchesMessage(editor, message)) {
+      if (typeof editor.value === "string") editor.value = message;
+      else editor.textContent = message;
+      editor.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: message,
+      }));
+    }
+    if (!editorMatchesMessage(editor, message)) throw new Error("Could not insert the ChatGPT message.");
   }
 
   function getComposer() {
@@ -321,6 +343,14 @@
       ready.editor.getAttribute?.("aria-busy") ?? "",
       ready.composer.getAttribute?.("aria-busy") ?? "",
     ].join("|");
+  }
+
+  function turnsSettledSignature(turns) {
+    return turns.map((turn) => [
+      turn.dataset.turn ?? "",
+      turn.dataset.turnId ?? "",
+      turn.textContent ?? "",
+    ].join(":")).join("|");
   }
 
   async function waitForComposer(timeoutMs) {
@@ -422,10 +452,11 @@
     const clone = element.cloneNode(true);
     clone.querySelectorAll("button, script, style, svg, [role='tooltip']").forEach((node) => node.remove());
     const container = document.createElement("div");
-    container.style.cssText = "position:fixed;left:-10000px;top:0;width:800px;visibility:hidden;pointer-events:none;";
+    container.style.cssText = "position:fixed;left:-10000px;top:0;width:800px;opacity:0;pointer-events:none;";
+    container.setAttribute("aria-hidden", "true");
     container.appendChild(clone);
     document.body.appendChild(container);
-    const text = container.innerText.replace(/\u00a0/g, " ").trim();
+    const text = (container.innerText || clone.textContent || "").replace(/\u00a0/g, " ").trim();
     container.remove();
     return text;
   }

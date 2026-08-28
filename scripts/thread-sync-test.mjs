@@ -46,7 +46,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.3.2");
+  assert.equal(manifest.version, "1.3.3");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -494,7 +494,10 @@ try {
       });
     }
     return new Response(JSON.stringify({
-      output: [{ content: [{ type: "output_text", text: "Inspect the remaining CI failure and fix the specific blocker before stopping." }] }],
+      output: [
+        { type: "reasoning", encrypted_content: "opaque-test-reasoning" },
+        { type: "message", content: [{ type: "output_text", text: "Inspect the remaining CI failure and fix the specific blocker before stopping." }] },
+      ],
       usage: { input_tokens: 123, output_tokens: 17, total_tokens: 140 },
     }), {
       status: 200,
@@ -563,7 +566,12 @@ try {
     assert.equal("max_output_tokens" in persistedSuccessLogs[0].request, false);
     assert.equal(persistedSuccessLogs[1].event, "request_succeeded");
     assert.equal(persistedSuccessLogs[1].request_id, "req_ralf_success");
-    assert.equal(persistedSuccessLogs[1].response.usage.total_tokens, 140);
+    assert.equal(persistedSuccessLogs[1].total_tokens, 140);
+    assert.equal(persistedSuccessLogs[1].response_text,
+      "Inspect the remaining CI failure and fix the specific blocker before stopping.");
+    assert.equal("response" in persistedSuccessLogs[1], false,
+      "the success audit record stores extracted response text instead of the opaque API payload");
+    assert.ok(!JSON.stringify(persistedSuccessLogs).includes("opaque-test-reasoning"));
     assert.ok(!JSON.stringify(persistedSuccessLogs).includes("test-key"));
     ralfCommands.complete({
       commandId: continueCommand.id,
@@ -655,6 +663,31 @@ try {
       "request_failed",
     ]);
     assert.equal(persistedLogs.at(-1).response.error.message, "Rate limit reached for test.");
+
+    const blankRalfUrl = `https://chatgpt.com/g/${projectId}/c/77777777-7777-4777-8777-777777777777`;
+    await ralfControllerRegistry.register(blankRalfUrl);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    await ralfController.tick();
+    const blankInspectCommand = await ralfCommands.claim("chrome-browser", ["ralf"], 1000);
+    assert.equal(blankInspectCommand.kind, "inspect_thread");
+    ralfCommands.complete({
+      commandId: blankInspectCommand.id,
+      browserId: "chrome-browser",
+      kind: "inspect_thread",
+      ok: true,
+      result: {
+        status: "idle",
+        workedSeconds: 20 * 60,
+        users: [{ id: "u7", text: "" }],
+        assistant: { synthetic: false, id: "a6", text: "" },
+      },
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const blankThread = (await ralfControllerRegistry.threads())
+      .find(thread => thread.conversationUrl === blankRalfUrl);
+    assert.equal(apiRequestCount, 2, "RALF must not classify a blank extracted transcript");
+    assert.equal(blankThread.state, "active", "a blank extracted transcript must not complete the thread");
+    assert.match(blankThread.lastError, /could not extract every ChatGPT user message/);
   } finally {
     ralfController.close();
     ralfCommands.close();
@@ -798,12 +831,16 @@ async function testContentScript(tokenA, tokenB) {
 async function testSendWaitsForSettlementAndRetriesIgnoredClick() {
   let automationListener;
   let now = 0;
-  let userCount = 0;
+  let userCount = 1;
+  let generationStarted = false;
   const clickTimes = [];
-  const location = new URL("https://chatgpt.com/");
+  const editorEvents = [];
+  const stopButton = {};
+  const location = new URL(urlA);
   const editor = {
     textContent: "",
     focus() {},
+    dispatchEvent(event) { editorEvents.push(event.type); },
     getAttribute(key) { return key === "contenteditable" ? "true" : null; },
   };
   const sendButton = {
@@ -813,8 +850,8 @@ async function testSendWaitsForSettlementAndRetriesIgnoredClick() {
       clickTimes.push(now);
       if (clickTimes.length === 2) {
         editor.textContent = "";
-        userCount = 1;
-        location.href = urlA;
+        userCount = 2;
+        generationStarted = true;
       }
     },
   };
@@ -830,20 +867,28 @@ async function testSendWaitsForSettlementAndRetriesIgnoredClick() {
     readyState: "complete",
     querySelector(selector) {
       if (selector === 'form[data-type="unified-composer"]') return composer;
+      if (selector === 'section[data-turn="user"] [data-message-author-role="user"]') {
+        return now >= 5_000 ? {} : null;
+      }
       if (selector === '#composer-submit-button' || selector === 'button[aria-label="Send prompt"]') return sendButton;
       if (selector === 'form[data-type="unified-composer"] button[data-testid="stop-button"]' ||
-          selector === 'button[data-testid="stop-button"]') return null;
+          selector === 'button[data-testid="stop-button"]') return generationStarted ? stopButton : null;
       return null;
     },
     querySelectorAll(selector) {
       if (selector === 'section[data-turn="user"]') return Array.from({ length: userCount }, () => ({}));
+      if (selector === "section[data-turn]") {
+        return [{
+          dataset: { turn: "assistant", turnId: "a1" },
+          get textContent() { return now < 5_000 ? "Hydrating" : "Ready"; },
+        }];
+      }
       return [];
     },
     createRange() { return { selectNodeContents() {} }; },
-    execCommand(command, _showUi, value) {
+    execCommand(command) {
       assert.equal(command, "insertText");
-      editor.textContent = value;
-      return true;
+      return false;
     },
   };
   const browser = {
@@ -867,6 +912,9 @@ async function testSendWaitsForSettlementAndRetriesIgnoredClick() {
   vm.runInNewContext(await readFile("support-extension/content-script.js", "utf8"), {
     window, location, document, browser,
     Date: { now: () => now },
+    InputEvent: class {
+      constructor(type) { this.type = type; }
+    },
     setTimeout: fakeSetTimeout,
   });
 
@@ -881,8 +929,14 @@ async function testSendWaitsForSettlementAndRetriesIgnoredClick() {
   assert.equal(response.ok, true, response.error);
   assert.equal(response.result.status, "sent");
   assert.equal(response.result.conversationUrl, urlA);
+  assert.deepEqual(editorEvents, ["input"],
+    "contenteditable insertion falls back to an input event when execCommand is unavailable");
   assert.equal(clickTimes.length, 2, "an ignored first click is retried once");
+  assert.ok(clickTimes[0] >= 10_000,
+    "an existing conversation must finish hydrating and remain stable before insertion");
   assert.ok(clickTimes[1] >= 30_000, "the retry does not start until the first 30-second send attempt has timed out");
+  assert.ok(now >= clickTimes[1] + 2_000,
+    "the automation tab remains open for two seconds after ChatGPT starts generating");
 }
 
 async function testRunningHydrationDetection() {
@@ -1004,10 +1058,14 @@ async function testWorkedDurationDetection() {
       return [];
     },
     createElement() {
+      let childText = "";
       return {
         style: {},
-        innerText: "",
-        appendChild(child) { this.innerText = child.text; },
+        setAttribute() {},
+        get innerText() {
+          return this.style.cssText?.includes("visibility:hidden") ? "" : childText;
+        },
+        appendChild(child) { childText = child.text; },
         remove() {},
       };
     },
@@ -1047,6 +1105,14 @@ async function testWorkedDurationDetection() {
   });
   assert.equal(response.ok, true);
   assert.equal(response.result.status, "idle");
+  assert.equal(response.result.users.length, 1);
+  assert.equal(response.result.users[0].id, "F1");
+  assert.equal(response.result.users[0].text, "Fix this end to end.",
+    "RALF inspection extracts the visible user message text");
+  assert.equal(response.result.assistant.synthetic, false);
+  assert.equal(response.result.assistant.id, "T1");
+  assert.equal(response.result.assistant.text, "The implementation is complete.",
+    "RALF inspection extracts the visible final assistant message text");
   assert.equal(response.result.workedSeconds, 26 * 60 + 15,
     "RALF inspection must parse a Worked for label that appears late during hydration");
   assert.ok(now >= 8_000, "RALF waits for the hydrated assistant turn to remain settled before reading duration");

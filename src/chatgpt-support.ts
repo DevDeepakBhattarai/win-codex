@@ -591,6 +591,13 @@ export class RalfController {
         return;
       }
 
+      if (inspection.users.length === 0 || inspection.users.some((message) => !message.text.trim())) {
+        throw new Error("RALF could not extract every ChatGPT user message.");
+      }
+      if (!inspection.assistant.text.trim()) {
+        throw new Error("RALF could not extract the final ChatGPT assistant message.");
+      }
+
       if (inspection.workedSeconds === null) {
         await this.options.registry.recordComplete(thread.threadId);
         return;
@@ -713,7 +720,7 @@ async function decideRalfContinuation(
       duration_ms: Date.now() - startedAt,
       ...responseTokenUsage(responseBody),
       action: decision.complete ? "complete" : "continue",
-      response: responseBody,
+      response_text: text,
     });
     return decision;
   } catch (error) {
