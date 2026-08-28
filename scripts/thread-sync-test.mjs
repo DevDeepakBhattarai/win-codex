@@ -46,7 +46,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.3.1");
+  assert.equal(manifest.version, "1.3.2");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -441,6 +441,35 @@ try {
   await retryCommandResult;
   claimHandlerBus.close();
 
+  const orphanedCommandBus = new SupportCommandBus();
+  const orphanedResult = orphanedCommandBus.execute({
+    feature: "ralf",
+    kind: "inspect_thread",
+    conversationUrl: urlA,
+  }, 25);
+  const orphanedOutcome = orphanedResult.then(
+    result => ({ result }),
+    error => ({ error }),
+  );
+  const orphanedCommand = await orphanedCommandBus.claim("same-browser", ["ralf"], 0);
+  const reclaimedCommand = await orphanedCommandBus.claim("same-browser", ["ralf"], 0);
+  let orphanedError;
+  if (!reclaimedCommand) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+    orphanedError = (await orphanedOutcome).error;
+  }
+  assert.equal(reclaimedCommand?.id, orphanedCommand.id,
+    `a browser must be able to resume its claimed RALF inspection instead of leaving it orphaned: ${orphanedError?.message ?? "no timeout captured"}`);
+  orphanedCommandBus.complete({
+    commandId: reclaimedCommand.id,
+    browserId: "same-browser",
+    kind: "inspect_thread",
+    ok: true,
+    result: { status: "running" },
+  });
+  assert.equal((await orphanedResult).result.status, "running");
+  orphanedCommandBus.close();
+
   const ralfControllerRoot = path.join(temporaryRoot, "ralf-controller");
   const ralfControllerRegistry = await RalfRegistry.open(ralfControllerRoot, 20);
   await ralfControllerRegistry.setProjects([projectId]);
@@ -507,7 +536,9 @@ try {
     assert.equal(continueCommand.targetUrl, ralfUrl);
     assert.equal(continueCommand.message, "Inspect the remaining CI failure and fix the specific blocker before stopping.");
     assert.equal(apiRequest.model, "gpt-5.6-terra");
-    assert.equal(apiRequest.max_output_tokens, 120);
+    assert.deepEqual(apiRequest.reasoning, { effort: "low" });
+    assert.equal("max_output_tokens" in apiRequest, false,
+      "RALF must not impose an output-token budget on classification");
     assert.match(JSON.stringify(apiRequest.input), /Fix the implementation end to end/);
     assert.match(JSON.stringify(apiRequest.input), /one CI failure remains/);
     assert.ok(ralfOpenAiLogs.some(line => line.includes("[ralf/openai]") && line.includes('"event":"request_started"') &&
@@ -528,6 +559,8 @@ try {
     assert.equal(persistedSuccessLogs[0].event, "request_started");
     assert.match(persistedSuccessLogs[0].timestamp, /^\d{4}-\d{2}-\d{2}T/);
     assert.match(JSON.stringify(persistedSuccessLogs[0].request), /Fix the implementation end to end/);
+    assert.deepEqual(persistedSuccessLogs[0].request.reasoning, { effort: "low" });
+    assert.equal("max_output_tokens" in persistedSuccessLogs[0].request, false);
     assert.equal(persistedSuccessLogs[1].event, "request_succeeded");
     assert.equal(persistedSuccessLogs[1].request_id, "req_ralf_success");
     assert.equal(persistedSuccessLogs[1].response.usage.total_tokens, 140);

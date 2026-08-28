@@ -153,6 +153,12 @@ export class SupportCommandBus {
 
   claim(browserId: string, features: SupportFeature[], waitMs = CLAIM_WAIT_MS, signal?: AbortSignal) {
     const featureSet = new Set(features);
+    const resumable = [...this.pending.values()].find((pending) =>
+      pending.claimedBy === browserId &&
+      pending.command.kind === "inspect_thread" &&
+      featureSet.has(pending.command.feature));
+    if (resumable) return Promise.resolve(resumable.command);
+
     const queuedIndex = this.queued.findIndex((pending) => featureSet.has(pending.command.feature));
     if (queuedIndex >= 0) {
       const [pending] = this.queued.splice(queuedIndex, 1);
@@ -655,7 +661,7 @@ async function decideRalfContinuation(
   ].join(" ");
   const requestBody = {
     model,
-    max_output_tokens: 120,
+    reasoning: { effort: "low" },
     input: [
       { role: "system", content: [{ type: "input_text", text: instruction }] },
       { role: "user", content: [{ type: "input_text", text: transcript }] },
