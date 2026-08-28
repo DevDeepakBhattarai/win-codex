@@ -9,6 +9,9 @@ import { z } from "zod";
 const MAX_RALF_THREADS = 2_000;
 const MAX_RALF_PROJECTS = 100;
 const DEFAULT_RALF_INTERVAL_MS = 25 * 60 * 1000;
+const MIN_RALF_INTERVAL_SECONDS = 1;
+const MAX_RALF_INTERVAL_SECONDS = 24 * 60 * 60;
+const RALF_SCHEDULER_TICK_MS = 1_000;
 const LOADING_RETRY_MS = 60 * 1000;
 const FAILURE_RETRY_MS = 2 * 60 * 1000;
 const COMMAND_TIMEOUT_MS = 20 * 60 * 1000;
@@ -233,8 +236,12 @@ const ralfStoreSchema = z.object({
   version: z.literal(2),
   projects: z.array(z.string()).max(MAX_RALF_PROJECTS),
   threads: z.array(ralfThreadSchema).max(MAX_RALF_THREADS),
+  loopIntervalMs: z.number().int().positive().max(MAX_RALF_INTERVAL_SECONDS * 1000).default(DEFAULT_RALF_INTERVAL_MS),
 });
 type RalfStore = z.infer<typeof ralfStoreSchema>;
+const ralfLoopIntervalSecondsSchema = z.number().int()
+  .min(MIN_RALF_INTERVAL_SECONDS)
+  .max(MAX_RALF_INTERVAL_SECONDS);
 
 export class RalfRegistry {
   private queue: Promise<unknown> = Promise.resolve();
@@ -242,13 +249,17 @@ export class RalfRegistry {
   private constructor(
     private readonly filePath: string,
     private state: RalfStore,
-    private readonly intervalMs: number,
   ) {}
 
-  static async open(dataDirectory: string, intervalMs = DEFAULT_RALF_INTERVAL_MS) {
+  static async open(dataDirectory: string, intervalMs?: number) {
     await mkdir(dataDirectory, { recursive: true });
     const filePath = path.join(dataDirectory, "ralf.json");
-    let state: RalfStore = { version: 2, projects: [], threads: [] };
+    let state: RalfStore = {
+      version: 2,
+      projects: [],
+      threads: [],
+      loopIntervalMs: DEFAULT_RALF_INTERVAL_MS,
+    };
     let migrated = false;
     try {
       const raw: unknown = JSON.parse(await readFile(filePath, "utf8"));
@@ -268,7 +279,11 @@ export class RalfRegistry {
     if (migrated) {
       await writeFile(filePath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
     }
-    return new RalfRegistry(filePath, state, intervalMs);
+    if (intervalMs !== undefined) {
+      if (!Number.isInteger(intervalMs) || intervalMs <= 0) throw new Error("RALF interval must be a positive integer.");
+      state.loopIntervalMs = intervalMs;
+    }
+    return new RalfRegistry(filePath, state);
   }
 
   async projects() {
@@ -279,6 +294,24 @@ export class RalfRegistry {
   async threads() {
     await this.queue;
     return this.state.threads.map((entry) => ({ ...entry }));
+  }
+
+  async settings() {
+    await this.queue;
+    return { loopIntervalSeconds: this.state.loopIntervalMs / 1000 };
+  }
+
+  async setLoopIntervalSeconds(value: number) {
+    const loopIntervalSeconds = ralfLoopIntervalSecondsSchema.parse(value);
+    const loopIntervalMs = loopIntervalSeconds * 1000;
+    return this.update((state) => {
+      state.loopIntervalMs = loopIntervalMs;
+      const nextCheckAt = Date.now() + loopIntervalMs;
+      for (const thread of state.threads) {
+        if (thread.state === "active") thread.nextCheckAt = nextCheckAt;
+      }
+      return { loopIntervalSeconds };
+    });
   }
 
   async setProjects(values: string[]) {
@@ -311,7 +344,7 @@ export class RalfRegistry {
         conversationUrl: conversation.conversationUrl,
         threadId: conversation.threadId,
         registeredAt: new Date().toISOString(),
-        nextCheckAt: Date.now() + this.intervalMs,
+        nextCheckAt: Date.now() + state.loopIntervalMs,
         state: "active",
       });
       return true;
@@ -325,8 +358,19 @@ export class RalfRegistry {
       .map((entry) => ({ ...entry }));
   }
 
+  async isActive(threadId: string) {
+    await this.queue;
+    return this.state.threads.some((entry) => entry.threadId === threadId && entry.state === "active");
+  }
+
   async recordRunning(threadId: string) {
-    await this.reschedule(threadId, this.intervalMs);
+    await this.update((state) => {
+      const thread = state.threads.find((entry) => entry.threadId === threadId && entry.state === "active");
+      if (!thread) return;
+      thread.lastCheckedAt = new Date().toISOString();
+      thread.lastError = undefined;
+      thread.nextCheckAt = Date.now() + state.loopIntervalMs;
+    });
   }
 
   async recordLoading(threadId: string) {
@@ -344,12 +388,13 @@ export class RalfRegistry {
   }
 
   async recordComplete(threadId: string) {
-    await this.update((state) => {
+    return this.update((state) => {
       const thread = state.threads.find((entry) => entry.threadId === threadId);
-      if (!thread) return;
+      if (!thread) return false;
       thread.state = "complete";
       thread.lastCheckedAt = new Date().toISOString();
       thread.lastError = undefined;
+      return true;
     });
   }
 
@@ -361,7 +406,7 @@ export class RalfRegistry {
       thread.lastCheckedAt = now;
       thread.lastContinuationAt = now;
       thread.lastError = undefined;
-      thread.nextCheckAt = Date.now() + this.intervalMs;
+      thread.nextCheckAt = Date.now() + state.loopIntervalMs;
     });
   }
 
@@ -457,7 +502,7 @@ export class RalfController {
   private readonly timer: NodeJS.Timeout;
 
   constructor(private readonly options: RalfControllerOptions) {
-    this.timer = setInterval(() => void this.tick(), options.checkEveryMs ?? 30_000);
+    this.timer = setInterval(() => void this.tick(), options.checkEveryMs ?? RALF_SCHEDULER_TICK_MS);
     this.timer.unref();
   }
 
@@ -483,6 +528,7 @@ export class RalfController {
       });
       if (!commandResult.ok) throw new Error(commandResult.error);
       if (commandResult.kind !== "inspect_thread") throw new Error("RALF received the wrong support command result.");
+      if (!await this.options.registry.isActive(thread.threadId)) return;
 
       const inspection = commandResult.result;
       if (inspection.status === "loading") {
@@ -504,6 +550,7 @@ export class RalfController {
         await this.options.registry.recordComplete(thread.threadId);
         return;
       }
+      if (!await this.options.registry.isActive(thread.threadId)) return;
 
       const sendResult = await this.options.commands.execute({
         feature: "ralf",
@@ -669,6 +716,47 @@ export function ralfThreadsGetHandler(registry: RalfRegistry, extensionToken: st
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
     res.setHeader("Cache-Control", "no-store");
     res.json({ threads: await registry.threads() });
+  };
+}
+
+export function ralfThreadCompleteHandler(registry: RalfRegistry, extensionToken: string): RequestHandler {
+  return async (req, res) => {
+    if (!authenticateSupportExtension(req, res, extensionToken)) return;
+    const parsed = z.string().uuid().safeParse(req.params.threadId);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Invalid RALF thread id." });
+      return;
+    }
+    const completed = await registry.recordComplete(parsed.data);
+    if (!completed) {
+      res.status(404).json({ error: "RALF thread not found." });
+      return;
+    }
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ threadId: parsed.data, state: "complete" });
+  };
+}
+
+export function ralfSettingsGetHandler(registry: RalfRegistry, extensionToken: string): RequestHandler {
+  return async (req, res) => {
+    if (!authenticateSupportExtension(req, res, extensionToken)) return;
+    res.setHeader("Cache-Control", "no-store");
+    res.json(await registry.settings());
+  };
+}
+
+export function ralfSettingsPutHandler(registry: RalfRegistry, extensionToken: string): RequestHandler {
+  const bodySchema = z.object({ loopIntervalSeconds: ralfLoopIntervalSecondsSchema }).strict();
+  return async (req, res) => {
+    if (!authenticateSupportExtension(req, res, extensionToken)) return;
+    const parsed = bodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: `RALF loop interval must be a whole number from ${MIN_RALF_INTERVAL_SECONDS} to ${MAX_RALF_INTERVAL_SECONDS} seconds.` });
+      return;
+    }
+    const settings = await registry.setLoopIntervalSeconds(parsed.data.loopIntervalSeconds);
+    res.setHeader("Cache-Control", "no-store");
+    res.json(settings);
   };
 }
 

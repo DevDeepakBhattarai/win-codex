@@ -211,6 +211,7 @@ export async function prepareThreadSync(dataDirectory: string, port = 6002) {
       commandResultUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/commands/result"),
       ralfRegisterUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/ralf/register"),
       ralfProjectsUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/ralf/projects"),
+      ralfSettingsUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/ralf/settings"),
       ralfThreadsUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/ralf/threads"),
       extensionToken,
     })};\n`,

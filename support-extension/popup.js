@@ -8,6 +8,7 @@ const DEFAULT_SETTINGS = {
 const SUBAGENT_PROJECT_KEY = "subagentProjectUrl";
 const RALF_MIN_WORKED_SECONDS_KEY = "ralfMinWorkedSeconds";
 const DEFAULT_RALF_MIN_WORKED_SECONDS = 19 * 60;
+const DEFAULT_RALF_LOOP_INTERVAL_SECONDS = 25 * 60;
 
 function validateLoopbackEndpoint(value, pathname) {
   const endpoint = new URL(value);
@@ -19,6 +20,7 @@ function validateLoopbackEndpoint(value, pathname) {
 }
 
 const ralfProjectsEndpoint = validateLoopbackEndpoint(config?.ralfProjectsUrl, "/chatgpt-support/ralf/projects");
+const ralfSettingsEndpoint = validateLoopbackEndpoint(config?.ralfSettingsUrl, "/chatgpt-support/ralf/settings");
 const ralfThreadsEndpoint = validateLoopbackEndpoint(config?.ralfThreadsUrl, "/chatgpt-support/ralf/threads");
 
 function element(id) {
@@ -109,11 +111,13 @@ function metaEntry(label, value) {
 
 function renderThread(thread) {
   const item = document.createElement("li");
-  const card = document.createElement("a");
+  const card = document.createElement("div");
   card.className = "thread";
-  card.target = "_blank";
-  card.rel = "noreferrer";
-  if (thread.conversationUrl.startsWith("https://chatgpt.com/")) card.href = thread.conversationUrl;
+  const link = document.createElement("a");
+  link.className = "thread-link";
+  link.target = "_blank";
+  link.rel = "noreferrer";
+  if (thread.conversationUrl.startsWith("https://chatgpt.com/")) link.href = thread.conversationUrl;
 
   const state = threadState(thread);
   const head = document.createElement("div");
@@ -138,20 +142,53 @@ function renderThread(thread) {
   }
   if (thread.state === "active") meta.append(metaEntry("Next check", formatRelative(thread.nextCheckAt)));
 
-  card.append(head, Object.assign(document.createElement("p"), {
+  link.append(head, Object.assign(document.createElement("p"), {
     className: "thread-project",
     textContent: projectLabel(thread.conversationUrl),
   }), meta);
 
   if (thread.lastError) {
-    card.append(Object.assign(document.createElement("p"), {
+    link.append(Object.assign(document.createElement("p"), {
       className: "thread-error",
       textContent: thread.lastError,
     }));
   }
 
+  card.append(link);
+  if (thread.state === "active") {
+    const actions = document.createElement("div");
+    actions.className = "thread-actions";
+    const completeButton = document.createElement("button");
+    completeButton.className = "button button-ghost";
+    completeButton.type = "button";
+    completeButton.textContent = "Mark complete";
+    completeButton.addEventListener("click", () => void markThreadComplete(thread, completeButton));
+    actions.append(completeButton);
+    card.append(actions);
+  }
+
   item.append(card);
   return item;
+}
+
+function threadCompleteEndpoint(threadId) {
+  const endpoint = new URL(ralfThreadsEndpoint.href);
+  endpoint.pathname = `${endpoint.pathname}/${encodeURIComponent(threadId)}/complete`;
+  return endpoint;
+}
+
+async function markThreadComplete(thread, button) {
+  if (!globalThis.confirm(`Mark RALF thread ${thread.threadId.slice(0, 8)} as complete? Local Codex will stop checking it.`)) return;
+  button.disabled = true;
+  button.textContent = "Marking...";
+  try {
+    await callServer(threadCompleteEndpoint(thread.threadId), { method: "PUT" });
+    await loadThreads();
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = "Mark complete";
+    setNote(element("threadsStatus"), errorMessage(error, "Could not mark the RALF thread complete."), "error");
+  }
 }
 
 function renderEmptyState() {
@@ -215,7 +252,7 @@ async function load() {
   }
   element(SUBAGENT_PROJECT_KEY).value = settings[SUBAGENT_PROJECT_KEY] ?? "";
   element(RALF_MIN_WORKED_SECONDS_KEY).value = String(settings[RALF_MIN_WORKED_SECONDS_KEY]);
-  await Promise.all([loadRalfProjects(), loadThreads()]);
+  await Promise.all([loadRalfProjects(), loadRalfSettings(), loadThreads()]);
 }
 
 async function notifySettingsChanged() {
@@ -277,6 +314,44 @@ async function saveRalfTime() {
   }
 }
 
+async function loadRalfSettings() {
+  const status = element("ralfLoopIntervalStatus");
+  try {
+    const { loopIntervalSeconds } = await callServer(ralfSettingsEndpoint);
+    element("ralfLoopIntervalSeconds").value = String(loopIntervalSeconds);
+  } catch (error) {
+    element("ralfLoopIntervalSeconds").value = String(DEFAULT_RALF_LOOP_INTERVAL_SECONDS);
+    setNote(status, errorMessage(error, "Could not load the RALF loop interval."), "error");
+  }
+}
+
+async function saveRalfLoopInterval() {
+  const button = element("saveRalfLoopInterval");
+  const input = element("ralfLoopIntervalSeconds");
+  const status = element("ralfLoopIntervalStatus");
+  const loopIntervalSeconds = Number(input.value);
+  if (!Number.isInteger(loopIntervalSeconds) || loopIntervalSeconds < 1 || loopIntervalSeconds > 86_400) {
+    setNote(status, "Enter a whole number from 1 to 86400 seconds.", "error");
+    return;
+  }
+
+  button.disabled = true;
+  try {
+    const settings = await callServer(ralfSettingsEndpoint, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ loopIntervalSeconds }),
+    });
+    input.value = String(settings.loopIntervalSeconds);
+    setNote(status, `Saved ${settings.loopIntervalSeconds} second${settings.loopIntervalSeconds === 1 ? "" : "s"}. Active threads were rescheduled.`);
+    await loadThreads();
+  } catch (error) {
+    setNote(status, errorMessage(error, "Could not save the RALF loop interval."), "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function loadRalfProjects() {
   const status = element("ralfProjectsStatus");
   try {
@@ -317,6 +392,7 @@ for (const key of Object.keys(DEFAULT_SETTINGS)) {
   element(key).addEventListener("change", () => void saveSettings());
 }
 element("saveSubagentProject").addEventListener("click", () => void saveSubagentProject());
+element("saveRalfLoopInterval").addEventListener("click", () => void saveRalfLoopInterval());
 element("saveRalfTime").addEventListener("click", () => void saveRalfTime());
 element("saveRalfProjects").addEventListener("click", () => void saveRalfProjects());
 element("refreshThreads").addEventListener("click", () => void loadThreads());

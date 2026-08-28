@@ -72,11 +72,20 @@
       </div>
 
       <div class="card">
+        <h2><label for="ralfLoopIntervalSeconds">RALF loop interval (seconds)</label></h2>
+        <input id="ralfLoopIntervalSeconds" type="number" min="1" max="86400" step="1" inputmode="numeric">
+        <div class="card-footer">
+          <button id="saveRalfLoopInterval" class="button" type="button">Save interval</button>
+          <p id="ralfLoopIntervalStatus" class="note">Default is 1500 seconds (25 minutes). Saving reschedules active threads.</p>
+        </div>
+      </div>
+
+      <div class="card">
         <h2><label for="ralfMinWorkedSeconds">RALF minimum worked time (seconds)</label></h2>
         <input id="ralfMinWorkedSeconds" type="number" min="0" max="86400" step="1" inputmode="numeric">
         <div class="card-footer">
           <button id="saveRalfTime" class="button" type="button">Save time</button>
-          <p id="ralfTimeStatus" class="note">Default is 1140 seconds (19 minutes). Set 0 for immediate duration-gate testing.</p>
+          <p id="ralfTimeStatus" class="note">Default is 1140 seconds (19 minutes). RALF continues only when ChatGPT reports more than this.</p>
         </div>
       </div>
 

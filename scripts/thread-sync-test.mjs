@@ -8,7 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { THREAD_SYNC_AGENT_INSTRUCTION, THREAD_SYNC_WIDGET_URI, ThreadSyncRegistry, parseConversationUrl, prepareThreadSync, registerThreadSync, threadSyncBindHandler, threadSyncBindUrl } from "../dist/thread-sync.js";
-import { RalfController, RalfRegistry, SupportCommandBus, normalizeChatGptMessageTarget, parseRalfProjectId, ralfThreadsGetHandler, registerChatGptMessaging, supportCommandClaimHandler } from "../dist/chatgpt-support.js";
+import { RalfController, RalfRegistry, SupportCommandBus, normalizeChatGptMessageTarget, parseRalfProjectId, ralfSettingsGetHandler, ralfSettingsPutHandler, ralfThreadCompleteHandler, ralfThreadsGetHandler, registerChatGptMessaging, supportCommandClaimHandler } from "../dist/chatgpt-support.js";
 
 const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "win-codex-thread-sync-test-"));
 const projectId = "g-p-6a87fafd6d948191ab3338e485c07c39";
@@ -46,7 +46,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.1.0");
+  assert.equal(manifest.version, "1.2.0");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -57,14 +57,18 @@ try {
   assert.match(preparedPopup, /id="panel-threads"/, "the popup exposes the RALF threads tab");
   assert.match(preparedPopup, /id="panel-settings"/, "the popup exposes the settings tab");
   assert.match(preparedPopup, /RALF projects/);
+  assert.match(preparedPopup, /RALF loop interval \(seconds\)/);
   assert.match(preparedPopup, /RALF minimum worked time \(seconds\)/);
   assert.match(preparedPopup, /config\.js/);
+  assert.match(await readFile(path.join(sync.extensionDirectory, "popup.js"), "utf8"), /Mark complete/,
+    "active RALF thread cards expose a manual completion action");
   const preparedConfig = {};
   vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), preparedConfig);
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.commandClaimUrl, "http://127.0.0.1:6002/chatgpt-support/commands/claim");
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.commandResultUrl, "http://127.0.0.1:6002/chatgpt-support/commands/result");
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralfRegisterUrl, "http://127.0.0.1:6002/chatgpt-support/ralf/register");
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralfProjectsUrl, "http://127.0.0.1:6002/chatgpt-support/ralf/projects");
+  assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralfSettingsUrl, "http://127.0.0.1:6002/chatgpt-support/ralf/settings");
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralfThreadsUrl, "http://127.0.0.1:6002/chatgpt-support/ralf/threads");
   assert.throws(() => normalizeChatGptMessageTarget("https://chatgpt.com/"), /project URL/);
   assert.equal(normalizeChatGptMessageTarget(namedProjectHome), namedProjectHome);
@@ -134,14 +138,61 @@ try {
   });
   assert.equal((await listThreads("Bearer wrong")).code, 401, "the thread list requires the extension token");
   assert.deepEqual((await listThreads()).body.threads.map(thread => thread.threadId), [parseConversationUrl(urlA).threadId]);
-  await projectScopedRegistry.recordComplete(parseConversationUrl(urlA).threadId);
+  const completeThreadHandler = ralfThreadCompleteHandler(projectScopedRegistry, sync.extensionToken);
+  const completeThread = (threadId, authorization = `Bearer ${sync.extensionToken}`) => new Promise(resolve => {
+    const response = {
+      status(code) { response.code = code; return response; },
+      json(body) { resolve({ code: response.code ?? 200, body }); },
+      setHeader() {},
+    };
+    completeThreadHandler({
+      params: { threadId },
+      get: name => (name === "authorization" ? authorization : undefined),
+    }, response);
+  });
+  assert.equal((await completeThread(parseConversationUrl(urlA).threadId, "Bearer wrong")).code, 401);
+  assert.equal((await completeThread("22222222-2222-4222-8222-222222222222")).code, 404);
+  assert.deepEqual((await completeThread(parseConversationUrl(urlA).threadId)).body,
+    { threadId: parseConversationUrl(urlA).threadId, state: "complete" });
+  assert.equal(await projectScopedRegistry.isActive(parseConversationUrl(urlA).threadId), false);
   assert.deepEqual((await projectScopedRegistry.threads()).map(thread => thread.state), ["complete"],
-    "completed threads stay listed for the popup after they stop being due");
+    "manually completed threads stay listed for the popup after they stop being due");
   assert.deepEqual(await projectScopedRegistry.due(), []);
   await projectScopedRegistry.setProjects([]);
   assert.equal((await projectScopedRegistry.due()).length, 0,
     "removing a RALF project removes its registered threads");
   assert.deepEqual(await projectScopedRegistry.threads(), []);
+
+  const timingRoot = path.join(temporaryRoot, "ralf-timing");
+  const timingRegistry = await RalfRegistry.open(timingRoot);
+  await timingRegistry.setProjects([projectId]);
+  await timingRegistry.register(urlA);
+  async function requestRalfSettings(handler, body, authorization = `Bearer ${sync.extensionToken}`) {
+    const result = { status: 200, body: undefined };
+    const req = { body, get: name => (name === "authorization" ? authorization : undefined) };
+    const res = {
+      status(code) { result.status = code; return this; },
+      json(value) { result.body = value; return this; },
+      setHeader() {},
+    };
+    await handler(req, res);
+    return result;
+  }
+  const getRalfSettings = ralfSettingsGetHandler(timingRegistry, sync.extensionToken);
+  const putRalfSettings = ralfSettingsPutHandler(timingRegistry, sync.extensionToken);
+  assert.deepEqual((await requestRalfSettings(getRalfSettings)).body, { loopIntervalSeconds: 25 * 60 });
+  assert.equal((await requestRalfSettings(getRalfSettings, undefined, "Bearer wrong")).status, 401);
+  const intervalChangedAt = Date.now();
+  assert.deepEqual((await requestRalfSettings(putRalfSettings, { loopIntervalSeconds: 1 })).body,
+    { loopIntervalSeconds: 1 });
+  const [rescheduledThread] = await timingRegistry.threads();
+  assert.ok(rescheduledThread.nextCheckAt >= intervalChangedAt + 900 &&
+    rescheduledThread.nextCheckAt <= intervalChangedAt + 1_100,
+    "changing the loop interval reschedules active threads from the current time");
+  assert.deepEqual((await requestRalfSettings(getRalfSettings)).body, { loopIntervalSeconds: 1 });
+  assert.equal((await requestRalfSettings(putRalfSettings, { loopIntervalSeconds: 0 })).status, 400);
+  assert.deepEqual(await (await RalfRegistry.open(timingRoot)).settings(), { loopIntervalSeconds: 1 },
+    "the RALF loop interval survives a server restart");
 
   const legacyRalfRoot = path.join(temporaryRoot, "legacy-ralf");
   await mkdir(legacyRalfRoot, { recursive: true });
