@@ -836,8 +836,11 @@ try {
   assert.ok(!resource.contents[0].text.includes(sync.extensionToken));
 
   await testContentScript(a.ticket.token, b.ticket.token);
+  await testWorkerKeepsLongAutomationAlive(sync);
   await testManualRalfButton();
   await testSendWaitsForSettlementAndRetriesIgnoredClick();
+  await testNewProjectComposerWithoutDataType();
+  await testReactTrackedTextareaEnablesSendButton();
   await testRunningHydrationDetection();
   await testWorkedDurationDetection();
   await testRalfAutoRegistration(sync);
@@ -857,7 +860,7 @@ try {
   await writeFile(storePath, "not valid json");
   await assert.rejects(ThreadSyncRegistry.open(temporaryRoot), SyntaxError, "corrupt state must not be silently reset");
 
-  console.log("Thread sync passed: required sync/get sequencing, handshake waiting, browser-neutral WebExtension APIs, DOM-independent MCP UI routing, persistence, auth, real Fetch port checks, and CSP.");
+  console.log("Thread sync passed: required sync/get sequencing, handshake waiting, long automation keepalive, blank-project composer discovery, React-tracked textarea input, browser-neutral WebExtension APIs, DOM-independent MCP UI routing, persistence, auth, real Fetch port checks, and CSP.");
   console.log("All tests were isolated. No network listener or browser was started.");
 } finally {
   await client?.close();
@@ -1022,6 +1025,197 @@ async function testSendWaitsForSettlementAndRetriesIgnoredClick() {
   assert.ok(clickTimes[1] >= 30_000, "the retry does not start until the first 30-second send attempt has timed out");
   assert.ok(now >= clickTimes[1] + 2_000,
     "the automation tab remains open for two seconds after ChatGPT starts generating");
+}
+
+async function testNewProjectComposerWithoutDataType() {
+  let automationListener;
+  let now = 0;
+  let generationStarted = false;
+  let userCount = 0;
+  const location = new URL(namedProjectHome);
+  const stopButton = {};
+  const editor = {
+    textContent: "",
+    focus() {},
+    closest(selector) { return selector === "form" ? composer : null; },
+    dispatchEvent() {},
+    getAttribute(key) { return key === "contenteditable" ? "true" : null; },
+  };
+  const sendButton = {
+    disabled: false,
+    getAttribute(key) { return key === "aria-disabled" ? "false" : null; },
+    click() {
+      editor.textContent = "";
+      userCount = 1;
+      generationStarted = true;
+      location.href = urlA;
+    },
+  };
+  const composer = {
+    getAttribute() { return null; },
+    querySelector(selector) {
+      if (selector === 'button[data-testid="stop-button"]') return generationStarted ? stopButton : null;
+      return null;
+    },
+  };
+  const document = {
+    readyState: "complete",
+    querySelector(selector) {
+      if (selector === 'form[data-type="unified-composer"]') return null;
+      if (selector === '#prompt-textarea[contenteditable="true"]' ||
+          selector === 'textarea[name="prompt-textarea"]') return editor;
+      if (selector === '#composer-submit-button' || selector === 'button[aria-label="Send prompt"]') return sendButton;
+      if (selector === 'form[data-type="unified-composer"] button[data-testid="stop-button"]' ||
+          selector === 'button[data-testid="stop-button"]') return generationStarted ? stopButton : null;
+      return null;
+    },
+    querySelectorAll(selector) {
+      if (selector === 'section[data-turn="user"]') return Array.from({ length: userCount }, () => ({}));
+      return [];
+    },
+    createRange() { return { selectNodeContents() {} }; },
+    execCommand() { return false; },
+  };
+  const browser = {
+    runtime: {
+      sendMessage: async () => ({}),
+      onMessage: { addListener: listener => { automationListener = listener; } },
+    },
+  };
+  const fakeSetTimeout = (callback, ms) => {
+    now += ms;
+    callback();
+    return 1;
+  };
+  const window = {
+    addEventListener() {},
+    getSelection() { return { removeAllRanges() {}, addRange() {} }; },
+  };
+
+  vm.runInNewContext(await readFile("support-extension/content-script.js", "utf8"), {
+    window, location, document, browser,
+    Date: { now: () => now },
+    InputEvent: class {},
+    setTimeout: fakeSetTimeout,
+  });
+  const response = await new Promise(resolve => {
+    automationListener({
+      type: "local-codex-support/automation-v1",
+      command: { kind: "send_message", message: "start the new project thread" },
+    }, {}, resolve);
+  });
+  assert.equal(response.ok, true, response.error);
+  assert.equal(response.result.conversationUrl, urlA);
+}
+
+async function testReactTrackedTextareaEnablesSendButton() {
+  let automationListener;
+  let now = 0;
+  let generationStarted = false;
+  let userCount = 1;
+  let visibleValue = "";
+  let nativeValueWritten = false;
+  let reactValue = "";
+  const location = new URL(urlA);
+  const message = "send the completed review to the parent";
+  const stopButton = {};
+  const textareaPrototype = {};
+  Object.defineProperty(textareaPrototype, "value", {
+    configurable: true,
+    get() { return visibleValue; },
+    set(value) {
+      visibleValue = value;
+      nativeValueWritten = true;
+    },
+  });
+  const editor = Object.create(textareaPrototype);
+  Object.defineProperty(editor, "value", {
+    configurable: true,
+    get() { return visibleValue; },
+    set(value) {
+      visibleValue = value;
+      nativeValueWritten = false;
+    },
+  });
+  Object.assign(editor, {
+    focus() {},
+    dispatchEvent(event) {
+      if (event.type === "input" && nativeValueWritten) reactValue = visibleValue;
+    },
+    getAttribute(key) { return key === "name" ? "prompt-textarea" : null; },
+  });
+  const sendButton = {
+    disabled: false,
+    getAttribute(key) {
+      if (key === "aria-disabled") return reactValue === message ? "false" : "true";
+      return null;
+    },
+    click() {
+      visibleValue = "";
+      reactValue = "";
+      userCount = 2;
+      generationStarted = true;
+    },
+  };
+  const composer = {
+    getAttribute() { return null; },
+    querySelector(selector) {
+      if (selector === 'textarea[name="prompt-textarea"]') return editor;
+      if (selector === 'button[data-testid="stop-button"]') return generationStarted ? stopButton : null;
+      return null;
+    },
+  };
+  const userTurn = { dataset: { turn: "user", turnId: "u1" }, textContent: "original request" };
+  const document = {
+    readyState: "complete",
+    querySelector(selector) {
+      if (selector === 'form[data-type="unified-composer"]') return composer;
+      if (selector === 'section[data-turn="user"] [data-message-author-role="user"]') return userTurn;
+      if (selector === '#composer-submit-button' || selector === 'button[aria-label="Send prompt"]') return sendButton;
+      if (selector === 'form[data-type="unified-composer"] button[data-testid="stop-button"]' ||
+          selector === 'button[data-testid="stop-button"]') return generationStarted ? stopButton : null;
+      return null;
+    },
+    querySelectorAll(selector) {
+      if (selector === 'section[data-turn="user"]') return Array.from({ length: userCount }, () => ({}));
+      if (selector === "section[data-turn]") return [userTurn];
+      return [];
+    },
+    createRange() { return { selectNodeContents() {} }; },
+    execCommand() { return false; },
+  };
+  const browser = {
+    runtime: {
+      sendMessage: async () => ({}),
+      onMessage: { addListener: listener => { automationListener = listener; } },
+    },
+  };
+  const fakeSetTimeout = (callback, ms) => {
+    now += ms;
+    callback();
+    return 1;
+  };
+  const window = {
+    addEventListener() {},
+    getSelection() { return { removeAllRanges() {}, addRange() {} }; },
+  };
+
+  vm.runInNewContext(await readFile("support-extension/content-script.js", "utf8"), {
+    window, location, document, browser,
+    Date: { now: () => now },
+    InputEvent: class {
+      constructor(type) { this.type = type; }
+    },
+    setTimeout: fakeSetTimeout,
+  });
+  const response = await new Promise(resolve => {
+    automationListener({
+      type: "local-codex-support/automation-v1",
+      command: { kind: "send_message", message },
+    }, {}, resolve);
+  });
+  assert.equal(response.ok, true, response.error);
+  assert.equal(response.result.conversationUrl, urlA);
 }
 
 async function testManualRalfButton() {
@@ -1513,6 +1707,82 @@ async function testManualRalfWorkerRequest(sync) {
     conversationUrl: urlA,
     reactivate: true,
   });
+}
+
+async function testWorkerKeepsLongAutomationAlive(sync) {
+  const generatedConfig = {};
+  vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), generatedConfig);
+  let keepAliveCallback;
+  let keepAliveCalls = 0;
+  let resolveAutomation;
+  const automationResult = new Promise(resolve => { resolveAutomation = resolve; });
+  const storage = {};
+  const context = {
+    URL,
+    AbortSignal,
+    AbortController,
+    crypto: globalThis.crypto,
+    console,
+    Response,
+    importScripts() {},
+    setTimeout(callback, ms) {
+      if (ms === 20_000) {
+        keepAliveCallback = callback;
+        return 99;
+      }
+      return setTimeout(callback, ms);
+    },
+    clearTimeout(timer) {
+      if (timer !== 99) clearTimeout(timer);
+    },
+    LOCAL_CODEX_THREAD_SYNC: generatedConfig.LOCAL_CODEX_THREAD_SYNC,
+    browser: {
+      runtime: {
+        id: "a".repeat(32),
+        getPlatformInfo: async () => { keepAliveCalls += 1; },
+        onMessage: { addListener() {} },
+        onInstalled: { addListener() {} },
+        onStartup: { addListener() {} },
+      },
+      tabs: {
+        onUpdated: { addListener() {} },
+        query: async () => [],
+        create: async () => ({ id: 11 }),
+        get: async () => ({ id: 11, status: "complete", url: namedProjectHome }),
+        sendMessage: async () => await automationResult,
+        remove: async () => {},
+      },
+      webNavigation: {
+        onHistoryStateUpdated: { addListener() {} },
+        onCommitted: { addListener() {} },
+      },
+      scripting: { executeScript: async () => {} },
+      storage: { local: {
+        async get(query) {
+          if (typeof query === "string") return { [query]: storage[query] };
+          return { ...query, ...storage };
+        },
+        async set(values) { Object.assign(storage, values); },
+      } },
+    },
+    fetch: async () => new Response("", { status: 200 }),
+  };
+  vm.runInNewContext(await readFile("support-extension/service-worker.js", "utf8"), context);
+  await new Promise(resolve => setImmediate(resolve));
+
+  const command = context.executeCommand({
+    id: "long-send",
+    feature: "threadMessaging",
+    kind: "send_message",
+    targetUrl: namedProjectHome,
+    message: "start a project thread",
+  }, "browser-a");
+  await new Promise(resolve => setImmediate(resolve));
+  await keepAliveCallback?.();
+  resolveAutomation({ ok: true, result: { status: "sent", conversationUrl: urlA } });
+  await command;
+  assert.equal(keepAliveCalls, 1,
+    "a long ChatGPT automation call must reset the extension worker idle timer before Chrome closes its response channel");
 }
 
 async function testAutomationRedirectGuard(sync) {

@@ -292,6 +292,19 @@
 
   function insertMessage(editor, message) {
     editor.focus();
+    if (typeof editor.value === "string") {
+      const valueSetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(editor), "value")?.set;
+      if (valueSetter) valueSetter.call(editor, message);
+      else editor.value = message;
+      editor.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: message,
+      }));
+      if (!editorMatchesMessage(editor, message)) throw new Error("Could not insert the ChatGPT message.");
+      return;
+    }
+
     const selection = window.getSelection();
     const range = document.createRange();
     range.selectNodeContents(editor);
@@ -299,8 +312,7 @@
     selection.addRange(range);
     const inserted = document.execCommand("insertText", false, message);
     if (!inserted || !editorMatchesMessage(editor, message)) {
-      if (typeof editor.value === "string") editor.value = message;
-      else editor.textContent = message;
+      editor.textContent = message;
       editor.dispatchEvent(new InputEvent("input", {
         bubbles: true,
         inputType: "insertText",
@@ -415,9 +427,12 @@
   }
 
   function getComposer() {
-    const composer = document.querySelector('form[data-type="unified-composer"]');
-    const editor = composer?.querySelector('#prompt-textarea[contenteditable="true"]') ??
-      composer?.querySelector('textarea[name="prompt-textarea"]');
+    const typedComposer = document.querySelector('form[data-type="unified-composer"]');
+    const editor = typedComposer?.querySelector('#prompt-textarea[contenteditable="true"]') ??
+      typedComposer?.querySelector('textarea[name="prompt-textarea"]') ??
+      document.querySelector('#prompt-textarea[contenteditable="true"]') ??
+      document.querySelector('textarea[name="prompt-textarea"]');
+    const composer = typedComposer ?? editor?.closest?.("form");
     return composer && editor ? { composer, editor } : null;
   }
 

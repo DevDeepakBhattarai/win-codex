@@ -25,6 +25,7 @@ const AUTOMATION_MESSAGE = "local-codex-support/automation-v1";
 const MANUAL_RALF_MESSAGE = "local-codex-support/ralf-check-now-v1";
 const REACTIVATE_RALF_MESSAGE = "local-codex-support/ralf-reactivate-v1";
 const SYNC_MESSAGE = "local-codex-thread-sync/bind-v1";
+const WORKER_KEEPALIVE_INTERVAL_MS = 20_000;
 let pollGeneration = 0;
 let pollController = null;
 const reportedRalfConversations = new Set();
@@ -240,6 +241,27 @@ async function sendAutomationMessage(tabId, command) {
   }
 }
 
+async function keepWorkerAliveUntil(operation) {
+  // A send retry can outlive Chrome's 30-second extension-worker idle window.
+  let stopped = false;
+  let timer;
+  const pulse = async () => {
+    try {
+      await extensionApi.runtime.getPlatformInfo?.();
+    } catch {
+      // The command still has its own bounded error path if a keepalive pulse fails.
+    }
+    if (!stopped) timer = setTimeout(pulse, WORKER_KEEPALIVE_INTERVAL_MS);
+  };
+  timer = setTimeout(pulse, WORKER_KEEPALIVE_INTERVAL_MS);
+  try {
+    return await operation;
+  } finally {
+    stopped = true;
+    clearTimeout(timer);
+  }
+}
+
 async function commandTargetUrl(command) {
   if (command.kind === "inspect_thread") return command.conversationUrl;
   if (typeof command.targetUrl === "string" && command.targetUrl) return command.targetUrl;
@@ -276,7 +298,7 @@ async function executeCommand(command, browserId) {
     if (typeof loadedTab.url !== "string" || !automationTargetMatches(loadedTab.url, targetUrl)) {
       throw new Error("ChatGPT automation was redirected away from the requested target.");
     }
-    const response = await sendAutomationMessage(tab.id, command);
+    const response = await keepWorkerAliveUntil(sendAutomationMessage(tab.id, command));
     if (!response?.ok) throw new Error(response?.error || "ChatGPT page automation failed.");
     if (command.kind === "send_message") {
       await registerRalfConversation(response.result?.conversationUrl).catch(() => undefined);
