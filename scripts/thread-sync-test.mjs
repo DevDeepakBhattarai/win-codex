@@ -8,7 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { THREAD_SYNC_AGENT_INSTRUCTION, THREAD_SYNC_WIDGET_URI, ThreadSyncRegistry, parseConversationUrl, prepareThreadSync, registerThreadSync, threadSyncBindHandler, threadSyncBindUrl } from "../dist/thread-sync.js";
-import { RalfController, RalfRegistry, SupportCommandBus, normalizeChatGptMessageTarget, parseRalfProjectId, ralfSettingsGetHandler, ralfSettingsPutHandler, ralfThreadActiveHandler, ralfThreadCompleteHandler, ralfThreadsGetHandler, registerChatGptMessaging, supportCommandClaimHandler } from "../dist/chatgpt-support.js";
+import { RalfController, RalfRegistry, SupportCommandBus, normalizeChatGptMessageTarget, parseRalfProjectId, ralfRegistrationHandler, ralfSettingsGetHandler, ralfSettingsPutHandler, ralfThreadActiveHandler, ralfThreadCheckHandler, ralfThreadCompleteHandler, ralfThreadsGetHandler, registerChatGptMessaging, supportCommandClaimHandler } from "../dist/chatgpt-support.js";
 
 const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "win-codex-thread-sync-test-"));
 const projectId = "g-p-6a87fafd6d948191ab3338e485c07c39";
@@ -75,6 +75,9 @@ try {
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralfProjectsUrl, "http://127.0.0.1:6002/chatgpt-support/ralf/projects");
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralfSettingsUrl, "http://127.0.0.1:6002/chatgpt-support/ralf/settings");
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralfThreadsUrl, "http://127.0.0.1:6002/chatgpt-support/ralf/threads");
+  const preparedContentScript = await readFile(path.join(sync.extensionDirectory, "content-script.js"), "utf8");
+  assert.match(preparedContentScript, /Run RALF now/,
+    "project conversations expose the manual RALF action");
   assert.throws(() => normalizeChatGptMessageTarget("https://chatgpt.com/"), /project URL/);
   assert.equal(normalizeChatGptMessageTarget(namedProjectHome), namedProjectHome);
   assert.equal(parseRalfProjectId(namedProjectHome), projectId);
@@ -186,7 +189,61 @@ try {
   assert.ok(reactivatedThread.nextCheckAt >= activatedAt + 900 && reactivatedThread.nextCheckAt <= activatedAt + 1_100,
     "reactivating a completed thread schedules a fresh loop check");
   assert.deepEqual(await projectScopedRegistry.due(), [], "reactivation does not trigger an immediate stale check");
+  let manualCheckTicks = 0;
+  const checkThreadHandler = ralfThreadCheckHandler(projectScopedRegistry, {
+    async tick() { manualCheckTicks += 1; },
+  }, sync.extensionToken);
+  const checkThread = (threadId, authorization = `Bearer ${sync.extensionToken}`) => new Promise(resolve => {
+    const response = {
+      status(code) { response.code = code; return response; },
+      json(body) { resolve({ code: response.code ?? 200, body }); },
+      setHeader() {},
+    };
+    checkThreadHandler({
+      params: { threadId },
+      get: name => (name === "authorization" ? authorization : undefined),
+    }, response);
+  });
+  const scheduledAt = Date.now();
+  assert.deepEqual(await checkThread(parseConversationUrl(urlA).threadId), {
+    code: 202,
+    body: { threadId: parseConversationUrl(urlA).threadId, status: "scheduled" },
+  });
+  assert.equal(manualCheckTicks, 1, "a manual RALF request starts the scheduler immediately");
+  assert.ok((await projectScopedRegistry.threads())[0].nextCheckAt >= scheduledAt);
+  assert.equal((await projectScopedRegistry.due()).length, 1,
+    "a manual RALF request sets the active thread timer to now");
   await completeThread(parseConversationUrl(urlA).threadId);
+  assert.equal((await checkThread(parseConversationUrl(urlA).threadId)).code, 409,
+    "completed RALF threads cannot be checked without reactivation");
+  assert.equal((await checkThread("22222222-2222-4222-8222-222222222222")).code, 404);
+  assert.equal((await checkThread(parseConversationUrl(urlA).threadId, "Bearer wrong")).code, 401);
+  const registerThreadHandler = ralfRegistrationHandler(projectScopedRegistry, sync.extensionToken);
+  const registerThread = (body) => new Promise(resolve => {
+    const response = {
+      status(code) { response.code = code; return response; },
+      json(responseBody) { resolve({ code: response.code ?? 200, body: responseBody }); },
+      setHeader() {},
+    };
+    registerThreadHandler({
+      body,
+      get: name => (name === "authorization" ? `Bearer ${sync.extensionToken}` : undefined),
+    }, response);
+  });
+  const messageSentAt = Date.now();
+  assert.deepEqual(await registerThread({ conversationUrl: urlA, reactivate: true }), {
+    code: 200,
+    body: { status: "registered" },
+  });
+  const [messageReactivatedThread] = await projectScopedRegistry.threads();
+  assert.equal(messageReactivatedThread.state, "active",
+    "a send-to-stop composer transition reactivates an existing completed RALF thread");
+  assert.ok(messageReactivatedThread.nextCheckAt >= messageSentAt + 900 &&
+    messageReactivatedThread.nextCheckAt <= messageSentAt + 1_100,
+  "the composer transition starts a fresh loop interval from the new message");
+  await registerThread({ conversationUrl: urlA, reactivate: true });
+  assert.equal((await projectScopedRegistry.threads())[0].nextCheckAt, messageReactivatedThread.nextCheckAt,
+    "reactivation does not reschedule a thread that is already active");
   await projectScopedRegistry.setProjects([]);
   assert.equal((await projectScopedRegistry.due()).length, 0,
     "removing a RALF project removes its registered threads");
@@ -753,10 +810,12 @@ try {
   assert.ok(!resource.contents[0].text.includes(sync.extensionToken));
 
   await testContentScript(a.ticket.token, b.ticket.token);
+  await testManualRalfButton();
   await testSendWaitsForSettlementAndRetriesIgnoredClick();
   await testRunningHydrationDetection();
   await testWorkedDurationDetection();
   await testRalfAutoRegistration(sync);
+  await testManualRalfWorkerRequest(sync);
   await testWorker(sync, a.ticket.token, request);
   await testAutomationRedirectGuard(sync);
   await testWidget(sync.widgetHtml, c.ticket);
@@ -937,6 +996,90 @@ async function testSendWaitsForSettlementAndRetriesIgnoredClick() {
   assert.ok(clickTimes[1] >= 30_000, "the retry does not start until the first 30-second send attempt has timed out");
   assert.ok(now >= clickTimes[1] + 2_000,
     "the automation tab remains open for two seconds after ChatGPT starts generating");
+}
+
+async function testManualRalfButton() {
+  let click;
+  let observed;
+  let running = false;
+  const sent = [];
+  const location = new URL(urlA);
+  const button = {
+    style: {},
+    isConnected: false,
+    setAttribute() {},
+    addEventListener(type, listener) {
+      if (type === "click") click = listener;
+    },
+  };
+  const composer = {
+    querySelector(selector) {
+      if (selector === 'button[data-testid="stop-button"]') return running ? {} : null;
+      return null;
+    },
+  };
+  const document = {
+    readyState: "complete",
+    documentElement: {},
+    body: {
+      appendChild(node) {
+        assert.equal(node, button);
+        button.isConnected = true;
+      },
+    },
+    createElement(tag) {
+      assert.equal(tag, "button");
+      return button;
+    },
+    querySelector(selector) {
+      if (selector === 'form[data-type="unified-composer"]') return composer;
+      if (selector === "#composer-submit-button" || selector === 'button[aria-label="Send prompt"]') {
+        return running ? null : {};
+      }
+      return null;
+    },
+  };
+  const browser = { runtime: {
+    sendMessage: async message => {
+      sent.push(message);
+      return { ok: true, status: "scheduled" };
+    },
+    onMessage: { addListener() {} },
+  } };
+  class MutationObserver {
+    constructor(listener) { observed = listener; }
+    observe() {}
+  }
+  vm.runInNewContext(await readFile("support-extension/content-script.js", "utf8"), {
+    window: { addEventListener() {} },
+    location,
+    document,
+    browser,
+    MutationObserver,
+    setTimeout: callback => { callback(); return 1; },
+  });
+  assert.equal(button.isConnected, true);
+  assert.equal(button.textContent, "Run RALF now");
+  assert.equal(typeof observed, "function");
+  assert.equal(sent.length, 0, "an initially idle composer does not reactivate RALF");
+  running = true;
+  observed();
+  await new Promise(resolve => setImmediate(resolve));
+  const reactivations = sent.filter(message => message.type === "local-codex-support/ralf-reactivate-v1");
+  assert.equal(reactivations.length, 1, "the send-to-stop transition reactivates the current RALF thread");
+  assert.equal(reactivations[0].conversationUrl, urlA);
+  observed();
+  assert.equal(sent.filter(message => message.type === "local-codex-support/ralf-reactivate-v1").length, 1,
+    "later stop-button mutations do not repeat the reactivation");
+  await click();
+  const manualChecks = sent.filter(message => message.type === "local-codex-support/ralf-check-now-v1");
+  assert.equal(manualChecks.length, 1);
+  assert.equal(manualChecks[0].conversationUrl, urlA);
+  assert.equal(button.disabled, false);
+  location.href = urlB;
+  observed();
+  assert.equal(sent.filter(message => message.type === "local-codex-support/ralf-reactivate-v1").length, 1,
+    "loading a different thread directly into a stop-button state does not reactivate it");
 }
 
 async function testRunningHydrationDetection() {
@@ -1236,6 +1379,114 @@ async function testRalfAutoRegistration(sync) {
   assert.deepEqual(registrationBodies.at(-1), { conversationUrl: urlB },
     "an AI-created project thread is registered from its saved conversation URL");
   assert.equal(commandResults.at(-1).ok, true);
+}
+
+async function testManualRalfWorkerRequest(sync) {
+  const generatedConfig = {};
+  vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), generatedConfig);
+  const extensionId = "a".repeat(32);
+  const storage = {};
+  const requests = [];
+  let runtimeListener;
+  let updatedListener;
+  const context = {
+    URL,
+    AbortSignal,
+    AbortController,
+    crypto: globalThis.crypto,
+    setTimeout,
+    clearTimeout,
+    console,
+    Response,
+    importScripts() {},
+    LOCAL_CODEX_THREAD_SYNC: generatedConfig.LOCAL_CODEX_THREAD_SYNC,
+    browser: {
+      runtime: {
+        id: extensionId,
+        onMessage: { addListener: listener => { runtimeListener = listener; } },
+        onInstalled: { addListener() {} },
+        onStartup: { addListener() {} },
+      },
+      tabs: {
+        onUpdated: { addListener: listener => { updatedListener = listener; } },
+        query: async () => [],
+        get: async () => ({ id: 7, url: urlA }),
+      },
+      webNavigation: {
+        onHistoryStateUpdated: { addListener() {} },
+        onCommitted: { addListener() {} },
+      },
+      scripting: { executeScript: async () => {} },
+      storage: { local: {
+        async get(query) {
+          if (typeof query === "string") return { [query]: storage[query] };
+          return { ...query, ...storage };
+        },
+        async set(values) { Object.assign(storage, values); },
+      } },
+    },
+    fetch: async (endpoint, options) => {
+      requests.push({ endpoint, options });
+      if (endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.ralfRegisterUrl) {
+        return new Response(JSON.stringify({ status: "registered" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ status: "scheduled" }), {
+        status: 202,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  };
+  vm.runInNewContext(await readFile("support-extension/service-worker.js", "utf8"), context);
+  await new Promise(resolve => setImmediate(resolve));
+  storage.ralf = true;
+
+  const response = await new Promise(resolve => {
+    const keepChannelOpen = runtimeListener({
+      type: "local-codex-support/ralf-check-now-v1",
+      conversationUrl: urlA,
+    }, {
+      id: extensionId,
+      frameId: 0,
+      tab: { id: 7 },
+      url: urlA,
+    }, resolve);
+    assert.equal(keepChannelOpen, true);
+  });
+  assert.equal(response.ok, true);
+  assert.equal(response.status, "scheduled");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].endpoint,
+    `${generatedConfig.LOCAL_CODEX_THREAD_SYNC.ralfThreadsUrl}/${parseConversationUrl(urlA).threadId}/check`);
+  assert.equal(requests[0].options.method, "PUT");
+  assert.equal(requests[0].options.headers.authorization, `Bearer ${sync.extensionToken}`);
+
+  updatedListener(7, { url: urlA });
+  await new Promise(resolve => setImmediate(resolve));
+  const registrationRequests = () => requests.filter(request =>
+    request.endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.ralfRegisterUrl);
+  assert.deepEqual(JSON.parse(registrationRequests()[0].options.body), { conversationUrl: urlA });
+
+  const reactivation = await new Promise(resolve => {
+    runtimeListener({
+      type: "local-codex-support/ralf-reactivate-v1",
+      conversationUrl: urlA,
+    }, {
+      id: extensionId,
+      frameId: 0,
+      tab: { id: 7 },
+      url: urlA,
+    }, resolve);
+  });
+  assert.equal(reactivation.ok, true);
+  assert.equal(registrationRequests().length, 2,
+    "composer reactivation bypasses navigation registration deduplication");
+  assert.deepEqual(JSON.parse(registrationRequests()[1].options.body), {
+    conversationUrl: urlA,
+    reactivate: true,
+  });
 }
 
 async function testAutomationRedirectGuard(sync) {

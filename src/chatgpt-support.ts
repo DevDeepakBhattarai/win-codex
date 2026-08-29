@@ -334,7 +334,7 @@ export class RalfRegistry {
     });
   }
 
-  async register(conversationUrl: string) {
+  async register(conversationUrl: string, options: { reactivate?: boolean } = {}) {
     const conversation = parseConversationUrl(conversationUrl);
     return this.update((state) => {
       if (!conversation.projectId || !state.projects.includes(conversation.projectId)) return false;
@@ -342,6 +342,11 @@ export class RalfRegistry {
       if (existing) {
         if (existing.conversationUrl !== conversation.conversationUrl) {
           existing.conversationUrl = conversation.conversationUrl;
+        }
+        if (options.reactivate && existing.state === "complete") {
+          existing.state = "active";
+          existing.lastError = undefined;
+          existing.nextCheckAt = Date.now() + state.loopIntervalMs;
         }
         return existing.state === "active";
       }
@@ -367,6 +372,16 @@ export class RalfRegistry {
   async isActive(threadId: string) {
     await this.queue;
     return this.state.threads.some((entry) => entry.threadId === threadId && entry.state === "active");
+  }
+
+  async scheduleNow(threadId: string): Promise<"scheduled" | "complete" | "missing"> {
+    return this.update((state) => {
+      const thread = state.threads.find((entry) => entry.threadId === threadId);
+      if (!thread) return "missing";
+      if (thread.state === "complete") return "complete";
+      thread.nextCheckAt = Date.now();
+      return "scheduled";
+    });
   }
 
   async recordRunning(threadId: string) {
@@ -814,7 +829,10 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
 }
 
 export function ralfRegistrationHandler(registry: RalfRegistry, extensionToken: string): RequestHandler {
-  const bodySchema = z.object({ conversationUrl: z.string().max(2048) }).strict();
+  const bodySchema = z.object({
+    conversationUrl: z.string().max(2048),
+    reactivate: z.boolean().optional(),
+  }).strict();
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
     const parsed = bodySchema.safeParse(req.body);
@@ -823,7 +841,9 @@ export function ralfRegistrationHandler(registry: RalfRegistry, extensionToken: 
       return;
     }
     try {
-      const registered = await registry.register(parsed.data.conversationUrl);
+      const registered = await registry.register(parsed.data.conversationUrl, {
+        reactivate: parsed.data.reactivate === true,
+      });
       res.setHeader("Cache-Control", "no-store");
       res.json({ status: registered ? "registered" : "ignored" });
     } catch (error) {
@@ -881,6 +901,33 @@ export function ralfThreadActiveHandler(registry: RalfRegistry, extensionToken: 
     }
     res.setHeader("Cache-Control", "no-store");
     res.json({ threadId: parsed.data, state: "active" });
+  };
+}
+
+export function ralfThreadCheckHandler(
+  registry: RalfRegistry,
+  controller: RalfController,
+  extensionToken: string,
+): RequestHandler {
+  return async (req, res) => {
+    if (!authenticateSupportExtension(req, res, extensionToken)) return;
+    const parsed = z.string().uuid().safeParse(req.params.threadId);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Invalid RALF thread id." });
+      return;
+    }
+    const result = await registry.scheduleNow(parsed.data);
+    if (result === "missing") {
+      res.status(404).json({ error: "RALF thread not found." });
+      return;
+    }
+    if (result === "complete") {
+      res.status(409).json({ error: "Mark this RALF thread active before checking it again." });
+      return;
+    }
+    await controller.tick();
+    res.setHeader("Cache-Control", "no-store");
+    res.status(202).json({ threadId: parsed.data, status: "scheduled" });
   };
 }
 

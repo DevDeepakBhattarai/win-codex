@@ -9,6 +9,8 @@
   const requestType = "local-codex-thread-sync/bind-v1";
   const responseType = "local-codex-thread-sync/result-v1";
   const automationType = "local-codex-support/automation-v1";
+  const manualRalfType = "local-codex-support/ralf-check-now-v1";
+  const reactivateRalfType = "local-codex-support/ralf-reactivate-v1";
   const sourceRoutes = new WeakMap();
   const pending = new Set();
   let route = location.pathname;
@@ -82,6 +84,8 @@
   };
 
   window.addEventListener("message", messageHandler);
+
+  installManualRalfButton();
 
   extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type !== automationType || !message.command) return;
@@ -304,6 +308,110 @@
       }));
     }
     if (!editorMatchesMessage(editor, message)) throw new Error("Could not insert the ChatGPT message.");
+  }
+
+  function installManualRalfButton() {
+    if (typeof document === "undefined" || typeof document.createElement !== "function" ||
+        typeof MutationObserver !== "function") return;
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "Run RALF now";
+    const defaultTitle = "Inspect this thread now and restart its RALF timer";
+    button.title = defaultTitle;
+    button.setAttribute("aria-live", "polite");
+    button.style.cssText = [
+      "position:fixed",
+      "right:16px",
+      "bottom:76px",
+      "z-index:2147483647",
+      "padding:8px 12px",
+      "border:1px solid rgba(255,255,255,.18)",
+      "border-radius:999px",
+      "background:#202123",
+      "color:#fff",
+      "box-shadow:0 4px 16px rgba(0,0,0,.22)",
+      "font:600 12px/1.2 ui-sans-serif,system-ui,sans-serif",
+      "cursor:pointer",
+    ].join(";");
+
+    let observedConversationUrl = null;
+    let previousComposerAction = null;
+
+    const observeComposerAction = () => {
+      const currentUrl = conversationUrl();
+      if (currentUrl !== observedConversationUrl) {
+        observedConversationUrl = currentUrl;
+        previousComposerAction = null;
+      }
+
+      const composer = document.querySelector('form[data-type="unified-composer"]');
+      if (!composer) return;
+      const action = composer.querySelector('button[data-testid="stop-button"]')
+        ? "stop"
+        : getSendButton() ? "send" : null;
+      if (!action) return;
+
+      if (action === "stop" && previousComposerAction === "send" &&
+          currentUrl?.startsWith("https://chatgpt.com/g/")) {
+        void extensionApi.runtime.sendMessage({
+          type: reactivateRalfType,
+          conversationUrl: currentUrl,
+        }).catch(() => undefined);
+      }
+      previousComposerAction = action;
+    };
+
+    const refresh = () => {
+      const currentUrl = conversationUrl();
+      const eligible = Boolean(currentUrl?.startsWith("https://chatgpt.com/g/"));
+      button.style.display = eligible ? "block" : "none";
+      if (eligible && document.body && !button.isConnected) document.body.appendChild(button);
+      observeComposerAction();
+    };
+
+    button.addEventListener("click", async () => {
+      const requestedUrl = conversationUrl();
+      if (!requestedUrl) return;
+      button.disabled = true;
+      button.style.cursor = "wait";
+      button.textContent = "Scheduling RALF...";
+      try {
+        const result = await extensionApi.runtime.sendMessage({
+          type: manualRalfType,
+          conversationUrl: requestedUrl,
+        });
+        if (!result?.ok) throw new Error(result?.error || "Could not schedule RALF.");
+        button.textContent = "RALF scheduled";
+        button.title = "RALF will inspect this thread now";
+      } catch (error) {
+        button.textContent = "RALF unavailable";
+        button.title = error instanceof Error ? error.message : String(error);
+      } finally {
+        setTimeout(() => {
+          if (conversationUrl() !== requestedUrl) return;
+          button.disabled = false;
+          button.style.cursor = "pointer";
+          button.textContent = "Run RALF now";
+          button.title = defaultTitle;
+        }, 2500);
+      }
+    });
+
+    const observer = new MutationObserver(refresh);
+    const start = () => {
+      refresh();
+      if (document.documentElement) {
+        observer.observe(document.documentElement, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["data-testid", "aria-label", "id"],
+        });
+      }
+    };
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start, { once: true });
+    else start();
   }
 
   function getComposer() {

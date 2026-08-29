@@ -30,7 +30,9 @@ RALF does not use Thread Sync for registration. The server keeps an explicit pro
 
 The **RALF threads** tab reads `/chatgpt-support/ralf/threads` and has separate Active and Completed views. A thread shows `retrying` when its last check failed, and the recorded error appears on the row. Use **Mark complete** to stop future checks manually. Use **Mark active** on a completed thread to schedule a fresh check using the configured loop interval.
 
-When a ChatGPT tab navigates to `/g/<project-id>/c/<thread-id>`, the support extension reports that URL to the RALF registration endpoint. The server registers it only when the project is allowlisted. This works for normal ChatGPT navigation and for project threads spawned by `chatgpt_message`. Removing a project from the allowlist removes its registered RALF threads.
+A project conversation shows a **Run RALF now** button. For an active registered thread, it makes the thread due immediately, runs the same inspection and classification path as the timer, and schedules the next check from the result. RALF automation must be enabled in at least one browser.
+
+When a ChatGPT tab navigates to `/g/<project-id>/c/<thread-id>`, the support extension reports that URL to the RALF registration endpoint. The server registers it only when the project is allowlisted. This works for normal ChatGPT navigation and for project threads spawned by `chatgpt_message`. On an existing project thread, the content script records the idle send-button state. If that composer changes to a stop button after a new message, the extension reactivates the RALF entry and starts a fresh loop interval. Loading a page that is already running does not reactivate it because no send-to-stop transition occurred. Removing a project from the allowlist removes its registered RALF threads.
 
 **RALF loop interval** controls the delay before checking a newly registered thread and before checking an active thread again. It defaults to 1500 seconds (25 minutes). The server persists this setting in `.data/ralf.json`, and saving a new value reschedules every active thread from the current time.
 
