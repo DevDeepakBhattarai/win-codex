@@ -222,6 +222,7 @@ export class SupportCommandBus {
 const ralfThreadSchema = z.object({
   conversationUrl: z.string().url(),
   threadId: z.string(),
+  manuallyRegistered: z.boolean().optional(),
   registeredAt: z.string(),
   nextCheckAt: z.number(),
   state: z.enum(["active", "complete"]),
@@ -327,6 +328,7 @@ export class RalfRegistry {
       state.projects = projects;
       const allowed = new Set(projects);
       state.threads = state.threads.filter((thread) => {
+        if (thread.manuallyRegistered) return true;
         const projectId = parseConversationUrl(thread.conversationUrl).projectId;
         return projectId !== undefined && allowed.has(projectId);
       });
@@ -334,16 +336,18 @@ export class RalfRegistry {
     });
   }
 
-  async register(conversationUrl: string, options: { reactivate?: boolean } = {}) {
+  async register(conversationUrl: string, options: { manual?: boolean; reactivate?: boolean } = {}) {
     const conversation = parseConversationUrl(conversationUrl);
     return this.update((state) => {
-      if (!conversation.projectId || !state.projects.includes(conversation.projectId)) return false;
+      const projectAllowed = conversation.projectId && state.projects.includes(conversation.projectId);
       const existing = state.threads.find((entry) => entry.threadId === conversation.threadId);
+      if (!options.manual && !projectAllowed && !existing?.manuallyRegistered) return false;
       if (existing) {
         if (existing.conversationUrl !== conversation.conversationUrl) {
           existing.conversationUrl = conversation.conversationUrl;
         }
-        if (options.reactivate && existing.state === "complete") {
+        if (options.manual) existing.manuallyRegistered = true;
+        if ((options.manual || options.reactivate) && existing.state === "complete") {
           existing.state = "active";
           existing.lastError = undefined;
           existing.nextCheckAt = Date.now() + state.loopIntervalMs;
@@ -354,6 +358,7 @@ export class RalfRegistry {
       state.threads.push({
         conversationUrl: conversation.conversationUrl,
         threadId: conversation.threadId,
+        ...(options.manual ? { manuallyRegistered: true } : {}),
         registeredAt: new Date().toISOString(),
         nextCheckAt: Date.now() + state.loopIntervalMs,
         state: "active",
@@ -831,6 +836,7 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
 export function ralfRegistrationHandler(registry: RalfRegistry, extensionToken: string): RequestHandler {
   const bodySchema = z.object({
     conversationUrl: z.string().max(2048),
+    manual: z.boolean().optional(),
     reactivate: z.boolean().optional(),
   }).strict();
   return async (req, res) => {
@@ -842,6 +848,7 @@ export function ralfRegistrationHandler(registry: RalfRegistry, extensionToken: 
     }
     try {
       const registered = await registry.register(parsed.data.conversationUrl, {
+        manual: parsed.data.manual === true,
         reactivate: parsed.data.reactivate === true,
       });
       res.setHeader("Cache-Control", "no-store");

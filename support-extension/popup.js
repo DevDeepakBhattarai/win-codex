@@ -20,6 +20,7 @@ function validateLoopbackEndpoint(value, pathname) {
 }
 
 const ralfProjectsEndpoint = validateLoopbackEndpoint(config?.ralfProjectsUrl, "/chatgpt-support/ralf/projects");
+const ralfRegisterEndpoint = validateLoopbackEndpoint(config?.ralfRegisterUrl, "/chatgpt-support/ralf/register");
 const ralfSettingsEndpoint = validateLoopbackEndpoint(config?.ralfSettingsUrl, "/chatgpt-support/ralf/settings");
 const ralfThreadsEndpoint = validateLoopbackEndpoint(config?.ralfThreadsUrl, "/chatgpt-support/ralf/threads");
 
@@ -88,6 +89,54 @@ const relativeTime = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" })
 const TIME_UNITS = [["day", 86_400], ["hour", 3_600], ["minute", 60], ["second", 1]];
 let threadFilter = "active";
 let loadedThreads = [];
+let currentConversationUrl;
+
+function conversationUrl(value) {
+  if (typeof value !== "string") return undefined;
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return undefined;
+  }
+  if (url.origin !== "https://chatgpt.com" || url.username || url.password ||
+      !/^(?:\/g\/[A-Za-z0-9_-]+)?\/c\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\/?$/i.test(url.pathname)) return undefined;
+  return `${url.origin}${url.pathname.replace(/\/$/, "")}`;
+}
+
+async function loadCurrentThread() {
+  const button = element("markCurrentThread");
+  const status = element("currentThreadStatus");
+  const [tab] = await extensionApi.tabs.query({ active: true, currentWindow: true });
+  currentConversationUrl = conversationUrl(tab?.url);
+  button.disabled = !currentConversationUrl;
+  setNote(status, currentConversationUrl
+    ? currentConversationUrl
+    : "Open a saved ChatGPT thread in this tab.");
+}
+
+async function markCurrentThread() {
+  const button = element("markCurrentThread");
+  const status = element("currentThreadStatus");
+  button.disabled = true;
+  button.textContent = "Marking...";
+  try {
+    await loadCurrentThread();
+    if (!currentConversationUrl) return;
+    await callServer(ralfRegisterEndpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ conversationUrl: currentConversationUrl, manual: true }),
+    });
+    setNote(status, "Marked for RALF. The project filter will not remove this thread.");
+    await loadThreads();
+  } catch (error) {
+    setNote(status, errorMessage(error, "Could not mark the current thread for RALF."), "error");
+  } finally {
+    button.textContent = "Mark for RALF";
+    button.disabled = !currentConversationUrl;
+  }
+}
 
 function formatRelative(timestamp) {
   const deltaSeconds = (timestamp - Date.now()) / 1000;
@@ -268,7 +317,7 @@ async function load() {
   }
   element(SUBAGENT_PROJECT_KEY).value = settings[SUBAGENT_PROJECT_KEY] ?? "";
   element(RALF_MIN_WORKED_SECONDS_KEY).value = String(settings[RALF_MIN_WORKED_SECONDS_KEY]);
-  await Promise.all([loadRalfProjects(), loadRalfSettings(), loadThreads()]);
+  await Promise.all([loadCurrentThread(), loadRalfProjects(), loadRalfSettings(), loadThreads()]);
 }
 
 async function notifySettingsChanged() {
@@ -411,6 +460,7 @@ element("saveSubagentProject").addEventListener("click", () => void saveSubagent
 element("saveRalfLoopInterval").addEventListener("click", () => void saveRalfLoopInterval());
 element("saveRalfTime").addEventListener("click", () => void saveRalfTime());
 element("saveRalfProjects").addEventListener("click", () => void saveRalfProjects());
+element("markCurrentThread").addEventListener("click", () => void markCurrentThread());
 element("refreshThreads").addEventListener("click", () => void loadThreads());
 for (const button of document.querySelectorAll("[data-thread-filter]")) {
   button.addEventListener("click", () => selectThreadFilter(button.dataset.threadFilter));

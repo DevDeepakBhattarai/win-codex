@@ -65,6 +65,11 @@ try {
     "active RALF thread cards expose a manual completion action");
   assert.match(preparedPopupScript, /Mark active/,
     "completed RALF thread cards expose a manual reactivation action");
+  assert.match(preparedPopup, /id="markCurrentThread"/, "the popup can mark its active ChatGPT thread for RALF");
+  assert.match(preparedPopupScript, /tabs\.query\(\{ active: true, currentWindow: true \}\)/,
+    "manual RALF registration reads the current tab URL");
+  assert.match(preparedPopupScript, /JSON\.stringify\(\{ conversationUrl: currentConversationUrl, manual: true \}\)/,
+    "the popup requests a project-filter override for the current thread");
   assert.match(preparedPopup, /data-thread-filter="active"/);
   assert.match(preparedPopup, /data-thread-filter="complete"/);
   const preparedConfig = {};
@@ -248,6 +253,27 @@ try {
   assert.equal((await projectScopedRegistry.due()).length, 0,
     "removing a RALF project removes its registered threads");
   assert.deepEqual(await projectScopedRegistry.threads(), []);
+  assert.deepEqual(await registerThread({ conversationUrl: urlA, manual: true }), {
+    code: 200,
+    body: { status: "registered" },
+  });
+  assert.deepEqual((await projectScopedRegistry.threads()).map(thread => ({
+    conversationUrl: thread.conversationUrl,
+    manuallyRegistered: thread.manuallyRegistered,
+    state: thread.state,
+  })), [{ conversationUrl: urlA, manuallyRegistered: true, state: "active" }],
+  "the popup can register a thread whose project is not allowlisted");
+  await projectScopedRegistry.setProjects([]);
+  assert.equal((await projectScopedRegistry.threads()).length, 1,
+    "project allowlist changes retain manually registered threads");
+  await completeThread(parseConversationUrl(urlA).threadId);
+  await registerThread({ conversationUrl: urlA, manual: true });
+  assert.equal(await projectScopedRegistry.isActive(parseConversationUrl(urlA).threadId), true,
+    "marking a completed thread from the popup starts a fresh RALF loop");
+  await completeThread(parseConversationUrl(urlA).threadId);
+  await registerThread({ conversationUrl: urlA, reactivate: true });
+  assert.equal(await projectScopedRegistry.isActive(parseConversationUrl(urlA).threadId), true,
+    "new messages can reactivate a manually registered thread outside the project allowlist");
 
   const timingRoot = path.join(temporaryRoot, "ralf-timing");
   const timingRegistry = await RalfRegistry.open(timingRoot);

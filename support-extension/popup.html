@@ -33,6 +33,13 @@
 
   <main>
     <section id="panel-threads" class="panel" role="tabpanel" aria-labelledby="tab-threads">
+      <div class="current-thread">
+        <div>
+          <strong>Current thread</strong>
+          <p id="currentThreadStatus" class="note">Checking the active tab...</p>
+        </div>
+        <button id="markCurrentThread" class="button" type="button" disabled>Mark for RALF</button>
+      </div>
       <div class="toolbar">
         <div class="counts" aria-label="Filter RALF threads by state">
           <button class="count" type="button" data-thread-filter="active" data-state="active" aria-pressed="true">
