@@ -48,7 +48,6 @@ import {
   createBrowserService,
   type BrowserActionInput,
   type BrowserDownloadInput,
-  type BrowserOwnershipActionInput,
 } from "./browser.js";
 import {
   prepareThreadSync,
@@ -1594,10 +1593,9 @@ function createMcpServer(ownerId: string) {
       THREAD_SYNC_AGENT_INSTRUCTION,
     ] : []),
     ...(BROWSER_BRIDGE_ENABLED ? [
-      "Call browser_open with the desired URL to begin browsing. Browser tools start Chrome when disconnected and wait for its installed extension to connect.",
-      "Use browser_snapshot before interacting and use fresh element refs. Existing user tabs require browser_tabs followed by browser_tab claim with the listed title and URL.",
-      "tabId is optional. Omit it to use the active tab in the last-focused window, or pass it to target a specific tab. Separate tabs can run concurrently, and tasks may switch or share tabs. Use browser_open active=false to open a background tab.",
-      "All tasks share one browser profile and controlled-tab list. When browser work is finished, release every controlled tab before ending the task unless the tab is intentionally preserved as a deliverable or handoff. Releasing a tab removes browser control without closing it. Cleanup affects all controlled tabs and consumes preservation marks; use individual release when other tasks may still be using the browser.",
+      "Start each tab exactly once. Call browser_open for a new tab; it returns an already-controlled tabId. To use an existing user tab, call browser_tabs, then browser_claim with that tab's exact tabId, title, and URL. Never claim a tab returned by browser_open or a tab whose controlled field is already true.",
+      "Keep the returned tabId and pass it to later browser calls. Use browser_snapshot before interacting and use fresh element refs.",
+      "For each tab you opened or claimed, browser_release is the last browser call for that tab. It closes tabs created by browser_open and removes control from claimed user tabs without closing them. Do not release a tab that this task did not open or claim, and do not use a tab after releasing it.",
     ] : []),
   ];
   const server = new McpServer({
@@ -1840,7 +1838,7 @@ function createMcpServer(ownerId: string) {
       {
         title: "List Chrome Tabs",
         description:
-          "List tabs in the user's real Chrome profile, starting Chrome if disconnected. Tabs are shared across tasks. Before controlling a user tab, call browser_tab action=claim with its listed title and URL; tabId selects a specific tab and may be omitted for the active tab. The claim fails if the tab changes after listing.",
+          "List tabs in the user's real Chrome profile before claiming an existing tab. Claim only a tab with ownership=user and controlled=false. Pass its exact tabId, title, and URL to browser_claim. The claim fails if the tab changes after listing.",
         inputSchema: {},
         annotations: {
           readOnlyHint: false,
@@ -1858,16 +1856,39 @@ function createMcpServer(ownerId: string) {
     );
 
     server.registerTool(
-      "browser_tab",
+      "browser_claim",
       {
-        title: "Manage Chrome Tab Ownership",
+        title: "Claim Existing Chrome Tab",
         description:
-          "Claim or release a user tab, mark a controlled tab as a deliverable or handoff, or clean up all controlled tabs across tasks. Starts Chrome if disconnected. Claim requires the exact title and URL from browser_tabs. tabId is optional and defaults to the active tab. Release is the normal final step for browser work: before ending the task, release every controlled tab that is not intentionally preserved as a deliverable or handoff. Releasing removes browser control without closing the tab. Cleanup closes unmarked agent tabs, releases unmarked user tabs, and preserves marked tabs for one cleanup only.",
+          "Take control of one existing user tab. This must be the first control operation for that tab. Pass the exact tabId, title, and URL from the latest browser_tabs result. Do not call this for tabs created by browser_open or tabs whose controlled field is already true.",
         inputSchema: {
-          action: z.enum(["claim", "release", "mark_deliverable", "mark_handoff", "cleanup"]),
-          tabId: z.number().int().nonnegative().optional(),
-          title: z.string().optional().describe("Exact title from browser_tabs, required for claim."),
-          url: z.string().optional().describe("Exact URL from browser_tabs, required for claim."),
+          tabId: z.number().int().nonnegative().describe("Exact Chrome tab ID from browser_tabs."),
+          title: z.string().describe("Exact title from browser_tabs."),
+          url: z.string().describe("Exact URL from browser_tabs."),
+        },
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          openWorldHint: false,
+        },
+      },
+      async (input) => {
+        const structuredContent = await browserService.claimTab(input);
+        return {
+          content: textContentFromStructuredContent(structuredContent),
+          structuredContent,
+        };
+      },
+    );
+
+    server.registerTool(
+      "browser_release",
+      {
+        title: "Release Chrome Tab",
+        description:
+          "End control of one tab. This must be the last browser operation for that tab. It closes a tab created by browser_open. It removes control from an existing user tab claimed with browser_claim without closing that tab. Release only tabs the current task opened or claimed.",
+        inputSchema: {
+          tabId: z.number().int().nonnegative().describe("Exact Chrome tab ID returned when control began."),
         },
         annotations: {
           readOnlyHint: false,
@@ -1875,8 +1896,8 @@ function createMcpServer(ownerId: string) {
           openWorldHint: false,
         },
       },
-      async (input) => {
-        const structuredContent = await browserService.manageTab(input as BrowserOwnershipActionInput);
+      async ({ tabId }) => {
+        const structuredContent = await browserService.releaseTab(tabId);
         return {
           content: textContentFromStructuredContent(structuredContent),
           structuredContent,
@@ -1889,7 +1910,7 @@ function createMcpServer(ownerId: string) {
       {
         title: "Open Chrome Tab",
         description:
-          "Open a tab at the desired URL in the user's real Chrome profile. Automatically start Chrome if disconnected and wait for its installed extension; call this directly without a process-launch or status prerequisite. Returns a controlled tabId and semantic snapshot. Tabs can be used concurrently. Set active=false to open in the background. Use browser_snapshot for a screenshot.",
+          "Open and take control of a new tab in the user's real Chrome profile. Call this directly; it starts Chrome if needed and waits for the extension. The returned tabId is already controlled, so do not claim it. Pass that tabId to later calls. When work in the tab is done, call browser_release as the final operation; it closes this agent-opened tab.",
         inputSchema: {
           url: z.string().url().optional().describe("Optional http:// or https:// URL to open."),
           active: z.boolean().default(true).describe("Whether the new tab should become active."),
@@ -1929,10 +1950,11 @@ function createMcpServer(ownerId: string) {
       {
         title: "Act In Chrome",
         description:
-          "Perform one action in a controlled Chrome tab, starting Chrome if disconnected, then return a fresh snapshot. tabId is optional: omit it for the active tab or pass it for a specific tab, including a background tab. Tasks may switch or share tabs. Existing user tabs require browser_tab claim. Prefer fresh element refs from browser_snapshot over selectors or coordinates.",
+          "Perform one action in a controlled Chrome tab and return a fresh snapshot. Pass the tabId returned by browser_open or browser_claim. Existing user tabs must be claimed first. Prefer fresh element refs from browser_snapshot over selectors or coordinates. Use close only when you intentionally need to close a tab immediately; browser_release is the normal final operation.",
         inputSchema: {
           tabId: z.number().int().nonnegative().optional().describe("Chrome tab ID. Omit to use the active tab in the last-focused window."),
-          action: z.enum(["navigate", "back", "forward", "reload", "click", "dblclick", "type", "press", "scroll", "wait", "activate", "close"]),
+          action: z.enum(["navigate", "back", "forward", "reload", "click", "dblclick", "type", "press", "scroll", "wait", "activate", "close"])
+            .describe("Action to perform. Prefer browser_release over close when finishing normal browser work."),
           url: z.string().optional().describe("Destination for navigate."),
           ref: z.string().optional().describe("Fresh element ref from the latest browser snapshot, such as e3."),
           locator: z.string().optional().describe("Playwright-style locator, for example css=#save or text=Continue."),

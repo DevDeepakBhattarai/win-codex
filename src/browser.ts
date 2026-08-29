@@ -38,7 +38,6 @@ export type BrowserTab = {
   url?: string;
   ownership?: "user" | "agent" | "claimed";
   controlled?: boolean;
-  mark?: "deliverable" | "handoff";
   parentTabId?: number;
 };
 
@@ -131,13 +130,6 @@ export type BrowserActionInput = {
   bypassCache?: boolean;
   button?: "left" | "middle" | "right";
   force?: boolean;
-};
-
-export type BrowserOwnershipActionInput = {
-  action: "claim" | "release" | "mark_deliverable" | "mark_handoff" | "cleanup";
-  tabId?: number;
-  title?: string;
-  url?: string;
 };
 
 export type BrowserDownload = {
@@ -236,7 +228,6 @@ type PendingDownload = {
 type BrowserTabState = {
   ownership: "agent" | "claimed";
   parentTabId?: number;
-  mark?: "deliverable" | "handoff";
   epoch: number;
   attached: boolean;
   attaching?: Promise<void>;
@@ -531,7 +522,7 @@ export class BrowserService {
     }
     this.downloadWaiters.clear();
     await Promise.all(
-      [...this.states.keys()].map((tabId) => this.releaseTab(tabId).catch(() => undefined)),
+      [...this.states.keys()].map((tabId) => this.detachTab(tabId).catch(() => undefined)),
     );
     await this.bridge.close();
   }
@@ -660,40 +651,36 @@ export class BrowserService {
     });
   }
 
-  async manageTab(input: BrowserOwnershipActionInput) {
+  async claimTab(input: { tabId: number; title: string; url: string }) {
     await this.ensureConnected();
-    if (input.action === "cleanup") return await this.cleanupTabs();
     const tabId = await this.resolveTabId(input.tabId);
-
-    if (input.action === "claim") {
-      if (this.states.has(tabId)) return { tab: this.describeTab(await this.bridge.request<BrowserTab>("tabs.get", { tabId })) };
-      const listing = this.claimListings.get(tabId);
-      if (!listing || Date.now() - listing.listedAt > CLAIM_LISTING_TTL_MS) {
-        throw new Error("The tab claim listing is missing or expired. List browser tabs again before claiming.");
-      }
-      if (input.title !== listing.title || input.url !== listing.url) {
-        throw new Error("The tab title or URL does not match the latest browser tab listing.");
-      }
-      const current = await this.bridge.request<BrowserTab>("tabs.get", { tabId });
-      if (current.title !== listing.title || current.url !== listing.url) {
-        this.claimListings.delete(tabId);
-        throw new Error("The browser tab changed after it was listed. List tabs again before claiming.");
-      }
-      this.createState(tabId, "claimed");
+    if (this.states.has(tabId)) return { tab: this.describeTab(await this.bridge.request<BrowserTab>("tabs.get", { tabId })) };
+    const listing = this.claimListings.get(tabId);
+    if (!listing || Date.now() - listing.listedAt > CLAIM_LISTING_TTL_MS) {
+      throw new Error("The tab claim listing is missing or expired. List browser tabs again before claiming.");
+    }
+    if (input.title !== listing.title || input.url !== listing.url) {
+      throw new Error("The tab title or URL does not match the latest browser tab listing.");
+    }
+    const current = await this.bridge.request<BrowserTab>("tabs.get", { tabId });
+    if (current.title !== listing.title || current.url !== listing.url) {
       this.claimListings.delete(tabId);
-      await this.ensureAttached(tabId);
-      this.recordAction(tabId, "claim");
-      return { tab: this.describeTab(current) };
+      throw new Error("The browser tab changed after it was listed. List tabs again before claiming.");
     }
+    this.createState(tabId, "claimed");
+    this.claimListings.delete(tabId);
+    await this.ensureAttached(tabId);
+    this.recordAction(tabId, "claim");
+    return { tab: this.describeTab(current) };
+  }
 
-    const state = this.state(tabId);
-    if (input.action === "release") {
-      await this.releaseTab(tabId);
-      return { tabId, released: true };
-    }
-    state.mark = input.action === "mark_handoff" ? "handoff" : "deliverable";
-    this.recordAction(tabId, input.action);
-    return { tab: this.describeTab(await this.bridge.request<BrowserTab>("tabs.get", { tabId })) };
+  async releaseTab(tabId: number) {
+    await this.ensureConnected();
+    const resolvedTabId = await this.resolveTabId(tabId);
+    const state = this.state(resolvedTabId);
+    const origin = state.ownership === "agent" ? "opened" : "claimed";
+    const closed = await this.finishTab(resolvedTabId);
+    return { tabId: resolvedTabId, origin, closed };
   }
 
   async upload(input: { tabId?: number; ref?: string; locator?: string; files: string[]; timeoutMs?: number }) {
@@ -828,12 +815,25 @@ export class BrowserService {
       ...tab,
       ownership: state?.ownership ?? "user",
       controlled: Boolean(state),
-      ...(state?.mark ? { mark: state.mark } : {}),
       ...(state?.parentTabId !== undefined ? { parentTabId: state.parentTabId } : {}),
     };
   }
 
-  private async releaseTab(tabId: number) {
+  private async finishTab(tabId: number) {
+    const state = this.state(tabId);
+    if (state.ownership === "agent") {
+      await state.attaching?.catch(() => undefined);
+      this.fileChooserWaiters.get(tabId)?.reject(new Error("Browser tab was closed."));
+      this.fileChooserWaiters.delete(tabId);
+      await this.bridge.request("tabs.close", { tabId });
+      this.states.delete(tabId);
+      return true;
+    }
+    await this.detachTab(tabId);
+    return false;
+  }
+
+  private async detachTab(tabId: number) {
     const state = this.state(tabId);
     await state.attaching?.catch(() => undefined);
     await this.bridge.request("overlay.hide", { tabId }).catch(() => undefined);
@@ -843,29 +843,6 @@ export class BrowserService {
     this.fileChooserWaiters.get(tabId)?.reject(new Error("Browser tab control was released."));
     this.fileChooserWaiters.delete(tabId);
     this.states.delete(tabId);
-  }
-
-  private async cleanupTabs() {
-    const closed: number[] = [];
-    const released: number[] = [];
-    const preserved: Array<{ tabId: number; mark: "deliverable" | "handoff" }> = [];
-
-    for (const [tabId, state] of [...this.states]) {
-      if (state.mark) {
-        preserved.push({ tabId, mark: state.mark });
-        state.mark = undefined;
-        continue;
-      }
-      if (state.ownership === "agent") {
-        await this.bridge.request("tabs.close", { tabId }).catch(() => undefined);
-        this.states.delete(tabId);
-        closed.push(tabId);
-      } else {
-        await this.releaseTab(tabId);
-        released.push(tabId);
-      }
-    }
-    return { closed, released, preserved };
   }
 
   private createFileChooserWaiter(tabId: number, timeoutMs: number) {

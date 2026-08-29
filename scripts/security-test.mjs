@@ -168,6 +168,11 @@ async function postMcp(body, accessToken, extraHeaders = {}) {
   };
 }
 
+function parseMcpPayload(responseText) {
+  const dataLine = responseText.split(/\r?\n/).find(line => line.startsWith("data: "));
+  return JSON.parse(dataLine ? dataLine.slice(6) : responseText);
+}
+
 async function waitForServer() {
   const started = Date.now();
   while (Date.now() - started < 30000) {
@@ -335,8 +340,11 @@ try {
   if (initialized.sessionId !== null) {
     throw new Error(`Stateless initialize unexpectedly returned Mcp-Session-Id: ${initialized.sessionId}`);
   }
-  if (!initialized.responseText.includes("tabId is optional") || !initialized.responseText.includes("Browser tools start Chrome")) {
-    throw new Error("Initialize did not deliver the browser startup and tab instructions.");
+  if (
+    !initialized.responseText.includes("Start each tab exactly once") ||
+    !initialized.responseText.includes("browser_release is the last browser call")
+  ) {
+    throw new Error("Initialize did not deliver the browser tab lifecycle instructions.");
   }
 
   const toolsListBody = {
@@ -347,22 +355,34 @@ try {
   };
   const protocolHeaders = { "mcp-protocol-version": "2025-06-18" };
   const toolsList = await postMcp(toolsListBody, token.access_token, protocolHeaders);
+  const toolsPayload = parseMcpPayload(toolsList.responseText);
+  const tools = toolsPayload.result.tools;
+  const toolNames = new Set(tools.map(tool => tool.name));
   if (
     toolsList.status !== 200 ||
-    !toolsList.responseText.includes("terminal") ||
-    !toolsList.responseText.includes("analyze_image") ||
-    !toolsList.responseText.includes("browser_snapshot") ||
-    !toolsList.responseText.includes("browser_action") ||
-    !toolsList.responseText.includes("browser_tab") ||
-    !toolsList.responseText.includes("browser_upload") ||
-    !toolsList.responseText.includes("browser_download")
+    !["terminal", "analyze_image", "browser_snapshot", "browser_action", "browser_claim", "browser_release", "browser_upload", "browser_download"]
+      .every(name => toolNames.has(name))
   ) {
     throw new Error(`Authenticated tools/list failed: ${JSON.stringify(toolsList)}`);
   }
-  for (const removedTool of ["read_text_file", "write_text_file", "list_directory", "browser_status", "browser_clipboard"]) {
-    if (toolsList.responseText.includes(`"name":"${removedTool}"`)) {
+  for (const removedTool of ["read_text_file", "write_text_file", "list_directory", "browser_status", "browser_tab", "browser_clipboard"]) {
+    if (toolNames.has(removedTool)) {
       throw new Error(`Removed tool is still advertised: ${removedTool}`);
     }
+  }
+  const claimSchema = tools.find(tool => tool.name === "browser_claim")?.inputSchema;
+  const releaseSchema = tools.find(tool => tool.name === "browser_release")?.inputSchema;
+  if (
+    claimSchema?.required?.length !== 3 ||
+    !["tabId", "title", "url"].every(field => claimSchema.required.includes(field)) ||
+    releaseSchema?.required?.length !== 1 ||
+    !releaseSchema.required.includes("tabId") ||
+    "title" in (releaseSchema?.properties ?? {}) ||
+    "url" in (releaseSchema?.properties ?? {})
+  ) {
+    throw new Error(
+      `Browser claim/release schemas are not exact: ${JSON.stringify({ claimSchema, releaseSchema })}`,
+    );
   }
   if (toolsList.sessionId !== null) {
     throw new Error(`Stateless tools/list unexpectedly returned Mcp-Session-Id: ${toolsList.sessionId}`);
@@ -479,7 +499,8 @@ try {
     browserToolsAdvertised:
       toolsList.responseText.includes("browser_snapshot") &&
       toolsList.responseText.includes("browser_action") &&
-      toolsList.responseText.includes("browser_tab") &&
+      toolsList.responseText.includes("browser_claim") &&
+      toolsList.responseText.includes("browser_release") &&
       toolsList.responseText.includes("browser_upload") &&
       toolsList.responseText.includes("browser_download"),
     macTerminalUsesBash: macTerminalInvocation.executable === "/bin/bash",

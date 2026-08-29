@@ -131,10 +131,6 @@ try {
   const cspTab = await service.open({ url: `${baseUrl}/csp`, active: false });
   await assertControlFavicon(context, cspTab.snapshot.tabId);
   await service.action({ tabId: cspTab.snapshot.tabId, action: "close" });
-  await service.manageTab({ action: "release", tabId: startupTabs[0] });
-  await waitUntil(async () => !isControlFavicon(await tabFavicon(context, startupTabs[0])), 5_000, "favicon restoration on a page without icon links");
-  const releasedStartup = (await service.listTabs()).find(tab => tab.id === startupTabs[0]);
-  await service.manageTab({ action: "claim", tabId: releasedStartup.id, title: releasedStartup.title, url: releasedStartup.url });
   for (const tabId of startupTabs) await service.action({ tabId, action: "close" });
 
   // Exercise the native executable launcher without touching the user's profile.
@@ -251,8 +247,8 @@ try {
   assert.ok(listedUserTab);
   const originalIcons = await readFavicons(userPage);
   await userPage.bringToFront();
-  await service.manageTab({
-    action: "claim",
+  await service.claimTab({
+    tabId: listedUserTab.id,
     title: listedUserTab.title,
     url: listedUserTab.url,
   });
@@ -262,30 +258,34 @@ try {
     "claimed-tab control aura",
   );
   await assertControlFavicon(context, listedUserTab.id);
-  await service.manageTab({ action: "release", tabId: listedUserTab.id });
+  await service.releaseTab(listedUserTab.id);
   assert.deepEqual(await readFavicons(userPage), originalIcons);
   await waitUntil(async () => (await tabFavicon(context, listedUserTab.id)) === `${baseUrl}/favicon.svg`, 5_000, "restored site favicon");
   await service.listTabs();
-  await service.manageTab({ action: "claim", tabId: listedUserTab.id, title: listedUserTab.title, url: listedUserTab.url });
+  await service.claimTab({ tabId: listedUserTab.id, title: listedUserTab.title, url: listedUserTab.url });
   await userPage.evaluate(() => {
     document.querySelector('link[rel="icon"]').setAttribute("href", "/updated.svg");
   });
   await waitUntil(async () => isControlFavicon((await readFavicons(userPage))[0].href), 5_000, "control favicon after site update");
 
+  const releasedAgentTab = await service.open({ url: `${baseUrl}/second`, active: false });
+  await service.releaseTab(releasedAgentTab.snapshot.tabId);
+  assert.equal(
+    (await service.listTabs()).some((tab) => tab.id === releasedAgentTab.snapshot.tabId),
+    false,
+    "releasing an agent-opened tab must close it",
+  );
+
   const newWindow = await service.open({ url: `${baseUrl}/second`, active: false, newWindow: true });
   const newWindowTabId = newWindow.snapshot.tabId;
-  await service.manageTab({ action: "mark_deliverable", tabId: agentTabId });
-  await service.manageTab({ action: "mark_handoff", tabId: listedUserTab.id });
-
-  const firstCleanup = await service.manageTab({ action: "cleanup" });
-  assert.ok(firstCleanup.closed.includes(newWindowTabId));
-  assert.ok(firstCleanup.closed.includes(popup.id));
-  assert.ok(firstCleanup.preserved.some((entry) => entry.tabId === agentTabId && entry.mark === "deliverable"));
-  assert.ok(firstCleanup.preserved.some((entry) => entry.tabId === listedUserTab.id && entry.mark === "handoff"));
-
-  const secondCleanup = await service.manageTab({ action: "cleanup" });
-  assert.ok(secondCleanup.closed.includes(agentTabId));
-  assert.ok(secondCleanup.released.includes(listedUserTab.id));
+  const popupRelease = await service.releaseTab(popup.id);
+  assert.deepEqual(popupRelease, { tabId: popup.id, origin: "opened", closed: true });
+  const windowRelease = await service.releaseTab(newWindowTabId);
+  assert.deepEqual(windowRelease, { tabId: newWindowTabId, origin: "opened", closed: true });
+  const agentRelease = await service.releaseTab(agentTabId);
+  assert.deepEqual(agentRelease, { tabId: agentTabId, origin: "opened", closed: true });
+  const userRelease = await service.releaseTab(listedUserTab.id);
+  assert.deepEqual(userRelease, { tabId: listedUserTab.id, origin: "claimed", closed: false });
   const releasedUserTab = (await service.listTabs()).find((tab) => tab.id === listedUserTab.id);
   assert.equal(releasedUserTab?.controlled, false);
   assert.equal(releasedUserTab?.ownership, "user");

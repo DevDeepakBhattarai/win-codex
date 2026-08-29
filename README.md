@@ -102,7 +102,8 @@ Once connected, ChatGPT can call the following tools to inspect, modify, and bui
     *   *Features*: Uses ChatGPT `openai/fileParams`, bounded HTTPS downloads, redirect limits, optional parent-directory creation, and overwrite control.
 *   **`start_process`**: Start an executable with strict argument-array semantics (no shell interpolation), optionally waiting for completion.
 *   **`browser_tabs`**: List tabs from the user's real Chrome profile with ownership state.
-*   **`browser_tab`**: Claim or release user tabs, mark handoffs or deliverables, and clean up agent-created tabs.
+*   **`browser_claim`**: Claim one existing user tab using the exact tab ID, title, and URL returned by `browser_tabs`.
+*   **`browser_release`**: End control of one tab. It closes agent-opened tabs and leaves claimed user tabs open.
 *   **`browser_open`**: Start Chrome if needed, wait for its extension, and open an agent-owned tab or window with automation attached.
 *   **`browser_snapshot`**: Inspect a tab with visible text, fresh element refs, related popups, a compact accessibility tree, console/network diagnostics, and an optional PNG screenshot.
 *   **`browser_action`**: Navigate, go back or forward, reload, click, double-click, type, press keys, scroll, wait, activate, or close a tab. Every action returns a fresh semantic snapshot.
@@ -200,11 +201,11 @@ Chrome must be installed and the generated extension must be loaded once. If the
 
 Chrome normally opens its default startup profile. If your extension is in another profile, set `BROWSER_PROFILE_DIRECTORY` to its directory name, such as `Profile 1`. For a custom user data location, also set `BROWSER_USER_DATA_DIRECTORY`. An already connected browser is reused regardless of these launch settings.
 
-### Tabs shared across tasks
+### Browser tab lifecycle
 
-`tabId` remains optional. Omit it to use the active tab in the last-focused window, or pass a tab ID to target a specific tab. Different tabs can run concurrently, including background tabs opened with `active: false`. Tasks can switch tabs or share the same tab. Existing user tabs still require a title-and-URL-checked claim before control.
+Start a tab in one of two ways. Use `browser_open` for a new tab; the returned tab is already controlled. To use an existing tab, call `browser_tabs` and then `browser_claim` with the exact `tabId`, title, and URL from that listing. Keep the returned `tabId` and pass it to later browser calls.
 
-All tasks share the profile and controlled-tab list. `browser_tab` with `action: "cleanup"` applies to all controlled tabs, not just one task's tabs. Close or release individual tabs when another task is still using the browser.
+`browser_release` is the final operation for a tab. It closes a tab created by `browser_open`. For a claimed user tab, it removes the control indicators and debugger attachment without closing the tab. Release only tabs the current task opened or claimed. There is no bulk browser cleanup action.
 
 Controlled pages show the viewport aura, animated mouse pointer, and a mouse favicon. The site favicon is restored when control is released. There is no control pill on the page. After an extension update, restart the server to refresh `.data/browser-extension`, reload the extension in `chrome://extensions`, and reload existing pages to replace their content scripts. Chrome's own debugger notification is separate from the page indicators.
 
@@ -264,7 +265,7 @@ Run `pnpm support:prepare` to generate `.data/support-extension` without startin
 *   **Visible Browser Control**: Controlled tabs show a blue viewport aura, an animated click pointer, and a mouse favicon. The overlay cannot receive input; release removes it and restores the site favicon.
 *   **Stale Element Protection**: Browser element refs are scoped to the latest snapshot and page epoch. Navigation or document changes invalidate old refs instead of clicking a recycled target.
 *   **Semantic Browser State**: Automation prefers Playwright locator semantics plus Chrome's accessibility tree. Coordinates are only a fallback for visual/canvas targets.
-*   **Tab Ownership**: Existing user tabs require a fresh title-and-URL-checked claim. Popups inherit agent ownership from their opener. Cleanup closes unmarked agent tabs and releases unmarked user tabs without closing them.
+*   **Tab Ownership**: Existing user tabs require a fresh title-and-URL-checked claim. Popups inherit agent ownership from their opener. Release closes agent-owned tabs and leaves claimed user tabs open.
 
 ---
 
