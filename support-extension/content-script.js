@@ -15,7 +15,7 @@
   let route = location.pathname;
   let generation = 0;
 
-  const SEND_ATTEMPT_TIMEOUT_MS = 30_000;
+  const SEND_ACKNOWLEDGEMENT_TIMEOUT_MS = 30_000;
   const SEND_NEW_CHAT_SETTLE_MS = 3_000;
   const SEND_CONVERSATION_SETTLE_MS = 5_000;
   const SEND_BUTTON_SETTLE_MS = 750;
@@ -192,33 +192,23 @@
     let clicked = false;
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const attemptStartedAt = Date.now();
-      const remaining = () => Math.max(0, SEND_ATTEMPT_TIMEOUT_MS - (Date.now() - attemptStartedAt));
-      const ready = await waitForSendReady(remaining());
-      if (!ready) {
-        if (attempt === 0) continue;
-        throw new Error("ChatGPT composer did not settle after the 30-second retry window.");
-      }
+      const ready = await waitForSendReady();
 
       if (!editorMatchesMessage(ready.editor, message)) {
         if (clicked) {
-          const acknowledged = await waitForSubmissionAcknowledged(baseline, remaining());
-          if (acknowledged) return await sentResult(remaining());
+          const acknowledged = await waitForSubmissionAcknowledged(baseline, SEND_ACKNOWLEDGEMENT_TIMEOUT_MS);
+          if (acknowledged) return await sentResult();
           throw new Error("ChatGPT changed the composer after submission; refusing an unsafe duplicate retry.");
         }
         insertMessage(ready.editor, message);
       }
 
-      const current = await waitForStableSendButton(message, remaining());
-      if (!current) {
-        if (attempt === 0 && !clicked) continue;
-        throw new Error("ChatGPT send button did not become stably available within 30 seconds.");
-      }
+      const current = await waitForStableSendButton(message);
 
       current.button.click();
       clicked = true;
-      const submitted = await waitForSubmissionAcknowledged(baseline, remaining());
-      if (submitted) return await sentResult(remaining());
+      const submitted = await waitForSubmissionAcknowledged(baseline, SEND_ACKNOWLEDGEMENT_TIMEOUT_MS);
+      if (submitted) return await sentResult();
 
       // Retry only when the exact submitted text is still present and the conversation
       // has not advanced. That is the case where the first click was genuinely ignored.
@@ -235,17 +225,15 @@
     throw new Error("ChatGPT did not acknowledge the submitted message after retrying.");
   }
 
-  async function sentResult(timeoutMs) {
-    const generationStarted = await waitFor(() => isRunning(), timeoutMs);
-    if (!generationStarted) throw new Error("ChatGPT did not start generating after the message was submitted.");
+  async function sentResult() {
+    await waitFor(() => isRunning());
     await sleep(SEND_GENERATION_HEADROOM_MS);
     const existingUrl = conversationUrl();
-    const savedUrl = existingUrl ?? await waitFor(() => conversationUrl(), timeoutMs);
-    if (!savedUrl) throw new Error("ChatGPT did not expose the saved conversation URL after sending.");
+    const savedUrl = existingUrl ?? await waitFor(() => conversationUrl());
     return { status: "sent", conversationUrl: savedUrl };
   }
 
-  async function waitForSendReady(timeoutMs) {
+  async function waitForSendReady() {
     return await waitForAllSettled(() => {
       const ready = getComposer();
       if (!ready || document.readyState === "loading" || isRunning()) return null;
@@ -258,10 +246,10 @@
         signature: [composerSettledSignature(ready), turnsSettledSignature(turns)].join("|"),
         quietMs: conversation ? SEND_CONVERSATION_SETTLE_MS : SEND_NEW_CHAT_SETTLE_MS,
       };
-    }, timeoutMs);
+    });
   }
 
-  async function waitForStableSendButton(message, timeoutMs) {
+  async function waitForStableSendButton(message) {
     return await waitForAllSettled(() => {
       const ready = getComposer();
       if (!ready || document.readyState === "loading" || !editorMatchesMessage(ready.editor, message)) return null;
@@ -272,7 +260,7 @@
         signature: [composerSettledSignature(ready), readEditorText(ready.editor), "send-ready"].join("|"),
         quietMs: SEND_BUTTON_SETTLE_MS,
       };
-    }, timeoutMs);
+    });
   }
 
   async function waitForSubmissionAcknowledged(baseline, timeoutMs) {
@@ -469,7 +457,7 @@
   }
 
   async function waitForAllSettled(sample, timeoutMs) {
-    const deadline = Date.now() + timeoutMs;
+    const deadline = timeoutMs === undefined ? Infinity : Date.now() + timeoutMs;
     let previousSignature = null;
     let stableSince = 0;
     while (Date.now() < deadline) {
@@ -535,7 +523,7 @@
   }
 
   async function waitFor(getElement, timeoutMs) {
-    const deadline = Date.now() + timeoutMs;
+    const deadline = timeoutMs === undefined ? Infinity : Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const value = getElement();
       if (value) return value;

@@ -46,7 +46,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.3.3");
+  assert.equal(manifest.version, "1.3.4");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -967,6 +967,7 @@ async function testContentScript(tokenA, tokenB) {
 async function testSendWaitsForSettlementAndRetriesIgnoredClick() {
   let automationListener;
   let now = 0;
+  const hydrationReadyAt = 65_000;
   let userCount = 1;
   let generationStarted = false;
   const clickTimes = [];
@@ -980,7 +981,7 @@ async function testSendWaitsForSettlementAndRetriesIgnoredClick() {
     getAttribute(key) { return key === "contenteditable" ? "true" : null; },
   };
   const sendButton = {
-    get disabled() { return now < 5_000; },
+    get disabled() { return now < hydrationReadyAt; },
     getAttribute() { return null; },
     click() {
       clickTimes.push(now);
@@ -1004,7 +1005,7 @@ async function testSendWaitsForSettlementAndRetriesIgnoredClick() {
     querySelector(selector) {
       if (selector === 'form[data-type="unified-composer"]') return composer;
       if (selector === 'section[data-turn="user"] [data-message-author-role="user"]') {
-        return now >= 5_000 ? {} : null;
+        return now >= hydrationReadyAt ? {} : null;
       }
       if (selector === '#composer-submit-button' || selector === 'button[aria-label="Send prompt"]') return sendButton;
       if (selector === 'form[data-type="unified-composer"] button[data-testid="stop-button"]' ||
@@ -1016,7 +1017,7 @@ async function testSendWaitsForSettlementAndRetriesIgnoredClick() {
       if (selector === "section[data-turn]") {
         return [{
           dataset: { turn: "assistant", turnId: "a1" },
-          get textContent() { return now < 5_000 ? "Hydrating" : "Ready"; },
+          get textContent() { return now < hydrationReadyAt ? "Hydrating" : "Ready"; },
         }];
       }
       return [];
@@ -1068,9 +1069,10 @@ async function testSendWaitsForSettlementAndRetriesIgnoredClick() {
   assert.deepEqual(editorEvents, ["input"],
     "contenteditable insertion falls back to an input event when execCommand is unavailable");
   assert.equal(clickTimes.length, 2, "an ignored first click is retried once");
-  assert.ok(clickTimes[0] >= 10_000,
-    "an existing conversation must finish hydrating and remain stable before insertion");
-  assert.ok(clickTimes[1] >= 30_000, "the retry does not start until the first 30-second send attempt has timed out");
+  assert.ok(clickTimes[0] >= hydrationReadyAt + 5_000,
+    "an existing conversation may take longer than the old retry window to hydrate, then must remain stable before insertion");
+  assert.ok(clickTimes[1] >= clickTimes[0] + 35_000,
+    "an ignored click is retried only after its acknowledgement window and another stable-composer check");
   assert.ok(now >= clickTimes[1] + 2_000,
     "the automation tab remains open for two seconds after ChatGPT starts generating");
 }
