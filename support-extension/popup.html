@@ -23,7 +23,7 @@
   <nav class="tabs" role="tablist" aria-label="Sections">
     <button id="tab-threads" class="tab" type="button" role="tab" data-panel="panel-threads"
             aria-controls="panel-threads" aria-selected="true">
-      RALF threads<span id="threadCount" class="badge">0</span>
+      RALPH threads
     </button>
     <button id="tab-settings" class="tab" type="button" role="tab" data-panel="panel-settings"
             aria-controls="panel-settings" aria-selected="false" tabindex="-1">
@@ -38,15 +38,15 @@
           <strong>Current thread</strong>
           <p id="currentThreadStatus" class="note">Checking the active tab...</p>
         </div>
-        <button id="markCurrentThread" class="button" type="button" disabled>Mark for RALF</button>
+        <button id="markCurrentThread" class="button" type="button" disabled>Mark for RALPH</button>
       </div>
       <div class="toolbar">
-        <div class="counts" aria-label="Filter RALF threads by state">
+        <div class="counts" aria-label="Filter RALPH threads by state">
           <button class="count" type="button" data-thread-filter="active" data-state="active" aria-pressed="true">
             <i aria-hidden="true"></i>Active <b id="activeCount">0</b>
           </button>
           <button class="count" type="button" data-thread-filter="complete" data-state="complete" aria-pressed="false">
-            <i aria-hidden="true"></i>Completed <b id="completeCount">0</b>
+            <i aria-hidden="true"></i>Completed
           </button>
         </div>
         <button id="refreshThreads" class="button button-ghost" type="button">Refresh</button>
@@ -63,14 +63,14 @@
           <span class="switch"><input id="threadSync" type="checkbox"><i aria-hidden="true"></i></span>
         </label>
         <label class="toggle">
-          <span class="toggle-text">RALF automation<small>Poll registered threads and continue stalled runs.</small></span>
-          <span class="switch"><input id="ralf" type="checkbox"><i aria-hidden="true"></i></span>
+          <span class="toggle-text">RALPH automation<small>Poll registered threads and continue stalled runs.</small></span>
+          <span class="switch"><input id="ralph" type="checkbox"><i aria-hidden="true"></i></span>
         </label>
         <label class="toggle">
           <span class="toggle-text">Agent thread messaging<small>Let agents open and post to ChatGPT threads.</small></span>
           <span class="switch"><input id="threadMessaging" type="checkbox"><i aria-hidden="true"></i></span>
         </label>
-        <p class="note">Enable RALF and agent messaging only in the browser you want Local Codex to automate.</p>
+        <p class="note">Enable RALPH and agent messaging only in the browser you want Local Codex to automate.</p>
       </div>
 
       <div class="card">
@@ -83,29 +83,29 @@
       </div>
 
       <div class="card">
-        <h2><label for="ralfLoopIntervalSeconds">RALF loop interval (seconds)</label></h2>
-        <input id="ralfLoopIntervalSeconds" type="number" min="1" max="86400" step="1" inputmode="numeric">
+        <h2><label for="ralphLoopIntervalSeconds">RALPH loop interval (seconds)</label></h2>
+        <input id="ralphLoopIntervalSeconds" type="number" min="1" max="86400" step="1" inputmode="numeric">
         <div class="card-footer">
-          <button id="saveRalfLoopInterval" class="button" type="button">Save interval</button>
-          <p id="ralfLoopIntervalStatus" class="note">Default is 1500 seconds (25 minutes). Saving reschedules active threads.</p>
+          <button id="saveRalphLoopInterval" class="button" type="button">Save interval</button>
+          <p id="ralphLoopIntervalStatus" class="note">Default is 1500 seconds (25 minutes). Saving reschedules active threads.</p>
         </div>
       </div>
 
       <div class="card">
-        <h2><label for="ralfMinWorkedSeconds">RALF minimum worked time (seconds)</label></h2>
-        <input id="ralfMinWorkedSeconds" type="number" min="0" max="86400" step="1" inputmode="numeric">
+        <h2><label for="ralphMinWorkedSeconds">RALPH minimum worked time (seconds)</label></h2>
+        <input id="ralphMinWorkedSeconds" type="number" min="0" max="86400" step="1" inputmode="numeric">
         <div class="card-footer">
-          <button id="saveRalfTime" class="button" type="button">Save time</button>
-          <p id="ralfTimeStatus" class="note">Default is 1140 seconds (19 minutes). RALF continues only when ChatGPT reports more than this.</p>
+          <button id="saveRalphTime" class="button" type="button">Save time</button>
+          <p id="ralphTimeStatus" class="note">Default is 1140 seconds (19 minutes). RALPH continues only when ChatGPT reports more than this.</p>
         </div>
       </div>
 
       <div class="card">
-        <h2><label for="ralfProjects">RALF projects</label></h2>
-        <textarea id="ralfProjects" rows="5" spellcheck="false" placeholder="One project URL or project ID per line"></textarea>
+        <h2><label for="ralphProjects">RALPH projects</label></h2>
+        <textarea id="ralphProjects" rows="5" spellcheck="false" placeholder="One project URL or project ID per line"></textarea>
         <div class="card-footer">
-          <button id="saveRalfProjects" class="button" type="button">Save projects</button>
-          <p id="ralfProjectsStatus" class="note">Only threads inside these projects are registered for RALF.</p>
+          <button id="saveRalphProjects" class="button" type="button">Save projects</button>
+          <p id="ralphProjectsStatus" class="note">Only threads inside these projects are registered for RALPH.</p>
         </div>
       </div>
     </section>

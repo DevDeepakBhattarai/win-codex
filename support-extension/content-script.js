@@ -9,8 +9,7 @@
   const requestType = "local-codex-thread-sync/bind-v1";
   const responseType = "local-codex-thread-sync/result-v1";
   const automationType = "local-codex-support/automation-v1";
-  const manualRalfType = "local-codex-support/ralf-check-now-v1";
-  const reactivateRalfType = "local-codex-support/ralf-reactivate-v1";
+  const reactivateRalphType = "local-codex-support/ralph-reactivate-v1";
   const sourceRoutes = new WeakMap();
   const pending = new Set();
   let route = location.pathname;
@@ -23,8 +22,8 @@
   const SEND_GENERATION_HEADROOM_MS = 2_000;
   const THREAD_ASSISTANT_SETTLE_MS = 5_000;
   const THREAD_UNCERTAIN_SETTLE_MS = 15_000;
-  const RALF_MIN_WORKED_SECONDS_KEY = "ralfMinWorkedSeconds";
-  const DEFAULT_RALF_MIN_WORKED_SECONDS = 19 * 60;
+  const RALPH_MIN_WORKED_SECONDS_KEY = "ralphMinWorkedSeconds";
+  const DEFAULT_RALPH_MIN_WORKED_SECONDS = 19 * 60;
 
   function conversationUrl() {
     const match = location.pathname.match(/^(?:\/g\/([A-Za-z0-9_-]+))?\/c\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/?$/i);
@@ -85,7 +84,7 @@
 
   window.addEventListener("message", messageHandler);
 
-  installManualRalfButton();
+  installRalphComposerObserver();
 
   extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type !== automationType || !message.command) return;
@@ -112,7 +111,7 @@
     const settled = await waitForStableTurns();
     if (!settled) return { status: "loading" };
     if (isRunning()) return { status: "running" };
-    const workedSeconds = getWorkedDurationSeconds(await getRalfMinWorkedSeconds());
+    const workedSeconds = getWorkedDurationSeconds(await getRalphMinWorkedSeconds());
     const turns = [...document.querySelectorAll("section[data-turn]")];
     const users = [];
     let lastUserIndex = -1;
@@ -322,31 +321,8 @@
     if (!editorMatchesMessage(editor, message)) throw new Error("Could not insert the ChatGPT message.");
   }
 
-  function installManualRalfButton() {
-    if (typeof document === "undefined" || typeof document.createElement !== "function" ||
-        typeof MutationObserver !== "function") return;
-
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = "Run RALF now";
-    const defaultTitle = "Inspect this thread now and restart its RALF timer";
-    button.title = defaultTitle;
-    button.setAttribute("aria-live", "polite");
-    button.style.cssText = [
-      "position:fixed",
-      "right:16px",
-      "bottom:76px",
-      "z-index:2147483647",
-      "padding:8px 12px",
-      "border:1px solid rgba(255,255,255,.18)",
-      "border-radius:999px",
-      "background:#202123",
-      "color:#fff",
-      "box-shadow:0 4px 16px rgba(0,0,0,.22)",
-      "font:600 12px/1.2 ui-sans-serif,system-ui,sans-serif",
-      "cursor:pointer",
-    ].join(";");
-
+  function installRalphComposerObserver() {
+    if (typeof document === "undefined" || typeof MutationObserver !== "function") return;
     let observedConversationUrl = null;
     let previousComposerAction = null;
 
@@ -367,7 +343,7 @@
       if (action === "stop" && previousComposerAction === "send" &&
           currentUrl?.startsWith("https://chatgpt.com/g/")) {
         void extensionApi.runtime.sendMessage({
-          type: reactivateRalfType,
+          type: reactivateRalphType,
           conversationUrl: currentUrl,
         }).catch(() => undefined);
       }
@@ -376,39 +352,8 @@
 
     const refresh = () => {
       const currentUrl = conversationUrl();
-      const eligible = Boolean(currentUrl?.startsWith("https://chatgpt.com/g/"));
-      button.style.display = eligible ? "block" : "none";
-      if (eligible && document.body && !button.isConnected) document.body.appendChild(button);
       observeComposerAction();
     };
-
-    button.addEventListener("click", async () => {
-      const requestedUrl = conversationUrl();
-      if (!requestedUrl) return;
-      button.disabled = true;
-      button.style.cursor = "wait";
-      button.textContent = "Scheduling RALF...";
-      try {
-        const result = await extensionApi.runtime.sendMessage({
-          type: manualRalfType,
-          conversationUrl: requestedUrl,
-        });
-        if (!result?.ok) throw new Error(result?.error || "Could not schedule RALF.");
-        button.textContent = "RALF scheduled";
-        button.title = "RALF will inspect this thread now";
-      } catch (error) {
-        button.textContent = "RALF unavailable";
-        button.title = error instanceof Error ? error.message : String(error);
-      } finally {
-        setTimeout(() => {
-          if (conversationUrl() !== requestedUrl) return;
-          button.disabled = false;
-          button.style.cursor = "pointer";
-          button.textContent = "Run RALF now";
-          button.title = defaultTitle;
-        }, 2500);
-      }
-    });
 
     const observer = new MutationObserver(refresh);
     const start = () => {
@@ -544,13 +489,13 @@
     return Boolean(document.querySelector('form[data-type="unified-composer"] button[data-testid="stop-button"]'));
   }
 
-  async function getRalfMinWorkedSeconds() {
-    if (!extensionApi.storage?.local?.get) return DEFAULT_RALF_MIN_WORKED_SECONDS;
+  async function getRalphMinWorkedSeconds() {
+    if (!extensionApi.storage?.local?.get) return DEFAULT_RALPH_MIN_WORKED_SECONDS;
     const stored = await extensionApi.storage.local.get({
-      [RALF_MIN_WORKED_SECONDS_KEY]: DEFAULT_RALF_MIN_WORKED_SECONDS,
+      [RALPH_MIN_WORKED_SECONDS_KEY]: DEFAULT_RALPH_MIN_WORKED_SECONDS,
     });
-    const value = stored[RALF_MIN_WORKED_SECONDS_KEY];
-    return Number.isInteger(value) && value >= 0 ? value : DEFAULT_RALF_MIN_WORKED_SECONDS;
+    const value = stored[RALPH_MIN_WORKED_SECONDS_KEY];
+    return Number.isInteger(value) && value >= 0 ? value : DEFAULT_RALPH_MIN_WORKED_SECONDS;
   }
 
   function getWorkedDurationSeconds(minWorkedSeconds) {

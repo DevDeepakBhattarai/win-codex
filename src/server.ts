@@ -56,17 +56,17 @@ import {
   threadSyncBindHandler,
 } from "./thread-sync.js";
 import {
-  RalfController,
-  RalfRegistry,
-  ralfProjectsGetHandler,
-  ralfProjectsPutHandler,
-  ralfRegistrationHandler,
-  ralfSettingsGetHandler,
-  ralfSettingsPutHandler,
-  ralfThreadActiveHandler,
-  ralfThreadCheckHandler,
-  ralfThreadCompleteHandler,
-  ralfThreadsGetHandler,
+  RalphController,
+  RalphRegistry,
+  ralphProjectsGetHandler,
+  ralphProjectsPutHandler,
+  ralphRegistrationHandler,
+  ralphSettingsGetHandler,
+  ralphSettingsPutHandler,
+  ralphThreadActiveHandler,
+  ralphThreadCheckHandler,
+  ralphThreadCompleteHandler,
+  ralphThreadsGetHandler,
   registerChatGptMessaging,
   SupportCommandBus,
   supportCommandClaimHandler,
@@ -116,8 +116,8 @@ const DATA_DIR = process.env.DATA_DIR ?? path.join(process.cwd(), ".data");
 const BROWSER_BRIDGE_ENABLED = process.env.BROWSER_BRIDGE_ENABLED !== "false";
 const THREAD_SYNC_ENABLED = process.env.THREAD_SYNC_ENABLED !== "false";
 const THREAD_SYNC_PORT = boundedIntegerEnv("THREAD_SYNC_PORT", 6002, 1, 65535);
-const RALF_MODEL = process.env.RALF_MODEL ?? "gpt-5.6-terra";
-const RALF_OPENAI_AUDIT_LOG_PATH = path.resolve(DATA_DIR, "ralf-openai.log");
+const RALPH_MODEL = process.env.RALPH_MODEL ?? "gpt-5.6-terra";
+const RALPH_OPENAI_AUDIT_LOG_PATH = path.resolve(DATA_DIR, "ralph-openai.log");
 const BROWSER_BRIDGE_PORT = boundedIntegerEnv(
   "BROWSER_BRIDGE_PORT",
   PORT + 1,
@@ -2708,14 +2708,14 @@ const threadSync = THREAD_SYNC_ENABLED
   ? await prepareThreadSync(DATA_DIR, THREAD_SYNC_PORT)
   : undefined;
 const supportCommands = threadSync ? new SupportCommandBus() : undefined;
-const ralfRegistry = threadSync ? await RalfRegistry.open(DATA_DIR) : undefined;
-const ralfController = supportCommands && ralfRegistry
-  ? new RalfController({
+const ralphRegistry = threadSync ? await RalphRegistry.open(DATA_DIR) : undefined;
+const ralphController = supportCommands && ralphRegistry
+  ? new RalphController({
       commands: supportCommands,
-      registry: ralfRegistry,
+      registry: ralphRegistry,
       apiKey: process.env.OPENAI_API_KEY,
-      model: RALF_MODEL,
-      auditLogPath: RALF_OPENAI_AUDIT_LOG_PATH,
+      model: RALPH_MODEL,
+      auditLogPath: RALPH_OPENAI_AUDIT_LOG_PATH,
     })
   : undefined;
 
@@ -2735,26 +2735,26 @@ const threadSyncHttpServer = threadSync
       syncApp.use(express.json({ limit: "5mb" }));
       syncApp.post("/thread-sync/bind", createRateLimiter("thread-sync", 60_000, 120),
         threadSyncBindHandler(threadSync.registry, threadSync.extensionToken));
-      if (ralfRegistry) {
-        syncApp.post("/chatgpt-support/ralf/register", createRateLimiter("ralf-register", 60_000, 240),
-          ralfRegistrationHandler(ralfRegistry, threadSync.extensionToken));
-        syncApp.get("/chatgpt-support/ralf/projects",
-          ralfProjectsGetHandler(ralfRegistry, threadSync.extensionToken));
-        syncApp.put("/chatgpt-support/ralf/projects",
-          ralfProjectsPutHandler(ralfRegistry, threadSync.extensionToken));
-        syncApp.get("/chatgpt-support/ralf/settings",
-          ralfSettingsGetHandler(ralfRegistry, threadSync.extensionToken));
-        syncApp.put("/chatgpt-support/ralf/settings",
-          ralfSettingsPutHandler(ralfRegistry, threadSync.extensionToken));
-        syncApp.get("/chatgpt-support/ralf/threads",
-          ralfThreadsGetHandler(ralfRegistry, threadSync.extensionToken));
-        syncApp.put("/chatgpt-support/ralf/threads/:threadId/complete",
-          ralfThreadCompleteHandler(ralfRegistry, threadSync.extensionToken));
-        syncApp.put("/chatgpt-support/ralf/threads/:threadId/active",
-          ralfThreadActiveHandler(ralfRegistry, threadSync.extensionToken));
-        if (ralfController) {
-          syncApp.put("/chatgpt-support/ralf/threads/:threadId/check",
-            ralfThreadCheckHandler(ralfRegistry, ralfController, threadSync.extensionToken));
+      if (ralphRegistry) {
+        syncApp.post("/chatgpt-support/ralph/register", createRateLimiter("ralph-register", 60_000, 240),
+          ralphRegistrationHandler(ralphRegistry, threadSync.extensionToken));
+        syncApp.get("/chatgpt-support/ralph/projects",
+          ralphProjectsGetHandler(ralphRegistry, threadSync.extensionToken));
+        syncApp.put("/chatgpt-support/ralph/projects",
+          ralphProjectsPutHandler(ralphRegistry, threadSync.extensionToken));
+        syncApp.get("/chatgpt-support/ralph/settings",
+          ralphSettingsGetHandler(ralphRegistry, threadSync.extensionToken));
+        syncApp.put("/chatgpt-support/ralph/settings",
+          ralphSettingsPutHandler(ralphRegistry, threadSync.extensionToken));
+        syncApp.get("/chatgpt-support/ralph/threads",
+          ralphThreadsGetHandler(ralphRegistry, threadSync.extensionToken));
+        syncApp.put("/chatgpt-support/ralph/threads/:threadId/complete",
+          ralphThreadCompleteHandler(ralphRegistry, threadSync.extensionToken));
+        syncApp.put("/chatgpt-support/ralph/threads/:threadId/active",
+          ralphThreadActiveHandler(ralphRegistry, threadSync.extensionToken));
+        if (ralphController) {
+          syncApp.put("/chatgpt-support/ralph/threads/:threadId/check",
+            ralphThreadCheckHandler(ralphRegistry, ralphController, threadSync.extensionToken));
         }
       }
       if (supportCommands) {
@@ -2787,8 +2787,8 @@ const httpServer = app.listen(PORT, HOST, () => {
   if (threadSync) {
     console.log(`Thread sync endpoint: ${threadSync.bindUrl}`);
     console.log(`Local Codex support extension: ${threadSync.extensionDirectory}`);
-    console.log(`RALF model: ${RALF_MODEL}`);
-    console.log(`RALF OpenAI audit log: ${RALF_OPENAI_AUDIT_LOG_PATH}`);
+    console.log(`RALPH model: ${RALPH_MODEL}`);
+    console.log(`RALPH OpenAI audit log: ${RALPH_OPENAI_AUDIT_LOG_PATH}`);
     console.log(`Thread sync store: ${path.resolve(DATA_DIR, "thread-sync.json")}`);
   }
   console.log(
@@ -2815,7 +2815,7 @@ async function shutdown(signal: string) {
   void browserService?.close().catch((error) =>
     console.error("Browser bridge shutdown failed:", error),
   );
-  ralfController?.close();
+  ralphController?.close();
   supportCommands?.close();
 
   try {

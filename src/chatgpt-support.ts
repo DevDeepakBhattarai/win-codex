@@ -6,19 +6,19 @@ import type { Request, RequestHandler, Response } from "express";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-const MAX_RALF_THREADS = 2_000;
-const MAX_RALF_PROJECTS = 100;
-const DEFAULT_RALF_INTERVAL_MS = 25 * 60 * 1000;
-const MIN_RALF_INTERVAL_SECONDS = 1;
-const MAX_RALF_INTERVAL_SECONDS = 24 * 60 * 60;
-const RALF_SCHEDULER_TICK_MS = 1_000;
+const MAX_RALPH_THREADS = 2_000;
+const MAX_RALPH_PROJECTS = 100;
+const DEFAULT_RALPH_INTERVAL_MS = 25 * 60 * 1000;
+const MIN_RALPH_INTERVAL_SECONDS = 1;
+const MAX_RALPH_INTERVAL_SECONDS = 24 * 60 * 60;
+const RALPH_SCHEDULER_TICK_MS = 1_000;
 const LOADING_RETRY_MS = 60 * 1000;
 const FAILURE_RETRY_MS = 2 * 60 * 1000;
 const COMMAND_TIMEOUT_MS = 20 * 60 * 1000;
 const CLAIM_WAIT_MS = 20_000;
 const MAX_CONTINUATION_CHARS = 500;
 
-export const supportFeatureSchema = z.enum(["ralf", "threadMessaging"]);
+export const supportFeatureSchema = z.enum(["ralph", "threadMessaging"]);
 export type SupportFeature = z.infer<typeof supportFeatureSchema>;
 
 const threadMessageSchema = z.object({
@@ -51,13 +51,13 @@ export type SendMessageResult = z.infer<typeof sendMessageResultSchema>;
 const supportCommandSchema = z.union([
   z.object({
     id: z.string(),
-    feature: z.literal("ralf"),
+    feature: z.literal("ralph"),
     kind: z.literal("inspect_thread"),
     conversationUrl: z.string().url(),
   }),
   z.object({
     id: z.string(),
-    feature: z.literal("ralf"),
+    feature: z.literal("ralph"),
     kind: z.literal("send_message"),
     targetUrl: z.string().url(),
     message: z.string(),
@@ -219,7 +219,7 @@ export class SupportCommandBus {
   }
 }
 
-const ralfThreadSchema = z.object({
+const ralphThreadSchema = z.object({
   conversationUrl: z.string().url(),
   threadId: z.string(),
   manuallyRegistered: z.boolean().optional(),
@@ -230,55 +230,55 @@ const ralfThreadSchema = z.object({
   lastContinuationAt: z.string().optional(),
   lastError: z.string().optional(),
 });
-const ralfStoreV1Schema = z.object({
+const ralphStoreV1Schema = z.object({
   version: z.literal(1),
-  threads: z.array(ralfThreadSchema).max(MAX_RALF_THREADS),
+  threads: z.array(ralphThreadSchema).max(MAX_RALPH_THREADS),
   exclusions: z.array(z.object({
     conversationUrl: z.string().url(),
     threadId: z.string(),
     excludedAt: z.string(),
-  })).max(MAX_RALF_THREADS),
+  })).max(MAX_RALPH_THREADS),
 });
-const ralfStoreSchema = z.object({
+const ralphStoreSchema = z.object({
   version: z.literal(2),
-  projects: z.array(z.string()).max(MAX_RALF_PROJECTS),
-  threads: z.array(ralfThreadSchema).max(MAX_RALF_THREADS),
-  loopIntervalMs: z.number().int().positive().max(MAX_RALF_INTERVAL_SECONDS * 1000).default(DEFAULT_RALF_INTERVAL_MS),
+  projects: z.array(z.string()).max(MAX_RALPH_PROJECTS),
+  threads: z.array(ralphThreadSchema).max(MAX_RALPH_THREADS),
+  loopIntervalMs: z.number().int().positive().max(MAX_RALPH_INTERVAL_SECONDS * 1000).default(DEFAULT_RALPH_INTERVAL_MS),
 });
-type RalfStore = z.infer<typeof ralfStoreSchema>;
-const ralfLoopIntervalSecondsSchema = z.number().int()
-  .min(MIN_RALF_INTERVAL_SECONDS)
-  .max(MAX_RALF_INTERVAL_SECONDS);
+type RalphStore = z.infer<typeof ralphStoreSchema>;
+const ralphLoopIntervalSecondsSchema = z.number().int()
+  .min(MIN_RALPH_INTERVAL_SECONDS)
+  .max(MAX_RALPH_INTERVAL_SECONDS);
 
-export class RalfRegistry {
+export class RalphRegistry {
   private queue: Promise<unknown> = Promise.resolve();
 
   private constructor(
     private readonly filePath: string,
-    private state: RalfStore,
+    private state: RalphStore,
   ) {}
 
   static async open(dataDirectory: string, intervalMs?: number) {
     await mkdir(dataDirectory, { recursive: true });
-    const filePath = path.join(dataDirectory, "ralf.json");
-    let state: RalfStore = {
+    const filePath = path.join(dataDirectory, "ralph.json");
+    let state: RalphStore = {
       version: 2,
       projects: [],
       threads: [],
-      loopIntervalMs: DEFAULT_RALF_INTERVAL_MS,
+      loopIntervalMs: DEFAULT_RALPH_INTERVAL_MS,
     };
     let migrated = false;
     try {
       const raw: unknown = JSON.parse(await readFile(filePath, "utf8"));
-      const current = ralfStoreSchema.safeParse(raw);
+      const current = ralphStoreSchema.safeParse(raw);
       if (current.success) {
         state = current.data;
-      } else if (ralfStoreV1Schema.safeParse(raw).success) {
+      } else if (ralphStoreV1Schema.safeParse(raw).success) {
         // Version 1 registered every synced thread and permanently excluded agent-created
-        // threads. Neither behavior belongs in the project-scoped RALF model.
+        // threads. Neither behavior belongs in the project-scoped RALPH model.
         migrated = true;
       } else {
-        state = ralfStoreSchema.parse(raw);
+        state = ralphStoreSchema.parse(raw);
       }
     } catch (error) {
       if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
@@ -287,10 +287,10 @@ export class RalfRegistry {
       await writeFile(filePath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
     }
     if (intervalMs !== undefined) {
-      if (!Number.isInteger(intervalMs) || intervalMs <= 0) throw new Error("RALF interval must be a positive integer.");
+      if (!Number.isInteger(intervalMs) || intervalMs <= 0) throw new Error("RALPH interval must be a positive integer.");
       state.loopIntervalMs = intervalMs;
     }
-    return new RalfRegistry(filePath, state);
+    return new RalphRegistry(filePath, state);
   }
 
   async projects() {
@@ -309,7 +309,7 @@ export class RalfRegistry {
   }
 
   async setLoopIntervalSeconds(value: number) {
-    const loopIntervalSeconds = ralfLoopIntervalSecondsSchema.parse(value);
+    const loopIntervalSeconds = ralphLoopIntervalSecondsSchema.parse(value);
     const loopIntervalMs = loopIntervalSeconds * 1000;
     return this.update((state) => {
       state.loopIntervalMs = loopIntervalMs;
@@ -322,8 +322,8 @@ export class RalfRegistry {
   }
 
   async setProjects(values: string[]) {
-    const projects = [...new Set(values.map(parseRalfProjectId))];
-    if (projects.length > MAX_RALF_PROJECTS) throw new Error(`RALF supports at most ${MAX_RALF_PROJECTS} projects.`);
+    const projects = [...new Set(values.map(parseRalphProjectId))];
+    if (projects.length > MAX_RALPH_PROJECTS) throw new Error(`RALPH supports at most ${MAX_RALPH_PROJECTS} projects.`);
     return this.update((state) => {
       state.projects = projects;
       const allowed = new Set(projects);
@@ -354,7 +354,7 @@ export class RalfRegistry {
         }
         return existing.state === "active";
       }
-      if (state.threads.length >= MAX_RALF_THREADS) throw new Error("RALF thread registration limit reached.");
+      if (state.threads.length >= MAX_RALPH_THREADS) throw new Error("RALPH thread registration limit reached.");
       state.threads.push({
         conversationUrl: conversation.conversationUrl,
         threadId: conversation.threadId,
@@ -457,7 +457,7 @@ export class RalfRegistry {
     });
   }
 
-  private update<T>(operation: (state: RalfStore) => T): Promise<T> {
+  private update<T>(operation: (state: RalphStore) => T): Promise<T> {
     const result = this.queue.then(async () => {
       const next = structuredClone(this.state);
       const value = operation(next);
@@ -481,14 +481,14 @@ function canonicalProjectId(value: string) {
   return value;
 }
 
-export function parseRalfProjectId(value: string) {
+export function parseRalphProjectId(value: string) {
   const trimmed = value.trim();
-  if (!trimmed) throw new Error("RALF project entries cannot be empty.");
+  if (!trimmed) throw new Error("RALPH project entries cannot be empty.");
   if (!trimmed.includes("://")) return canonicalProjectId(trimmed);
 
   const url = new URL(trimmed);
   if (url.origin !== "https://chatgpt.com" || url.username || url.password) {
-    throw new Error("RALF projects must use https://chatgpt.com.");
+    throw new Error("RALPH projects must use https://chatgpt.com.");
   }
   const match = url.pathname.match(/^\/g\/([^/]+)\/(?:project|c\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/?$/i);
   if (!match) throw new Error("Expected a ChatGPT project home or project conversation URL.");
@@ -526,8 +526,8 @@ export function normalizeChatGptMessageTarget(value: string) {
   return parseConversationUrl(value).conversationUrl;
 }
 
-interface RalfControllerOptions {
-  registry: RalfRegistry;
+interface RalphControllerOptions {
+  registry: RalphRegistry;
   commands: SupportCommandBus;
   apiKey?: string;
   model: string;
@@ -535,7 +535,7 @@ interface RalfControllerOptions {
   checkEveryMs?: number;
 }
 
-class RalfOpenAiAuditLog {
+class RalphOpenAiAuditLog {
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly filePath: string) {}
@@ -547,7 +547,7 @@ class RalfOpenAiAuditLog {
     required = false,
   ) {
     const record = JSON.stringify({ timestamp: new Date().toISOString(), event, ...details });
-    const terminalMessage = `[ralf/openai] ${record}`;
+    const terminalMessage = `[ralph/openai] ${record}`;
     if (level === "error") console.error(terminalMessage);
     else console.log(terminalMessage);
 
@@ -560,20 +560,20 @@ class RalfOpenAiAuditLog {
       await pending;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`[ralf/openai] audit_write_failed path=${JSON.stringify(this.filePath)} error=${JSON.stringify(message)}`);
-      if (required) throw new Error(`Cannot persist the RALF OpenAI audit log: ${message}`);
+      console.error(`[ralph/openai] audit_write_failed path=${JSON.stringify(this.filePath)} error=${JSON.stringify(message)}`);
+      if (required) throw new Error(`Cannot persist the RALPH OpenAI audit log: ${message}`);
     }
   }
 }
 
-export class RalfController {
+export class RalphController {
   private readonly inFlight = new Set<string>();
   private readonly timer: NodeJS.Timeout;
-  private readonly auditLog: RalfOpenAiAuditLog;
+  private readonly auditLog: RalphOpenAiAuditLog;
 
-  constructor(private readonly options: RalfControllerOptions) {
-    this.auditLog = new RalfOpenAiAuditLog(options.auditLogPath);
-    this.timer = setInterval(() => void this.tick(), options.checkEveryMs ?? RALF_SCHEDULER_TICK_MS);
+  constructor(private readonly options: RalphControllerOptions) {
+    this.auditLog = new RalphOpenAiAuditLog(options.auditLogPath);
+    this.timer = setInterval(() => void this.tick(), options.checkEveryMs ?? RALPH_SCHEDULER_TICK_MS);
     this.timer.unref();
   }
 
@@ -590,15 +590,15 @@ export class RalfController {
     clearInterval(this.timer);
   }
 
-  private async check(thread: z.infer<typeof ralfThreadSchema>) {
+  private async check(thread: z.infer<typeof ralphThreadSchema>) {
     try {
       const commandResult = await this.options.commands.execute({
-        feature: "ralf",
+        feature: "ralph",
         kind: "inspect_thread",
         conversationUrl: thread.conversationUrl,
       });
       if (!commandResult.ok) throw new Error(commandResult.error);
-      if (commandResult.kind !== "inspect_thread") throw new Error("RALF received the wrong support command result.");
+      if (commandResult.kind !== "inspect_thread") throw new Error("RALPH received the wrong support command result.");
       if (!await this.options.registry.isActive(thread.threadId)) return;
 
       const inspection = commandResult.result;
@@ -612,10 +612,10 @@ export class RalfController {
       }
 
       if (inspection.users.length === 0 || inspection.users.some((message) => !message.text.trim())) {
-        throw new Error("RALF could not extract every ChatGPT user message.");
+        throw new Error("RALPH could not extract every ChatGPT user message.");
       }
       if (!inspection.assistant.text.trim()) {
-        throw new Error("RALF could not extract the final ChatGPT assistant message.");
+        throw new Error("RALPH could not extract the final ChatGPT assistant message.");
       }
 
       if (inspection.workedSeconds === null) {
@@ -623,7 +623,7 @@ export class RalfController {
         return;
       }
 
-      const decision = await decideRalfContinuation(
+      const decision = await decideRalphContinuation(
         inspection,
         this.options.apiKey,
         this.options.model,
@@ -637,17 +637,17 @@ export class RalfController {
       if (!await this.options.registry.isActive(thread.threadId)) return;
 
       const sendResult = await this.options.commands.execute({
-        feature: "ralf",
+        feature: "ralph",
         kind: "send_message",
         targetUrl: thread.conversationUrl,
         message: decision.instruction,
       });
       if (!sendResult.ok) throw new Error(sendResult.error);
-      if (sendResult.kind !== "send_message") throw new Error("RALF received the wrong send-message result.");
+      if (sendResult.kind !== "send_message") throw new Error("RALPH received the wrong send-message result.");
       await this.options.registry.recordContinuation(thread.threadId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`[ralf] thread=${JSON.stringify(thread.conversationUrl)} failed: ${message}`);
+      console.error(`[ralph] thread=${JSON.stringify(thread.conversationUrl)} failed: ${message}`);
       await this.options.registry.recordFailure(thread.threadId, message);
     }
   }
@@ -668,20 +668,20 @@ function responseTokenUsage(value: unknown) {
   };
 }
 
-async function decideRalfContinuation(
+async function decideRalphContinuation(
   inspection: Extract<ThreadInspection, { status: "idle" }>,
   apiKey: string | undefined,
   model: string,
   conversationUrl: string,
-  auditLog: RalfOpenAiAuditLog,
+  auditLog: RalphOpenAiAuditLog,
 ) {
-  if (!apiKey) throw new Error("OPENAI_API_KEY is required for RALF continuation decisions.");
+  if (!apiKey) throw new Error("OPENAI_API_KEY is required for RALPH continuation decisions.");
   const transcript = [
     ...inspection.users.map((message) => `USER:\n${message.text}`),
     `ASSISTANT:\n${inspection.assistant.text}`,
   ].join("\n\n");
   const instruction = [
-    "You control a RALF loop for another ChatGPT thread.",
+    "You control a RALPH loop for another ChatGPT thread.",
     "Decide whether the user's requested work is fully complete based only on all user messages and the final assistant message below.",
     "If complete, reply with exactly COMPLETE.",
     "If incomplete, reply with only a very short one or two sentence instruction telling the agent what to do next. Do not say generic 'continue'. Do not explain your reasoning.",
@@ -723,12 +723,12 @@ async function decideRalfContinuation(
       } catch {
         responseBody = rawBody;
       }
-      throw new Error(`OpenAI RALF decision failed with HTTP ${response.status}: ${rawBody.slice(0, 1_000)}`);
+      throw new Error(`OpenAI RALPH decision failed with HTTP ${response.status}: ${rawBody.slice(0, 1_000)}`);
     }
 
     responseBody = await response.json();
     const text = extractResponsesText(responseBody).trim();
-    if (!text) throw new Error("OpenAI RALF decision returned no text.");
+    if (!text) throw new Error("OpenAI RALPH decision returned no text.");
     const decision = /^COMPLETE\.?$/i.test(text)
       ? { complete: true as const }
       : { complete: false as const, instruction: compactContinuation(text) };
@@ -779,7 +779,7 @@ function extractResponsesText(value: unknown) {
 
 function compactContinuation(value: string) {
   const normalized = value.replace(/\s+/g, " ").replace(/^['"]|['"]$/g, "").trim();
-  if (!normalized) throw new Error("OpenAI RALF decision returned an empty continuation instruction.");
+  if (!normalized) throw new Error("OpenAI RALPH decision returned an empty continuation instruction.");
   return normalized.length <= MAX_CONTINUATION_CHARS
     ? normalized
     : `${normalized.slice(0, MAX_CONTINUATION_CHARS - 1).trimEnd()}…`;
@@ -833,7 +833,7 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
   };
 }
 
-export function ralfRegistrationHandler(registry: RalfRegistry, extensionToken: string): RequestHandler {
+export function ralphRegistrationHandler(registry: RalphRegistry, extensionToken: string): RequestHandler {
   const bodySchema = z.object({
     conversationUrl: z.string().max(2048),
     manual: z.boolean().optional(),
@@ -843,7 +843,7 @@ export function ralfRegistrationHandler(registry: RalfRegistry, extensionToken: 
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
     const parsed = bodySchema.safeParse(req.body);
     if (!parsed.success) {
-      res.status(400).json({ error: "Invalid RALF registration request." });
+      res.status(400).json({ error: "Invalid RALPH registration request." });
       return;
     }
     try {
@@ -854,12 +854,12 @@ export function ralfRegistrationHandler(registry: RalfRegistry, extensionToken: 
       res.setHeader("Cache-Control", "no-store");
       res.json({ status: registered ? "registered" : "ignored" });
     } catch (error) {
-      res.status(400).json({ error: error instanceof Error ? error.message : "RALF registration failed." });
+      res.status(400).json({ error: error instanceof Error ? error.message : "RALPH registration failed." });
     }
   };
 }
 
-export function ralfProjectsGetHandler(registry: RalfRegistry, extensionToken: string): RequestHandler {
+export function ralphProjectsGetHandler(registry: RalphRegistry, extensionToken: string): RequestHandler {
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
     res.setHeader("Cache-Control", "no-store");
@@ -867,7 +867,7 @@ export function ralfProjectsGetHandler(registry: RalfRegistry, extensionToken: s
   };
 }
 
-export function ralfThreadsGetHandler(registry: RalfRegistry, extensionToken: string): RequestHandler {
+export function ralphThreadsGetHandler(registry: RalphRegistry, extensionToken: string): RequestHandler {
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
     res.setHeader("Cache-Control", "no-store");
@@ -875,17 +875,17 @@ export function ralfThreadsGetHandler(registry: RalfRegistry, extensionToken: st
   };
 }
 
-export function ralfThreadCompleteHandler(registry: RalfRegistry, extensionToken: string): RequestHandler {
+export function ralphThreadCompleteHandler(registry: RalphRegistry, extensionToken: string): RequestHandler {
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
     const parsed = z.string().uuid().safeParse(req.params.threadId);
     if (!parsed.success) {
-      res.status(400).json({ error: "Invalid RALF thread id." });
+      res.status(400).json({ error: "Invalid RALPH thread id." });
       return;
     }
     const completed = await registry.recordComplete(parsed.data);
     if (!completed) {
-      res.status(404).json({ error: "RALF thread not found." });
+      res.status(404).json({ error: "RALPH thread not found." });
       return;
     }
     res.setHeader("Cache-Control", "no-store");
@@ -893,17 +893,17 @@ export function ralfThreadCompleteHandler(registry: RalfRegistry, extensionToken
   };
 }
 
-export function ralfThreadActiveHandler(registry: RalfRegistry, extensionToken: string): RequestHandler {
+export function ralphThreadActiveHandler(registry: RalphRegistry, extensionToken: string): RequestHandler {
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
     const parsed = z.string().uuid().safeParse(req.params.threadId);
     if (!parsed.success) {
-      res.status(400).json({ error: "Invalid RALF thread id." });
+      res.status(400).json({ error: "Invalid RALPH thread id." });
       return;
     }
     const activated = await registry.recordActive(parsed.data);
     if (!activated) {
-      res.status(404).json({ error: "RALF thread not found." });
+      res.status(404).json({ error: "RALPH thread not found." });
       return;
     }
     res.setHeader("Cache-Control", "no-store");
@@ -911,25 +911,25 @@ export function ralfThreadActiveHandler(registry: RalfRegistry, extensionToken: 
   };
 }
 
-export function ralfThreadCheckHandler(
-  registry: RalfRegistry,
-  controller: RalfController,
+export function ralphThreadCheckHandler(
+  registry: RalphRegistry,
+  controller: RalphController,
   extensionToken: string,
 ): RequestHandler {
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
     const parsed = z.string().uuid().safeParse(req.params.threadId);
     if (!parsed.success) {
-      res.status(400).json({ error: "Invalid RALF thread id." });
+      res.status(400).json({ error: "Invalid RALPH thread id." });
       return;
     }
     const result = await registry.scheduleNow(parsed.data);
     if (result === "missing") {
-      res.status(404).json({ error: "RALF thread not found." });
+      res.status(404).json({ error: "RALPH thread not found." });
       return;
     }
     if (result === "complete") {
-      res.status(409).json({ error: "Mark this RALF thread active before checking it again." });
+      res.status(409).json({ error: "Mark this RALPH thread active before checking it again." });
       return;
     }
     await controller.tick();
@@ -938,7 +938,7 @@ export function ralfThreadCheckHandler(
   };
 }
 
-export function ralfSettingsGetHandler(registry: RalfRegistry, extensionToken: string): RequestHandler {
+export function ralphSettingsGetHandler(registry: RalphRegistry, extensionToken: string): RequestHandler {
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
     res.setHeader("Cache-Control", "no-store");
@@ -946,13 +946,13 @@ export function ralfSettingsGetHandler(registry: RalfRegistry, extensionToken: s
   };
 }
 
-export function ralfSettingsPutHandler(registry: RalfRegistry, extensionToken: string): RequestHandler {
-  const bodySchema = z.object({ loopIntervalSeconds: ralfLoopIntervalSecondsSchema }).strict();
+export function ralphSettingsPutHandler(registry: RalphRegistry, extensionToken: string): RequestHandler {
+  const bodySchema = z.object({ loopIntervalSeconds: ralphLoopIntervalSecondsSchema }).strict();
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
     const parsed = bodySchema.safeParse(req.body);
     if (!parsed.success) {
-      res.status(400).json({ error: `RALF loop interval must be a whole number from ${MIN_RALF_INTERVAL_SECONDS} to ${MAX_RALF_INTERVAL_SECONDS} seconds.` });
+      res.status(400).json({ error: `RALPH loop interval must be a whole number from ${MIN_RALPH_INTERVAL_SECONDS} to ${MAX_RALPH_INTERVAL_SECONDS} seconds.` });
       return;
     }
     const settings = await registry.setLoopIntervalSeconds(parsed.data.loopIntervalSeconds);
@@ -961,15 +961,15 @@ export function ralfSettingsPutHandler(registry: RalfRegistry, extensionToken: s
   };
 }
 
-export function ralfProjectsPutHandler(registry: RalfRegistry, extensionToken: string): RequestHandler {
+export function ralphProjectsPutHandler(registry: RalphRegistry, extensionToken: string): RequestHandler {
   const bodySchema = z.object({
-    projects: z.array(z.string().min(1).max(2048)).max(MAX_RALF_PROJECTS),
+    projects: z.array(z.string().min(1).max(2048)).max(MAX_RALPH_PROJECTS),
   }).strict();
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
     const parsed = bodySchema.safeParse(req.body);
     if (!parsed.success) {
-      res.status(400).json({ error: "Invalid RALF projects request." });
+      res.status(400).json({ error: "Invalid RALPH projects request." });
       return;
     }
     try {
@@ -977,7 +977,7 @@ export function ralfProjectsPutHandler(registry: RalfRegistry, extensionToken: s
       res.setHeader("Cache-Control", "no-store");
       res.json({ projects });
     } catch (error) {
-      res.status(400).json({ error: error instanceof Error ? error.message : "Could not update RALF projects." });
+      res.status(400).json({ error: error instanceof Error ? error.message : "Could not update RALPH projects." });
     }
   };
 }

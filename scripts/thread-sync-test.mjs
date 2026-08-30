@@ -8,7 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { THREAD_SYNC_AGENT_INSTRUCTION, THREAD_SYNC_WIDGET_URI, ThreadSyncRegistry, parseConversationUrl, prepareThreadSync, registerThreadSync, threadSyncBindHandler, threadSyncBindUrl } from "../dist/thread-sync.js";
-import { RalfController, RalfRegistry, SupportCommandBus, normalizeChatGptMessageTarget, parseRalfProjectId, ralfRegistrationHandler, ralfSettingsGetHandler, ralfSettingsPutHandler, ralfThreadActiveHandler, ralfThreadCheckHandler, ralfThreadCompleteHandler, ralfThreadsGetHandler, registerChatGptMessaging, supportCommandClaimHandler } from "../dist/chatgpt-support.js";
+import { RalphController, RalphRegistry, SupportCommandBus, normalizeChatGptMessageTarget, parseRalphProjectId, ralphRegistrationHandler, ralphSettingsGetHandler, ralphSettingsPutHandler, ralphThreadActiveHandler, ralphThreadCheckHandler, ralphThreadCompleteHandler, ralphThreadsGetHandler, registerChatGptMessaging, supportCommandClaimHandler } from "../dist/chatgpt-support.js";
 
 const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "win-codex-thread-sync-test-"));
 const projectId = "g-p-6a87fafd6d948191ab3338e485c07c39";
@@ -20,7 +20,7 @@ const idB = { ownerId: "grant-one", sessionId: "session-B" };
 let client;
 let server;
 let supportCommands;
-let ralfRegistry;
+let ralphRegistry;
 
 try {
   assert.equal(threadSyncBindUrl(), "http://127.0.0.1:6002/thread-sync/bind");
@@ -54,44 +54,56 @@ try {
     "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:*");
   const preparedPopup = await readFile(path.join(sync.extensionDirectory, "popup.html"), "utf8");
   assert.match(preparedPopup, /Sub-agent project URL/);
-  assert.match(preparedPopup, /id="panel-threads"/, "the popup exposes the RALF threads tab");
+  assert.match(preparedPopup, /id="panel-threads"/, "the popup exposes the RALPH threads tab");
   assert.match(preparedPopup, /id="panel-settings"/, "the popup exposes the settings tab");
-  assert.match(preparedPopup, /RALF projects/);
-  assert.match(preparedPopup, /RALF loop interval \(seconds\)/);
-  assert.match(preparedPopup, /RALF minimum worked time \(seconds\)/);
+  assert.match(preparedPopup, /RALPH projects/);
+  assert.match(preparedPopup, /RALPH loop interval \(seconds\)/);
+  assert.match(preparedPopup, /RALPH minimum worked time \(seconds\)/);
   assert.match(preparedPopup, /config\.js/);
   const preparedPopupScript = await readFile(path.join(sync.extensionDirectory, "popup.js"), "utf8");
   assert.match(preparedPopupScript, /Mark complete/,
-    "active RALF thread cards expose a manual completion action");
+    "active RALPH thread cards expose a manual completion action");
   assert.match(preparedPopupScript, /Mark active/,
-    "completed RALF thread cards expose a manual reactivation action");
-  assert.match(preparedPopup, /id="markCurrentThread"/, "the popup can mark its active ChatGPT thread for RALF");
+    "completed RALPH thread cards expose a manual reactivation action");
+  assert.match(preparedPopupScript, /textContent = "Check now"/,
+    "active RALPH thread cards expose an immediate check action");
+  assert.match(preparedPopupScript, /threadStateEndpoint\(thread\.threadId, "check"\)/,
+    "the popup immediate action uses the server check endpoint");
+  assert.match(preparedPopup, /id="markCurrentThread"/, "the popup can mark its active ChatGPT thread for RALPH");
   assert.match(preparedPopupScript, /tabs\.query\(\{ active: true, currentWindow: true \}\)/,
-    "manual RALF registration reads the current tab URL");
+    "manual RALPH registration reads the current tab URL");
   assert.match(preparedPopupScript, /JSON\.stringify\(\{ conversationUrl: currentConversationUrl, manual: true \}\)/,
     "the popup requests a project-filter override for the current thread");
-  assert.match(preparedPopup, /data-thread-filter="active"/);
+  assert.match(preparedPopup, /data-thread-filter="active"[^>]*>[\s\S]*?id="activeCount"/,
+    "the active thread filter shows its count");
   assert.match(preparedPopup, /data-thread-filter="complete"/);
+  assert.doesNotMatch(preparedPopup, /id="(?:threadCount|completeCount)"/,
+    "the popup does not count all or completed threads");
+  assert.match(preparedPopupScript, /textContent: thread\.conversationUrl/,
+    "thread cards show their full ChatGPT URL");
+  assert.match(preparedPopupScript,
+    /sort\(\(left, right\) => Date\.parse\(right\.registeredAt\) - Date\.parse\(left\.registeredAt\)\)/,
+    "thread cards sort from most recently registered to oldest");
   const preparedConfig = {};
   vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), preparedConfig);
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.commandClaimUrl, "http://127.0.0.1:6002/chatgpt-support/commands/claim");
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.commandResultUrl, "http://127.0.0.1:6002/chatgpt-support/commands/result");
-  assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralfRegisterUrl, "http://127.0.0.1:6002/chatgpt-support/ralf/register");
-  assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralfProjectsUrl, "http://127.0.0.1:6002/chatgpt-support/ralf/projects");
-  assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralfSettingsUrl, "http://127.0.0.1:6002/chatgpt-support/ralf/settings");
-  assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralfThreadsUrl, "http://127.0.0.1:6002/chatgpt-support/ralf/threads");
+  assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralphRegisterUrl, "http://127.0.0.1:6002/chatgpt-support/ralph/register");
+  assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralphProjectsUrl, "http://127.0.0.1:6002/chatgpt-support/ralph/projects");
+  assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralphSettingsUrl, "http://127.0.0.1:6002/chatgpt-support/ralph/settings");
+  assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralphThreadsUrl, "http://127.0.0.1:6002/chatgpt-support/ralph/threads");
   const preparedContentScript = await readFile(path.join(sync.extensionDirectory, "content-script.js"), "utf8");
-  assert.match(preparedContentScript, /Run RALF now/,
-    "project conversations expose the manual RALF action");
+  assert.doesNotMatch(preparedContentScript, /Run RALPH now|installManualRalphButton/,
+    "the content script does not inject a RALPH button into ChatGPT");
   assert.throws(() => normalizeChatGptMessageTarget("https://chatgpt.com/"), /project URL/);
   assert.equal(normalizeChatGptMessageTarget(namedProjectHome), namedProjectHome);
-  assert.equal(parseRalfProjectId(namedProjectHome), projectId);
-  assert.equal(parseRalfProjectId(urlA), projectId);
+  assert.equal(parseRalphProjectId(namedProjectHome), projectId);
+  assert.equal(parseRalphProjectId(urlA), projectId);
   assert.throws(() => normalizeChatGptMessageTarget("https://evil.example/"));
 
   const registry = sync.registry;
-  ralfRegistry = await RalfRegistry.open(temporaryRoot, 20);
-  await ralfRegistry.setProjects([projectId]);
+  ralphRegistry = await RalphRegistry.open(temporaryRoot, 20);
+  await ralphRegistry.setProjects([projectId]);
   supportCommands = new SupportCommandBus();
   const [a, b, againA] = await Promise.all([registry.context(idA), registry.context(idB), registry.context(idA)]);
   assert.equal(a.ticket.token, againA.ticket.token, "repeated sync calls reuse the pending ticket");
@@ -135,9 +147,9 @@ try {
   assert.equal(refreshedBinding.conversationUrl, urlA,
     "rebinding the same thread refreshes its exact ChatGPT route");
   assert.equal((await routeRefreshRegistry.binding(routeRefreshIdentity)).conversationUrl, urlA);
-  const projectScopedRegistry = await RalfRegistry.open(routeRefreshRoot, 20);
+  const projectScopedRegistry = await RalphRegistry.open(routeRefreshRoot, 20);
   assert.equal(await projectScopedRegistry.register(urlA), false,
-    "RALF ignores project threads until their project is explicitly configured");
+    "RALPH ignores project threads until their project is explicitly configured");
   assert.deepEqual(await projectScopedRegistry.setProjects([namedProjectHome, projectId]), [projectId],
     "named project home URLs canonicalize to the stable project id");
   assert.equal(await projectScopedRegistry.register(urlA), true);
@@ -147,11 +159,11 @@ try {
     [[urlA, "active"]], "the popup thread list reports every registered thread");
   const listThreads = (authorization = `Bearer ${sync.extensionToken}`) => new Promise(resolve => {
     const response = { status(code) { response.code = code; return response; }, json(body) { resolve({ code: response.code ?? 200, body }); }, setHeader() {} };
-    ralfThreadsGetHandler(projectScopedRegistry, sync.extensionToken)({ get: name => (name === "authorization" ? authorization : undefined) }, response);
+    ralphThreadsGetHandler(projectScopedRegistry, sync.extensionToken)({ get: name => (name === "authorization" ? authorization : undefined) }, response);
   });
   assert.equal((await listThreads("Bearer wrong")).code, 401, "the thread list requires the extension token");
   assert.deepEqual((await listThreads()).body.threads.map(thread => thread.threadId), [parseConversationUrl(urlA).threadId]);
-  const completeThreadHandler = ralfThreadCompleteHandler(projectScopedRegistry, sync.extensionToken);
+  const completeThreadHandler = ralphThreadCompleteHandler(projectScopedRegistry, sync.extensionToken);
   const completeThread = (threadId, authorization = `Bearer ${sync.extensionToken}`) => new Promise(resolve => {
     const response = {
       status(code) { response.code = code; return response; },
@@ -172,7 +184,7 @@ try {
     "manually completed threads stay listed for the popup after they stop being due");
   assert.deepEqual(await projectScopedRegistry.due(), []);
   await projectScopedRegistry.setLoopIntervalSeconds(1);
-  const activateThreadHandler = ralfThreadActiveHandler(projectScopedRegistry, sync.extensionToken);
+  const activateThreadHandler = ralphThreadActiveHandler(projectScopedRegistry, sync.extensionToken);
   const activateThread = (threadId, authorization = `Bearer ${sync.extensionToken}`) => new Promise(resolve => {
     const response = {
       status(code) { response.code = code; return response; },
@@ -195,7 +207,7 @@ try {
     "reactivating a completed thread schedules a fresh loop check");
   assert.deepEqual(await projectScopedRegistry.due(), [], "reactivation does not trigger an immediate stale check");
   let manualCheckTicks = 0;
-  const checkThreadHandler = ralfThreadCheckHandler(projectScopedRegistry, {
+  const checkThreadHandler = ralphThreadCheckHandler(projectScopedRegistry, {
     async tick() { manualCheckTicks += 1; },
   }, sync.extensionToken);
   const checkThread = (threadId, authorization = `Bearer ${sync.extensionToken}`) => new Promise(resolve => {
@@ -214,16 +226,16 @@ try {
     code: 202,
     body: { threadId: parseConversationUrl(urlA).threadId, status: "scheduled" },
   });
-  assert.equal(manualCheckTicks, 1, "a manual RALF request starts the scheduler immediately");
+  assert.equal(manualCheckTicks, 1, "a manual RALPH request starts the scheduler immediately");
   assert.ok((await projectScopedRegistry.threads())[0].nextCheckAt >= scheduledAt);
   assert.equal((await projectScopedRegistry.due()).length, 1,
-    "a manual RALF request sets the active thread timer to now");
+    "a manual RALPH request sets the active thread timer to now");
   await completeThread(parseConversationUrl(urlA).threadId);
   assert.equal((await checkThread(parseConversationUrl(urlA).threadId)).code, 409,
-    "completed RALF threads cannot be checked without reactivation");
+    "completed RALPH threads cannot be checked without reactivation");
   assert.equal((await checkThread("22222222-2222-4222-8222-222222222222")).code, 404);
   assert.equal((await checkThread(parseConversationUrl(urlA).threadId, "Bearer wrong")).code, 401);
-  const registerThreadHandler = ralfRegistrationHandler(projectScopedRegistry, sync.extensionToken);
+  const registerThreadHandler = ralphRegistrationHandler(projectScopedRegistry, sync.extensionToken);
   const registerThread = (body) => new Promise(resolve => {
     const response = {
       status(code) { response.code = code; return response; },
@@ -242,7 +254,7 @@ try {
   });
   const [messageReactivatedThread] = await projectScopedRegistry.threads();
   assert.equal(messageReactivatedThread.state, "active",
-    "a send-to-stop composer transition reactivates an existing completed RALF thread");
+    "a send-to-stop composer transition reactivates an existing completed RALPH thread");
   assert.ok(messageReactivatedThread.nextCheckAt >= messageSentAt + 900 &&
     messageReactivatedThread.nextCheckAt <= messageSentAt + 1_100,
   "the composer transition starts a fresh loop interval from the new message");
@@ -251,7 +263,7 @@ try {
     "reactivation does not reschedule a thread that is already active");
   await projectScopedRegistry.setProjects([]);
   assert.equal((await projectScopedRegistry.due()).length, 0,
-    "removing a RALF project removes its registered threads");
+    "removing a RALPH project removes its registered threads");
   assert.deepEqual(await projectScopedRegistry.threads(), []);
   assert.deepEqual(await registerThread({ conversationUrl: urlA, manual: true }), {
     code: 200,
@@ -269,17 +281,17 @@ try {
   await completeThread(parseConversationUrl(urlA).threadId);
   await registerThread({ conversationUrl: urlA, manual: true });
   assert.equal(await projectScopedRegistry.isActive(parseConversationUrl(urlA).threadId), true,
-    "marking a completed thread from the popup starts a fresh RALF loop");
+    "marking a completed thread from the popup starts a fresh RALPH loop");
   await completeThread(parseConversationUrl(urlA).threadId);
   await registerThread({ conversationUrl: urlA, reactivate: true });
   assert.equal(await projectScopedRegistry.isActive(parseConversationUrl(urlA).threadId), true,
     "new messages can reactivate a manually registered thread outside the project allowlist");
 
-  const timingRoot = path.join(temporaryRoot, "ralf-timing");
-  const timingRegistry = await RalfRegistry.open(timingRoot);
+  const timingRoot = path.join(temporaryRoot, "ralph-timing");
+  const timingRegistry = await RalphRegistry.open(timingRoot);
   await timingRegistry.setProjects([projectId]);
   await timingRegistry.register(urlA);
-  async function requestRalfSettings(handler, body, authorization = `Bearer ${sync.extensionToken}`) {
+  async function requestRalphSettings(handler, body, authorization = `Bearer ${sync.extensionToken}`) {
     const result = { status: 200, body: undefined };
     const req = { body, get: name => (name === "authorization" ? authorization : undefined) };
     const res = {
@@ -290,25 +302,25 @@ try {
     await handler(req, res);
     return result;
   }
-  const getRalfSettings = ralfSettingsGetHandler(timingRegistry, sync.extensionToken);
-  const putRalfSettings = ralfSettingsPutHandler(timingRegistry, sync.extensionToken);
-  assert.deepEqual((await requestRalfSettings(getRalfSettings)).body, { loopIntervalSeconds: 25 * 60 });
-  assert.equal((await requestRalfSettings(getRalfSettings, undefined, "Bearer wrong")).status, 401);
+  const getRalphSettings = ralphSettingsGetHandler(timingRegistry, sync.extensionToken);
+  const putRalphSettings = ralphSettingsPutHandler(timingRegistry, sync.extensionToken);
+  assert.deepEqual((await requestRalphSettings(getRalphSettings)).body, { loopIntervalSeconds: 25 * 60 });
+  assert.equal((await requestRalphSettings(getRalphSettings, undefined, "Bearer wrong")).status, 401);
   const intervalChangedAt = Date.now();
-  assert.deepEqual((await requestRalfSettings(putRalfSettings, { loopIntervalSeconds: 1 })).body,
+  assert.deepEqual((await requestRalphSettings(putRalphSettings, { loopIntervalSeconds: 1 })).body,
     { loopIntervalSeconds: 1 });
   const [rescheduledThread] = await timingRegistry.threads();
   assert.ok(rescheduledThread.nextCheckAt >= intervalChangedAt + 900 &&
     rescheduledThread.nextCheckAt <= intervalChangedAt + 1_100,
     "changing the loop interval reschedules active threads from the current time");
-  assert.deepEqual((await requestRalfSettings(getRalfSettings)).body, { loopIntervalSeconds: 1 });
-  assert.equal((await requestRalfSettings(putRalfSettings, { loopIntervalSeconds: 0 })).status, 400);
-  assert.deepEqual(await (await RalfRegistry.open(timingRoot)).settings(), { loopIntervalSeconds: 1 },
-    "the RALF loop interval survives a server restart");
+  assert.deepEqual((await requestRalphSettings(getRalphSettings)).body, { loopIntervalSeconds: 1 });
+  assert.equal((await requestRalphSettings(putRalphSettings, { loopIntervalSeconds: 0 })).status, 400);
+  assert.deepEqual(await (await RalphRegistry.open(timingRoot)).settings(), { loopIntervalSeconds: 1 },
+    "the RALPH loop interval survives a server restart");
 
-  const legacyRalfRoot = path.join(temporaryRoot, "legacy-ralf");
-  await mkdir(legacyRalfRoot, { recursive: true });
-  await writeFile(path.join(legacyRalfRoot, "ralf.json"), JSON.stringify({
+  const legacyRalphRoot = path.join(temporaryRoot, "legacy-ralph");
+  await mkdir(legacyRalphRoot, { recursive: true });
+  await writeFile(path.join(legacyRalphRoot, "ralph.json"), JSON.stringify({
     version: 1,
     threads: [{
       conversationUrl: urlA,
@@ -323,11 +335,11 @@ try {
       excludedAt: new Date(0).toISOString(),
     }],
   }));
-  const migratedRalfRegistry = await RalfRegistry.open(legacyRalfRoot, 20);
-  assert.deepEqual(await migratedRalfRegistry.projects(), []);
-  assert.deepEqual(await migratedRalfRegistry.due(), [],
-    "legacy blanket RALF registrations do not survive the project-scoped migration");
-  assert.equal(JSON.parse(await readFile(path.join(legacyRalfRoot, "ralf.json"), "utf8")).version, 2);
+  const migratedRalphRegistry = await RalphRegistry.open(legacyRalphRoot, 20);
+  assert.deepEqual(await migratedRalphRegistry.projects(), []);
+  assert.deepEqual(await migratedRalphRegistry.due(), [],
+    "legacy blanket RALPH registrations do not survive the project-scoped migration");
+  assert.equal(JSON.parse(await readFile(path.join(legacyRalphRoot, "ralph.json"), "utf8")).version, 2);
 
   const handler = threadSyncBindHandler(registry, sync.extensionToken);
   async function request(body, authorization = `Bearer ${sync.extensionToken}`, origin = "chrome-extension://" + "a".repeat(32)) {
@@ -351,8 +363,8 @@ try {
   assert.deepEqual((await request({ token: a.ticket.token, conversationUrl: urlA }, `Bearer ${sync.extensionToken}`, "moz-extension://thread-sync-test")).body,
     { status: "bound" }, "standard non-Chrome WebExtension origins are accepted");
   await new Promise(resolve => setTimeout(resolve, 25));
-  assert.equal((await ralfRegistry.due()).some(thread => thread.conversationUrl === urlA), false,
-    "thread sync does not register conversations for RALF");
+  assert.equal((await ralphRegistry.due()).some(thread => thread.conversationUrl === urlA), false,
+    "thread sync does not register conversations for RALPH");
 
   // Exercise actual MCP metadata forwarding without opening an HTTP listener.
   server = new McpServer({ name: "thread-sync-test", version: "1" });
@@ -457,7 +469,7 @@ try {
   assert.equal(messageResult.structuredContent.conversationUrl, urlA);
 
   const abandonedController = new AbortController();
-  const abandonedClaim = supportCommands.claim("chrome-browser", ["ralf"], 1000, abandonedController.signal);
+  const abandonedClaim = supportCommands.claim("chrome-browser", ["ralph"], 1000, abandonedController.signal);
   abandonedController.abort();
   assert.equal(await abandonedClaim, undefined, "an aborted browser poll cannot steal a later command");
 
@@ -465,7 +477,7 @@ try {
   const claimHandler = supportCommandClaimHandler(claimHandlerBus, sync.extensionToken);
   const makeClaimRequest = (browserId) => {
     const req = new EventEmitter();
-    req.body = { browserId, features: ["ralf"] };
+    req.body = { browserId, features: ["ralph"] };
     req.get = key => ({
       authorization: `Bearer ${sync.extensionToken}`,
       origin: "chrome-extension://" + "a".repeat(32),
@@ -485,7 +497,7 @@ try {
   await new Promise(resolve => setImmediate(resolve));
   healthyPoll.req.emit("close");
   const healthyCommandResult = claimHandlerBus.execute({
-    feature: "ralf",
+    feature: "ralph",
     kind: "inspect_thread",
     conversationUrl: urlA,
   });
@@ -507,11 +519,11 @@ try {
   disconnectedPoll.res.emit("close");
   await disconnectedPollResult;
   const retryCommandResult = claimHandlerBus.execute({
-    feature: "ralf",
+    feature: "ralph",
     kind: "inspect_thread",
     conversationUrl: urlA,
   });
-  const retryCommand = await claimHandlerBus.claim("retry-browser", ["ralf"], 1000);
+  const retryCommand = await claimHandlerBus.claim("retry-browser", ["ralph"], 1000);
   assert.equal(retryCommand.kind, "inspect_thread",
     "a disconnected long poll must not steal a future command");
   claimHandlerBus.complete({
@@ -526,7 +538,7 @@ try {
 
   const orphanedCommandBus = new SupportCommandBus();
   const orphanedResult = orphanedCommandBus.execute({
-    feature: "ralf",
+    feature: "ralph",
     kind: "inspect_thread",
     conversationUrl: urlA,
   }, 25);
@@ -534,15 +546,15 @@ try {
     result => ({ result }),
     error => ({ error }),
   );
-  const orphanedCommand = await orphanedCommandBus.claim("same-browser", ["ralf"], 0);
-  const reclaimedCommand = await orphanedCommandBus.claim("same-browser", ["ralf"], 0);
+  const orphanedCommand = await orphanedCommandBus.claim("same-browser", ["ralph"], 0);
+  const reclaimedCommand = await orphanedCommandBus.claim("same-browser", ["ralph"], 0);
   let orphanedError;
   if (!reclaimedCommand) {
     await new Promise(resolve => setTimeout(resolve, 50));
     orphanedError = (await orphanedOutcome).error;
   }
   assert.equal(reclaimedCommand?.id, orphanedCommand.id,
-    `a browser must be able to resume its claimed RALF inspection instead of leaving it orphaned: ${orphanedError?.message ?? "no timeout captured"}`);
+    `a browser must be able to resume its claimed RALPH inspection instead of leaving it orphaned: ${orphanedError?.message ?? "no timeout captured"}`);
   orphanedCommandBus.complete({
     commandId: reclaimedCommand.id,
     browserId: "same-browser",
@@ -553,19 +565,19 @@ try {
   assert.equal((await orphanedResult).result.status, "running");
   orphanedCommandBus.close();
 
-  const ralfControllerRoot = path.join(temporaryRoot, "ralf-controller");
-  const ralfControllerRegistry = await RalfRegistry.open(ralfControllerRoot, 20);
-  await ralfControllerRegistry.setProjects([projectId]);
-  const ralfCommands = new SupportCommandBus();
+  const ralphControllerRoot = path.join(temporaryRoot, "ralph-controller");
+  const ralphControllerRegistry = await RalphRegistry.open(ralphControllerRoot, 20);
+  await ralphControllerRegistry.setProjects([projectId]);
+  const ralphCommands = new SupportCommandBus();
   const originalFetch = globalThis.fetch;
   const originalConsoleLog = console.log;
   const originalConsoleError = console.error;
-  const ralfOpenAiLogs = [];
+  const ralphOpenAiLogs = [];
   let apiRequest;
   let apiRequestCount = 0;
   let failNextApiRequest = false;
-  console.log = (...values) => ralfOpenAiLogs.push(values.join(" "));
-  console.error = (...values) => ralfOpenAiLogs.push(values.join(" "));
+  console.log = (...values) => ralphOpenAiLogs.push(values.join(" "));
+  console.error = (...values) => ralphOpenAiLogs.push(values.join(" "));
   globalThis.fetch = async (_url, options) => {
     apiRequestCount += 1;
     apiRequest = JSON.parse(options.body);
@@ -573,7 +585,7 @@ try {
       failNextApiRequest = false;
       return new Response(JSON.stringify({ error: { message: "Rate limit reached for test." } }), {
         status: 429,
-        headers: { "content-type": "application/json", "x-request-id": "req_ralf_failure" },
+        headers: { "content-type": "application/json", "x-request-id": "req_ralph_failure" },
       });
     }
     return new Response(JSON.stringify({
@@ -584,25 +596,25 @@ try {
       usage: { input_tokens: 123, output_tokens: 17, total_tokens: 140 },
     }), {
       status: 200,
-      headers: { "content-type": "application/json", "x-request-id": "req_ralf_success" },
+      headers: { "content-type": "application/json", "x-request-id": "req_ralph_success" },
     });
   };
-  const ralfController = new RalfController({
-    registry: ralfControllerRegistry,
-    commands: ralfCommands,
+  const ralphController = new RalphController({
+    registry: ralphControllerRegistry,
+    commands: ralphCommands,
     apiKey: "test-key",
     model: "gpt-5.6-terra",
-    auditLogPath: path.join(ralfControllerRoot, "ralf-openai.log"),
+    auditLogPath: path.join(ralphControllerRoot, "ralph-openai.log"),
     checkEveryMs: 60_000,
   });
   try {
-    const ralfUrl = `https://chatgpt.com/g/${projectId}/c/22222222-2222-4222-8222-222222222222`;
-    await ralfControllerRegistry.register(ralfUrl);
+    const ralphUrl = `https://chatgpt.com/g/${projectId}/c/22222222-2222-4222-8222-222222222222`;
+    await ralphControllerRegistry.register(ralphUrl);
     await new Promise(resolve => setTimeout(resolve, 25));
-    await ralfController.tick();
-    const inspectCommand = await ralfCommands.claim("chrome-browser", ["ralf"], 1000);
+    await ralphController.tick();
+    const inspectCommand = await ralphCommands.claim("chrome-browser", ["ralph"], 1000);
     assert.equal(inspectCommand.kind, "inspect_thread");
-    ralfCommands.complete({
+    ralphCommands.complete({
       commandId: inspectCommand.id,
       browserId: "chrome-browser",
       kind: "inspect_thread",
@@ -617,29 +629,29 @@ try {
         assistant: { synthetic: false, id: "a1", text: "I implemented most of it, but one CI failure remains." },
       },
     });
-    const continueCommand = await ralfCommands.claim("chrome-browser", ["ralf"], 1000);
+    const continueCommand = await ralphCommands.claim("chrome-browser", ["ralph"], 1000);
     assert.equal(continueCommand.kind, "send_message");
-    assert.equal(continueCommand.targetUrl, ralfUrl);
+    assert.equal(continueCommand.targetUrl, ralphUrl);
     assert.equal(continueCommand.message, "Inspect the remaining CI failure and fix the specific blocker before stopping.");
     assert.equal(apiRequest.model, "gpt-5.6-terra");
     assert.deepEqual(apiRequest.reasoning, { effort: "low" });
     assert.equal("max_output_tokens" in apiRequest, false,
-      "RALF must not impose an output-token budget on classification");
+      "RALPH must not impose an output-token budget on classification");
     assert.match(JSON.stringify(apiRequest.input), /Fix the implementation end to end/);
     assert.match(JSON.stringify(apiRequest.input), /one CI failure remains/);
-    assert.ok(ralfOpenAiLogs.some(line => line.includes("[ralf/openai]") && line.includes('"event":"request_started"') &&
-      line.includes(`"thread":${JSON.stringify(ralfUrl)}`) && line.includes('"model":"gpt-5.6-terra"') &&
+    assert.ok(ralphOpenAiLogs.some(line => line.includes("[ralph/openai]") && line.includes('"event":"request_started"') &&
+      line.includes(`"thread":${JSON.stringify(ralphUrl)}`) && line.includes('"model":"gpt-5.6-terra"') &&
       line.includes("Fix the implementation end to end") && line.includes("one CI failure remains")),
-      "the request audit log includes the exact RALF instruction and transcript sent to OpenAI");
-    assert.ok(ralfOpenAiLogs.some(line => line.includes('"event":"request_succeeded"') &&
-      line.includes('"request_id":"req_ralf_success"') && line.includes('"http_status":200') &&
+      "the request audit log includes the exact RALPH instruction and transcript sent to OpenAI");
+    assert.ok(ralphOpenAiLogs.some(line => line.includes('"event":"request_succeeded"') &&
+      line.includes('"request_id":"req_ralph_success"') && line.includes('"http_status":200') &&
       line.includes('"input_tokens":123') && line.includes('"output_tokens":17') &&
       line.includes('"total_tokens":140') && line.includes('"action":"continue"') &&
       line.includes("Inspect the remaining CI failure and fix the specific blocker before stopping.")),
       "the success audit log includes the exact OpenAI response body");
-    assert.ok(ralfOpenAiLogs.every(line => !line.includes("test-key")),
-      "RALF OpenAI audit logs must not expose the API key");
-    const persistedSuccessLogs = (await readFile(path.join(ralfControllerRoot, "ralf-openai.log"), "utf8"))
+    assert.ok(ralphOpenAiLogs.every(line => !line.includes("test-key")),
+      "RALPH OpenAI audit logs must not expose the API key");
+    const persistedSuccessLogs = (await readFile(path.join(ralphControllerRoot, "ralph-openai.log"), "utf8"))
       .trim().split("\n").map(line => JSON.parse(line));
     assert.equal(persistedSuccessLogs.length, 2);
     assert.equal(persistedSuccessLogs[0].event, "request_started");
@@ -648,7 +660,7 @@ try {
     assert.deepEqual(persistedSuccessLogs[0].request.reasoning, { effort: "low" });
     assert.equal("max_output_tokens" in persistedSuccessLogs[0].request, false);
     assert.equal(persistedSuccessLogs[1].event, "request_succeeded");
-    assert.equal(persistedSuccessLogs[1].request_id, "req_ralf_success");
+    assert.equal(persistedSuccessLogs[1].request_id, "req_ralph_success");
     assert.equal(persistedSuccessLogs[1].total_tokens, 140);
     assert.equal(persistedSuccessLogs[1].response_text,
       "Inspect the remaining CI failure and fix the specific blocker before stopping.");
@@ -656,23 +668,23 @@ try {
       "the success audit record stores extracted response text instead of the opaque API payload");
     assert.ok(!JSON.stringify(persistedSuccessLogs).includes("opaque-test-reasoning"));
     assert.ok(!JSON.stringify(persistedSuccessLogs).includes("test-key"));
-    ralfCommands.complete({
+    ralphCommands.complete({
       commandId: continueCommand.id,
       browserId: "chrome-browser",
       kind: "send_message",
       ok: true,
-      result: { status: "sent", conversationUrl: ralfUrl },
+      result: { status: "sent", conversationUrl: ralphUrl },
     });
     await new Promise(resolve => setTimeout(resolve, 10));
-    await ralfControllerRegistry.recordComplete("22222222-2222-4222-8222-222222222222");
+    await ralphControllerRegistry.recordComplete("22222222-2222-4222-8222-222222222222");
 
-    const shortRalfUrl = `https://chatgpt.com/g/${projectId}/c/33333333-3333-4333-8333-333333333333`;
-    await ralfControllerRegistry.register(shortRalfUrl);
+    const shortRalphUrl = `https://chatgpt.com/g/${projectId}/c/33333333-3333-4333-8333-333333333333`;
+    await ralphControllerRegistry.register(shortRalphUrl);
     await new Promise(resolve => setTimeout(resolve, 25));
-    await ralfController.tick();
-    const shortInspectCommand = await ralfCommands.claim("chrome-browser", ["ralf"], 1000);
+    await ralphController.tick();
+    const shortInspectCommand = await ralphCommands.claim("chrome-browser", ["ralph"], 1000);
     assert.equal(shortInspectCommand.kind, "inspect_thread");
-    ralfCommands.complete({
+    ralphCommands.complete({
       commandId: shortInspectCommand.id,
       browserId: "chrome-browser",
       kind: "inspect_thread",
@@ -685,16 +697,16 @@ try {
       },
     });
     await new Promise(resolve => setTimeout(resolve, 20));
-    assert.equal(apiRequestCount, 1, "RALF must not call OpenAI for a task that took 19 minutes or less");
-    assert.equal(await ralfCommands.claim("chrome-browser", ["ralf"], 0), undefined);
+    assert.equal(apiRequestCount, 1, "RALPH must not call OpenAI for a task that took 19 minutes or less");
+    assert.equal(await ralphCommands.claim("chrome-browser", ["ralph"], 0), undefined);
 
-    const unknownRalfUrl = `https://chatgpt.com/g/${projectId}/c/44444444-4444-4444-8444-444444444444`;
-    await ralfControllerRegistry.register(unknownRalfUrl);
+    const unknownRalphUrl = `https://chatgpt.com/g/${projectId}/c/44444444-4444-4444-8444-444444444444`;
+    await ralphControllerRegistry.register(unknownRalphUrl);
     await new Promise(resolve => setTimeout(resolve, 25));
-    await ralfController.tick();
-    const unknownInspectCommand = await ralfCommands.claim("chrome-browser", ["ralf"], 1000);
+    await ralphController.tick();
+    const unknownInspectCommand = await ralphCommands.claim("chrome-browser", ["ralph"], 1000);
     assert.equal(unknownInspectCommand.kind, "inspect_thread");
-    ralfCommands.complete({
+    ralphCommands.complete({
       commandId: unknownInspectCommand.id,
       browserId: "chrome-browser",
       kind: "inspect_thread",
@@ -707,17 +719,17 @@ try {
       },
     });
     await new Promise(resolve => setTimeout(resolve, 20));
-    assert.equal(apiRequestCount, 1, "RALF must not call OpenAI when the worked duration is unavailable");
-    assert.equal(await ralfCommands.claim("chrome-browser", ["ralf"], 0), undefined);
+    assert.equal(apiRequestCount, 1, "RALPH must not call OpenAI when the worked duration is unavailable");
+    assert.equal(await ralphCommands.claim("chrome-browser", ["ralph"], 0), undefined);
 
-    const failedRalfUrl = `https://chatgpt.com/g/${projectId}/c/55555555-5555-4555-8555-555555555555`;
-    await ralfControllerRegistry.register(failedRalfUrl);
+    const failedRalphUrl = `https://chatgpt.com/g/${projectId}/c/55555555-5555-4555-8555-555555555555`;
+    await ralphControllerRegistry.register(failedRalphUrl);
     await new Promise(resolve => setTimeout(resolve, 25));
     failNextApiRequest = true;
-    await ralfController.tick();
-    const failedInspectCommand = await ralfCommands.claim("chrome-browser", ["ralf"], 1000);
+    await ralphController.tick();
+    const failedInspectCommand = await ralphCommands.claim("chrome-browser", ["ralph"], 1000);
     assert.equal(failedInspectCommand.kind, "inspect_thread");
-    ralfCommands.complete({
+    ralphCommands.complete({
       commandId: failedInspectCommand.id,
       browserId: "chrome-browser",
       kind: "inspect_thread",
@@ -731,13 +743,13 @@ try {
     });
     await new Promise(resolve => setTimeout(resolve, 20));
     assert.equal(apiRequestCount, 2);
-    assert.ok(ralfOpenAiLogs.some(line => line.includes('"event":"request_failed"') &&
-      line.includes('"request_id":"req_ralf_failure"') && line.includes('"http_status":429') &&
+    assert.ok(ralphOpenAiLogs.some(line => line.includes('"event":"request_failed"') &&
+      line.includes('"request_id":"req_ralph_failure"') && line.includes('"http_status":429') &&
       line.includes('"duration_ms":') && line.includes("Rate limit reached for test")),
       "the failure audit log includes the exact OpenAI error response body");
-    assert.match((await ralfControllerRegistry.threads()).find(thread => thread.conversationUrl === failedRalfUrl).lastError,
-      /HTTP 429/, "an OpenAI failure remains visible in the RALF thread state");
-    const persistedLogs = (await readFile(path.join(ralfControllerRoot, "ralf-openai.log"), "utf8"))
+    assert.match((await ralphControllerRegistry.threads()).find(thread => thread.conversationUrl === failedRalphUrl).lastError,
+      /HTTP 429/, "an OpenAI failure remains visible in the RALPH thread state");
+    const persistedLogs = (await readFile(path.join(ralphControllerRoot, "ralph-openai.log"), "utf8"))
       .trim().split("\n").map(line => JSON.parse(line));
     assert.deepEqual(persistedLogs.map(record => record.event), [
       "request_started",
@@ -747,13 +759,13 @@ try {
     ]);
     assert.equal(persistedLogs.at(-1).response.error.message, "Rate limit reached for test.");
 
-    const blankRalfUrl = `https://chatgpt.com/g/${projectId}/c/77777777-7777-4777-8777-777777777777`;
-    await ralfControllerRegistry.register(blankRalfUrl);
+    const blankRalphUrl = `https://chatgpt.com/g/${projectId}/c/77777777-7777-4777-8777-777777777777`;
+    await ralphControllerRegistry.register(blankRalphUrl);
     await new Promise(resolve => setTimeout(resolve, 25));
-    await ralfController.tick();
-    const blankInspectCommand = await ralfCommands.claim("chrome-browser", ["ralf"], 1000);
+    await ralphController.tick();
+    const blankInspectCommand = await ralphCommands.claim("chrome-browser", ["ralph"], 1000);
     assert.equal(blankInspectCommand.kind, "inspect_thread");
-    ralfCommands.complete({
+    ralphCommands.complete({
       commandId: blankInspectCommand.id,
       browserId: "chrome-browser",
       kind: "inspect_thread",
@@ -766,21 +778,21 @@ try {
       },
     });
     await new Promise(resolve => setTimeout(resolve, 20));
-    const blankThread = (await ralfControllerRegistry.threads())
-      .find(thread => thread.conversationUrl === blankRalfUrl);
-    assert.equal(apiRequestCount, 2, "RALF must not classify a blank extracted transcript");
+    const blankThread = (await ralphControllerRegistry.threads())
+      .find(thread => thread.conversationUrl === blankRalphUrl);
+    assert.equal(apiRequestCount, 2, "RALPH must not classify a blank extracted transcript");
     assert.equal(blankThread.state, "active", "a blank extracted transcript must not complete the thread");
     assert.match(blankThread.lastError, /could not extract every ChatGPT user message/);
   } finally {
-    ralfController.close();
-    ralfCommands.close();
+    ralphController.close();
+    ralphCommands.close();
     globalThis.fetch = originalFetch;
     console.log = originalConsoleLog;
     console.error = originalConsoleError;
   }
 
-  const blockedAuditRoot = path.join(temporaryRoot, "ralf-blocked-audit");
-  const blockedAuditRegistry = await RalfRegistry.open(blockedAuditRoot, 20);
+  const blockedAuditRoot = path.join(temporaryRoot, "ralph-blocked-audit");
+  const blockedAuditRegistry = await RalphRegistry.open(blockedAuditRoot, 20);
   await blockedAuditRegistry.setProjects([projectId]);
   const blockedAuditCommands = new SupportCommandBus();
   let blockedApiRequestCount = 0;
@@ -788,9 +800,9 @@ try {
     blockedApiRequestCount += 1;
     throw new Error("OpenAI must not be called when the audit log cannot be written.");
   };
-  console.log = (...values) => ralfOpenAiLogs.push(values.join(" "));
-  console.error = (...values) => ralfOpenAiLogs.push(values.join(" "));
-  const blockedAuditController = new RalfController({
+  console.log = (...values) => ralphOpenAiLogs.push(values.join(" "));
+  console.error = (...values) => ralphOpenAiLogs.push(values.join(" "));
+  const blockedAuditController = new RalphController({
     registry: blockedAuditRegistry,
     commands: blockedAuditCommands,
     apiKey: "test-key",
@@ -803,7 +815,7 @@ try {
     await blockedAuditRegistry.register(blockedAuditUrl);
     await new Promise(resolve => setTimeout(resolve, 25));
     await blockedAuditController.tick();
-    const blockedAuditInspect = await blockedAuditCommands.claim("chrome-browser", ["ralf"], 1000);
+    const blockedAuditInspect = await blockedAuditCommands.claim("chrome-browser", ["ralph"], 1000);
     blockedAuditCommands.complete({
       commandId: blockedAuditInspect.id,
       browserId: "chrome-browser",
@@ -818,8 +830,8 @@ try {
     });
     await new Promise(resolve => setTimeout(resolve, 20));
     assert.equal(blockedApiRequestCount, 0,
-      "RALF must not spend money when it cannot persist the request audit record");
-    assert.match((await blockedAuditRegistry.threads())[0].lastError, /Cannot persist the RALF OpenAI audit log/);
+      "RALPH must not spend money when it cannot persist the request audit record");
+    assert.match((await blockedAuditRegistry.threads())[0].lastError, /Cannot persist the RALPH OpenAI audit log/);
   } finally {
     blockedAuditController.close();
     blockedAuditCommands.close();
@@ -837,14 +849,14 @@ try {
 
   await testContentScript(a.ticket.token, b.ticket.token);
   await testWorkerKeepsLongAutomationAlive(sync);
-  await testManualRalfButton();
+  await testRalphComposerObserver();
   await testSendWaitsForSettlementAndRetriesIgnoredClick();
   await testNewProjectComposerWithoutDataType();
   await testReactTrackedTextareaEnablesSendButton();
   await testRunningHydrationDetection();
   await testWorkedDurationDetection();
-  await testRalfAutoRegistration(sync);
-  await testManualRalfWorkerRequest(sync);
+  await testRalphAutoRegistration(sync);
+  await testRalphWorkerReactivation(sync);
   await testWorker(sync, a.ticket.token, request);
   await testAutomationRedirectGuard(sync);
   await testWidget(sync.widgetHtml, c.ticket);
@@ -1218,20 +1230,12 @@ async function testReactTrackedTextareaEnablesSendButton() {
   assert.equal(response.result.conversationUrl, urlA);
 }
 
-async function testManualRalfButton() {
-  let click;
+async function testRalphComposerObserver() {
   let observed;
   let running = false;
   const sent = [];
   const location = new URL(urlA);
-  const button = {
-    style: {},
-    isConnected: false,
-    setAttribute() {},
-    addEventListener(type, listener) {
-      if (type === "click") click = listener;
-    },
-  };
+  let createdElements = 0;
   const composer = {
     querySelector(selector) {
       if (selector === 'button[data-testid="stop-button"]') return running ? {} : null;
@@ -1241,16 +1245,7 @@ async function testManualRalfButton() {
   const document = {
     readyState: "complete",
     documentElement: {},
-    body: {
-      appendChild(node) {
-        assert.equal(node, button);
-        button.isConnected = true;
-      },
-    },
-    createElement(tag) {
-      assert.equal(tag, "button");
-      return button;
-    },
+    createElement() { createdElements += 1; return {}; },
     querySelector(selector) {
       if (selector === 'form[data-type="unified-composer"]') return composer;
       if (selector === "#composer-submit-button" || selector === 'button[aria-label="Send prompt"]') {
@@ -1278,27 +1273,21 @@ async function testManualRalfButton() {
     MutationObserver,
     setTimeout: callback => { callback(); return 1; },
   });
-  assert.equal(button.isConnected, true);
-  assert.equal(button.textContent, "Run RALF now");
+  assert.equal(createdElements, 0, "the content script does not add controls to the ChatGPT page");
   assert.equal(typeof observed, "function");
-  assert.equal(sent.length, 0, "an initially idle composer does not reactivate RALF");
+  assert.equal(sent.length, 0, "an initially idle composer does not reactivate RALPH");
   running = true;
   observed();
   await new Promise(resolve => setImmediate(resolve));
-  const reactivations = sent.filter(message => message.type === "local-codex-support/ralf-reactivate-v1");
-  assert.equal(reactivations.length, 1, "the send-to-stop transition reactivates the current RALF thread");
+  const reactivations = sent.filter(message => message.type === "local-codex-support/ralph-reactivate-v1");
+  assert.equal(reactivations.length, 1, "the send-to-stop transition reactivates the current RALPH thread");
   assert.equal(reactivations[0].conversationUrl, urlA);
   observed();
-  assert.equal(sent.filter(message => message.type === "local-codex-support/ralf-reactivate-v1").length, 1,
+  assert.equal(sent.filter(message => message.type === "local-codex-support/ralph-reactivate-v1").length, 1,
     "later stop-button mutations do not repeat the reactivation");
-  await click();
-  const manualChecks = sent.filter(message => message.type === "local-codex-support/ralf-check-now-v1");
-  assert.equal(manualChecks.length, 1);
-  assert.equal(manualChecks[0].conversationUrl, urlA);
-  assert.equal(button.disabled, false);
   location.href = urlB;
   observed();
-  assert.equal(sent.filter(message => message.type === "local-codex-support/ralf-reactivate-v1").length, 1,
+  assert.equal(sent.filter(message => message.type === "local-codex-support/ralph-reactivate-v1").length, 1,
     "loading a different thread directly into a stop-button state does not reactivate it");
 }
 
@@ -1374,7 +1363,7 @@ async function testRunningHydrationDetection() {
 async function testWorkedDurationDetection() {
   let automationListener;
   let now = 0;
-  let ralfMinWorkedSeconds = 19 * 60;
+  let ralphMinWorkedSeconds = 19 * 60;
 
   const textNode = text => ({
     textContent: text,
@@ -1440,7 +1429,7 @@ async function testWorkedDurationDetection() {
     },
     storage: {
       local: {
-        get: async defaults => ({ ...defaults, ralfMinWorkedSeconds }),
+        get: async defaults => ({ ...defaults, ralphMinWorkedSeconds }),
       },
     },
   };
@@ -1471,14 +1460,14 @@ async function testWorkedDurationDetection() {
   assert.equal(response.result.users.length, 1);
   assert.equal(response.result.users[0].id, "F1");
   assert.equal(response.result.users[0].text, "Fix this end to end.",
-    "RALF inspection extracts the visible user message text");
+    "RALPH inspection extracts the visible user message text");
   assert.equal(response.result.assistant.synthetic, false);
   assert.equal(response.result.assistant.id, "T1");
   assert.equal(response.result.assistant.text, "The implementation is complete.",
-    "RALF inspection extracts the visible final assistant message text");
+    "RALPH inspection extracts the visible final assistant message text");
   assert.equal(response.result.workedSeconds, 26 * 60 + 15,
-    "RALF inspection must parse a Worked for label that appears late during hydration");
-  assert.ok(now >= 8_000, "RALF waits for the hydrated assistant turn to remain settled before reading duration");
+    "RALPH inspection must parse a Worked for label that appears late during hydration");
+  assert.ok(now >= 8_000, "RALPH waits for the hydrated assistant turn to remain settled before reading duration");
 
   durationButton.textContent = "Worked for 19m";
   const shortResponse = await new Promise(resolve => {
@@ -1489,9 +1478,9 @@ async function testWorkedDurationDetection() {
   });
   assert.equal(shortResponse.ok, true);
   assert.equal(shortResponse.result.workedSeconds, null,
-    "content-script RALF cutoff filters durations at or below the configured threshold");
+    "content-script RALPH cutoff filters durations at or below the configured threshold");
 
-  ralfMinWorkedSeconds = 0;
+  ralphMinWorkedSeconds = 0;
   durationButton.textContent = "Worked for 1s";
   const testModeResponse = await new Promise(resolve => {
     automationListener({
@@ -1501,11 +1490,11 @@ async function testWorkedDurationDetection() {
   });
   assert.equal(testModeResponse.ok, true);
   assert.equal(testModeResponse.result.workedSeconds, 1,
-    "RALF inspection uses the popup-configured minimum worked time");
+    "RALPH inspection uses the popup-configured minimum worked time");
 }
 
 
-async function testRalfAutoRegistration(sync) {
+async function testRalphAutoRegistration(sync) {
   const generatedConfig = {};
   vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), generatedConfig);
   const registrationBodies = [];
@@ -1554,7 +1543,7 @@ async function testRalfAutoRegistration(sync) {
       } },
     },
     fetch: async (endpoint, options) => {
-      if (endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.ralfRegisterUrl) {
+      if (endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.ralphRegisterUrl) {
         registrationBodies.push(JSON.parse(options.body));
         return new Response(JSON.stringify({ status: "registered" }), {
           status: 200,
@@ -1586,7 +1575,7 @@ async function testRalfAutoRegistration(sync) {
 
   historyListener({ frameId: 0, url: "https://chatgpt.com/c/55555555-5555-4555-8555-555555555555" });
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(registrationBodies.length, 1, "normal non-project conversations are never offered to RALF");
+  assert.equal(registrationBodies.length, 1, "normal non-project conversations are never offered to RALPH");
 
   await context.executeCommand({
     id: "agent-project-thread",
@@ -1601,7 +1590,7 @@ async function testRalfAutoRegistration(sync) {
   assert.equal(commandResults.at(-1).ok, true);
 }
 
-async function testManualRalfWorkerRequest(sync) {
+async function testRalphWorkerReactivation(sync) {
   const generatedConfig = {};
   vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), generatedConfig);
   const extensionId = "a".repeat(32);
@@ -1647,7 +1636,7 @@ async function testManualRalfWorkerRequest(sync) {
     },
     fetch: async (endpoint, options) => {
       requests.push({ endpoint, options });
-      if (endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.ralfRegisterUrl) {
+      if (endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.ralphRegisterUrl) {
         return new Response(JSON.stringify({ status: "registered" }), {
           status: 200,
           headers: { "content-type": "application/json" },
@@ -1661,37 +1650,15 @@ async function testManualRalfWorkerRequest(sync) {
   };
   vm.runInNewContext(await readFile("support-extension/service-worker.js", "utf8"), context);
   await new Promise(resolve => setImmediate(resolve));
-  storage.ralf = true;
-
-  const response = await new Promise(resolve => {
-    const keepChannelOpen = runtimeListener({
-      type: "local-codex-support/ralf-check-now-v1",
-      conversationUrl: urlA,
-    }, {
-      id: extensionId,
-      frameId: 0,
-      tab: { id: 7 },
-      url: urlA,
-    }, resolve);
-    assert.equal(keepChannelOpen, true);
-  });
-  assert.equal(response.ok, true);
-  assert.equal(response.status, "scheduled");
-  assert.equal(requests.length, 1);
-  assert.equal(requests[0].endpoint,
-    `${generatedConfig.LOCAL_CODEX_THREAD_SYNC.ralfThreadsUrl}/${parseConversationUrl(urlA).threadId}/check`);
-  assert.equal(requests[0].options.method, "PUT");
-  assert.equal(requests[0].options.headers.authorization, `Bearer ${sync.extensionToken}`);
-
   updatedListener(7, { url: urlA });
   await new Promise(resolve => setImmediate(resolve));
   const registrationRequests = () => requests.filter(request =>
-    request.endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.ralfRegisterUrl);
+    request.endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.ralphRegisterUrl);
   assert.deepEqual(JSON.parse(registrationRequests()[0].options.body), { conversationUrl: urlA });
 
   const reactivation = await new Promise(resolve => {
     runtimeListener({
-      type: "local-codex-support/ralf-reactivate-v1",
+      type: "local-codex-support/ralph-reactivate-v1",
       conversationUrl: urlA,
     }, {
       id: extensionId,

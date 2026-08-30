@@ -9,26 +9,24 @@ const config = globalThis.LOCAL_CODEX_THREAD_SYNC;
 const bindEndpoint = validateLoopbackEndpoint(config?.bindUrl, "/thread-sync/bind");
 const claimEndpoint = validateLoopbackEndpoint(config?.commandClaimUrl, "/chatgpt-support/commands/claim");
 const resultEndpoint = validateLoopbackEndpoint(config?.commandResultUrl, "/chatgpt-support/commands/result");
-const ralfRegisterEndpoint = validateLoopbackEndpoint(config?.ralfRegisterUrl, "/chatgpt-support/ralf/register");
-const ralfThreadsEndpoint = validateLoopbackEndpoint(config?.ralfThreadsUrl, "/chatgpt-support/ralf/threads");
+const ralphRegisterEndpoint = validateLoopbackEndpoint(config?.ralphRegisterUrl, "/chatgpt-support/ralph/register");
 if (typeof config?.extensionToken !== "string" || config.extensionToken.length < 32) {
   throw new Error("Local Codex Support extension token is missing or invalid.");
 }
 
 const DEFAULT_SETTINGS = Object.freeze({
   threadSync: true,
-  ralf: false,
+  ralph: false,
   threadMessaging: false,
   subagentProjectUrl: "",
 });
 const AUTOMATION_MESSAGE = "local-codex-support/automation-v1";
-const MANUAL_RALF_MESSAGE = "local-codex-support/ralf-check-now-v1";
-const REACTIVATE_RALF_MESSAGE = "local-codex-support/ralf-reactivate-v1";
+const REACTIVATE_RALPH_MESSAGE = "local-codex-support/ralph-reactivate-v1";
 const SYNC_MESSAGE = "local-codex-thread-sync/bind-v1";
 const WORKER_KEEPALIVE_INTERVAL_MS = 20_000;
 let pollGeneration = 0;
 let pollController = null;
-const reportedRalfConversations = new Set();
+const reportedRalphConversations = new Set();
 
 function validateLoopbackEndpoint(value, pathname) {
   const endpoint = new URL(value);
@@ -98,26 +96,26 @@ async function getSettings() {
   const stored = await extensionApi.storage.local.get(DEFAULT_SETTINGS);
   return {
     threadSync: stored.threadSync !== false,
-    ralf: stored.ralf === true,
+    ralph: stored.ralph === true,
     threadMessaging: stored.threadMessaging === true,
     subagentProjectUrl: typeof stored.subagentProjectUrl === "string" ? stored.subagentProjectUrl : "",
   };
 }
 
-async function registerRalfConversation(value, { reactivate = false } = {}) {
+async function registerRalphConversation(value, { reactivate = false } = {}) {
   const currentUrl = conversationUrl(value);
   if (!currentUrl || !currentUrl.startsWith("https://chatgpt.com/g/") ||
-      (!reactivate && reportedRalfConversations.has(currentUrl))) return;
-  const response = await fetch(ralfRegisterEndpoint.href, {
+      (!reactivate && reportedRalphConversations.has(currentUrl))) return;
+  const response = await fetch(ralphRegisterEndpoint.href, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${config.extensionToken}` },
     body: JSON.stringify({ conversationUrl: currentUrl, ...(reactivate ? { reactivate: true } : {}) }),
     signal: AbortSignal.timeout(5000),
     redirect: "error",
   });
-  if (!response.ok) throw new Error(`RALF registration returned ${response.status}.`);
+  if (!response.ok) throw new Error(`RALPH registration returned ${response.status}.`);
   const data = await response.json();
-  if (data.status === "registered" || data.status === "ignored") reportedRalfConversations.add(currentUrl);
+  if (data.status === "registered" || data.status === "ignored") reportedRalphConversations.add(currentUrl);
 }
 
 async function getBrowserId() {
@@ -165,46 +163,16 @@ async function bind(message, sender) {
   }
 }
 
-async function requestRalfCheck(message, sender) {
+async function reactivateRalphConversation(message, sender) {
   if (sender.id !== extensionApi.runtime.id || sender.frameId !== 0 || !Number.isInteger(sender.tab?.id)) {
     return { ok: false, error: "Invalid extension message source." };
   }
   const requestedUrl = conversationUrl(message.conversationUrl);
   const currentUrl = conversationUrl((await extensionApi.tabs.get(sender.tab.id)).url);
   if (!requestedUrl || requestedUrl !== currentUrl || !requestedUrl.startsWith("https://chatgpt.com/g/")) {
-    return { ok: false, error: "RALF no longer matches the current conversation." };
+    return { ok: false, error: "RALPH no longer matches the current conversation." };
   }
-  const threadId = requestedUrl.slice(requestedUrl.lastIndexOf("/") + 1);
-  const endpoint = new URL(ralfThreadsEndpoint.href);
-  endpoint.pathname = `${endpoint.pathname}/${encodeURIComponent(threadId)}/check`;
-  try {
-    const response = await fetch(endpoint.href, {
-      method: "PUT",
-      headers: { authorization: `Bearer ${config.extensionToken}` },
-      signal: AbortSignal.timeout(5000),
-      redirect: "error",
-    });
-    const data = response.headers.get("content-type")?.startsWith("application/json")
-      ? await response.json()
-      : undefined;
-    return response.ok
-      ? { ok: true, status: data?.status ?? "scheduled" }
-      : { ok: false, error: data?.error || `Local Codex returned ${response.status}.` };
-  } catch {
-    return { ok: false, error: `Could not reach ${ralfThreadsEndpoint.origin}.` };
-  }
-}
-
-async function reactivateRalfConversation(message, sender) {
-  if (sender.id !== extensionApi.runtime.id || sender.frameId !== 0 || !Number.isInteger(sender.tab?.id)) {
-    return { ok: false, error: "Invalid extension message source." };
-  }
-  const requestedUrl = conversationUrl(message.conversationUrl);
-  const currentUrl = conversationUrl((await extensionApi.tabs.get(sender.tab.id)).url);
-  if (!requestedUrl || requestedUrl !== currentUrl || !requestedUrl.startsWith("https://chatgpt.com/g/")) {
-    return { ok: false, error: "RALF no longer matches the current conversation." };
-  }
-  await registerRalfConversation(currentUrl, { reactivate: true });
+  await registerRalphConversation(currentUrl, { reactivate: true });
   return { ok: true };
 }
 
@@ -301,7 +269,7 @@ async function executeCommand(command, browserId) {
     const response = await keepWorkerAliveUntil(sendAutomationMessage(tab.id, command));
     if (!response?.ok) throw new Error(response?.error || "ChatGPT page automation failed.");
     if (command.kind === "send_message") {
-      await registerRalfConversation(response.result?.conversationUrl).catch(() => undefined);
+      await registerRalphConversation(response.result?.conversationUrl).catch(() => undefined);
     }
     await postResult({
       commandId: command.id,
@@ -325,7 +293,7 @@ async function executeCommand(command, browserId) {
 
 function enabledAutomationFeatures(settings) {
   const features = [];
-  if (settings.ralf) features.push("ralf");
+  if (settings.ralph) features.push("ralph");
   if (settings.threadMessaging) features.push("threadMessaging");
   return features;
 }
@@ -382,20 +350,14 @@ extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
     );
     return true;
   }
-  if (message?.type === MANUAL_RALF_MESSAGE) {
-    void requestRalfCheck(message, sender).then(sendResponse, () =>
-      sendResponse({ ok: false, error: "The source tab is no longer available." }),
-    );
-    return true;
-  }
-  if (message?.type === REACTIVATE_RALF_MESSAGE) {
-    void reactivateRalfConversation(message, sender).then(sendResponse, () =>
-      sendResponse({ ok: false, error: "Could not reactivate the RALF thread." }),
+  if (message?.type === REACTIVATE_RALPH_MESSAGE) {
+    void reactivateRalphConversation(message, sender).then(sendResponse, () =>
+      sendResponse({ ok: false, error: "Could not reactivate the RALPH thread." }),
     );
     return true;
   }
   if (message?.type === "local-codex-support/settings-changed") {
-    reportedRalfConversations.clear();
+    reportedRalphConversations.clear();
     restartPolling();
     void scanExistingTabs();
     sendResponse({ ok: true });
@@ -409,19 +371,19 @@ async function scanExistingTabs() {
     if (Number.isInteger(tab.id)) {
       tasks.push(extensionApi.scripting.executeScript({ target: { tabId: tab.id }, files: ["content-script.js"] }));
     }
-    if (typeof tab.url === "string") tasks.push(registerRalfConversation(tab.url));
+    if (typeof tab.url === "string") tasks.push(registerRalphConversation(tab.url));
     return tasks;
   }));
 }
 
 extensionApi.tabs.onUpdated?.addListener((_tabId, changeInfo) => {
-  if (typeof changeInfo.url === "string") void registerRalfConversation(changeInfo.url).catch(() => undefined);
+  if (typeof changeInfo.url === "string") void registerRalphConversation(changeInfo.url).catch(() => undefined);
 });
 extensionApi.webNavigation?.onHistoryStateUpdated?.addListener((details) => {
-  if (details.frameId === 0) void registerRalfConversation(details.url).catch(() => undefined);
+  if (details.frameId === 0) void registerRalphConversation(details.url).catch(() => undefined);
 });
 extensionApi.webNavigation?.onCommitted?.addListener((details) => {
-  if (details.frameId === 0) void registerRalfConversation(details.url).catch(() => undefined);
+  if (details.frameId === 0) void registerRalphConversation(details.url).catch(() => undefined);
 });
 
 extensionApi.runtime.onInstalled.addListener(() => {
