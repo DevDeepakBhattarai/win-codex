@@ -402,7 +402,7 @@ async function loadRalphSettings() {
     element("ralphLoopIntervalSeconds").value = String(loopIntervalSeconds);
   } catch (error) {
     element("ralphLoopIntervalSeconds").value = String(DEFAULT_RALPH_LOOP_INTERVAL_SECONDS);
-    setNote(status, errorMessage(error, "Could not load the RALPH loop interval."), "error");
+    setNote(status, errorMessage(error, "Could not load the RALPH initial check delay."), "error");
   }
 }
 
@@ -424,10 +424,10 @@ async function saveRalphLoopInterval() {
       body: JSON.stringify({ loopIntervalSeconds }),
     });
     input.value = String(settings.loopIntervalSeconds);
-    setNote(status, `Saved ${settings.loopIntervalSeconds} second${settings.loopIntervalSeconds === 1 ? "" : "s"}. Active threads were rescheduled.`);
+    setNote(status, `Saved ${settings.loopIntervalSeconds} second${settings.loopIntervalSeconds === 1 ? "" : "s"}. Active threads were rescheduled; later checks remain 5 minutes apart.`);
     await loadThreads();
   } catch (error) {
-    setNote(status, errorMessage(error, "Could not save the RALPH loop interval."), "error");
+    setNote(status, errorMessage(error, "Could not save the RALPH initial check delay."), "error");
   } finally {
     button.disabled = false;
   }

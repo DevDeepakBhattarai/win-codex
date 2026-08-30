@@ -342,10 +342,15 @@
 
       if (action === "stop" && previousComposerAction === "send" &&
           currentUrl?.startsWith("https://chatgpt.com/g/")) {
-        void extensionApi.runtime.sendMessage({
-          type: reactivateRalphType,
-          conversationUrl: currentUrl,
-        }).catch(() => undefined);
+        try {
+          const delivery = extensionApi.runtime.sendMessage({
+            type: reactivateRalphType,
+            conversationUrl: currentUrl,
+          });
+          void Promise.resolve(delivery).catch(() => undefined);
+        } catch {
+          // An extension reload invalidates this script while its page observer remains alive.
+        }
       }
       previousComposerAction = action;
     };

@@ -57,7 +57,7 @@ try {
   assert.match(preparedPopup, /id="panel-threads"/, "the popup exposes the RALPH threads tab");
   assert.match(preparedPopup, /id="panel-settings"/, "the popup exposes the settings tab");
   assert.match(preparedPopup, /RALPH projects/);
-  assert.match(preparedPopup, /RALPH loop interval \(seconds\)/);
+  assert.match(preparedPopup, /RALPH initial check delay \(seconds\)/);
   assert.match(preparedPopup, /RALPH minimum worked time \(seconds\)/);
   assert.match(preparedPopup, /config\.js/);
   const preparedPopupScript = await readFile(path.join(sync.extensionDirectory, "popup.js"), "utf8");
@@ -155,6 +155,18 @@ try {
   assert.equal(await projectScopedRegistry.register(urlA), true);
   await new Promise(resolve => setTimeout(resolve, 25));
   assert.equal((await projectScopedRegistry.due()).some(thread => thread.conversationUrl === urlA), true);
+  const runningCheckedAt = Date.now();
+  await projectScopedRegistry.recordRunning(parseConversationUrl(urlA).threadId);
+  const [runningThread] = await projectScopedRegistry.threads();
+  assert.ok(runningThread.nextCheckAt >= runningCheckedAt + 299_900 &&
+    runningThread.nextCheckAt <= runningCheckedAt + 300_100,
+  "a running RALPH thread is checked again after 5 minutes");
+  const continuationSentAt = Date.now();
+  await projectScopedRegistry.recordContinuation(parseConversationUrl(urlA).threadId);
+  const [continuedThread] = await projectScopedRegistry.threads();
+  assert.ok(continuedThread.nextCheckAt >= continuationSentAt + 299_900 &&
+    continuedThread.nextCheckAt <= continuationSentAt + 300_100,
+  "a continued RALPH thread is checked again after 5 minutes");
   assert.deepEqual((await projectScopedRegistry.threads()).map(thread => [thread.conversationUrl, thread.state]),
     [[urlA, "active"]], "the popup thread list reports every registered thread");
   const listThreads = (authorization = `Bearer ${sync.extensionToken}`) => new Promise(resolve => {
@@ -257,7 +269,7 @@ try {
     "a send-to-stop composer transition reactivates an existing completed RALPH thread");
   assert.ok(messageReactivatedThread.nextCheckAt >= messageSentAt + 900 &&
     messageReactivatedThread.nextCheckAt <= messageSentAt + 1_100,
-  "the composer transition starts a fresh loop interval from the new message");
+  "the composer transition starts a fresh initial delay from the new message");
   await registerThread({ conversationUrl: urlA, reactivate: true });
   assert.equal((await projectScopedRegistry.threads())[0].nextCheckAt, messageReactivatedThread.nextCheckAt,
     "reactivation does not reschedule a thread that is already active");
@@ -290,7 +302,12 @@ try {
   const timingRoot = path.join(temporaryRoot, "ralph-timing");
   const timingRegistry = await RalphRegistry.open(timingRoot);
   await timingRegistry.setProjects([projectId]);
+  const registeredAt = Date.now();
   await timingRegistry.register(urlA);
+  const [initiallyScheduledThread] = await timingRegistry.threads();
+  assert.ok(initiallyScheduledThread.nextCheckAt >= registeredAt + 1_499_900 &&
+    initiallyScheduledThread.nextCheckAt <= registeredAt + 1_500_100,
+  "a new RALPH thread waits 25 minutes for its first check");
   async function requestRalphSettings(handler, body, authorization = `Bearer ${sync.extensionToken}`) {
     const result = { status: 200, body: undefined };
     const req = { body, get: name => (name === "authorization" ? authorization : undefined) };
@@ -312,11 +329,11 @@ try {
   const [rescheduledThread] = await timingRegistry.threads();
   assert.ok(rescheduledThread.nextCheckAt >= intervalChangedAt + 900 &&
     rescheduledThread.nextCheckAt <= intervalChangedAt + 1_100,
-    "changing the loop interval reschedules active threads from the current time");
+    "changing the initial delay reschedules active threads from the current time");
   assert.deepEqual((await requestRalphSettings(getRalphSettings)).body, { loopIntervalSeconds: 1 });
   assert.equal((await requestRalphSettings(putRalphSettings, { loopIntervalSeconds: 0 })).status, 400);
   assert.deepEqual(await (await RalphRegistry.open(timingRoot)).settings(), { loopIntervalSeconds: 1 },
-    "the RALPH loop interval survives a server restart");
+    "the RALPH initial delay survives a server restart");
 
   const legacyRalphRoot = path.join(temporaryRoot, "legacy-ralph");
   await mkdir(legacyRalphRoot, { recursive: true });
@@ -591,7 +608,7 @@ try {
     return new Response(JSON.stringify({
       output: [
         { type: "reasoning", encrypted_content: "opaque-test-reasoning" },
-        { type: "message", content: [{ type: "output_text", text: "Inspect the remaining CI failure and fix the specific blocker before stopping." }] },
+        { type: "message", content: [{ type: "output_text", text: "Continue by resolving the remaining CI failure." }] },
       ],
       usage: { input_tokens: 123, output_tokens: 17, total_tokens: 140 },
     }), {
@@ -632,11 +649,17 @@ try {
     const continueCommand = await ralphCommands.claim("chrome-browser", ["ralph"], 1000);
     assert.equal(continueCommand.kind, "send_message");
     assert.equal(continueCommand.targetUrl, ralphUrl);
-    assert.equal(continueCommand.message, "Inspect the remaining CI failure and fix the specific blocker before stopping.");
+    assert.equal(continueCommand.message, "Continue by resolving the remaining CI failure.");
     assert.equal(apiRequest.model, "gpt-5.6-terra");
     assert.deepEqual(apiRequest.reasoning, { effort: "low" });
     assert.equal("max_output_tokens" in apiRequest, false,
       "RALPH must not impose an output-token budget on classification");
+    const classifierInstruction = apiRequest.input[0].content[0].text;
+    assert.match(classifierInstruction, /tool access expires after 25 minutes in each turn/);
+    assert.match(classifierInstruction, /working agent is more capable than you/);
+    assert.match(classifierInstruction, /reply in English with one short sentence/);
+    assert.match(classifierInstruction, /names only the unfinished work stated or clearly implied by the transcript/);
+    assert.match(classifierInstruction, /Do not explain, add steps, or repeat completed work/);
     assert.match(JSON.stringify(apiRequest.input), /Fix the implementation end to end/);
     assert.match(JSON.stringify(apiRequest.input), /one CI failure remains/);
     assert.ok(ralphOpenAiLogs.some(line => line.includes("[ralph/openai]") && line.includes('"event":"request_started"') &&
@@ -647,7 +670,7 @@ try {
       line.includes('"request_id":"req_ralph_success"') && line.includes('"http_status":200') &&
       line.includes('"input_tokens":123') && line.includes('"output_tokens":17') &&
       line.includes('"total_tokens":140') && line.includes('"action":"continue"') &&
-      line.includes("Inspect the remaining CI failure and fix the specific blocker before stopping.")),
+      line.includes("Continue by resolving the remaining CI failure.")),
       "the success audit log includes the exact OpenAI response body");
     assert.ok(ralphOpenAiLogs.every(line => !line.includes("test-key")),
       "RALPH OpenAI audit logs must not expose the API key");
@@ -662,8 +685,7 @@ try {
     assert.equal(persistedSuccessLogs[1].event, "request_succeeded");
     assert.equal(persistedSuccessLogs[1].request_id, "req_ralph_success");
     assert.equal(persistedSuccessLogs[1].total_tokens, 140);
-    assert.equal(persistedSuccessLogs[1].response_text,
-      "Inspect the remaining CI failure and fix the specific blocker before stopping.");
+    assert.equal(persistedSuccessLogs[1].response_text, "Continue by resolving the remaining CI failure.");
     assert.equal("response" in persistedSuccessLogs[1], false,
       "the success audit record stores extracted response text instead of the opaque API payload");
     assert.ok(!JSON.stringify(persistedSuccessLogs).includes("opaque-test-reasoning"));
@@ -1233,6 +1255,7 @@ async function testReactTrackedTextareaEnablesSendButton() {
 async function testRalphComposerObserver() {
   let observed;
   let running = false;
+  let contextInvalidated = false;
   const sent = [];
   const location = new URL(urlA);
   let createdElements = 0;
@@ -1255,9 +1278,10 @@ async function testRalphComposerObserver() {
     },
   };
   const browser = { runtime: {
-    sendMessage: async message => {
+    sendMessage: message => {
+      if (contextInvalidated) throw new Error("Extension context invalidated.");
       sent.push(message);
-      return { ok: true, status: "scheduled" };
+      return Promise.resolve({ ok: true, status: "scheduled" });
     },
     onMessage: { addListener() {} },
   } };
@@ -1289,6 +1313,12 @@ async function testRalphComposerObserver() {
   observed();
   assert.equal(sent.filter(message => message.type === "local-codex-support/ralph-reactivate-v1").length, 1,
     "loading a different thread directly into a stop-button state does not reactivate it");
+  running = false;
+  observed();
+  contextInvalidated = true;
+  running = true;
+  assert.doesNotThrow(observed,
+    "a stale content script must ignore a synchronously invalidated extension context");
 }
 
 async function testRunningHydrationDetection() {

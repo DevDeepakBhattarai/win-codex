@@ -83,11 +83,11 @@
       </div>
 
       <div class="card">
-        <h2><label for="ralphLoopIntervalSeconds">RALPH loop interval (seconds)</label></h2>
+        <h2><label for="ralphLoopIntervalSeconds">RALPH initial check delay (seconds)</label></h2>
         <input id="ralphLoopIntervalSeconds" type="number" min="1" max="86400" step="1" inputmode="numeric">
         <div class="card-footer">
-          <button id="saveRalphLoopInterval" class="button" type="button">Save interval</button>
-          <p id="ralphLoopIntervalStatus" class="note">Default is 1500 seconds (25 minutes). Saving reschedules active threads.</p>
+          <button id="saveRalphLoopInterval" class="button" type="button">Save delay</button>
+          <p id="ralphLoopIntervalStatus" class="note">Default is 1500 seconds (25 minutes). Later checks run every 300 seconds (5 minutes).</p>
         </div>
       </div>
 

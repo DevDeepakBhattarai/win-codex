@@ -8,7 +8,8 @@ import { z } from "zod";
 
 const MAX_RALPH_THREADS = 2_000;
 const MAX_RALPH_PROJECTS = 100;
-const DEFAULT_RALPH_INTERVAL_MS = 25 * 60 * 1000;
+const DEFAULT_RALPH_INITIAL_DELAY_MS = 25 * 60 * 1000;
+const RALPH_RECHECK_INTERVAL_MS = 5 * 60 * 1000;
 const MIN_RALPH_INTERVAL_SECONDS = 1;
 const MAX_RALPH_INTERVAL_SECONDS = 24 * 60 * 60;
 const RALPH_SCHEDULER_TICK_MS = 1_000;
@@ -243,7 +244,7 @@ const ralphStoreSchema = z.object({
   version: z.literal(2),
   projects: z.array(z.string()).max(MAX_RALPH_PROJECTS),
   threads: z.array(ralphThreadSchema).max(MAX_RALPH_THREADS),
-  loopIntervalMs: z.number().int().positive().max(MAX_RALPH_INTERVAL_SECONDS * 1000).default(DEFAULT_RALPH_INTERVAL_MS),
+  loopIntervalMs: z.number().int().positive().max(MAX_RALPH_INTERVAL_SECONDS * 1000).default(DEFAULT_RALPH_INITIAL_DELAY_MS),
 });
 type RalphStore = z.infer<typeof ralphStoreSchema>;
 const ralphLoopIntervalSecondsSchema = z.number().int()
@@ -265,7 +266,7 @@ export class RalphRegistry {
       version: 2,
       projects: [],
       threads: [],
-      loopIntervalMs: DEFAULT_RALPH_INTERVAL_MS,
+      loopIntervalMs: DEFAULT_RALPH_INITIAL_DELAY_MS,
     };
     let migrated = false;
     try {
@@ -395,7 +396,7 @@ export class RalphRegistry {
       if (!thread) return;
       thread.lastCheckedAt = new Date().toISOString();
       thread.lastError = undefined;
-      thread.nextCheckAt = Date.now() + state.loopIntervalMs;
+      thread.nextCheckAt = Date.now() + RALPH_RECHECK_INTERVAL_MS;
     });
   }
 
@@ -443,7 +444,7 @@ export class RalphRegistry {
       thread.lastCheckedAt = now;
       thread.lastContinuationAt = now;
       thread.lastError = undefined;
-      thread.nextCheckAt = Date.now() + state.loopIntervalMs;
+      thread.nextCheckAt = Date.now() + RALPH_RECHECK_INTERVAL_MS;
     });
   }
 
@@ -681,10 +682,12 @@ async function decideRalphContinuation(
     `ASSISTANT:\n${inspection.assistant.text}`,
   ].join("\n\n");
   const instruction = [
-    "You control a RALPH loop for another ChatGPT thread.",
-    "Decide whether the user's requested work is fully complete based only on all user messages and the final assistant message below.",
-    "If complete, reply with exactly COMPLETE.",
-    "If incomplete, reply with only a very short one or two sentence instruction telling the agent what to do next. Do not say generic 'continue'. Do not explain your reasoning.",
+    "You classify whether another agent has finished the user's request.",
+    "Its tool access expires after 25 minutes in each turn, and a new message starts a fresh turn with tool access restored.",
+    "The working agent is more capable than you and already has the full conversation, so do not plan or choose how it should work.",
+    "Based only on all user messages and the final assistant message below, reply with exactly COMPLETE if the request is finished.",
+    "If work remains, reply in English with one short sentence that tells the agent to continue and names only the unfinished work stated or clearly implied by the transcript.",
+    "Do not explain, add steps, or repeat completed work.",
   ].join(" ");
   const requestBody = {
     model,
@@ -952,7 +955,7 @@ export function ralphSettingsPutHandler(registry: RalphRegistry, extensionToken:
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
     const parsed = bodySchema.safeParse(req.body);
     if (!parsed.success) {
-      res.status(400).json({ error: `RALPH loop interval must be a whole number from ${MIN_RALPH_INTERVAL_SECONDS} to ${MAX_RALPH_INTERVAL_SECONDS} seconds.` });
+      res.status(400).json({ error: `RALPH initial check delay must be a whole number from ${MIN_RALPH_INTERVAL_SECONDS} to ${MAX_RALPH_INTERVAL_SECONDS} seconds.` });
       return;
     }
     const settings = await registry.setLoopIntervalSeconds(parsed.data.loopIntervalSeconds);
