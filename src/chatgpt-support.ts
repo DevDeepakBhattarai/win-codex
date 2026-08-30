@@ -224,6 +224,7 @@ const ralphThreadSchema = z.object({
   conversationUrl: z.string().url(),
   threadId: z.string(),
   manuallyRegistered: z.boolean().optional(),
+  agentCreated: z.boolean().optional(),
   registeredAt: z.string(),
   nextCheckAt: z.number(),
   state: z.enum(["active", "complete"]),
@@ -329,7 +330,7 @@ export class RalphRegistry {
       state.projects = projects;
       const allowed = new Set(projects);
       state.threads = state.threads.filter((thread) => {
-        if (thread.manuallyRegistered) return true;
+        if (thread.manuallyRegistered || thread.agentCreated) return true;
         const projectId = parseConversationUrl(thread.conversationUrl).projectId;
         return projectId !== undefined && allowed.has(projectId);
       });
@@ -337,18 +338,19 @@ export class RalphRegistry {
     });
   }
 
-  async register(conversationUrl: string, options: { manual?: boolean; reactivate?: boolean } = {}) {
+  async register(conversationUrl: string, options: { manual?: boolean; reactivate?: boolean; agentCreated?: boolean } = {}) {
     const conversation = parseConversationUrl(conversationUrl);
     return this.update((state) => {
       const projectAllowed = conversation.projectId && state.projects.includes(conversation.projectId);
       const existing = state.threads.find((entry) => entry.threadId === conversation.threadId);
-      if (!options.manual && !projectAllowed && !existing?.manuallyRegistered) return false;
+      if (!options.manual && !options.agentCreated && !projectAllowed && !existing?.manuallyRegistered && !existing?.agentCreated) return false;
       if (existing) {
         if (existing.conversationUrl !== conversation.conversationUrl) {
           existing.conversationUrl = conversation.conversationUrl;
         }
         if (options.manual) existing.manuallyRegistered = true;
-        if ((options.manual || options.reactivate) && existing.state === "complete") {
+        if (options.agentCreated) existing.agentCreated = true;
+        if ((options.manual || options.agentCreated || options.reactivate) && existing.state === "complete") {
           existing.state = "active";
           existing.lastError = undefined;
           existing.nextCheckAt = Date.now() + state.loopIntervalMs;
@@ -360,6 +362,7 @@ export class RalphRegistry {
         conversationUrl: conversation.conversationUrl,
         threadId: conversation.threadId,
         ...(options.manual ? { manuallyRegistered: true } : {}),
+        ...(options.agentCreated ? { agentCreated: true } : {}),
         registeredAt: new Date().toISOString(),
         nextCheckAt: Date.now() + state.loopIntervalMs,
         state: "active",
@@ -841,6 +844,7 @@ export function ralphRegistrationHandler(registry: RalphRegistry, extensionToken
     conversationUrl: z.string().max(2048),
     manual: z.boolean().optional(),
     reactivate: z.boolean().optional(),
+    agentCreated: z.boolean().optional(),
   }).strict();
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
@@ -853,6 +857,7 @@ export function ralphRegistrationHandler(registry: RalphRegistry, extensionToken
       const registered = await registry.register(parsed.data.conversationUrl, {
         manual: parsed.data.manual === true,
         reactivate: parsed.data.reactivate === true,
+        agentCreated: parsed.data.agentCreated === true,
       });
       res.setHeader("Cache-Control", "no-store");
       res.json({ status: registered ? "registered" : "ignored" });
@@ -1004,7 +1009,7 @@ export function registerChatGptMessaging(
 ) {
   server.registerTool("chatgpt_message", {
     title: "Send ChatGPT Message",
-    description: "Start a new ChatGPT thread or send a message to an existing ChatGPT thread through the Local Codex Support extension. Omit targetUrl to start a new sub-agent in the project configured in the extension popup. Provide an existing /c/... conversation URL to message that thread instead.",
+    description: "Start a new ChatGPT thread or send a message to an existing ChatGPT thread through the Local Codex Support extension. Omit targetUrl to start a new sub-agent in the project configured in the extension popup. New AI-created sub-agent threads are registered for RALPH automatically. Provide an existing /c/... conversation URL to message that thread instead.",
     inputSchema: {
       targetUrl: z.string().url().optional().describe("Optional ChatGPT project new-chat URL or existing conversation URL. Omit this to use the extension's configured Sub-agent project."),
       message: z.string().min(1).max(200_000).describe("Message to send."),

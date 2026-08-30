@@ -102,14 +102,18 @@ async function getSettings() {
   };
 }
 
-async function registerRalphConversation(value, { reactivate = false } = {}) {
+async function registerRalphConversation(value, { reactivate = false, agentCreated = false } = {}) {
   const currentUrl = conversationUrl(value);
   if (!currentUrl || !currentUrl.startsWith("https://chatgpt.com/g/") ||
-      (!reactivate && reportedRalphConversations.has(currentUrl))) return;
+      (!reactivate && !agentCreated && reportedRalphConversations.has(currentUrl))) return;
   const response = await fetch(ralphRegisterEndpoint.href, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${config.extensionToken}` },
-    body: JSON.stringify({ conversationUrl: currentUrl, ...(reactivate ? { reactivate: true } : {}) }),
+    body: JSON.stringify({
+      conversationUrl: currentUrl,
+      ...(reactivate ? { reactivate: true } : {}),
+      ...(agentCreated ? { agentCreated: true } : {}),
+    }),
     signal: AbortSignal.timeout(5000),
     redirect: "error",
   });
@@ -258,6 +262,7 @@ async function executeCommand(command, browserId) {
     return;
   }
 
+  const createsNewThread = command.kind === "send_message" && projectHomeId(targetUrl) !== null;
   const tab = await extensionApi.tabs.create({ url: targetUrl, active: false });
   if (!Number.isInteger(tab.id)) throw new Error("ChatGPT automation tab did not receive an id.");
 
@@ -269,7 +274,9 @@ async function executeCommand(command, browserId) {
     const response = await keepWorkerAliveUntil(sendAutomationMessage(tab.id, command));
     if (!response?.ok) throw new Error(response?.error || "ChatGPT page automation failed.");
     if (command.kind === "send_message") {
-      await registerRalphConversation(response.result?.conversationUrl).catch(() => undefined);
+      const registration = registerRalphConversation(response.result?.conversationUrl, { agentCreated: createsNewThread });
+      if (createsNewThread) await registration;
+      else await registration.catch(() => undefined);
     }
     await postResult({
       commandId: command.id,

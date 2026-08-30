@@ -58,10 +58,11 @@ MCP tool calls never mount Thread Sync UI. The support extension now intentional
 reads ChatGPT conversation content only for RALPH inspection and performs narrowly
 scoped ChatGPT tab automation only for RALPH and `chatgpt_message`.
 
-RALPH registration is independent from current-thread lookup. Only conversations
-inside explicitly configured RALPH projects are kept in the RALPH registry. Named
-project-home paths are canonicalized to their stable project ID, and removing a
-project removes its registered RALPH threads. Project threads created through
-`chatgpt_message` follow the same allowlist as manually created project threads.
+RALPH registration is independent from current-thread lookup. Normal ChatGPT
+project conversations are kept only when their project is explicitly configured
+for RALPH. Named project-home paths are canonicalized to their stable project ID,
+and removing a project removes those automatically observed threads. Threads
+created by AI through `chatgpt_message` are registered for RALPH immediately and
+remain registered even when their project is not in the normal RALPH allowlist.
 The initial thread sync still requires an MCP client that renders the attached
 Apps component and a locally installed Local Codex Support extension.

@@ -290,6 +290,20 @@ try {
   await projectScopedRegistry.setProjects([]);
   assert.equal((await projectScopedRegistry.threads()).length, 1,
     "project allowlist changes retain manually registered threads");
+  assert.deepEqual(await registerThread({ conversationUrl: urlB, agentCreated: true }), {
+    code: 200,
+    body: { status: "registered" },
+  });
+  const agentCreatedThread = (await projectScopedRegistry.threads()).find(thread => thread.conversationUrl === urlB);
+  assert.deepEqual(agentCreatedThread && {
+    conversationUrl: agentCreatedThread.conversationUrl,
+    agentCreated: agentCreatedThread.agentCreated,
+    state: agentCreatedThread.state,
+  }, { conversationUrl: urlB, agentCreated: true, state: "active" },
+  "AI-created sub-agents register even when their project is not allowlisted");
+  await projectScopedRegistry.setProjects([]);
+  assert.equal((await projectScopedRegistry.threads()).length, 2,
+    "project allowlist changes retain AI-created sub-agents in RALPH");
   await completeThread(parseConversationUrl(urlA).threadId);
   await registerThread({ conversationUrl: urlA, manual: true });
   assert.equal(await projectScopedRegistry.isActive(parseConversationUrl(urlA).threadId), true,
@@ -1607,6 +1621,11 @@ async function testRalphAutoRegistration(sync) {
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(registrationBodies.length, 1, "normal non-project conversations are never offered to RALPH");
 
+  historyListener({ frameId: 0, url: urlB });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(registrationBodies.at(-1), { conversationUrl: urlB },
+    "SPA navigation may observe the new sub-agent thread before the send command finishes");
+
   await context.executeCommand({
     id: "agent-project-thread",
     feature: "threadMessaging",
@@ -1615,8 +1634,8 @@ async function testRalphAutoRegistration(sync) {
   }, "browser-a");
   assert.equal(createdUrls.at(-1), namedProjectHome,
     "a target-less new-thread command opens the project saved in extension settings");
-  assert.deepEqual(registrationBodies.at(-1), { conversationUrl: urlB },
-    "an AI-created project thread is registered from its saved conversation URL");
+  assert.deepEqual(registrationBodies.at(-1), { conversationUrl: urlB, agentCreated: true },
+    "an AI-created project thread is registered for RALPH from its saved conversation URL");
   assert.equal(commandResults.at(-1).ok, true);
 }
 
