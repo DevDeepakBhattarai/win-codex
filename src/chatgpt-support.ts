@@ -16,6 +16,7 @@ const RALPH_SCHEDULER_TICK_MS = 1_000;
 const LOADING_RETRY_MS = 60 * 1000;
 const FAILURE_RETRY_MS = 2 * 60 * 1000;
 const COMMAND_TIMEOUT_MS = 20 * 60 * 1000;
+const INSPECT_CLAIM_LEASE_MS = 5 * 60 * 1000;
 const CLAIM_WAIT_MS = 20_000;
 const MAX_CONTINUATION_CHARS = 500;
 
@@ -107,6 +108,7 @@ interface PendingCommand {
   reject: (error: Error) => void;
   timeout: NodeJS.Timeout;
   claimedBy?: string;
+  claimedAt?: number;
 }
 
 interface ClaimWaiter {
@@ -122,6 +124,8 @@ export class SupportCommandBus {
   private readonly queued: PendingCommand[] = [];
   private readonly pending = new Map<string, PendingCommand>();
   private readonly waiters = new Set<ClaimWaiter>();
+
+  constructor(private readonly inspectClaimLeaseMs = INSPECT_CLAIM_LEASE_MS) {}
 
   execute(
     command: SupportCommandInput,
@@ -144,6 +148,7 @@ export class SupportCommandBus {
       const waiter = [...this.waiters].find((candidate) => candidate.features.has(fullCommand.feature));
       if (waiter) {
         pending.claimedBy = waiter.browserId;
+        pending.claimedAt = Date.now();
         this.resolveWaiter(waiter, fullCommand);
         return;
       }
@@ -155,15 +160,21 @@ export class SupportCommandBus {
   claim(browserId: string, features: SupportFeature[], waitMs = CLAIM_WAIT_MS, signal?: AbortSignal) {
     const featureSet = new Set(features);
     const resumable = [...this.pending.values()].find((pending) =>
-      pending.claimedBy === browserId &&
       pending.command.kind === "inspect_thread" &&
-      featureSet.has(pending.command.feature));
-    if (resumable) return Promise.resolve(resumable.command);
+      featureSet.has(pending.command.feature) &&
+      (pending.claimedBy === browserId ||
+        (pending.claimedAt !== undefined && Date.now() - pending.claimedAt >= this.inspectClaimLeaseMs)));
+    if (resumable) {
+      resumable.claimedBy = browserId;
+      resumable.claimedAt = Date.now();
+      return Promise.resolve(resumable.command);
+    }
 
     const queuedIndex = this.queued.findIndex((pending) => featureSet.has(pending.command.feature));
     if (queuedIndex >= 0) {
       const [pending] = this.queued.splice(queuedIndex, 1);
       pending.claimedBy = browserId;
+      pending.claimedAt = Date.now();
       return Promise.resolve(pending.command);
     }
 

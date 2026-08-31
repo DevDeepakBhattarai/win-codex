@@ -596,6 +596,35 @@ try {
   assert.equal((await orphanedResult).result.status, "running");
   orphanedCommandBus.close();
 
+  const reassignedCommandBus = new SupportCommandBus(0);
+  const reassignedResult = reassignedCommandBus.execute({
+    feature: "ralph",
+    kind: "inspect_thread",
+    conversationUrl: urlA,
+  }, 25);
+  const reassignedOutcome = reassignedResult.then(
+    result => ({ result }),
+    error => ({ error }),
+  );
+  const abandonedCommand = await reassignedCommandBus.claim("browser-before-restart", ["ralph"], 0);
+  const replacementCommand = await reassignedCommandBus.claim("browser-after-restart", ["ralph"], 0);
+  let reassignedError;
+  if (!replacementCommand) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+    reassignedError = (await reassignedOutcome).error;
+  }
+  assert.equal(replacementCommand?.id, abandonedCommand.id,
+    `an abandoned RALPH inspection must be reassigned after its claim lease expires: ${reassignedError?.message ?? "no timeout captured"}`);
+  reassignedCommandBus.complete({
+    commandId: replacementCommand.id,
+    browserId: "browser-after-restart",
+    kind: "inspect_thread",
+    ok: true,
+    result: { status: "running" },
+  });
+  assert.equal((await reassignedResult).result.status, "running");
+  reassignedCommandBus.close();
+
   const ralphControllerRoot = path.join(temporaryRoot, "ralph-controller");
   const ralphControllerRegistry = await RalphRegistry.open(ralphControllerRoot, 20);
   await ralphControllerRegistry.setProjects([projectId]);
@@ -885,8 +914,9 @@ try {
 
   await testContentScript(a.ticket.token, b.ticket.token);
   await testWorkerKeepsLongAutomationAlive(sync);
+  await testWorkerTimesOutHungAutomation(sync);
   await testRalphComposerObserver();
-  await testSendWaitsForSettlementAndRetriesIgnoredClick();
+  await testSendWaitsForLoadedConversationAndClicksOnce();
   await testNewProjectComposerWithoutDataType();
   await testReactTrackedTextareaEnablesSendButton();
   await testRunningHydrationDetection();
@@ -964,12 +994,14 @@ async function testContentScript(tokenA, tokenB) {
   assert.equal(replies.length, previousReplies, "delayed acknowledgement is not applied after navigation");
 }
 
-async function testSendWaitsForSettlementAndRetriesIgnoredClick() {
+async function testSendWaitsForLoadedConversationAndClicksOnce() {
   let automationListener;
   let now = 0;
-  const hydrationReadyAt = 65_000;
+  const userReadyAt = 65_000;
+  const assistantReadyAt = 80_000;
   let userCount = 1;
   let generationStarted = false;
+  let insertedAt;
   const clickTimes = [];
   const editorEvents = [];
   const stopButton = {};
@@ -977,15 +1009,18 @@ async function testSendWaitsForSettlementAndRetriesIgnoredClick() {
   const editor = {
     textContent: "",
     focus() {},
-    dispatchEvent(event) { editorEvents.push(event.type); },
+    dispatchEvent(event) {
+      editorEvents.push(event.type);
+      if (event.type === "input") insertedAt = now;
+    },
     getAttribute(key) { return key === "contenteditable" ? "true" : null; },
   };
   const sendButton = {
-    get disabled() { return now < hydrationReadyAt; },
+    disabled: false,
     getAttribute() { return null; },
     click() {
       clickTimes.push(now);
-      if (clickTimes.length === 2) {
+      if (now >= assistantReadyAt) {
         editor.textContent = "";
         userCount = 2;
         generationStarted = true;
@@ -1005,7 +1040,10 @@ async function testSendWaitsForSettlementAndRetriesIgnoredClick() {
     querySelector(selector) {
       if (selector === 'form[data-type="unified-composer"]') return composer;
       if (selector === 'section[data-turn="user"] [data-message-author-role="user"]') {
-        return now >= hydrationReadyAt ? {} : null;
+        return now >= userReadyAt ? {} : null;
+      }
+      if (selector === 'section[data-turn="assistant"] [data-message-author-role="assistant"]') {
+        return now >= assistantReadyAt ? {} : null;
       }
       if (selector === '#composer-submit-button' || selector === 'button[aria-label="Send prompt"]') return sendButton;
       if (selector === 'form[data-type="unified-composer"] button[data-testid="stop-button"]' ||
@@ -1015,10 +1053,18 @@ async function testSendWaitsForSettlementAndRetriesIgnoredClick() {
     querySelectorAll(selector) {
       if (selector === 'section[data-turn="user"]') return Array.from({ length: userCount }, () => ({}));
       if (selector === "section[data-turn]") {
-        return [{
+        const turns = [];
+        if (now >= userReadyAt) turns.push({
+          dataset: { turn: "user", turnId: "u1" },
+          textContent: "Request",
+          querySelector: query => query === '[data-message-author-role="user"]' ? {} : null,
+        });
+        if (now >= assistantReadyAt) turns.push({
           dataset: { turn: "assistant", turnId: "a1" },
-          get textContent() { return now < hydrationReadyAt ? "Hydrating" : "Ready"; },
-        }];
+          textContent: "Ready",
+          querySelector: query => query === '[data-message-author-role="assistant"]' ? {} : null,
+        });
+        return turns;
       }
       return [];
     },
@@ -1068,12 +1114,12 @@ async function testSendWaitsForSettlementAndRetriesIgnoredClick() {
   assert.equal(response.result.conversationUrl, urlA);
   assert.deepEqual(editorEvents, ["input"],
     "contenteditable insertion falls back to an input event when execCommand is unavailable");
-  assert.equal(clickTimes.length, 2, "an ignored first click is retried once");
-  assert.ok(clickTimes[0] >= hydrationReadyAt + 5_000,
-    "an existing conversation may take longer than the old retry window to hydrate, then must remain stable before insertion");
-  assert.ok(clickTimes[1] >= clickTimes[0] + 35_000,
-    "an ignored click is retried only after its acknowledgement window and another stable-composer check");
-  assert.ok(now >= clickTimes[1] + 2_000,
+  assert.equal(clickTimes.length, 1, "RALPH must click send exactly once");
+  assert.ok(insertedAt >= assistantReadyAt,
+    "an existing conversation must load both its user and assistant turns before insertion");
+  assert.ok(clickTimes[0] >= insertedAt + 7_000,
+    "RALPH must leave copied text in the composer for seven seconds before sending");
+  assert.ok(now >= clickTimes[0] + 2_000,
     "the automation tab remains open for two seconds after ChatGPT starts generating");
 }
 
@@ -1082,19 +1128,24 @@ async function testNewProjectComposerWithoutDataType() {
   let now = 0;
   let generationStarted = false;
   let userCount = 0;
+  let insertedAt;
+  let clickedAt;
   const location = new URL(namedProjectHome);
   const stopButton = {};
   const editor = {
     textContent: "",
     focus() {},
     closest(selector) { return selector === "form" ? composer : null; },
-    dispatchEvent() {},
+    dispatchEvent(event) {
+      if (event.type === "input") insertedAt = now;
+    },
     getAttribute(key) { return key === "contenteditable" ? "true" : null; },
   };
   const sendButton = {
     disabled: false,
     getAttribute(key) { return key === "aria-disabled" ? "false" : null; },
     click() {
+      clickedAt = now;
       editor.textContent = "";
       userCount = 1;
       generationStarted = true;
@@ -1145,7 +1196,9 @@ async function testNewProjectComposerWithoutDataType() {
   vm.runInNewContext(await readFile("support-extension/content-script.js", "utf8"), {
     window, location, document, browser,
     Date: { now: () => now },
-    InputEvent: class {},
+    InputEvent: class {
+      constructor(type) { this.type = type; }
+    },
     setTimeout: fakeSetTimeout,
   });
   const response = await new Promise(resolve => {
@@ -1156,6 +1209,8 @@ async function testNewProjectComposerWithoutDataType() {
   });
   assert.equal(response.ok, true, response.error);
   assert.equal(response.result.conversationUrl, urlA);
+  assert.ok(clickedAt >= insertedAt + 5_000,
+    "a new project thread must wait five seconds after insertion before sending");
 }
 
 async function testReactTrackedTextareaEnablesSendButton() {
@@ -1215,12 +1270,22 @@ async function testReactTrackedTextareaEnablesSendButton() {
       return null;
     },
   };
-  const userTurn = { dataset: { turn: "user", turnId: "u1" }, textContent: "original request" };
+  const userTurn = {
+    dataset: { turn: "user", turnId: "u1" },
+    textContent: "original request",
+    querySelector: selector => selector === '[data-message-author-role="user"]' ? {} : null,
+  };
+  const assistantTurn = {
+    dataset: { turn: "assistant", turnId: "a1" },
+    textContent: "finished response",
+    querySelector: selector => selector === '[data-message-author-role="assistant"]' ? {} : null,
+  };
   const document = {
     readyState: "complete",
     querySelector(selector) {
       if (selector === 'form[data-type="unified-composer"]') return composer;
       if (selector === 'section[data-turn="user"] [data-message-author-role="user"]') return userTurn;
+      if (selector === 'section[data-turn="assistant"] [data-message-author-role="assistant"]') return assistantTurn;
       if (selector === '#composer-submit-button' || selector === 'button[aria-label="Send prompt"]') return sendButton;
       if (selector === 'form[data-type="unified-composer"] button[data-testid="stop-button"]' ||
           selector === 'button[data-testid="stop-button"]') return generationStarted ? stopButton : null;
@@ -1228,7 +1293,7 @@ async function testReactTrackedTextareaEnablesSendButton() {
     },
     querySelectorAll(selector) {
       if (selector === 'section[data-turn="user"]') return Array.from({ length: userCount }, () => ({}));
-      if (selector === "section[data-turn]") return [userTurn];
+      if (selector === "section[data-turn]") return [userTurn, assistantTurn];
       return [];
     },
     createRange() { return { selectNodeContents() {} }; },
@@ -1340,6 +1405,7 @@ async function testRalphComposerObserver() {
 async function testRunningHydrationDetection() {
   let automationListener;
   let now = 0;
+  const runningStateReadyAt = 75_000;
   const stopButton = {};
   const userMessage = {
     getAttribute: key => key === "data-message-id" ? "u1" : null,
@@ -1354,7 +1420,7 @@ async function testRunningHydrationDetection() {
   const composer = {
     querySelector(selector) {
       if (selector === '#prompt-textarea[contenteditable="true"]') return editor;
-      if (selector === 'button[data-testid="stop-button"]' && now >= 2_500) return stopButton;
+      if (selector === 'button[data-testid="stop-button"]' && now >= runningStateReadyAt) return stopButton;
       return null;
     },
   };
@@ -1364,7 +1430,7 @@ async function testRunningHydrationDetection() {
       if (selector === 'section[data-turn="user"]') return userTurn;
       if (selector === 'button[data-testid="stop-button"]' ||
           selector === 'form[data-type="unified-composer"] button[data-testid="stop-button"]') {
-        return now >= 2_500 ? stopButton : null;
+        return now >= runningStateReadyAt ? stopButton : null;
       }
       return null;
     },
@@ -1399,10 +1465,11 @@ async function testRunningHydrationDetection() {
     }, {}, resolve);
     assert.equal(keepChannelOpen, true);
   });
-  assert.equal(response.ok, true);
+  assert.equal(response.ok, true, response.error);
   assert.equal(response.result.status, "running",
     "a still-hydrating running thread must not be classified as stopped before the stop button appears");
-  assert.ok(now >= 2_500);
+  assert.ok(now >= runningStateReadyAt,
+    "RALPH must keep waiting when a long conversation takes more than one minute to reveal its running state");
 }
 
 
@@ -1801,6 +1868,88 @@ async function testWorkerKeepsLongAutomationAlive(sync) {
   await command;
   assert.equal(keepAliveCalls, 1,
     "a long ChatGPT automation call must reset the extension worker idle timer before Chrome closes its response channel");
+}
+
+async function testWorkerTimesOutHungAutomation(sync) {
+  const generatedConfig = {};
+  vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), generatedConfig);
+  let automationTimeoutCallback;
+  let removedTab = false;
+  const postedResults = [];
+  const storage = {};
+  const context = {
+    URL,
+    AbortSignal,
+    AbortController,
+    crypto: globalThis.crypto,
+    console,
+    Response,
+    importScripts() {},
+    setTimeout(callback, ms) {
+      if (ms === 8 * 60_000) {
+        automationTimeoutCallback = callback;
+        return 98;
+      }
+      if (ms === 20_000) return 99;
+      return setTimeout(callback, ms);
+    },
+    clearTimeout(timer) {
+      if (timer !== 98 && timer !== 99) clearTimeout(timer);
+    },
+    LOCAL_CODEX_THREAD_SYNC: generatedConfig.LOCAL_CODEX_THREAD_SYNC,
+    browser: {
+      runtime: {
+        id: "a".repeat(32),
+        getPlatformInfo: async () => {},
+        onMessage: { addListener() {} },
+        onInstalled: { addListener() {} },
+        onStartup: { addListener() {} },
+      },
+      tabs: {
+        onUpdated: { addListener() {} },
+        query: async () => [],
+        create: async () => ({ id: 11 }),
+        get: async () => ({ id: 11, status: "complete", url: urlA }),
+        sendMessage: async () => await new Promise(() => {}),
+        remove: async () => { removedTab = true; },
+      },
+      webNavigation: {
+        onHistoryStateUpdated: { addListener() {} },
+        onCommitted: { addListener() {} },
+      },
+      scripting: { executeScript: async () => {} },
+      storage: { local: {
+        async get(query) {
+          if (typeof query === "string") return { [query]: storage[query] };
+          return { ...query, ...storage };
+        },
+        async set(values) { Object.assign(storage, values); },
+      } },
+    },
+    fetch: async (endpoint, options) => {
+      assert.equal(endpoint, generatedConfig.LOCAL_CODEX_THREAD_SYNC.commandResultUrl);
+      postedResults.push(JSON.parse(options.body));
+      return new Response("", { status: 200 });
+    },
+  };
+  vm.runInNewContext(await readFile("support-extension/service-worker.js", "utf8"), context);
+  await new Promise(resolve => setImmediate(resolve));
+
+  const command = context.executeCommand({
+    id: "hung-inspection",
+    feature: "ralph",
+    kind: "inspect_thread",
+    conversationUrl: urlA,
+  }, "browser-a");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(typeof automationTimeoutCallback, "function");
+  automationTimeoutCallback();
+  await command;
+
+  assert.equal(postedResults.length, 1);
+  assert.equal(postedResults[0].ok, false);
+  assert.match(postedResults[0].error, /Timed out waiting for ChatGPT page automation/);
+  assert.equal(removedTab, true, "a timed-out automation closes its background tab");
 }
 
 async function testAutomationRedirectGuard(sync) {

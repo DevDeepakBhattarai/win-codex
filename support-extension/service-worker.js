@@ -24,6 +24,7 @@ const AUTOMATION_MESSAGE = "local-codex-support/automation-v1";
 const REACTIVATE_RALPH_MESSAGE = "local-codex-support/ralph-reactivate-v1";
 const SYNC_MESSAGE = "local-codex-thread-sync/bind-v1";
 const WORKER_KEEPALIVE_INTERVAL_MS = 20_000;
+const AUTOMATION_RESPONSE_TIMEOUT_MS = 8 * 60_000;
 let pollGeneration = 0;
 let pollController = null;
 const reportedRalphConversations = new Set();
@@ -213,8 +214,23 @@ async function sendAutomationMessage(tabId, command) {
   }
 }
 
+async function sendAutomationMessageWithTimeout(tabId, command) {
+  let timeout;
+  try {
+    return await Promise.race([
+      sendAutomationMessage(tabId, command),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("Timed out waiting for ChatGPT page automation.")),
+          AUTOMATION_RESPONSE_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function keepWorkerAliveUntil(operation) {
-  // A send retry can outlive Chrome's 30-second extension-worker idle window.
+  // A long page automation can outlive Chrome's 30-second extension-worker idle window.
   let stopped = false;
   let timer;
   const pulse = async () => {
@@ -263,15 +279,17 @@ async function executeCommand(command, browserId) {
   }
 
   const createsNewThread = command.kind === "send_message" && projectHomeId(targetUrl) !== null;
-  const tab = await extensionApi.tabs.create({ url: targetUrl, active: false });
-  if (!Number.isInteger(tab.id)) throw new Error("ChatGPT automation tab did not receive an id.");
+  let tabId;
 
   try {
-    const loadedTab = await waitForTabComplete(tab.id);
+    const tab = await extensionApi.tabs.create({ url: targetUrl, active: false });
+    if (!Number.isInteger(tab.id)) throw new Error("ChatGPT automation tab did not receive an id.");
+    tabId = tab.id;
+    const loadedTab = await waitForTabComplete(tabId);
     if (typeof loadedTab.url !== "string" || !automationTargetMatches(loadedTab.url, targetUrl)) {
       throw new Error("ChatGPT automation was redirected away from the requested target.");
     }
-    const response = await keepWorkerAliveUntil(sendAutomationMessage(tab.id, command));
+    const response = await keepWorkerAliveUntil(sendAutomationMessageWithTimeout(tabId, command));
     if (!response?.ok) throw new Error(response?.error || "ChatGPT page automation failed.");
     if (command.kind === "send_message") {
       const registration = registerRalphConversation(response.result?.conversationUrl, { agentCreated: createsNewThread });
@@ -294,7 +312,7 @@ async function executeCommand(command, browserId) {
       error: error instanceof Error ? error.message : String(error),
     }).catch(() => undefined);
   } finally {
-    await extensionApi.tabs.remove(tab.id).catch(() => undefined);
+    if (tabId !== undefined) await extensionApi.tabs.remove(tabId).catch(() => undefined);
   }
 }
 

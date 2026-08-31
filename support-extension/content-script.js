@@ -16,12 +16,14 @@
   let generation = 0;
 
   const SEND_ACKNOWLEDGEMENT_TIMEOUT_MS = 30_000;
-  const SEND_NEW_CHAT_SETTLE_MS = 3_000;
+  const SEND_NEW_CHAT_SETTLE_MS = 5_000;
   const SEND_CONVERSATION_SETTLE_MS = 5_000;
-  const SEND_BUTTON_SETTLE_MS = 750;
+  const SEND_NEW_CHAT_DELAY_MS = 5_000;
+  const SEND_CONVERSATION_DELAY_MS = 7_000;
   const SEND_GENERATION_HEADROOM_MS = 2_000;
   const THREAD_ASSISTANT_SETTLE_MS = 5_000;
-  const THREAD_UNCERTAIN_SETTLE_MS = 15_000;
+  const THREAD_UNCERTAIN_SETTLE_MS = 2 * 60_000;
+  const THREAD_SETTLE_TIMEOUT_MS = 2.5 * 60_000;
   const RALPH_MIN_WORKED_SECONDS_KEY = "ralphMinWorkedSeconds";
   const DEFAULT_RALPH_MIN_WORKED_SECONDS = 19 * 60;
 
@@ -184,45 +186,26 @@
   async function sendMessage(message) {
     if (typeof message !== "string" || !message.trim()) throw new Error("A non-empty ChatGPT message is required.");
 
+    const ready = await waitForSendReady();
     const baseline = {
       previousUserCount: document.querySelectorAll('section[data-turn="user"]').length,
       previousConversationUrl: conversationUrl(),
       message,
     };
-    let clicked = false;
+    insertMessage(ready.editor, message);
+    await sleep(ready.existingConversation ? SEND_CONVERSATION_DELAY_MS : SEND_NEW_CHAT_DELAY_MS);
 
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const ready = await waitForSendReady();
+    const button = await waitFor(() => {
+      const current = getComposer();
+      if (!current || !editorMatchesMessage(current.editor, message)) return null;
+      const candidate = getSendButton();
+      return isActionableButton(candidate) ? candidate : null;
+    });
+    button.click();
 
-      if (!editorMatchesMessage(ready.editor, message)) {
-        if (clicked) {
-          const acknowledged = await waitForSubmissionAcknowledged(baseline, SEND_ACKNOWLEDGEMENT_TIMEOUT_MS);
-          if (acknowledged) return await sentResult();
-          throw new Error("ChatGPT changed the composer after submission; refusing an unsafe duplicate retry.");
-        }
-        insertMessage(ready.editor, message);
-      }
-
-      const current = await waitForStableSendButton(message);
-
-      current.button.click();
-      clicked = true;
-      const submitted = await waitForSubmissionAcknowledged(baseline, SEND_ACKNOWLEDGEMENT_TIMEOUT_MS);
-      if (submitted) return await sentResult();
-
-      // Retry only when the exact submitted text is still present and the conversation
-      // has not advanced. That is the case where the first click was genuinely ignored.
-      const latest = getComposer();
-      const safeToRetry = attempt === 0 && latest &&
-        editorMatchesMessage(latest.editor, message) &&
-        document.querySelectorAll('section[data-turn="user"]').length === baseline.previousUserCount &&
-        !isRunning();
-      if (!safeToRetry) {
-        throw new Error("ChatGPT did not acknowledge the submitted message; refusing an unsafe duplicate retry.");
-      }
-    }
-
-    throw new Error("ChatGPT did not acknowledge the submitted message after retrying.");
+    const submitted = await waitForSubmissionAcknowledged(baseline, SEND_ACKNOWLEDGEMENT_TIMEOUT_MS);
+    if (!submitted) throw new Error("ChatGPT did not acknowledge the submitted message; the message was not retried.");
+    return await sentResult();
   }
 
   async function sentResult() {
@@ -239,26 +222,16 @@
       if (!ready || document.readyState === "loading" || isRunning()) return null;
       const conversation = conversationUrl();
       const turns = [...document.querySelectorAll("section[data-turn]")];
-      if (conversation &&
-          !document.querySelector('section[data-turn="user"] [data-message-author-role="user"]')) return null;
+      const lastUserIndex = turns.findLastIndex((turn) => turn.dataset.turn === "user");
+      const hasLoadedUser = lastUserIndex >= 0 &&
+        turns[lastUserIndex].querySelector?.('[data-message-author-role="user"]');
+      const hasAssistantAfterLastUser = turns.slice(lastUserIndex + 1).some((turn) =>
+        turn.dataset.turn === "assistant" && turn.querySelector?.('[data-message-author-role="assistant"]'));
+      if (conversation && (!hasLoadedUser || !hasAssistantAfterLastUser)) return null;
       return {
-        value: ready,
+        value: { ...ready, existingConversation: Boolean(conversation) },
         signature: [composerSettledSignature(ready), turnsSettledSignature(turns)].join("|"),
         quietMs: conversation ? SEND_CONVERSATION_SETTLE_MS : SEND_NEW_CHAT_SETTLE_MS,
-      };
-    });
-  }
-
-  async function waitForStableSendButton(message) {
-    return await waitForAllSettled(() => {
-      const ready = getComposer();
-      if (!ready || document.readyState === "loading" || !editorMatchesMessage(ready.editor, message)) return null;
-      const button = getSendButton();
-      if (!isActionableButton(button)) return null;
-      return {
-        value: { ...ready, button },
-        signature: [composerSettledSignature(ready), readEditorText(ready.editor), "send-ready"].join("|"),
-        quietMs: SEND_BUTTON_SETTLE_MS,
       };
     });
   }
@@ -452,7 +425,7 @@
         signature,
         quietMs: hasAssistantAfterLastUser ? THREAD_ASSISTANT_SETTLE_MS : THREAD_UNCERTAIN_SETTLE_MS,
       };
-    }, 60_000);
+    }, THREAD_SETTLE_TIMEOUT_MS);
     return Boolean(settled);
   }
 
