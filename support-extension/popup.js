@@ -168,14 +168,19 @@ function renderThread(thread) {
   const state = threadState(thread);
   const head = document.createElement("div");
   head.className = "thread-head";
-  head.append(Object.assign(document.createElement("span"), {
+  const title = Object.assign(document.createElement("span"), {
     className: "thread-id",
-    textContent: thread.threadId.slice(0, 8),
-  }));
+    textContent: thread.title || "Waiting for title…",
+  });
+  if (!thread.title) title.dataset.placeholder = "true";
+  head.append(title);
   const pill = document.createElement("span");
   pill.className = "pill";
   pill.dataset.state = state;
-  pill.append(document.createElement("i"), state);
+  const pillLabel = state === "retrying"
+    ? state
+    : thread.mode === "continuous" && thread.state === "active" ? "continuous" : state;
+  pill.append(document.createElement("i"), pillLabel);
   head.append(pill);
 
   const meta = document.createElement("p");
@@ -186,6 +191,7 @@ function renderThread(thread) {
   } else if (thread.lastCheckedAt) {
     meta.append(metaEntry("Checked", formatRelative(Date.parse(thread.lastCheckedAt))));
   }
+  if (thread.parentThreadId) meta.append(metaEntry("Parent", thread.parentThreadId.slice(0, 8)));
   if (thread.state === "active") meta.append(metaEntry("Next check", formatRelative(thread.nextCheckAt)));
 
   link.append(head, Object.assign(document.createElement("p"), {
@@ -212,6 +218,16 @@ function renderThread(thread) {
     checkButton.addEventListener("click", () => void checkThreadNow(thread, checkButton));
     actions.append(checkButton);
   }
+  const modeButton = document.createElement("button");
+  modeButton.className = "button button-ghost";
+  modeButton.type = "button";
+  modeButton.textContent = thread.mode === "continuous" ? "Stop continuous" : "Run continuously";
+  modeButton.title = thread.mode === "continuous"
+    ? "Return this thread to normal RALPH completion behavior"
+    : "Keep giving this thread new turns until you stop continuous mode";
+  modeButton.addEventListener("click", () => void setThreadMode(thread, modeButton));
+  actions.append(modeButton);
+
   const stateButton = document.createElement("button");
   stateButton.className = "button button-ghost";
   stateButton.type = "button";
@@ -241,6 +257,25 @@ async function checkThreadNow(thread, button) {
     button.disabled = false;
     button.textContent = "Check now";
     setNote(element("threadsStatus"), errorMessage(error, "Could not start the RALPH check."), "error");
+  }
+}
+
+async function setThreadMode(thread, button) {
+  const nextMode = thread.mode === "continuous" ? "normal" : "continuous";
+  button.disabled = true;
+  button.textContent = nextMode === "continuous" ? "Starting..." : "Stopping...";
+  try {
+    const endpoint = threadStateEndpoint(thread.threadId, "mode");
+    await callServer(endpoint, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: nextMode }),
+    });
+    await loadThreads();
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = thread.mode === "continuous" ? "Stop continuous" : "Run continuously";
+    setNote(element("threadsStatus"), errorMessage(error, "Could not change the RALPH mode."), "error");
   }
 }
 
@@ -331,9 +366,8 @@ async function load() {
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     element(key).checked = Boolean(settings[key]);
   }
-  element(SUBAGENT_PROJECT_KEY).value = settings[SUBAGENT_PROJECT_KEY] ?? "";
   element(RALPH_MIN_WORKED_SECONDS_KEY).value = String(settings[RALPH_MIN_WORKED_SECONDS_KEY]);
-  await Promise.all([loadCurrentThread(), loadRalphProjects(), loadRalphSettings(), loadThreads()]);
+  await Promise.all([loadCurrentThread(), loadRalphProjects(), loadRalphSettings(settings[SUBAGENT_PROJECT_KEY]), loadThreads()]);
 }
 
 async function notifySettingsChanged() {
@@ -364,11 +398,17 @@ async function saveSubagentProject() {
   const status = element("subagentProjectStatus");
   button.disabled = true;
   try {
-    const projectUrl = normalizeProjectUrl(input.value);
-    await extensionApi.storage.local.set({ [SUBAGENT_PROJECT_KEY]: projectUrl });
-    input.value = projectUrl;
-    setNote(status, "Saved. New agent threads will spawn in this project.");
-    await notifySettingsChanged();
+    const projectUrl = input.value.trim() ? normalizeProjectUrl(input.value) : null;
+    const settings = await callServer(ralphSettingsEndpoint, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ subagentProjectUrl: projectUrl }),
+    });
+    input.value = settings.subagentProjectUrl ?? "";
+    await extensionApi.storage.local.remove?.(SUBAGENT_PROJECT_KEY);
+    setNote(status, settings.subagentProjectUrl
+      ? "Saved on the Local Codex server. New agent threads will spawn in this project."
+      : "No dedicated project configured. New agent threads will start at chatgpt.com.");
   } catch (error) {
     setNote(status, errorMessage(error, "Could not save the sub-agent project."), "error");
   } finally {
@@ -395,14 +435,31 @@ async function saveRalphTime() {
   }
 }
 
-async function loadRalphSettings() {
+async function loadRalphSettings(legacySubagentProjectUrl = "") {
   const status = element("ralphLoopIntervalStatus");
+  const projectStatus = element("subagentProjectStatus");
   try {
-    const { loopIntervalSeconds } = await callServer(ralphSettingsEndpoint);
-    element("ralphLoopIntervalSeconds").value = String(loopIntervalSeconds);
+    let settings = await callServer(ralphSettingsEndpoint);
+    if (!settings.subagentProjectUrl && legacySubagentProjectUrl) {
+      const projectUrl = normalizeProjectUrl(legacySubagentProjectUrl);
+      settings = await callServer(ralphSettingsEndpoint, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ subagentProjectUrl: projectUrl }),
+      });
+      await extensionApi.storage.local.remove?.(SUBAGENT_PROJECT_KEY);
+      setNote(projectStatus, "Migrated the saved Sub-agent project to the Local Codex server.");
+    } else {
+      setNote(projectStatus, settings.subagentProjectUrl
+        ? "Stored on the Local Codex server. New agent threads spawn inside this project."
+        : "No dedicated project configured. New agent threads start at chatgpt.com.");
+    }
+    element(SUBAGENT_PROJECT_KEY).value = settings.subagentProjectUrl ?? "";
+    element("ralphLoopIntervalSeconds").value = String(settings.loopIntervalSeconds);
   } catch (error) {
+    element(SUBAGENT_PROJECT_KEY).value = legacySubagentProjectUrl || "";
     element("ralphLoopIntervalSeconds").value = String(DEFAULT_RALPH_LOOP_INTERVAL_SECONDS);
-    setNote(status, errorMessage(error, "Could not load the RALPH initial check delay."), "error");
+    setNote(status, errorMessage(error, "Could not load Local Codex support settings."), "error");
   }
 }
 

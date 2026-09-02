@@ -217,8 +217,11 @@ export async function prepareThreadSync(dataDirectory: string, port = 6002) {
     })};\n`,
     { encoding: "utf8", mode: 0o600 },
   );
-  const widgetHtml = await readFile(new URL("../thread-sync-widget/widget.html", import.meta.url), "utf8");
-  return { registry, extensionToken, extensionDirectory, widgetHtml, bindUrl };
+  const [widgetHtml, subagentWidgetHtml] = await Promise.all([
+    readFile(new URL("../thread-sync-widget/widget.html", import.meta.url), "utf8"),
+    readFile(new URL("../subagent-widget/widget.html", import.meta.url), "utf8"),
+  ]);
+  return { registry, extensionToken, extensionDirectory, widgetHtml, subagentWidgetHtml, bindUrl };
 }
 
 function authenticateExtension(req: Request, res: Response, extensionToken: string) {

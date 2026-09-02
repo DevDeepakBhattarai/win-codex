@@ -1,7 +1,8 @@
 (() => {
-  const handlerKey = "__localCodexSupportInstalledV1";
-  if (globalThis[handlerKey]) return;
-  globalThis[handlerKey] = true;
+  const handlerKey = "__localCodexSupportInstalled";
+  const contentScriptVersion = "1.3.11";
+  if (globalThis[handlerKey]?.version === contentScriptVersion) return;
+  globalThis[handlerKey] = { version: contentScriptVersion };
 
   const extensionApi = globalThis.browser ?? globalThis.chrome;
   if (!extensionApi?.runtime?.sendMessage || !extensionApi?.runtime?.onMessage) return;
@@ -10,17 +11,17 @@
   const responseType = "local-codex-thread-sync/result-v1";
   const automationType = "local-codex-support/automation-v1";
   const reactivateRalphType = "local-codex-support/ralph-reactivate-v1";
+  const titleObservedType = "local-codex-support/title-observed-v1";
   const sourceRoutes = new WeakMap();
   const pending = new Set();
   let route = location.pathname;
   let generation = 0;
 
   const SEND_ACKNOWLEDGEMENT_TIMEOUT_MS = 30_000;
-  const SEND_NEW_CHAT_SETTLE_MS = 5_000;
-  const SEND_CONVERSATION_SETTLE_MS = 5_000;
-  const SEND_NEW_CHAT_DELAY_MS = 5_000;
-  const SEND_CONVERSATION_DELAY_MS = 7_000;
-  const SEND_GENERATION_HEADROOM_MS = 2_000;
+  const SEND_NEW_CHAT_SETTLE_MS = 500;
+  const SEND_CONVERSATION_SETTLE_MS = 1_000;
+  const SEND_BUTTON_SETTLE_MS = 250;
+  const SEND_GENERATION_HEADROOM_MS = 500;
   const THREAD_ASSISTANT_SETTLE_MS = 5_000;
   const THREAD_UNCERTAIN_SETTLE_MS = 2 * 60_000;
   const THREAD_SETTLE_TIMEOUT_MS = 2.5 * 60_000;
@@ -35,6 +36,15 @@
       : `https://chatgpt.com/c/${match[2].toLowerCase()}`;
   }
 
+  function threadTitle() {
+    const value = document.title?.trim();
+    if (!value) return undefined;
+    const title = value.replace(/\s+-\s+ChatGPT$/i, "").trim();
+    if (!title || /^ChatGPT(?:\s+[\u002d\u2013\u2014]\s+.+)?$/i.test(title)) return undefined;
+    const parts = title.split(/\s+[\u002d\u2013\u2014]\s+/).map((part) => part.trim());
+    if (parts.some((part) => /^New chat$/i.test(part))) return undefined;
+    return title.slice(0, 200);
+  }
   function currentRoute() {
     if (route !== location.pathname) {
       route = location.pathname;
@@ -86,6 +96,7 @@
 
   window.addEventListener("message", messageHandler);
 
+  installTitleObserver();
   installRalphComposerObserver();
 
   extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -104,15 +115,16 @@
   }
 
   async function inspectThread() {
+    const title = threadTitle();
     const ready = await waitForConversationReady(5 * 60_000);
-    if (!ready) return { status: "loading" };
+    if (!ready) return { status: "loading", ...(title ? { title } : {}) };
 
     const stopButton = ready.composer.querySelector('button[data-testid="stop-button"]');
-    if (stopButton) return { status: "running" };
+    if (stopButton) return { status: "running", ...(title ? { title } : {}) };
 
     const settled = await waitForStableTurns();
-    if (!settled) return { status: "loading" };
-    if (isRunning()) return { status: "running" };
+    if (!settled) return { status: "loading", ...(title ? { title } : {}) };
+    if (isRunning()) return { status: "running", ...(title ? { title } : {}) };
     const workedSeconds = getWorkedDurationSeconds(await getRalphMinWorkedSeconds());
     const turns = [...document.querySelectorAll("section[data-turn]")];
     const users = [];
@@ -133,7 +145,7 @@
       });
     }
 
-    if (lastUserIndex < 0) return { status: "loading" };
+    if (lastUserIndex < 0) return { status: "loading", ...(title ? { title } : {}) };
 
     let assistantTurn = null;
     for (let index = lastUserIndex + 1; index < turns.length; index += 1) {
@@ -141,9 +153,10 @@
     }
 
     if (!assistantTurn) {
-      if (isRunning()) return { status: "running" };
+      if (isRunning()) return { status: "running", ...(title ? { title } : {}) };
       return {
         status: "idle",
+        ...(title ? { title } : {}),
         workedSeconds,
         users,
         assistant: {
@@ -156,9 +169,10 @@
     const assistantMessages = [...assistantTurn.querySelectorAll('[data-message-author-role="assistant"]')];
     const finalMessage = assistantMessages.at(-1) ?? null;
     if (!finalMessage) {
-      if (isRunning()) return { status: "running" };
+      if (isRunning()) return { status: "running", ...(title ? { title } : {}) };
       return {
         status: "idle",
+        ...(title ? { title } : {}),
         workedSeconds,
         users,
         assistant: {
@@ -168,11 +182,12 @@
       };
     }
 
-    if (isRunning()) return { status: "running" };
+    if (isRunning()) return { status: "running", ...(title ? { title } : {}) };
     const text = extractText(finalMessage);
     if (!text) throw new Error("Could not extract the text of the final ChatGPT assistant message.");
     return {
       status: "idle",
+      ...(title ? { title } : {}),
       workedSeconds,
       users,
       assistant: {
@@ -190,18 +205,22 @@
     const baseline = {
       previousUserCount: document.querySelectorAll('section[data-turn="user"]').length,
       previousConversationUrl: conversationUrl(),
-      message,
     };
     insertMessage(ready.editor, message);
-    await sleep(ready.existingConversation ? SEND_CONVERSATION_DELAY_MS : SEND_NEW_CHAT_DELAY_MS);
 
-    const button = await waitFor(() => {
-      const current = getComposer();
-      if (!current || !editorMatchesMessage(current.editor, message)) return null;
-      const candidate = getSendButton();
-      return isActionableButton(candidate) ? candidate : null;
-    });
-    button.click();
+    const current = await waitForAllSettled(() => {
+      const composer = getComposer();
+      if (!composer) return null;
+      const button = getSendButton(composer.composer);
+      if (!isActionableButton(button)) return null;
+      return {
+        value: { ...composer, button },
+        signature: `${composerSettledSignature(composer)}|send-ready`,
+        quietMs: SEND_BUTTON_SETTLE_MS,
+      };
+    }, SEND_ACKNOWLEDGEMENT_TIMEOUT_MS);
+    if (!current) throw new Error("ChatGPT send button did not become actionable.");
+    current.button.click();
 
     const submitted = await waitForSubmissionAcknowledged(baseline, SEND_ACKNOWLEDGEMENT_TIMEOUT_MS);
     if (!submitted) throw new Error("ChatGPT did not acknowledge the submitted message; the message was not retried.");
@@ -209,11 +228,11 @@
   }
 
   async function sentResult() {
-    await waitFor(() => isRunning());
+    const savedUrl = conversationUrl() ?? await waitFor(() => conversationUrl(), SEND_ACKNOWLEDGEMENT_TIMEOUT_MS);
+    if (!savedUrl) throw new Error("ChatGPT submitted the message but did not create a conversation URL.");
     await sleep(SEND_GENERATION_HEADROOM_MS);
-    const existingUrl = conversationUrl();
-    const savedUrl = existingUrl ?? await waitFor(() => conversationUrl());
-    return { status: "sent", conversationUrl: savedUrl };
+    const title = threadTitle();
+    return { status: "sent", conversationUrl: savedUrl, ...(title ? { title } : {}) };
   }
 
   async function waitForSendReady() {
@@ -244,8 +263,6 @@
       const currentUrl = conversationUrl();
       if (!baseline.previousConversationUrl && currentUrl) return true;
 
-      const current = getComposer();
-      if (current && !editorMatchesMessage(current.editor, baseline.message)) return true;
       return null;
     }, timeoutMs));
   }
@@ -261,7 +278,6 @@
         inputType: "insertText",
         data: message,
       }));
-      if (!editorMatchesMessage(editor, message)) throw new Error("Could not insert the ChatGPT message.");
       return;
     }
 
@@ -271,17 +287,65 @@
     selection.removeAllRanges();
     selection.addRange(range);
     const inserted = document.execCommand("insertText", false, message);
-    if (!inserted || !editorMatchesMessage(editor, message)) {
-      editor.textContent = message;
-      editor.dispatchEvent(new InputEvent("input", {
-        bubbles: true,
-        inputType: "insertText",
-        data: message,
-      }));
-    }
-    if (!editorMatchesMessage(editor, message)) throw new Error("Could not insert the ChatGPT message.");
+    if (!inserted) throw new Error("ChatGPT rejected the prompt insertion.");
   }
 
+
+  function installTitleObserver() {
+    if (typeof document === "undefined") return;
+    let reportedUrl = null;
+    let reportedTitle = null;
+    let titleObserver;
+    let discoveryObserver;
+
+    const report = () => {
+      const currentUrl = conversationUrl();
+      const title = threadTitle();
+      if (!currentUrl?.startsWith("https://chatgpt.com/g/") || !title ||
+          (reportedUrl === currentUrl && reportedTitle === title)) return;
+      try {
+        const delivery = extensionApi.runtime.sendMessage({
+          type: titleObservedType,
+          conversationUrl: currentUrl,
+          title,
+        });
+        void Promise.resolve(delivery).then((result) => {
+          if (result?.ok) {
+            reportedUrl = currentUrl;
+            reportedTitle = title;
+          }
+        }).catch(() => undefined);
+      } catch {
+        // A stale content script is harmless; reinjection will install a fresh observer.
+      }
+    };
+
+    const observeTitle = () => {
+      const node = document.querySelector("title");
+      if (!node || typeof MutationObserver !== "function") return false;
+      discoveryObserver?.disconnect();
+      titleObserver?.disconnect();
+      titleObserver = new MutationObserver(report);
+      titleObserver.observe(node, { childList: true, characterData: true, subtree: true });
+      report();
+      return true;
+    };
+
+    if (!observeTitle() && typeof MutationObserver === "function" && document.documentElement) {
+      discoveryObserver = new MutationObserver(() => {
+        if (observeTitle()) discoveryObserver?.disconnect();
+      });
+      discoveryObserver.observe(document.documentElement, { childList: true, subtree: true });
+    }
+
+    window.addEventListener("popstate", () => {
+      reportedUrl = null;
+      reportedTitle = null;
+      report();
+    });
+    report();
+    if (typeof setInterval === "function") setInterval(report, 1_000);
+  }
   function installRalphComposerObserver() {
     if (typeof document === "undefined" || typeof MutationObserver !== "function") return;
     let observedConversationUrl = null;
@@ -298,7 +362,7 @@
       if (!composer) return;
       const action = composer.querySelector('button[data-testid="stop-button"]')
         ? "stop"
-        : getSendButton() ? "send" : null;
+        : getSendButton(composer) ? "send" : null;
       if (!action) return;
 
       if (action === "stop" && previousComposerAction === "send" &&
@@ -347,27 +411,19 @@
     return composer && editor ? { composer, editor } : null;
   }
 
-  function getSendButton() {
-    return document.querySelector("#composer-submit-button") ??
-      document.querySelector('button[aria-label="Send prompt"]');
+  function getSendButton(composer) {
+    const root = composer ?? document;
+    return root.querySelector("#composer-submit-button") ??
+      root.querySelector('button[data-testid="send-button"]') ??
+      root.querySelector('button[aria-label="Send prompt"]');
   }
 
   function isActionableButton(button) {
     return Boolean(button && !button.disabled && button.getAttribute?.("aria-disabled") !== "true");
   }
 
-  function readEditorText(editor) {
-    if (!editor) return "";
-    const value = typeof editor.value === "string" ? editor.value : editor.textContent ?? "";
-    return value.replace(/\u00a0/g, " ").replace(/\r\n?/g, "\n").trim();
-  }
-
-  function editorMatchesMessage(editor, message) {
-    return readEditorText(editor) === message.replace(/\u00a0/g, " ").replace(/\r\n?/g, "\n").trim();
-  }
-
   function composerSettledSignature(ready) {
-    const sendButton = getSendButton();
+    const sendButton = getSendButton(ready.composer);
     const stopButton = ready.composer.querySelector('button[data-testid="stop-button"]');
     return [
       location.pathname,

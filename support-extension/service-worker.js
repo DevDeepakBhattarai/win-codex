@@ -18,16 +18,17 @@ const DEFAULT_SETTINGS = Object.freeze({
   threadSync: true,
   ralph: false,
   threadMessaging: false,
-  subagentProjectUrl: "",
 });
 const AUTOMATION_MESSAGE = "local-codex-support/automation-v1";
 const REACTIVATE_RALPH_MESSAGE = "local-codex-support/ralph-reactivate-v1";
+const TITLE_OBSERVED_MESSAGE = "local-codex-support/title-observed-v1";
 const SYNC_MESSAGE = "local-codex-thread-sync/bind-v1";
 const WORKER_KEEPALIVE_INTERVAL_MS = 20_000;
 const AUTOMATION_RESPONSE_TIMEOUT_MS = 8 * 60_000;
 let pollGeneration = 0;
 let pollController = null;
 const reportedRalphConversations = new Set();
+const parkedSyncTabs = new Map();
 
 function validateLoopbackEndpoint(value, pathname) {
   const endpoint = new URL(value);
@@ -51,6 +52,14 @@ function conversationUrl(value) {
   }
 }
 
+function normalizeThreadTitle(value) {
+  if (typeof value !== "string") return undefined;
+  const title = value.trim().replace(/\s+-\s+ChatGPT$/i, "").trim();
+  if (!title || /^ChatGPT(?:\s+[\u002d\u2013\u2014]\s+.+)?$/i.test(title)) return undefined;
+  const parts = title.split(/\s+[\u002d\u2013\u2014]\s+/).map(part => part.trim());
+  if (parts.some(part => /^New chat$/i.test(part))) return undefined;
+  return title.slice(0, 200);
+}
 function projectHomeId(value) {
   try {
     const url = new URL(value);
@@ -59,17 +68,6 @@ function projectHomeId(value) {
     if (!match) return null;
     const canonical = match[1].match(/^(g-p-[0-9a-f]{32})(?:-[A-Za-z0-9_-]+)?$/i);
     return canonical ? canonical[1].toLowerCase() : match[1];
-  } catch {
-    return null;
-  }
-}
-
-function normalizedProjectHomeUrl(value) {
-  if (typeof value !== "string" || !value.trim()) return null;
-  try {
-    const url = new URL(value.trim());
-    if (url.origin !== "https://chatgpt.com" || url.username || url.password || !projectHomeId(url.href)) return null;
-    return `https://chatgpt.com${url.pathname.replace(/\/$/, "")}`;
   } catch {
     return null;
   }
@@ -99,14 +97,14 @@ async function getSettings() {
     threadSync: stored.threadSync !== false,
     ralph: stored.ralph === true,
     threadMessaging: stored.threadMessaging === true,
-    subagentProjectUrl: typeof stored.subagentProjectUrl === "string" ? stored.subagentProjectUrl : "",
   };
 }
 
-async function registerRalphConversation(value, { reactivate = false, agentCreated = false } = {}) {
+async function registerRalphConversation(value, { reactivate = false, agentCreated = false, title } = {}) {
   const currentUrl = conversationUrl(value);
+  const currentTitle = normalizeThreadTitle(title);
   if (!currentUrl || !currentUrl.startsWith("https://chatgpt.com/g/") ||
-      (!reactivate && !agentCreated && reportedRalphConversations.has(currentUrl))) return;
+      (!reactivate && !agentCreated && !currentTitle && reportedRalphConversations.has(currentUrl))) return;
   const response = await fetch(ralphRegisterEndpoint.href, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${config.extensionToken}` },
@@ -114,6 +112,7 @@ async function registerRalphConversation(value, { reactivate = false, agentCreat
       conversationUrl: currentUrl,
       ...(reactivate ? { reactivate: true } : {}),
       ...(agentCreated ? { agentCreated: true } : {}),
+      ...(currentTitle ? { title: currentTitle } : {}),
     }),
     signal: AbortSignal.timeout(5000),
     redirect: "error",
@@ -129,6 +128,24 @@ async function getBrowserId() {
   const browserId = crypto.randomUUID();
   await extensionApi.storage.local.set({ browserId });
   return browserId;
+}
+
+function parkSyncTab(tabId, timeoutMs = 2 * 60_000) {
+  return new Promise((resolve) => {
+    const finish = () => {
+      const parked = parkedSyncTabs.get(tabId);
+      if (!parked || parked.finish !== finish) return;
+      parkedSyncTabs.delete(tabId);
+      clearTimeout(parked.timeout);
+      resolve();
+    };
+    const timeout = setTimeout(finish, timeoutMs);
+    parkedSyncTabs.set(tabId, { finish, timeout });
+  });
+}
+
+function finishParkedSyncTab(tabId) {
+  parkedSyncTabs.get(tabId)?.finish();
 }
 
 async function bind(message, sender) {
@@ -160,6 +177,7 @@ async function bind(message, sender) {
       redirect: "error",
     });
     const data = await response.json();
+    if (response.ok) finishParkedSyncTab(sender.tab.id);
     return response.ok
       ? data
       : { status: "error", error: data.error || `Thread Sync returned ${response.status}.`, retryable: response.status === 429 || response.status >= 500 };
@@ -178,6 +196,21 @@ async function reactivateRalphConversation(message, sender) {
     return { ok: false, error: "RALPH no longer matches the current conversation." };
   }
   await registerRalphConversation(currentUrl, { reactivate: true });
+  return { ok: true };
+}
+
+async function reportRalphTitle(message, sender) {
+  if (sender.id !== extensionApi.runtime.id || sender.frameId !== 0 || !Number.isInteger(sender.tab?.id)) {
+    return { ok: false, error: "Invalid extension message source." };
+  }
+  const requestedUrl = conversationUrl(message.conversationUrl);
+  const currentTab = await extensionApi.tabs.get(sender.tab.id);
+  const currentUrl = conversationUrl(currentTab.url);
+  const title = normalizeThreadTitle(message.title);
+  if (!requestedUrl || requestedUrl !== currentUrl || !requestedUrl.startsWith("https://chatgpt.com/g/") || !title) {
+    return { ok: false, error: "RALPH title no longer matches the current conversation." };
+  }
+  await registerRalphConversation(currentUrl, { title });
   return { ok: true };
 }
 
@@ -251,16 +284,9 @@ async function keepWorkerAliveUntil(operation) {
 }
 
 async function commandTargetUrl(command) {
-  if (command.kind === "inspect_thread") return command.conversationUrl;
+  if (command.kind === "inspect_thread" || command.kind === "prepare_thread") return command.conversationUrl;
   if (typeof command.targetUrl === "string" && command.targetUrl) return command.targetUrl;
-  if (command.feature !== "threadMessaging") throw new Error("ChatGPT support command is missing its target URL.");
-
-  const settings = await getSettings();
-  const projectUrl = normalizedProjectHomeUrl(settings.subagentProjectUrl);
-  if (!projectUrl) {
-    throw new Error("Set a Sub-agent project URL in the Local Codex Support extension popup before starting a new agent thread.");
-  }
-  return projectUrl;
+  throw new Error("ChatGPT support command is missing its server-resolved target URL.");
 }
 
 async function executeCommand(command, browserId) {
@@ -289,12 +315,29 @@ async function executeCommand(command, browserId) {
     if (typeof loadedTab.url !== "string" || !automationTargetMatches(loadedTab.url, targetUrl)) {
       throw new Error("ChatGPT automation was redirected away from the requested target.");
     }
+
+    if (command.kind === "prepare_thread") {
+      const parkedTabId = tabId;
+      const parkedSync = parkSyncTab(parkedTabId);
+      await postResult({
+        commandId: command.id,
+        browserId,
+        kind: command.kind,
+        ok: true,
+        result: { status: "prepared", conversationUrl: targetUrl },
+      });
+      tabId = undefined;
+      void keepWorkerAliveUntil(parkedSync).finally(() =>
+        extensionApi.tabs.remove(parkedTabId).catch(() => undefined));
+      return;
+    }
+
     const response = await keepWorkerAliveUntil(sendAutomationMessageWithTimeout(tabId, command));
     if (!response?.ok) throw new Error(response?.error || "ChatGPT page automation failed.");
-    if (command.kind === "send_message") {
-      const registration = registerRalphConversation(response.result?.conversationUrl, { agentCreated: createsNewThread });
-      if (createsNewThread) await registration;
-      else await registration.catch(() => undefined);
+    if (command.kind === "send_message" && !createsNewThread) {
+      await registerRalphConversation(response.result?.conversationUrl, {
+        title: response.result?.title,
+      }).catch(() => undefined);
     }
     await postResult({
       commandId: command.id,
@@ -312,7 +355,10 @@ async function executeCommand(command, browserId) {
       error: error instanceof Error ? error.message : String(error),
     }).catch(() => undefined);
   } finally {
-    if (tabId !== undefined) await extensionApi.tabs.remove(tabId).catch(() => undefined);
+    if (tabId !== undefined) {
+      finishParkedSyncTab(tabId);
+      await extensionApi.tabs.remove(tabId).catch(() => undefined);
+    }
   }
 }
 
@@ -381,6 +427,12 @@ extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
     );
     return true;
   }
+  if (message?.type === TITLE_OBSERVED_MESSAGE) {
+    void reportRalphTitle(message, sender).then(sendResponse, () =>
+      sendResponse({ ok: false, error: "Could not persist the RALPH thread title." }),
+    );
+    return true;
+  }
   if (message?.type === "local-codex-support/settings-changed") {
     reportedRalphConversations.clear();
     restartPolling();
@@ -396,13 +448,18 @@ async function scanExistingTabs() {
     if (Number.isInteger(tab.id)) {
       tasks.push(extensionApi.scripting.executeScript({ target: { tabId: tab.id }, files: ["content-script.js"] }));
     }
-    if (typeof tab.url === "string") tasks.push(registerRalphConversation(tab.url));
+    if (typeof tab.url === "string") tasks.push(registerRalphConversation(tab.url, { title: tab.title }));
     return tasks;
   }));
 }
 
-extensionApi.tabs.onUpdated?.addListener((_tabId, changeInfo) => {
-  if (typeof changeInfo.url === "string") void registerRalphConversation(changeInfo.url).catch(() => undefined);
+
+extensionApi.tabs.onUpdated?.addListener((_tabId, changeInfo, tab) => {
+  const observedUrl = typeof changeInfo.url === "string" ? changeInfo.url : tab?.url;
+  if (typeof observedUrl !== "string" ||
+      (typeof changeInfo.url !== "string" && typeof changeInfo.title !== "string")) return;
+  const observedTitle = typeof changeInfo.title === "string" ? changeInfo.title : undefined;
+  void registerRalphConversation(observedUrl, { title: observedTitle }).catch(() => undefined);
 });
 extensionApi.webNavigation?.onHistoryStateUpdated?.addListener((details) => {
   if (details.frameId === 0) void registerRalphConversation(details.url).catch(() => undefined);

@@ -66,8 +66,10 @@ import {
   ralphThreadActiveHandler,
   ralphThreadCheckHandler,
   ralphThreadCompleteHandler,
+  ralphThreadModeHandler,
   ralphThreadsGetHandler,
-  registerChatGptMessaging,
+  registerChatGptAgents,
+  SUBAGENT_AGENT_INSTRUCTION,
   SupportCommandBus,
   supportCommandClaimHandler,
   supportCommandResultHandler,
@@ -1591,6 +1593,7 @@ function createMcpServer(ownerId: string) {
   const instructions = [
     ...(threadSync ? [
       THREAD_SYNC_AGENT_INSTRUCTION,
+      SUBAGENT_AGENT_INSTRUCTION,
     ] : []),
     ...(BROWSER_BRIDGE_ENABLED ? [
       "Start each tab exactly once. Call browser_open for a new tab; it returns an already-controlled tabId. To use an existing user tab, call browser_tabs, then browser_claim with that tab's exact tabId, title, and URL. Never claim a tab returned by browser_open or a tab whose controlled field is already true.",
@@ -1604,7 +1607,16 @@ function createMcpServer(ownerId: string) {
   }, instructions.length > 0 ? { instructions: instructions.join("\n") } : {});
 
   if (threadSync) registerThreadSync(server, threadSync, ownerId);
-  if (supportCommands) registerChatGptMessaging(server, supportCommands);
+  if (threadSync && supportCommands && ralphRegistry) {
+    registerChatGptAgents(
+      server,
+      supportCommands,
+      threadSync.registry,
+      ralphRegistry,
+      ownerId,
+      threadSync.subagentWidgetHtml,
+    );
+  }
 
   server.registerTool(
     "terminal",
@@ -2735,9 +2747,9 @@ const threadSyncHttpServer = threadSync
       syncApp.use(express.json({ limit: "5mb" }));
       syncApp.post("/thread-sync/bind", createRateLimiter("thread-sync", 60_000, 120),
         threadSyncBindHandler(threadSync.registry, threadSync.extensionToken));
-      if (ralphRegistry) {
+      if (ralphRegistry && supportCommands) {
         syncApp.post("/chatgpt-support/ralph/register", createRateLimiter("ralph-register", 60_000, 240),
-          ralphRegistrationHandler(ralphRegistry, threadSync.extensionToken));
+          ralphRegistrationHandler(ralphRegistry, supportCommands, threadSync.extensionToken));
         syncApp.get("/chatgpt-support/ralph/projects",
           ralphProjectsGetHandler(ralphRegistry, threadSync.extensionToken));
         syncApp.put("/chatgpt-support/ralph/projects",
@@ -2752,6 +2764,8 @@ const threadSyncHttpServer = threadSync
           ralphThreadCompleteHandler(ralphRegistry, threadSync.extensionToken));
         syncApp.put("/chatgpt-support/ralph/threads/:threadId/active",
           ralphThreadActiveHandler(ralphRegistry, threadSync.extensionToken));
+        syncApp.put("/chatgpt-support/ralph/threads/:threadId/mode",
+          ralphThreadModeHandler(ralphRegistry, threadSync.extensionToken));
         if (ralphController) {
           syncApp.put("/chatgpt-support/ralph/threads/:threadId/check",
             ralphThreadCheckHandler(ralphRegistry, ralphController, threadSync.extensionToken));

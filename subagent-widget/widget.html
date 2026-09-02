@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sub-agents</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      height: 336px;
+      margin: 0;
+      overflow: hidden;
+      background: transparent;
+      color: CanvasText;
+    }
+    body { padding: 4px; }
+    .panel {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      width: min(100%, 560px);
+      height: 100%;
+      overflow: hidden;
+      border: 1px solid color-mix(in srgb, currentColor 13%, transparent);
+      border-radius: 15px;
+      background: color-mix(in srgb, Canvas 97%, transparent);
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 52px;
+      padding: 10px 13px;
+      border-bottom: 1px solid color-mix(in srgb, currentColor 9%, transparent);
+    }
+    .mark {
+      position: relative;
+      width: 25px;
+      height: 25px;
+      flex: 0 0 auto;
+      border-radius: 8px;
+      background: color-mix(in srgb, currentColor 7%, transparent);
+    }
+    .mark::before, .mark::after {
+      content: "";
+      position: absolute;
+      width: 8px;
+      height: 8px;
+      border: 1.5px solid currentColor;
+      border-radius: 50%;
+      opacity: .68;
+    }
+    .mark::before { left: 5px; top: 5px; }
+    .mark::after { right: 5px; bottom: 5px; }
+    .heading { min-width: 0; flex: 1; }
+    .title { font-size: 13px; font-weight: 650; line-height: 1.2; }
+    .summary { margin-top: 2px; font-size: 11px; line-height: 1.25; opacity: .58; }
+    .list {
+      min-height: 0;
+      overflow-x: hidden;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      scrollbar-gutter: stable;
+    }
+    .agent {
+      display: grid;
+      grid-template-columns: 8px minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      min-height: 56px;
+      padding: 10px 13px;
+      color: inherit;
+      text-decoration: none;
+    }
+    .agent + .agent { border-top: 1px solid color-mix(in srgb, currentColor 8%, transparent); }
+    .agent:hover { background: color-mix(in srgb, currentColor 4%, transparent); }
+    .agent:focus-visible { outline: 2px solid currentColor; outline-offset: -3px; }
+    .status-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; opacity: .3; }
+    .status-dot.active { opacity: .82; }
+    .status-dot.error { background: #d14d41; opacity: 1; }
+    .copy { min-width: 0; }
+    .name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 12.5px;
+      font-weight: 620;
+      line-height: 1.3;
+    }
+    .meta {
+      display: flex;
+      gap: 8px;
+      margin-top: 3px;
+      min-width: 0;
+      font-size: 10.5px;
+      line-height: 1.25;
+      opacity: .58;
+    }
+    .meta span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .state { font-size: 10.5px; line-height: 1.2; opacity: .64; white-space: nowrap; }
+    .error-text { color: #d14d41; opacity: .95 !important; }
+    .empty {
+      display: grid;
+      place-items: center;
+      height: 100%;
+      min-height: 0;
+      padding: 20px;
+      text-align: center;
+    }
+    .empty-copy { max-width: 300px; }
+    .empty-visual {
+      position: relative;
+      width: 46px;
+      height: 38px;
+      margin: 0 auto 10px;
+      opacity: .54;
+    }
+    .empty-visual::before, .empty-visual::after {
+      content: "";
+      position: absolute;
+      width: 20px;
+      height: 20px;
+      border: 1.5px solid currentColor;
+      border-radius: 50%;
+      background: color-mix(in srgb, Canvas 97%, transparent);
+    }
+    .empty-visual::before { left: 4px; top: 4px; }
+    .empty-visual::after { right: 4px; bottom: 4px; }
+    .empty-link {
+      position: absolute;
+      left: 20px;
+      top: 18px;
+      width: 10px;
+      height: 1.5px;
+      transform: rotate(35deg);
+      background: currentColor;
+      opacity: .7;
+    }
+    .empty strong { display: block; font-size: 12.5px; font-weight: 650; line-height: 1.3; }
+    .empty p { margin: 5px 0 0; font-size: 11px; line-height: 1.4; opacity: .58; }
+  </style>
+</head>
+<body>
+  <section class="panel" aria-live="polite">
+    <div class="header">
+      <span class="mark" aria-hidden="true"></span>
+      <div class="heading">
+        <div class="title">Sub-agents</div>
+        <div id="summary" class="summary">Loading agents...</div>
+      </div>
+    </div>
+    <div id="root" class="list"></div>
+  </section>
+  <script>
+    const root = document.getElementById("root");
+    const summary = document.getElementById("summary");
+
+    function relative(value) {
+      if (!value) return null;
+      const timestamp = typeof value === "number" ? value : Date.parse(value);
+      if (!Number.isFinite(timestamp)) return null;
+      const seconds = Math.round((timestamp - Date.now()) / 1000);
+      const absolute = Math.abs(seconds);
+      if (absolute < 60) return seconds >= 0 ? `in ${absolute}s` : `${absolute}s ago`;
+      const minutes = Math.round(absolute / 60);
+      if (minutes < 60) return seconds >= 0 ? `in ${minutes}m` : `${minutes}m ago`;
+      const hours = Math.round(minutes / 60);
+      return seconds >= 0 ? `in ${hours}h` : `${hours}h ago`;
+    }
+
+    function stateLabel(agent) {
+      if (agent.lastError) return "Needs attention";
+      if (agent.state === "complete") return "Done";
+      return agent.mode === "continuous" ? "Continuous" : "Working";
+    }
+
+    function emptyState() {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      const copy = document.createElement("div");
+      copy.className = "empty-copy";
+      const visual = document.createElement("div");
+      visual.className = "empty-visual";
+      visual.setAttribute("aria-hidden", "true");
+      visual.append(Object.assign(document.createElement("span"), { className: "empty-link" }));
+      copy.append(
+        visual,
+        Object.assign(document.createElement("strong"), { textContent: "No sub-agents yet" }),
+        Object.assign(document.createElement("p"), {
+          textContent: "Agents started from this conversation will appear here with their live RALPH state.",
+        }),
+      );
+      empty.append(copy);
+      return empty;
+    }
+
+    function render(result) {
+      const data = result?.structuredContent ?? result?.mcp_tool_result?.structuredContent ?? result?.call_tool_result?.structuredContent;
+      const agents = Array.isArray(data?.subagents) ? data.subagents : [];
+      root.replaceChildren();
+      summary.textContent = agents.length === 0
+        ? "Nothing running from this conversation"
+        : `${agents.length} ${agents.length === 1 ? "agent" : "agents"}`;
+
+      if (agents.length === 0) {
+        root.append(emptyState());
+        return;
+      }
+
+      for (const agent of agents) {
+        const row = document.createElement("a");
+        row.className = "agent";
+        row.href = agent.conversationUrl;
+        row.target = "_blank";
+        row.rel = "noreferrer";
+
+        const dot = document.createElement("span");
+        dot.className = `status-dot ${agent.lastError ? "error" : agent.state === "active" ? "active" : ""}`;
+        dot.setAttribute("aria-hidden", "true");
+
+        const copy = document.createElement("div");
+        copy.className = "copy";
+        copy.append(Object.assign(document.createElement("div"), {
+          className: "name",
+          textContent: agent.title || `Sub-agent ${String(agent.threadId).slice(0, 8)}`,
+        }));
+
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        const activity = relative(agent.lastContinuationAt || agent.lastCheckedAt || agent.registeredAt);
+        if (agent.lastError) {
+          meta.append(Object.assign(document.createElement("span"), { className: "error-text", textContent: agent.lastError }));
+        } else if (activity) {
+          meta.append(Object.assign(document.createElement("span"), { textContent: `Activity ${activity}` }));
+        }
+        if (!agent.lastError && agent.state === "active") {
+          const next = relative(agent.nextCheckAt);
+          if (next) meta.append(Object.assign(document.createElement("span"), { textContent: `RALPH ${next}` }));
+        }
+        copy.append(meta);
+
+        row.append(
+          dot,
+          copy,
+          Object.assign(document.createElement("span"), { className: "state", textContent: stateLabel(agent) }),
+        );
+        root.append(row);
+      }
+    }
+
+    function readOpenAiResult() {
+      const metadata = window.openai?.toolResponseMetadata;
+      const result = metadata?.structuredContent
+        ? metadata
+        : metadata?.mcp_tool_result ?? metadata?.call_tool_result ?? metadata;
+      render(result);
+    }
+
+    window.addEventListener("openai:set_globals", readOpenAiResult);
+    window.addEventListener("message", (event) => {
+      const message = event.data;
+      if (event.source !== window.parent || message?.jsonrpc !== "2.0") return;
+      if (message.id === "subagent-ui-init" && message.result) {
+        window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} }, "*");
+      }
+      if (message.method === "ui/notifications/tool-result") render(message.params);
+      if (message.method === "ui/resource-teardown") {
+        window.parent.postMessage({ jsonrpc: "2.0", id: message.id, result: {} }, "*");
+      }
+    });
+
+    readOpenAiResult();
+    window.parent.postMessage({
+      jsonrpc: "2.0",
+      id: "subagent-ui-init",
+      method: "ui/initialize",
+      params: {
+        protocolVersion: "2026-01-26",
+        appInfo: { name: "local-codex-subagents", version: "1.3.0" },
+        appCapabilities: {},
+      },
+    }, "*");
+  </script>
+</body>
+</html>
