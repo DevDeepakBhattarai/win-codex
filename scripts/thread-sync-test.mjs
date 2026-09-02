@@ -48,7 +48,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.3.11");
+  assert.equal(manifest.version, "1.3.12");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -105,7 +105,7 @@ try {
     "page automation has exactly one send click call site");
   assert.match(preparedContentScript, /message was not retried/,
     "an unacknowledged send fails without retrying the prompt");
-  assert.match(preparedContentScript, /contentScriptVersion = "1\.3\.11"/,
+  assert.match(preparedContentScript, /contentScriptVersion = "1\.3\.12"/,
     "extension reloads can replace a stale page script with the current content-script version");
   assert.equal(parseRalphProjectId(namedProjectHome), projectId);
   assert.equal(parseRalphProjectId(urlA), projectId);
@@ -593,7 +593,9 @@ try {
   assert.equal(startSubagentCommand.targetUrl, "https://chatgpt.com/",
     "an unset Sub-agent project falls back to the normal ChatGPT new-chat page");
   assert.match(startSubagentCommand.message, /Review the implementation independently/);
-  assert.match(startSubagentCommand.message, /send_thread_message/);
+  assert.match(startSubagentCommand.message, /send_thread_message exactly once/);
+  assert.match(startSubagentCommand.message, /Never retry send_thread_message/);
+  assert.match(startSubagentCommand.message, /deliveryId "[0-9a-f-]{36}"/);
   assert.match(startSubagentCommand.message, new RegExp(bareUrlA.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
     "the callback URL is injected from the parent session binding");
   supportCommands.complete({
@@ -663,9 +665,10 @@ try {
   });
   assert.equal(projectMessage.isError, true, "send_thread_message cannot create a thread");
 
+  const callbackDeliveryId = "77777777-7777-4777-8777-777777777777";
   const messageCall = client.callTool({
     name: "send_thread_message",
-    arguments: { targetUrl: urlB, message: "Sub-agent result is ready." },
+    arguments: { targetUrl: urlB, message: "Sub-agent result is ready.", deliveryId: callbackDeliveryId },
   });
   const messageCommand = await supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
   assert.equal(messageCommand.targetUrl, urlB);
@@ -680,6 +683,22 @@ try {
   const messageResult = await messageCall;
   assert.notEqual(messageResult.isError, true);
   assert.equal(messageResult.structuredContent.conversationUrl, urlB);
+
+  const replayedMessage = await client.callTool({
+    name: "send_thread_message",
+    arguments: { targetUrl: urlB, message: "Sub-agent result is ready.", deliveryId: callbackDeliveryId },
+  });
+  assert.notEqual(replayedMessage.isError, true);
+  assert.equal(replayedMessage.structuredContent.conversationUrl, urlB);
+  assert.equal(await supportCommands.claim("chrome-browser", ["threadMessaging"], 0), undefined,
+    "replaying the same callback deliveryId must return the cached result without creating another browser command");
+
+  const conflictingReplay = await client.callTool({
+    name: "send_thread_message",
+    arguments: { targetUrl: urlB, message: "Different payload", deliveryId: callbackDeliveryId },
+  });
+  assert.equal(conflictingReplay.isError, true);
+  assert.match(conflictingReplay.content[0].text, /deliveryId was already used for a different message/);
 
   const abandonedController = new AbortController();
   const abandonedClaim = supportCommands.claim("chrome-browser", ["ralph"], 1000, abandonedController.signal);
@@ -1173,6 +1192,7 @@ try {
     "the Sub-agent app renders a designed empty state");
   await testContentScript(a.ticket.token, b.ticket.token);
   await testWorkerKeepsLongAutomationAlive(sync);
+  await testWorkerNeverRedispatchesAfterLostResponse(sync);
   await testWorkerTimesOutHungAutomation(sync);
   await testRalphComposerObserver();
   await testSendWaitsForLoadedConversationAndClicksOnce();
@@ -2221,6 +2241,86 @@ async function testWorkerKeepsLongAutomationAlive(sync) {
   await command;
   assert.equal(keepAliveCalls, 1,
     "a long ChatGPT automation call must reset the extension worker idle timer before Chrome closes its response channel");
+}
+
+async function testWorkerNeverRedispatchesAfterLostResponse(sync) {
+  const generatedConfig = {};
+  vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), generatedConfig);
+  let automationDispatches = 0;
+  let injected = 0;
+  const postedResults = [];
+  const storage = {};
+  const context = {
+    URL,
+    AbortSignal,
+    AbortController,
+    crypto: globalThis.crypto,
+    console,
+    Response,
+    importScripts() {},
+    setTimeout,
+    clearTimeout,
+    LOCAL_CODEX_THREAD_SYNC: generatedConfig.LOCAL_CODEX_THREAD_SYNC,
+    browser: {
+      runtime: {
+        id: "a".repeat(32),
+        getPlatformInfo: async () => {},
+        onMessage: { addListener() {} },
+        onInstalled: { addListener() {} },
+        onStartup: { addListener() {} },
+      },
+      tabs: {
+        onUpdated: { addListener() {} },
+        query: async () => [],
+        create: async () => ({ id: 11 }),
+        get: async () => ({ id: 11, status: "complete", url: urlA }),
+        sendMessage: async (_tabId, payload) => {
+          assert.equal(payload.type, "local-codex-support/automation-v1");
+          automationDispatches += 1;
+          // Simulate the dangerous boundary: the page already received and acted on the
+          // command, but the extension response channel disappears before the worker sees
+          // the acknowledgement. A retry here would duplicate the ChatGPT user message.
+          throw new Error("The message port closed after delivery.");
+        },
+        remove: async () => {},
+      },
+      webNavigation: {
+        onHistoryStateUpdated: { addListener() {} },
+        onCommitted: { addListener() {} },
+      },
+      scripting: { executeScript: async () => { injected += 1; } },
+      storage: { local: {
+        async get(query) {
+          if (typeof query === "string") return { [query]: storage[query] };
+          return { ...query, ...storage };
+        },
+        async set(values) { Object.assign(storage, values); },
+      } },
+    },
+    fetch: async (endpoint, options) => {
+      assert.equal(endpoint, generatedConfig.LOCAL_CODEX_THREAD_SYNC.commandResultUrl);
+      postedResults.push(JSON.parse(options.body));
+      return new Response("", { status: 200 });
+    },
+  };
+  vm.runInNewContext(await readFile("support-extension/service-worker.js", "utf8"), context);
+  await new Promise(resolve => setImmediate(resolve));
+
+  await context.executeCommand({
+    id: "lost-send-response",
+    feature: "threadMessaging",
+    kind: "send_message",
+    targetUrl: urlA,
+    message: "must be dispatched once",
+  }, "browser-a");
+
+  assert.equal(injected, 1, "the content script is established before the side-effecting dispatch");
+  assert.equal(automationDispatches, 1,
+    "a lost tabs.sendMessage response must never cause the same side-effecting command to be dispatched again");
+  assert.equal(postedResults.length, 1);
+  assert.equal(postedResults[0].ok, false,
+    "an ambiguous post-delivery failure is surfaced instead of being hidden behind an unsafe retry");
+  assert.match(postedResults[0].error, /message port closed after delivery/);
 }
 
 async function testWorkerTimesOutHungAutomation(sync) {

@@ -1,9 +1,10 @@
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import type { Request, RequestHandler, Response } from "express";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 const MAX_RALPH_THREADS = 2_000;
@@ -20,6 +21,8 @@ const INSPECT_CLAIM_LEASE_MS = 5 * 60 * 1000;
 const CLAIM_WAIT_MS = 20_000;
 const RALPH_PREPARE_TIMEOUT_MS = 3 * 60 * 1000;
 const MAX_CONTINUATION_CHARS = 500;
+const THREAD_MESSAGE_REPLAY_TTL_MS = 30 * 60 * 1000;
+const MAX_THREAD_MESSAGE_REPLAYS = 1_000;
 
 export const SUBAGENT_WIDGET_URI = "ui://local-codex/subagents-v1.html";
 export const SUBAGENT_AGENT_INSTRUCTION = [
@@ -1193,12 +1196,13 @@ interface ThreadBindingLookup {
   } | undefined>;
 }
 
-function subagentPrompt(message: string, parentConversationUrl: string) {
+function subagentPrompt(message: string, parentConversationUrl: string, deliveryId: string) {
   return [
     message.trim(),
     "",
     "You are a sub-agent working in a separate ChatGPT conversation.",
-    `When the assigned task is finished, report the result back to the parent conversation by calling send_thread_message with targetUrl ${JSON.stringify(parentConversationUrl)}.`,
+    `When the assigned task is finished, report the result back to the parent conversation by calling send_thread_message exactly once with targetUrl ${JSON.stringify(parentConversationUrl)} and deliveryId ${JSON.stringify(deliveryId)}.`,
+    "Never retry send_thread_message, even if the tool reports an error or an uncertain outcome, because the first delivery may already have succeeded.",
     "Include the useful result, findings, changed files or commits, and verification status. Do not wait for the parent to poll you.",
   ].join("\n");
 }
@@ -1247,6 +1251,12 @@ export function registerChatGptAgents(
   ownerId: string,
   widgetHtml: string,
 ) {
+  const threadMessageReplays = new Map<string, {
+    fingerprint: string;
+    expiresAt: number;
+    result: Promise<CallToolResult>;
+  }>();
+
   server.registerResource("subagent-widget", SUBAGENT_WIDGET_URI, { mimeType: "text/html;profile=mcp-app" }, async () => ({
     contents: [{ uri: SUBAGENT_WIDGET_URI, mimeType: "text/html;profile=mcp-app", text: widgetHtml, _meta: { ui: { prefersBorder: false, csp: { connectDomains: [], resourceDomains: [] } } } }],
   }));
@@ -1278,11 +1288,12 @@ export function registerChatGptAgents(
 
     try {
       const { subagentProjectUrl } = await registry.settings();
+      const callbackDeliveryId = randomUUID();
       const result = await commands.execute({
         feature: "threadMessaging",
         kind: "send_message",
         targetUrl: subagentProjectUrl ?? "https://chatgpt.com/",
-        message: subagentPrompt(message, parent.conversationUrl),
+        message: subagentPrompt(message, parent.conversationUrl, callbackDeliveryId),
       });
       if (!result.ok) throw new Error(result.error);
       if (result.kind !== "send_message") throw new Error("Sub-agent creation received the wrong support command result.");
@@ -1311,14 +1322,15 @@ export function registerChatGptAgents(
 
   server.registerTool("send_thread_message", {
     title: "Send Thread Message",
-    description: "Send a message to an existing ChatGPT conversation. Sub-agents use this as their callback channel to report results to the parent URL supplied by start_subagent. This tool never creates a new thread.",
+    description: "Send a message to an existing ChatGPT conversation. Sub-agents use this as their callback channel to report results to the parent URL supplied by start_subagent. Repeated delivery of the same idempotency key is returned from cache instead of sending again. This tool never creates a new thread.",
     inputSchema: {
       targetUrl: z.string().url().describe("Exact existing ChatGPT /c/... conversation URL."),
       message: z.string().min(1).max(200_000).describe("Message to send to that conversation."),
+      deliveryId: z.string().uuid().optional().describe("Stable idempotency key supplied by start_subagent for a final callback."),
     },
     outputSchema: { conversationUrl: z.string().url() },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-  }, async ({ targetUrl, message }) => {
+  }, async ({ targetUrl, message, deliveryId }, extra) => {
     let normalizedTarget: string;
     try {
       normalizedTarget = parseConversationUrl(targetUrl).conversationUrl;
@@ -1328,27 +1340,76 @@ export function registerChatGptAgents(
         content: [{ type: "text", text: error instanceof Error ? error.message : "Invalid ChatGPT conversation URL." }],
       };
     }
-    try {
-      const result = await commands.execute({
-        feature: "threadMessaging",
-        kind: "send_message",
-        targetUrl: normalizedTarget,
-        message,
-      });
-      if (!result.ok) throw new Error(result.error);
-      if (result.kind !== "send_message") throw new Error("Thread messaging received the wrong support command result.");
-      const conversation = parseConversationUrl(result.result.conversationUrl);
-      const structuredContent = { conversationUrl: conversation.conversationUrl };
-      return {
-        content: [{ type: "text", text: conversation.conversationUrl }],
-        structuredContent,
-      };
-    } catch (error) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: error instanceof Error ? error.message : "ChatGPT thread messaging failed." }],
-      };
+    const fingerprint = createHash("sha256")
+      .update(normalizedTarget)
+      .update("\0")
+      .update(message)
+      .digest("base64url");
+    const openAiSession = extra._meta?.["openai/session"];
+    const requestScope = typeof extra.sessionId === "string" && extra.sessionId
+      ? extra.sessionId
+      : typeof openAiSession === "string" && openAiSession
+        ? openAiSession
+        : undefined;
+    const replayKey = deliveryId
+      ? `delivery:${deliveryId}`
+      : requestScope !== undefined
+        ? `request:${requestScope}:${String(extra.requestId)}:${fingerprint}`
+        : undefined;
+    const now = Date.now();
+    for (const [key, entry] of threadMessageReplays) {
+      if (entry.expiresAt <= now) threadMessageReplays.delete(key);
     }
+    if (replayKey) {
+      const replay = threadMessageReplays.get(replayKey);
+      if (replay) {
+        if (replay.fingerprint !== fingerprint) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: "This send_thread_message deliveryId was already used for a different message." }],
+          };
+        }
+        return await replay.result;
+      }
+    }
+
+    const delivery = (async (): Promise<CallToolResult> => {
+      try {
+        const result = await commands.execute({
+          feature: "threadMessaging",
+          kind: "send_message",
+          targetUrl: normalizedTarget,
+          message,
+        });
+        if (!result.ok) throw new Error(result.error);
+        if (result.kind !== "send_message") throw new Error("Thread messaging received the wrong support command result.");
+        const conversation = parseConversationUrl(result.result.conversationUrl);
+        const structuredContent = { conversationUrl: conversation.conversationUrl };
+        return {
+          content: [{ type: "text", text: conversation.conversationUrl }],
+          structuredContent,
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: error instanceof Error ? error.message : "ChatGPT thread messaging failed." }],
+        };
+      }
+    })();
+
+    if (replayKey) {
+      threadMessageReplays.set(replayKey, {
+        fingerprint,
+        expiresAt: now + THREAD_MESSAGE_REPLAY_TTL_MS,
+        result: delivery,
+      });
+      while (threadMessageReplays.size > MAX_THREAD_MESSAGE_REPLAYS) {
+        const oldest = threadMessageReplays.keys().next().value;
+        if (oldest === undefined) break;
+        threadMessageReplays.delete(oldest);
+      }
+    }
+    return await delivery;
   });
 
   server.registerTool("list_subagents", {

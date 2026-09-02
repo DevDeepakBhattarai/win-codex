@@ -239,12 +239,11 @@ async function waitForTabComplete(tabId, timeoutMs = 5 * 60_000) {
 }
 
 async function sendAutomationMessage(tabId, command) {
-  try {
-    return await extensionApi.tabs.sendMessage(tabId, { type: AUTOMATION_MESSAGE, command });
-  } catch {
-    await extensionApi.scripting.executeScript({ target: { tabId }, files: ["content-script.js"] });
-    return await extensionApi.tabs.sendMessage(tabId, { type: AUTOMATION_MESSAGE, command });
-  }
+  // Establish the receiver before dispatching a side-effecting command. Never retry the
+  // command itself: tabs.sendMessage can reject after the page already handled it, for
+  // example when an extension reload or tab teardown closes the response channel.
+  await extensionApi.scripting.executeScript({ target: { tabId }, files: ["content-script.js"] });
+  return await extensionApi.tabs.sendMessage(tabId, { type: AUTOMATION_MESSAGE, command });
 }
 
 async function sendAutomationMessageWithTimeout(tabId, command) {
