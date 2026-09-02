@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.3.12";
+  const contentScriptVersion = "1.3.13";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -17,11 +17,9 @@
   let route = location.pathname;
   let generation = 0;
 
-  const SEND_ACKNOWLEDGEMENT_TIMEOUT_MS = 30_000;
-  const SEND_NEW_CHAT_SETTLE_MS = 500;
-  const SEND_CONVERSATION_SETTLE_MS = 1_000;
-  const SEND_BUTTON_SETTLE_MS = 250;
-  const SEND_GENERATION_HEADROOM_MS = 500;
+  const SEND_SETTLE_MS = 5_000;
+  const SEND_READY_TIMEOUT_MS = 5 * 60_000;
+  const SEND_NAVIGATION_TIMEOUT_MS = 60_000;
   const THREAD_ASSISTANT_SETTLE_MS = 5_000;
   const THREAD_UNCERTAIN_SETTLE_MS = 2 * 60_000;
   const THREAD_SETTLE_TIMEOUT_MS = 2.5 * 60_000;
@@ -201,70 +199,38 @@
   async function sendMessage(message) {
     if (typeof message !== "string" || !message.trim()) throw new Error("A non-empty ChatGPT message is required.");
 
-    const ready = await waitForSendReady();
-    const baseline = {
-      previousUserCount: document.querySelectorAll('section[data-turn="user"]').length,
-      previousConversationUrl: conversationUrl(),
-    };
+    const existingConversationUrl = conversationUrl();
+    if (existingConversationUrl) {
+      const loadedUserTurn = await waitFor(
+        () => document.querySelector('section[data-turn="user"] [data-message-author-role="user"]'),
+        SEND_READY_TIMEOUT_MS,
+      );
+      if (!loadedUserTurn) throw new Error("The existing ChatGPT thread did not load a user message.");
+    }
+
+    await sleep(SEND_SETTLE_MS);
+
+    const ready = await waitForComposer(SEND_READY_TIMEOUT_MS);
+    if (!ready) throw new Error("ChatGPT composer did not become available.");
     insertMessage(ready.editor, message);
 
-    const current = await waitForAllSettled(() => {
+    await sleep(SEND_SETTLE_MS);
+
+    const current = await waitFor(() => {
       const composer = getComposer();
       if (!composer) return null;
       const button = getSendButton(composer.composer);
-      if (!isActionableButton(button)) return null;
-      return {
-        value: { ...composer, button },
-        signature: `${composerSettledSignature(composer)}|send-ready`,
-        quietMs: SEND_BUTTON_SETTLE_MS,
-      };
-    }, SEND_ACKNOWLEDGEMENT_TIMEOUT_MS);
+      return isActionableButton(button) ? { ...composer, button } : null;
+    }, SEND_READY_TIMEOUT_MS);
     if (!current) throw new Error("ChatGPT send button did not become actionable.");
+
     current.button.click();
 
-    const submitted = await waitForSubmissionAcknowledged(baseline, SEND_ACKNOWLEDGEMENT_TIMEOUT_MS);
-    if (!submitted) throw new Error("ChatGPT did not acknowledge the submitted message; the message was not retried.");
-    return await sentResult();
-  }
+    const savedUrl = existingConversationUrl ?? await waitFor(() => conversationUrl(), SEND_NAVIGATION_TIMEOUT_MS);
+    if (!savedUrl) throw new Error("ChatGPT did not navigate to the newly created conversation after sending.");
 
-  async function sentResult() {
-    const savedUrl = conversationUrl() ?? await waitFor(() => conversationUrl(), SEND_ACKNOWLEDGEMENT_TIMEOUT_MS);
-    if (!savedUrl) throw new Error("ChatGPT submitted the message but did not create a conversation URL.");
-    await sleep(SEND_GENERATION_HEADROOM_MS);
     const title = threadTitle();
     return { status: "sent", conversationUrl: savedUrl, ...(title ? { title } : {}) };
-  }
-
-  async function waitForSendReady() {
-    return await waitForAllSettled(() => {
-      const ready = getComposer();
-      if (!ready || document.readyState === "loading" || isRunning()) return null;
-      const conversation = conversationUrl();
-      const turns = [...document.querySelectorAll("section[data-turn]")];
-      const lastUserIndex = turns.findLastIndex((turn) => turn.dataset.turn === "user");
-      const hasLoadedUser = lastUserIndex >= 0 &&
-        turns[lastUserIndex].querySelector?.('[data-message-author-role="user"]');
-      const hasAssistantAfterLastUser = turns.slice(lastUserIndex + 1).some((turn) =>
-        turn.dataset.turn === "assistant" && turn.querySelector?.('[data-message-author-role="assistant"]'));
-      if (conversation && (!hasLoadedUser || !hasAssistantAfterLastUser)) return null;
-      return {
-        value: { ...ready, existingConversation: Boolean(conversation) },
-        signature: [composerSettledSignature(ready), turnsSettledSignature(turns)].join("|"),
-        quietMs: conversation ? SEND_CONVERSATION_SETTLE_MS : SEND_NEW_CHAT_SETTLE_MS,
-      };
-    });
-  }
-
-  async function waitForSubmissionAcknowledged(baseline, timeoutMs) {
-    return Boolean(await waitFor(() => {
-      const currentUserCount = document.querySelectorAll('section[data-turn="user"]').length;
-      if (currentUserCount > baseline.previousUserCount || isRunning()) return true;
-
-      const currentUrl = conversationUrl();
-      if (!baseline.previousConversationUrl && currentUrl) return true;
-
-      return null;
-    }, timeoutMs));
   }
 
   function insertMessage(editor, message) {
@@ -422,26 +388,6 @@
     return Boolean(button && !button.disabled && button.getAttribute?.("aria-disabled") !== "true");
   }
 
-  function composerSettledSignature(ready) {
-    const sendButton = getSendButton(ready.composer);
-    const stopButton = ready.composer.querySelector('button[data-testid="stop-button"]');
-    return [
-      location.pathname,
-      stopButton ? "stop" : "idle",
-      sendButton ? (isActionableButton(sendButton) ? "send-enabled" : "send-disabled") : "send-missing",
-      ready.editor.getAttribute?.("contenteditable") ?? "",
-      ready.editor.getAttribute?.("aria-busy") ?? "",
-      ready.composer.getAttribute?.("aria-busy") ?? "",
-    ].join("|");
-  }
-
-  function turnsSettledSignature(turns) {
-    return turns.map((turn) => [
-      turn.dataset.turn ?? "",
-      turn.dataset.turnId ?? "",
-      turn.textContent ?? "",
-    ].join(":")).join("|");
-  }
 
   async function waitForComposer(timeoutMs) {
     return await waitFor(() => getComposer(), timeoutMs);

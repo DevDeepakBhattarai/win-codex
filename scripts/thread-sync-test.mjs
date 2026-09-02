@@ -48,7 +48,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.3.12");
+  assert.equal(manifest.version, "1.3.13");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -103,9 +103,11 @@ try {
     "page automation has exactly one prompt insertion call site");
   assert.equal((preparedContentScript.match(/current\.button\.click\(\)/g) ?? []).length, 1,
     "page automation has exactly one send click call site");
-  assert.match(preparedContentScript, /message was not retried/,
-    "an unacknowledged send fails without retrying the prompt");
-  assert.match(preparedContentScript, /contentScriptVersion = "1\.3\.12"/,
+  assert.doesNotMatch(preparedContentScript, /waitForSubmissionAcknowledged|composerSettledSignature|turnsSettledSignature/,
+    "thread sending does not use acknowledgement or DOM-stability heuristics");
+  assert.match(preparedContentScript, /const SEND_SETTLE_MS = 5_000;/,
+    "thread sending uses the fixed five-second settle requested for typing and sending");
+  assert.match(preparedContentScript, /contentScriptVersion = "1\.3\.13"/,
     "extension reloads can replace a stale page script with the current content-script version");
   assert.equal(parseRalphProjectId(namedProjectHome), projectId);
   assert.equal(parseRalphProjectId(urlA), projectId);
@@ -1435,14 +1437,12 @@ async function testSendWaitsForLoadedConversationAndClicksOnce() {
   assert.equal(insertionCalls, 1, "the prompt is inserted exactly once");
   assert.deepEqual(editorEvents, [], "contenteditable insertion does not perform a second fallback write");
   assert.equal(clickTimes.length, 1, "RALPH must click send exactly once");
-  assert.ok(insertedAt >= assistantReadyAt,
-    "an existing conversation must load both its user and assistant turns before insertion");
-  assert.ok(clickTimes[0] >= insertedAt + 250,
-    "the active send button must remain stable before the one permitted click");
-  assert.ok(clickTimes[0] < insertedAt + 2_000,
-    "message submission must not add multi-second artificial delays after insertion");
-  assert.ok(now >= clickTimes[0] + 500,
-    "the automation tab keeps a short generation headroom after ChatGPT accepts the message");
+  assert.ok(insertedAt >= userReadyAt + 5_000,
+    "an existing conversation waits for a loaded user turn and then the fixed page settle");
+  assert.ok(insertedAt < assistantReadyAt,
+    "thread messaging does not wait for an assistant turn before typing");
+  assert.ok(clickTimes[0] >= insertedAt + 5_000,
+    "the message is typed once, left to settle for five seconds, then sent once");
 }
 
 async function testNewProjectComposerWithoutDataType() {
@@ -1553,10 +1553,10 @@ async function testNewProjectComposerWithoutDataType() {
   assert.equal(response.result.conversationUrl, urlA);
   assert.equal(insertionCalls, 1, "a new sub-agent prompt is inserted exactly once");
   assert.equal(clickCount, 1, "a new sub-agent prompt is sent exactly once");
-  assert.ok(clickedAt >= insertedAt + 250,
-    "a new project thread waits for a stable actionable send button");
-  assert.ok(clickedAt < insertedAt + 2_000,
-    "a new project thread sends promptly enough for the MCP caller to receive its result");
+  assert.ok(insertedAt >= 5_000,
+    "a new project page gets a fixed five-second settle before typing");
+  assert.ok(clickedAt >= insertedAt + 5_000,
+    "a new project prompt settles for five seconds before the one send click");
 }
 
 async function testReactTrackedTextareaEnablesSendButton() {
