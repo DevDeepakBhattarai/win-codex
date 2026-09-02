@@ -693,6 +693,26 @@ try {
   assert.equal(await supportCommands.claim("chrome-browser", ["threadMessaging"], 0), undefined,
     "replaying the same callback deliveryId must return the cached result without creating another browser command");
 
+  const replayServer = new McpServer({ name: "thread-sync-replay-test", version: "1" });
+  registerChatGptAgents(replayServer, supportCommands, registry, ralphRegistry, "mcp-grant", sync.subagentWidgetHtml);
+  const replayClient = new Client({ name: "thread-sync-replay-test", version: "1" });
+  const [replayClientTransport, replayServerTransport] = InMemoryTransport.createLinkedPair();
+  await replayServer.connect(replayServerTransport);
+  await replayClient.connect(replayClientTransport);
+  try {
+    const replayedAcrossStatelessRequest = await replayClient.callTool({
+      name: "send_thread_message",
+      arguments: { targetUrl: urlB, message: "Sub-agent result is ready.", deliveryId: callbackDeliveryId },
+    });
+    assert.notEqual(replayedAcrossStatelessRequest.isError, true);
+    assert.equal(replayedAcrossStatelessRequest.structuredContent.conversationUrl, urlB);
+    assert.equal(await supportCommands.claim("chrome-browser", ["threadMessaging"], 0), undefined,
+      "callback idempotency must survive the stateless MCP server instance being recreated for another POST");
+  } finally {
+    await replayClient.close();
+    await replayServer.close();
+  }
+
   const conflictingReplay = await client.callTool({
     name: "send_thread_message",
     arguments: { targetUrl: urlB, message: "Different payload", deliveryId: callbackDeliveryId },

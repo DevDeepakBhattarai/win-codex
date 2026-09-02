@@ -24,6 +24,13 @@ const MAX_CONTINUATION_CHARS = 500;
 const THREAD_MESSAGE_REPLAY_TTL_MS = 30 * 60 * 1000;
 const MAX_THREAD_MESSAGE_REPLAYS = 1_000;
 
+type ThreadMessageReplay = {
+  fingerprint: string;
+  expiresAt: number;
+  result: Promise<CallToolResult>;
+};
+const threadMessageReplays = new Map<string, ThreadMessageReplay>();
+
 export const SUBAGENT_WIDGET_URI = "ui://local-codex/subagents-v1.html";
 export const SUBAGENT_AGENT_INSTRUCTION = [
   "For delegated coding or research work, first call sync_current_thread and then get_current_thread_url so this parent conversation has a fresh binding.",
@@ -1251,12 +1258,6 @@ export function registerChatGptAgents(
   ownerId: string,
   widgetHtml: string,
 ) {
-  const threadMessageReplays = new Map<string, {
-    fingerprint: string;
-    expiresAt: number;
-    result: Promise<CallToolResult>;
-  }>();
-
   server.registerResource("subagent-widget", SUBAGENT_WIDGET_URI, { mimeType: "text/html;profile=mcp-app" }, async () => ({
     contents: [{ uri: SUBAGENT_WIDGET_URI, mimeType: "text/html;profile=mcp-app", text: widgetHtml, _meta: { ui: { prefersBorder: false, csp: { connectDomains: [], resourceDomains: [] } } } }],
   }));
@@ -1352,9 +1353,9 @@ export function registerChatGptAgents(
         ? openAiSession
         : undefined;
     const replayKey = deliveryId
-      ? `delivery:${deliveryId}`
+      ? `delivery:${ownerId}:${deliveryId}`
       : requestScope !== undefined
-        ? `request:${requestScope}:${String(extra.requestId)}:${fingerprint}`
+        ? `request:${ownerId}:${requestScope}:${String(extra.requestId)}:${fingerprint}`
         : undefined;
     const now = Date.now();
     for (const [key, entry] of threadMessageReplays) {
