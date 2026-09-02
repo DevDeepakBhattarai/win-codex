@@ -25,7 +25,6 @@ const THREAD_MESSAGE_REPLAY_TTL_MS = 30 * 60 * 1000;
 const MAX_THREAD_MESSAGE_REPLAYS = 1_000;
 
 type ThreadMessageReplay = {
-  fingerprint: string;
   expiresAt: number;
   result: Promise<CallToolResult>;
 };
@@ -1203,14 +1202,18 @@ interface ThreadBindingLookup {
   } | undefined>;
 }
 
-function subagentPrompt(message: string, parentConversationUrl: string, deliveryId: string) {
+function subagentPrompt(message: string, parentConversationUrl: string) {
   return [
     message.trim(),
     "",
     "You are a sub-agent working in a separate ChatGPT conversation.",
-    `When the assigned task is finished, report the result back to the parent conversation by calling send_thread_message exactly once with targetUrl ${JSON.stringify(parentConversationUrl)} and deliveryId ${JSON.stringify(deliveryId)}.`,
-    "Never retry send_thread_message, even if the tool reports an error or an uncertain outcome, because the first delivery may already have succeeded.",
-    "Include the useful result, findings, changed files or commits, and verification status. Do not wait for the parent to poll you.",
+    "MANDATORY CALLBACK PROCEDURE:",
+    "1. Complete the assigned task in this child conversation.",
+    `2. BEFORE you produce your final assistant response here, you MUST call send_thread_message exactly once with targetUrl ${JSON.stringify(parentConversationUrl)}. Put your complete final report in the tool's message argument.`,
+    "3. A normal assistant reply in this child conversation is NOT delivered to the parent and does NOT count as reporting back. Do not merely write the result here.",
+    "4. After the send_thread_message call returns, do not call it again. If it reports an error or uncertain outcome, do not retry it because the first delivery may already have succeeded.",
+    "5. Only after that tool call may you end this child turn with a brief acknowledgement.",
+    "The callback message should contain the useful result, findings, changed files or commits, and verification status.",
   ].join("\n");
 }
 
@@ -1289,12 +1292,11 @@ export function registerChatGptAgents(
 
     try {
       const { subagentProjectUrl } = await registry.settings();
-      const callbackDeliveryId = randomUUID();
       const result = await commands.execute({
         feature: "threadMessaging",
         kind: "send_message",
         targetUrl: subagentProjectUrl ?? "https://chatgpt.com/",
-        message: subagentPrompt(message, parent.conversationUrl, callbackDeliveryId),
+        message: subagentPrompt(message, parent.conversationUrl),
       });
       if (!result.ok) throw new Error(result.error);
       if (result.kind !== "send_message") throw new Error("Sub-agent creation received the wrong support command result.");
@@ -1323,15 +1325,14 @@ export function registerChatGptAgents(
 
   server.registerTool("send_thread_message", {
     title: "Send Thread Message",
-    description: "Send a message to an existing ChatGPT conversation exactly once per deliveryId. Generate one UUID for each logical message and reuse that same deliveryId for any retry. Sub-agents receive their callback deliveryId from start_subagent. Repeated delivery of the same idempotency key returns the first result instead of sending again. This tool never creates a new thread.",
+    description: "Send one message to an existing ChatGPT conversation. Transport retries of the same MCP request are deduplicated internally. This tool never creates a new thread.",
     inputSchema: {
       targetUrl: z.string().url().describe("Exact existing ChatGPT /c/... conversation URL."),
       message: z.string().min(1).max(200_000).describe("Message to send to that conversation."),
-      deliveryId: z.string().uuid().describe("Required idempotency key. Generate one UUID per logical message and reuse it unchanged for every retry of that message."),
     },
     outputSchema: { conversationUrl: z.string().url() },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-  }, async ({ targetUrl, message, deliveryId }) => {
+  }, async ({ targetUrl, message }, extra) => {
     let normalizedTarget: string;
     try {
       normalizedTarget = parseConversationUrl(targetUrl).conversationUrl;
@@ -1341,26 +1342,22 @@ export function registerChatGptAgents(
         content: [{ type: "text", text: error instanceof Error ? error.message : "Invalid ChatGPT conversation URL." }],
       };
     }
+
     const fingerprint = createHash("sha256")
       .update(normalizedTarget)
       .update("\0")
       .update(message)
       .digest("base64url");
-    const replayKey = `delivery:${ownerId}:${deliveryId}`;
+    const session = typeof extra._meta?.["openai/session"] === "string"
+      ? extra._meta["openai/session"]
+      : "";
+    const replayKey = `request:${ownerId}:${session}:${String(extra.requestId)}:${fingerprint}`;
     const now = Date.now();
     for (const [key, entry] of threadMessageReplays) {
       if (entry.expiresAt <= now) threadMessageReplays.delete(key);
     }
     const replay = threadMessageReplays.get(replayKey);
-    if (replay) {
-      if (replay.fingerprint !== fingerprint) {
-        return {
-          isError: true,
-          content: [{ type: "text", text: "This send_thread_message deliveryId was already used for a different message." }],
-        };
-      }
-      return await replay.result;
-    }
+    if (replay) return await replay.result;
 
     const delivery = (async (): Promise<CallToolResult> => {
       try {
@@ -1387,7 +1384,6 @@ export function registerChatGptAgents(
     })();
 
     threadMessageReplays.set(replayKey, {
-      fingerprint,
       expiresAt: now + THREAD_MESSAGE_REPLAY_TTL_MS,
       result: delivery,
     });

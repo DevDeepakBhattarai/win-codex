@@ -532,9 +532,9 @@ try {
   assert.match(startSubagentDefinition.description, /sync_current_thread and then get_current_thread_url/);
   assert.match(startSubagentDefinition.description, /send_thread_message/);
   assert.equal(startSubagentDefinition._meta.ui.resourceUri, SUBAGENT_WIDGET_URI);
-  assert.match(sendThreadDefinition.description, /exactly once per deliveryId/);
-  assert.ok(sendThreadDefinition.inputSchema.required.includes("deliveryId"),
-    "send_thread_message requires a stable idempotency key for every logical message");
+  assert.match(sendThreadDefinition.description, /deduplicated internally/);
+  assert.deepEqual([...sendThreadDefinition.inputSchema.required].sort(), ["message", "targetUrl"],
+    "send_thread_message keeps the public API to targetUrl and message only");
   assert.equal(listSubagentsDefinition._meta.ui.resourceUri, SUBAGENT_WIDGET_URI);
   assert.equal(tools.some(tool => tool.name === "chatgpt_message"), false, "the ambiguous chatgpt_message tool is removed");
   const syncCall = sessionId => client.callTool({ name: "sync_current_thread", arguments: {}, _meta: { "openai/session": sessionId } });
@@ -597,9 +597,13 @@ try {
   assert.equal(startSubagentCommand.targetUrl, "https://chatgpt.com/",
     "an unset Sub-agent project falls back to the normal ChatGPT new-chat page");
   assert.match(startSubagentCommand.message, /Review the implementation independently/);
-  assert.match(startSubagentCommand.message, /send_thread_message exactly once/);
-  assert.match(startSubagentCommand.message, /Never retry send_thread_message/);
-  assert.match(startSubagentCommand.message, /deliveryId "[0-9a-f-]{36}"/);
+  assert.match(startSubagentCommand.message, /MANDATORY CALLBACK PROCEDURE/);
+  assert.match(startSubagentCommand.message, /BEFORE you produce your final assistant response here, you MUST call send_thread_message exactly once/);
+  assert.match(startSubagentCommand.message, /normal assistant reply.*NOT delivered to the parent/i);
+  assert.match(startSubagentCommand.message, /does NOT count as reporting back/i);
+  assert.match(startSubagentCommand.message, /do not retry it because the first delivery may already have succeeded/i);
+  assert.doesNotMatch(startSubagentCommand.message, /deliveryId/,
+    "sub-agents do not manage transport idempotency tokens themselves");
   assert.match(startSubagentCommand.message, new RegExp(bareUrlA.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
     "the callback URL is injected from the parent session binding");
   supportCommands.complete({
@@ -668,23 +672,14 @@ try {
     arguments: {
       targetUrl: namedProjectHome,
       message: "must target an existing thread",
-      deliveryId: "66666666-6666-4666-8666-666666666666",
     },
   });
   assert.equal(projectMessage.isError, true, "send_thread_message cannot create a thread");
 
-  const missingDeliveryId = await client.callTool({
-    name: "send_thread_message",
-    arguments: { targetUrl: urlB, message: "must be rejected without idempotency" },
-  });
-  assert.equal(missingDeliveryId.isError, true,
-    "send_thread_message rejects calls that cannot be made idempotent");
-  assert.equal(await supportCommands.claim("chrome-browser", ["threadMessaging"], 0), undefined);
 
-  const callbackDeliveryId = "77777777-7777-4777-8777-777777777777";
   const messageCall = client.callTool({
     name: "send_thread_message",
-    arguments: { targetUrl: urlB, message: "Sub-agent result is ready.", deliveryId: callbackDeliveryId },
+    arguments: { targetUrl: urlB, message: "Sub-agent result is ready." },
   });
   const messageCommand = await supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
   assert.equal(messageCommand.targetUrl, urlB);
@@ -700,42 +695,42 @@ try {
   assert.notEqual(messageResult.isError, true);
   assert.equal(messageResult.structuredContent.conversationUrl, urlB);
 
-  const replayedMessage = await client.callTool({
-    name: "send_thread_message",
-    arguments: { targetUrl: urlB, message: "Sub-agent result is ready.", deliveryId: callbackDeliveryId },
+  let firstReplayHandler;
+  const firstReplayServer = {
+    registerResource() {},
+    registerTool(name, _definition, handler) {
+      if (name === "send_thread_message") firstReplayHandler = handler;
+    },
+  };
+  registerChatGptAgents(firstReplayServer, supportCommands, registry, ralphRegistry, "mcp-grant", sync.subagentWidgetHtml);
+  assert.equal(typeof firstReplayHandler, "function");
+  const retryArguments = { targetUrl: urlB, message: "Transport retry probe." };
+  const retryExtra = { requestId: "same-mcp-request", _meta: { "openai/session": "mcp-A" } };
+  const firstRetryCall = firstReplayHandler(retryArguments, retryExtra);
+  const retryDeliveryCommand = await supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
+  assert.equal(retryDeliveryCommand.message, retryArguments.message);
+  supportCommands.complete({
+    commandId: retryDeliveryCommand.id,
+    browserId: "chrome-browser",
+    kind: "send_message",
+    ok: true,
+    result: { status: "sent", conversationUrl: urlB },
   });
-  assert.notEqual(replayedMessage.isError, true);
-  assert.equal(replayedMessage.structuredContent.conversationUrl, urlB);
+  const firstRetryResult = await firstRetryCall;
+  assert.equal(firstRetryResult.structuredContent.conversationUrl, urlB);
+
+  let secondReplayHandler;
+  const secondReplayServer = {
+    registerResource() {},
+    registerTool(name, _definition, handler) {
+      if (name === "send_thread_message") secondReplayHandler = handler;
+    },
+  };
+  registerChatGptAgents(secondReplayServer, supportCommands, registry, ralphRegistry, "mcp-grant", sync.subagentWidgetHtml);
+  const replayedRetryResult = await secondReplayHandler(retryArguments, retryExtra);
+  assert.equal(replayedRetryResult.structuredContent.conversationUrl, urlB);
   assert.equal(await supportCommands.claim("chrome-browser", ["threadMessaging"], 0), undefined,
-    "replaying the same callback deliveryId must return the cached result without creating another browser command");
-
-  const replayServer = new McpServer({ name: "thread-sync-replay-test", version: "1" });
-  registerChatGptAgents(replayServer, supportCommands, registry, ralphRegistry, "mcp-grant", sync.subagentWidgetHtml);
-  const replayClient = new Client({ name: "thread-sync-replay-test", version: "1" });
-  const [replayClientTransport, replayServerTransport] = InMemoryTransport.createLinkedPair();
-  await replayServer.connect(replayServerTransport);
-  await replayClient.connect(replayClientTransport);
-  try {
-    const replayedAcrossStatelessRequest = await replayClient.callTool({
-      name: "send_thread_message",
-      arguments: { targetUrl: urlB, message: "Sub-agent result is ready.", deliveryId: callbackDeliveryId },
-    });
-    assert.notEqual(replayedAcrossStatelessRequest.isError, true);
-    assert.equal(replayedAcrossStatelessRequest.structuredContent.conversationUrl, urlB);
-    assert.equal(await supportCommands.claim("chrome-browser", ["threadMessaging"], 0), undefined,
-      "callback idempotency must survive the stateless MCP server instance being recreated for another POST");
-  } finally {
-    await replayClient.close();
-    await replayServer.close();
-  }
-
-  const conflictingReplay = await client.callTool({
-    name: "send_thread_message",
-    arguments: { targetUrl: urlB, message: "Different payload", deliveryId: callbackDeliveryId },
-  });
-  assert.equal(conflictingReplay.isError, true);
-  assert.match(conflictingReplay.content[0].text, /deliveryId was already used for a different message/);
-
+    "the same MCP request id and payload is deduplicated across stateless server instances");
   const abandonedController = new AbortController();
   const abandonedClaim = supportCommands.claim("chrome-browser", ["ralph"], 1000, abandonedController.signal);
   abandonedController.abort();
