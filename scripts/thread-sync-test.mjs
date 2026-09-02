@@ -530,7 +530,9 @@ try {
   assert.match(startSubagentDefinition.description, /sync_current_thread and then get_current_thread_url/);
   assert.match(startSubagentDefinition.description, /send_thread_message/);
   assert.equal(startSubagentDefinition._meta.ui.resourceUri, SUBAGENT_WIDGET_URI);
-  assert.match(sendThreadDefinition.description, /existing ChatGPT conversation/);
+  assert.match(sendThreadDefinition.description, /exactly once per deliveryId/);
+  assert.ok(sendThreadDefinition.inputSchema.required.includes("deliveryId"),
+    "send_thread_message requires a stable idempotency key for every logical message");
   assert.equal(listSubagentsDefinition._meta.ui.resourceUri, SUBAGENT_WIDGET_URI);
   assert.equal(tools.some(tool => tool.name === "chatgpt_message"), false, "the ambiguous chatgpt_message tool is removed");
   const syncCall = sessionId => client.callTool({ name: "sync_current_thread", arguments: {}, _meta: { "openai/session": sessionId } });
@@ -661,9 +663,21 @@ try {
 
   const projectMessage = await client.callTool({
     name: "send_thread_message",
-    arguments: { targetUrl: namedProjectHome, message: "must target an existing thread" },
+    arguments: {
+      targetUrl: namedProjectHome,
+      message: "must target an existing thread",
+      deliveryId: "66666666-6666-4666-8666-666666666666",
+    },
   });
   assert.equal(projectMessage.isError, true, "send_thread_message cannot create a thread");
+
+  const missingDeliveryId = await client.callTool({
+    name: "send_thread_message",
+    arguments: { targetUrl: urlB, message: "must be rejected without idempotency" },
+  });
+  assert.equal(missingDeliveryId.isError, true,
+    "send_thread_message rejects calls that cannot be made idempotent");
+  assert.equal(await supportCommands.claim("chrome-browser", ["threadMessaging"], 0), undefined);
 
   const callbackDeliveryId = "77777777-7777-4777-8777-777777777777";
   const messageCall = client.callTool({

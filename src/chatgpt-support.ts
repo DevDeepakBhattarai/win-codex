@@ -1323,15 +1323,15 @@ export function registerChatGptAgents(
 
   server.registerTool("send_thread_message", {
     title: "Send Thread Message",
-    description: "Send a message to an existing ChatGPT conversation. Sub-agents use this as their callback channel to report results to the parent URL supplied by start_subagent. Repeated delivery of the same idempotency key is returned from cache instead of sending again. This tool never creates a new thread.",
+    description: "Send a message to an existing ChatGPT conversation exactly once per deliveryId. Generate one UUID for each logical message and reuse that same deliveryId for any retry. Sub-agents receive their callback deliveryId from start_subagent. Repeated delivery of the same idempotency key returns the first result instead of sending again. This tool never creates a new thread.",
     inputSchema: {
       targetUrl: z.string().url().describe("Exact existing ChatGPT /c/... conversation URL."),
       message: z.string().min(1).max(200_000).describe("Message to send to that conversation."),
-      deliveryId: z.string().uuid().optional().describe("Stable idempotency key supplied by start_subagent for a final callback."),
+      deliveryId: z.string().uuid().describe("Required idempotency key. Generate one UUID per logical message and reuse it unchanged for every retry of that message."),
     },
     outputSchema: { conversationUrl: z.string().url() },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-  }, async ({ targetUrl, message, deliveryId }, extra) => {
+  }, async ({ targetUrl, message, deliveryId }) => {
     let normalizedTarget: string;
     try {
       normalizedTarget = parseConversationUrl(targetUrl).conversationUrl;
@@ -1346,32 +1346,20 @@ export function registerChatGptAgents(
       .update("\0")
       .update(message)
       .digest("base64url");
-    const openAiSession = extra._meta?.["openai/session"];
-    const requestScope = typeof extra.sessionId === "string" && extra.sessionId
-      ? extra.sessionId
-      : typeof openAiSession === "string" && openAiSession
-        ? openAiSession
-        : undefined;
-    const replayKey = deliveryId
-      ? `delivery:${ownerId}:${deliveryId}`
-      : requestScope !== undefined
-        ? `request:${ownerId}:${requestScope}:${String(extra.requestId)}:${fingerprint}`
-        : undefined;
+    const replayKey = `delivery:${ownerId}:${deliveryId}`;
     const now = Date.now();
     for (const [key, entry] of threadMessageReplays) {
       if (entry.expiresAt <= now) threadMessageReplays.delete(key);
     }
-    if (replayKey) {
-      const replay = threadMessageReplays.get(replayKey);
-      if (replay) {
-        if (replay.fingerprint !== fingerprint) {
-          return {
-            isError: true,
-            content: [{ type: "text", text: "This send_thread_message deliveryId was already used for a different message." }],
-          };
-        }
-        return await replay.result;
+    const replay = threadMessageReplays.get(replayKey);
+    if (replay) {
+      if (replay.fingerprint !== fingerprint) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "This send_thread_message deliveryId was already used for a different message." }],
+        };
       }
+      return await replay.result;
     }
 
     const delivery = (async (): Promise<CallToolResult> => {
@@ -1398,17 +1386,15 @@ export function registerChatGptAgents(
       }
     })();
 
-    if (replayKey) {
-      threadMessageReplays.set(replayKey, {
-        fingerprint,
-        expiresAt: now + THREAD_MESSAGE_REPLAY_TTL_MS,
-        result: delivery,
-      });
-      while (threadMessageReplays.size > MAX_THREAD_MESSAGE_REPLAYS) {
-        const oldest = threadMessageReplays.keys().next().value;
-        if (oldest === undefined) break;
-        threadMessageReplays.delete(oldest);
-      }
+    threadMessageReplays.set(replayKey, {
+      fingerprint,
+      expiresAt: now + THREAD_MESSAGE_REPLAY_TTL_MS,
+      result: delivery,
+    });
+    while (threadMessageReplays.size > MAX_THREAD_MESSAGE_REPLAYS) {
+      const oldest = threadMessageReplays.keys().next().value;
+      if (oldest === undefined) break;
+      threadMessageReplays.delete(oldest);
     }
     return await delivery;
   });
