@@ -37,9 +37,9 @@ The child callback instruction requires `send_thread_message` before the child's
 
 ### Hide transport idempotency from the model
 
-`send_thread_message` exposes only `targetUrl` and `message`. The model does not create or manage a `deliveryId`.
+`start_subagent` and `send_thread_message` keep transport idempotency below the model-facing API. `send_thread_message` exposes only `targetUrl` and `message`; the model does not create or manage a `deliveryId`.
 
-The server deduplicates retries of the same MCP request internally using the request identity, `openai/session`, normalized target, and message fingerprint. The replay cache is shared across stateless MCP server instances in the process. A new logical tool call remains a new send.
+The server deduplicates retries of the same MCP request internally using the tool name, request identity, `openai/session`, and payload fingerprint. `send_thread_message` also fingerprints the normalized target. The replay cache is shared across stateless MCP server instances in the process. A new logical tool call remains a new send or a new child.
 
 This keeps transport retry handling below the tool contract instead of requiring the model to preserve an idempotency token across attempts.
 

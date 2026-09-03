@@ -53,7 +53,7 @@ When `THREAD_SYNC_ENABLED` is not `false`, the server also exposes:
 
 - `sync_current_thread` mounts the Thread Sync MCP App and binds the current `openai/session` to the visible ChatGPT conversation.
 - `get_current_thread_url` returns the URL from that binding. It never guesses or constructs a conversation URL.
-- `start_subagent` starts a separate ChatGPT child conversation. The parent must be synced first.
+- `start_subagent` starts a separate ChatGPT child conversation. The parent must be synced first. Transport retries of the same MCP request are deduplicated internally.
 - `send_thread_message` sends one message to an existing ChatGPT conversation. Its public inputs are only `targetUrl` and `message`; transport retries of the same MCP request are deduplicated internally.
 - `list_subagents` shows the children created by the current synced parent, including their title and RALPH state.
 
@@ -205,7 +205,7 @@ The parent must call `sync_current_thread` and then `get_current_thread_url` bef
 
 For both new child creation and messages to existing conversations, the support extension uses a single-send path. It gives the ChatGPT page a fixed five-second settle period before typing, types the message once, waits another five seconds, waits for an actionable send button, and clicks once. For an existing conversation, it first waits for a loaded user turn. It does not wait for an assistant turn and does not use DOM-stability or post-send acknowledgement heuristics.
 
-`send_thread_message` does not expose a `deliveryId`. The server deduplicates retries of the same MCP request by the request identity, session, target, and payload. A new logical tool call is still a new send.
+`start_subagent` and `send_thread_message` keep transport idempotency internal. The server deduplicates retries of the same MCP request by tool, request identity, session, and payload fingerprint. `send_thread_message` also fingerprints its normalized target. A new logical tool call remains a new send or a new child.
 
 ## RALPH
 

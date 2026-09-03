@@ -21,14 +21,35 @@ const INSPECT_CLAIM_LEASE_MS = 5 * 60 * 1000;
 const CLAIM_WAIT_MS = 20_000;
 const RALPH_PREPARE_TIMEOUT_MS = 3 * 60 * 1000;
 const MAX_CONTINUATION_CHARS = 500;
-const THREAD_MESSAGE_REPLAY_TTL_MS = 30 * 60 * 1000;
-const MAX_THREAD_MESSAGE_REPLAYS = 1_000;
+const TOOL_REQUEST_REPLAY_TTL_MS = 30 * 60 * 1000;
+const MAX_TOOL_REQUEST_REPLAYS = 1_000;
 
-type ThreadMessageReplay = {
+type ToolRequestReplay = {
   expiresAt: number;
   result: Promise<CallToolResult>;
 };
-const threadMessageReplays = new Map<string, ThreadMessageReplay>();
+const toolRequestReplays = new Map<string, ToolRequestReplay>();
+
+function replayToolRequest(replayKey: string, createResult: () => Promise<CallToolResult>) {
+  const now = Date.now();
+  for (const [key, entry] of toolRequestReplays) {
+    if (entry.expiresAt <= now) toolRequestReplays.delete(key);
+  }
+  const replay = toolRequestReplays.get(replayKey);
+  if (replay) return replay.result;
+
+  const result = createResult();
+  toolRequestReplays.set(replayKey, {
+    expiresAt: now + TOOL_REQUEST_REPLAY_TTL_MS,
+    result,
+  });
+  while (toolRequestReplays.size > MAX_TOOL_REQUEST_REPLAYS) {
+    const oldest = toolRequestReplays.keys().next().value;
+    if (oldest === undefined) break;
+    toolRequestReplays.delete(oldest);
+  }
+  return result;
+}
 
 export const SUBAGENT_WIDGET_URI = "ui://local-codex/subagents-v1.html";
 export const SUBAGENT_AGENT_INSTRUCTION = [
@@ -1267,7 +1288,7 @@ export function registerChatGptAgents(
 
   server.registerTool("start_subagent", {
     title: "Start Sub-agent",
-    description: "Start an independent ChatGPT sub-agent. The server uses the configured Sub-agent project when one is set and otherwise starts from chatgpt.com. Before calling this tool, call sync_current_thread and then get_current_thread_url so the parent thread is freshly bound. The child cannot implicitly return to this conversation, so this tool automatically appends the bound parent URL and instructs the child to report back with send_thread_message. The new child is registered for RALPH automatically.",
+    description: "Start an independent ChatGPT sub-agent. Transport retries of the same MCP request are deduplicated internally. The server uses the configured Sub-agent project when one is set and otherwise starts from chatgpt.com. Before calling this tool, call sync_current_thread and then get_current_thread_url so the parent thread is freshly bound. The child cannot implicitly return to this conversation, so this tool automatically appends the bound parent URL and instructs the child to report back with send_thread_message. The new child is registered for RALPH automatically.",
     inputSchema: {
       message: z.string().min(1).max(190_000).describe("Complete bounded task for the sub-agent. Do not include callback plumbing; it is added automatically."),
     },
@@ -1290,37 +1311,43 @@ export function registerChatGptAgents(
       };
     }
 
-    try {
-      const { subagentProjectUrl } = await registry.settings();
-      const result = await commands.execute({
-        feature: "threadMessaging",
-        kind: "send_message",
-        targetUrl: subagentProjectUrl ?? "https://chatgpt.com/",
-        message: subagentPrompt(message, parent.conversationUrl),
-      });
-      if (!result.ok) throw new Error(result.error);
-      if (result.kind !== "send_message") throw new Error("Sub-agent creation received the wrong support command result.");
-      const child = parseConversationUrl(result.result.conversationUrl);
-      const registration = await registry.register(child.conversationUrl, {
-        agentCreated: true,
-        parentThreadId: parent.threadId,
-        title: result.result.title,
-      });
-      if (registration === "registered") prepareFreshRalphThread(commands, child.conversationUrl);
-      const structuredContent = {
-        parentConversationUrl: parent.conversationUrl,
-        subagents: (await registry.subagents(parent.threadId)).map(subagentView),
-      };
-      return {
-        content: [{ type: "text", text: child.conversationUrl }],
-        structuredContent,
-      };
-    } catch (error) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: error instanceof Error ? error.message : "Sub-agent creation failed." }],
-      };
-    }
+    const fingerprint = createHash("sha256")
+      .update(message)
+      .digest("base64url");
+    const replayKey = `start_subagent:${ownerId}:${session}:${String(extra.requestId)}:${fingerprint}`;
+    return await replayToolRequest(replayKey, async () => {
+      try {
+        const { subagentProjectUrl } = await registry.settings();
+        const result = await commands.execute({
+          feature: "threadMessaging",
+          kind: "send_message",
+          targetUrl: subagentProjectUrl ?? "https://chatgpt.com/",
+          message: subagentPrompt(message, parent.conversationUrl),
+        });
+        if (!result.ok) throw new Error(result.error);
+        if (result.kind !== "send_message") throw new Error("Sub-agent creation received the wrong support command result.");
+        const child = parseConversationUrl(result.result.conversationUrl);
+        const registration = await registry.register(child.conversationUrl, {
+          agentCreated: true,
+          parentThreadId: parent.threadId,
+          title: result.result.title,
+        });
+        if (registration === "registered") prepareFreshRalphThread(commands, child.conversationUrl);
+        const structuredContent = {
+          parentConversationUrl: parent.conversationUrl,
+          subagents: (await registry.subagents(parent.threadId)).map(subagentView),
+        };
+        return {
+          content: [{ type: "text", text: child.conversationUrl }],
+          structuredContent,
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: error instanceof Error ? error.message : "Sub-agent creation failed." }],
+        };
+      }
+    });
   });
 
   server.registerTool("send_thread_message", {
@@ -1351,15 +1378,8 @@ export function registerChatGptAgents(
     const session = typeof extra._meta?.["openai/session"] === "string"
       ? extra._meta["openai/session"]
       : "";
-    const replayKey = `request:${ownerId}:${session}:${String(extra.requestId)}:${fingerprint}`;
-    const now = Date.now();
-    for (const [key, entry] of threadMessageReplays) {
-      if (entry.expiresAt <= now) threadMessageReplays.delete(key);
-    }
-    const replay = threadMessageReplays.get(replayKey);
-    if (replay) return await replay.result;
-
-    const delivery = (async (): Promise<CallToolResult> => {
+    const replayKey = `send_thread_message:${ownerId}:${session}:${String(extra.requestId)}:${fingerprint}`;
+    return await replayToolRequest(replayKey, async (): Promise<CallToolResult> => {
       try {
         const result = await commands.execute({
           feature: "threadMessaging",
@@ -1381,18 +1401,7 @@ export function registerChatGptAgents(
           content: [{ type: "text", text: error instanceof Error ? error.message : "ChatGPT thread messaging failed." }],
         };
       }
-    })();
-
-    threadMessageReplays.set(replayKey, {
-      expiresAt: now + THREAD_MESSAGE_REPLAY_TTL_MS,
-      result: delivery,
     });
-    while (threadMessageReplays.size > MAX_THREAD_MESSAGE_REPLAYS) {
-      const oldest = threadMessageReplays.keys().next().value;
-      if (oldest === undefined) break;
-      threadMessageReplays.delete(oldest);
-    }
-    return await delivery;
   });
 
   server.registerTool("list_subagents", {

@@ -17,6 +17,7 @@ const urlA = `https://chatgpt.com/g/${projectId}/c/11111111-1111-4111-8111-11111
 const urlB = `https://chatgpt.com/g/${projectId}/c/12345678-abcd-4321-abcd-123456789abc`;
 const urlC = `https://chatgpt.com/g/${projectId}/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`;
 const urlD = `https://chatgpt.com/g/${projectId}/c/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb`;
+const urlE = `https://chatgpt.com/g/${projectId}/c/cccccccc-cccc-4ccc-8ccc-cccccccccccc`;
 const idA = { ownerId: "grant-one", sessionId: "session-A" };
 const idB = { ownerId: "grant-one", sessionId: "session-B" };
 let client;
@@ -531,6 +532,7 @@ try {
   assert.match(startSubagentDefinition.description, /Sub-agent project/);
   assert.match(startSubagentDefinition.description, /sync_current_thread and then get_current_thread_url/);
   assert.match(startSubagentDefinition.description, /send_thread_message/);
+  assert.match(startSubagentDefinition.description, /deduplicated internally/);
   assert.equal(startSubagentDefinition._meta.ui.resourceUri, SUBAGENT_WIDGET_URI);
   assert.match(sendThreadDefinition.description, /deduplicated internally/);
   assert.deepEqual([...sendThreadDefinition.inputSchema.required].sort(), ["message", "targetUrl"],
@@ -731,6 +733,57 @@ try {
   assert.equal(replayedRetryResult.structuredContent.conversationUrl, urlB);
   assert.equal(await supportCommands.claim("chrome-browser", ["threadMessaging"], 0), undefined,
     "the same MCP request id and payload is deduplicated across stateless server instances");
+  let firstSubagentReplayHandler;
+  const firstSubagentReplayServer = {
+    registerResource() {},
+    registerTool(name, _definition, handler) {
+      if (name === "start_subagent") firstSubagentReplayHandler = handler;
+    },
+  };
+  registerChatGptAgents(firstSubagentReplayServer, supportCommands, registry, ralphRegistry, "mcp-grant", sync.subagentWidgetHtml);
+  let secondSubagentReplayHandler;
+  const secondSubagentReplayServer = {
+    registerResource() {},
+    registerTool(name, _definition, handler) {
+      if (name === "start_subagent") secondSubagentReplayHandler = handler;
+    },
+  };
+  registerChatGptAgents(secondSubagentReplayServer, supportCommands, registry, ralphRegistry, "mcp-grant", sync.subagentWidgetHtml);
+  assert.equal(typeof firstSubagentReplayHandler, "function");
+  assert.equal(typeof secondSubagentReplayHandler, "function");
+  const subagentRetryArguments = { message: "Start exactly one child for this transport request." };
+  const subagentRetryExtra = { requestId: "same-start-subagent-request", _meta: { "openai/session": "mcp-A" } };
+  const firstSubagentRetryCall = firstSubagentReplayHandler(subagentRetryArguments, subagentRetryExtra);
+  const secondSubagentRetryCall = secondSubagentReplayHandler(subagentRetryArguments, subagentRetryExtra);
+  await new Promise(resolve => setImmediate(resolve));
+  const subagentRetryCommand = await supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
+  assert.equal(subagentRetryCommand.message.includes(subagentRetryArguments.message), true);
+  assert.equal(await supportCommands.claim("helium-browser", ["threadMessaging"], 0), undefined,
+    "a transport retry of the same start_subagent request must not create a second child command");
+  supportCommands.complete({
+    commandId: subagentRetryCommand.id,
+    browserId: "chrome-browser",
+    kind: "send_message",
+    ok: true,
+    result: { status: "sent", conversationUrl: urlE, title: "Replay-safe child" },
+  });
+  const [firstSubagentRetryResult, secondSubagentRetryResult] = await Promise.all([
+    firstSubagentRetryCall,
+    secondSubagentRetryCall,
+  ]);
+  assert.equal(firstSubagentRetryResult.structuredContent.subagents.at(-1).conversationUrl, urlE);
+  assert.deepEqual(secondSubagentRetryResult, firstSubagentRetryResult,
+    "the retried MCP request reuses the original start_subagent result");
+  const replayPreparation = await supportCommands.claim("chrome-browser", ["ralph"], 1000);
+  assert.equal(replayPreparation.conversationUrl, urlE);
+  supportCommands.complete({
+    commandId: replayPreparation.id,
+    browserId: "chrome-browser",
+    kind: "prepare_thread",
+    ok: true,
+    result: { status: "prepared", conversationUrl: urlE },
+  });
+
   const abandonedController = new AbortController();
   const abandonedClaim = supportCommands.claim("chrome-browser", ["ralph"], 1000, abandonedController.signal);
   abandonedController.abort();
