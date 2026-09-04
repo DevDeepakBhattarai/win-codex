@@ -2,15 +2,16 @@
 
 The Local Codex Support extension is the ChatGPT-specific companion to the MCP server. It is separate from `browser-extension/`, which controls general Chrome tabs.
 
-The support extension handles three jobs:
+The support extension handles four jobs:
 
 - **Thread sync** binds the current ChatGPT conversation URL to the MCP caller's `openai/session` for `sync_current_thread` and `get_current_thread_url`.
+- **Thread preparation executor** opens parked tabs for unsynced threads. Enable it only in the Chrome automation profile.
 - **RALPH automation** inspects registered ChatGPT threads and sends a continuation when a due thread still needs work.
 - **Agent thread messaging** executes the browser side of `start_subagent` and `send_thread_message`.
 
 The popup has two tabs. **RALPH threads** shows registered threads with readable titles, state, recent activity, next check, errors, and parent information for sub-agents. **Settings** contains the browser feature toggles, Sub-agent project, RALPH timing, and the RALPH project allowlist.
 
-Automation commands are claimed atomically by one enabled browser instance. Thread sync can be enabled in more than one compatible browser because binding is idempotent. RALPH automation and Agent thread messaging should normally be enabled in only one browser.
+Automation commands are claimed atomically by one enabled browser instance. Thread sync can be enabled in more than one compatible browser because binding is idempotent. Enable **Thread preparation executor** only in the Chrome automation profile. RALPH automation and Agent thread messaging should normally also be enabled in only one automation browser.
 
 ## Install
 
@@ -18,7 +19,7 @@ Automation commands are claimed atomically by one enabled browser instance. Thre
 2. Start or restart Local Codex. The support listener defaults to `http://127.0.0.1:6002`. Set `THREAD_SYNC_PORT` to use another port or `THREAD_SYNC_ENABLED=false` to disable the support listener.
 3. Remove the obsolete **Local Codex Thread Sync** extension if it is still installed.
 4. Load `.data/support-extension` as an unpacked extension. Load the generated directory, not the source `support-extension` directory.
-5. Choose which browser handles each feature. Thread sync can run in multiple browsers. Keep RALPH automation and Agent thread messaging on the browser that should execute automation commands.
+5. Choose which browser handles each feature. Thread sync can run in multiple browsers. Enable **Thread preparation executor** only in the Chrome profile that the backend launches. Keep RALPH automation and Agent thread messaging on the browser that should execute those commands.
 6. Set **Sub-agent project** if child conversations should be created inside a dedicated ChatGPT project. The value is stored on the Local Codex server and shared by executor browsers.
 7. Reload the unpacked extension after rerunning `pnpm support:prepare`.
 
@@ -26,32 +27,29 @@ Keep `.data` private. It contains the support-extension credential, thread bindi
 
 ## Thread sync
 
-Thread lookup is an explicit two-step flow:
+Thread Sync is a one-time binding for each ChatGPT conversation session.
 
-1. Call `sync_current_thread` from the ChatGPT conversation that needs a binding.
-2. Call `get_current_thread_url` after the sync handshake succeeds.
+1. The agent calls `sync_current_thread` at the start of the conversation.
+2. If the tool reports `syncing`, the Thread Sync MCP App performs the browser handshake and the agent follows with `get_current_thread_url`.
+3. If the tool reports `synced`, it returns the saved URL immediately. No second handshake starts.
 
-`get_current_thread_url` only reads an existing binding. It never infers a conversation URL from a project, title, browser tab, or previous thread.
+The support extension observes every ChatGPT `/c/...` route and reports it to the local backend, regardless of RALPH registration. If the thread is not already bound, the backend ensures that a recent preparation executor is available and queues one `prepare_thread` command. Duplicate observations share the same in-flight preparation. After a successful preparation, later observations do not prepare that unsynced thread again during the same server run.
 
-A fresh RALPH registration may open the thread in a parked background tab so the agent has a page on which to mount Thread Sync. A successful sync closes that parked tab early.
+The Chrome profile with **Thread preparation executor** enabled opens the conversation in a parked background tab. The backend allows at most three parked preparations at once. The successful binding handshake releases that tab and its preparation slot early. A bound thread never gets another preparation tab.
 
 ## Sub-agents
 
-`start_subagent` accepts only the child task. It does not accept a project or conversation target. The parent must call `sync_current_thread` and then `get_current_thread_url` before starting a child.
+`start_subagent` accepts only the child task. The parent must already have completed its one-time Thread Sync binding.
 
-The server resolves the parent from `openai/session`, chooses the configured **Sub-agent project**, or falls back to `https://chatgpt.com/`. It appends the bound parent URL and a mandatory callback procedure to the child task.
+The server resolves the parent from `openai/session`, chooses the configured **Sub-agent project**, or falls back to `https://chatgpt.com/`. It creates a local job under `<DATA_DIR>/subagents/` and gives the child the job ID and result path. The child prompt does not contain the parent URL.
 
-The callback procedure tells the child to:
+A child behaves as a bounded sub-agent. It starts by syncing its own conversation once, avoids nested delegation unless the user explicitly requested it, and finishes with `submit_subagent_result`. That tool stores the complete report in the assigned local `.md` file.
 
-1. Finish the assigned work in the child conversation.
-2. Call `send_thread_message` exactly once before producing its final assistant response.
-3. Put the complete final report in the tool's `message` argument.
-4. Treat a normal assistant reply in the child as local to that child, not as delivery to the parent.
-5. Never retry the callback after the tool returns, even after an uncertain transport result.
+The backend watches unfinished jobs. `start_subagent` waits until the child has a prepared Thread Sync tab before returning normal startup success. If preparation fails after the child already exists, the job records the error and the tool surfaces it without creating another child. When the result file contains data, the backend sends the parent a short wake-up message with the job ID and result path. The report itself never travels through browser messaging. Failed parent wake-ups use exponential backoff and stop after five attempts; the terminal error remains visible in `list_subagents`. The parent reads the file and continues from that content.
 
 The child is registered for RALPH immediately and stores its parent thread ID.
 
-`list_subagents` returns the children created by the current synced parent and mounts the Sub-agent MCP App. The view includes each child's title, RALPH state, mode, recent activity, and errors.
+`list_subagents` returns children created by the current synced parent and mounts the Sub-agent MCP App. The view includes each child's title, RALPH state, mode, result path, result state, recent activity, and errors.
 
 ## Thread message delivery
 
@@ -108,9 +106,11 @@ The thread stays active until the user selects **Stop continuous** or marks it c
 
 ## Initial thread preparation
 
-Every fresh RALPH registration schedules `prepare_thread` in the browser that owns RALPH automation. This applies to normal allowlisted project threads, manually registered threads, and agent-created sub-agents.
+Thread preparation is independent from RALPH. The support extension reports every observed ChatGPT conversation route to `/chatgpt-support/threads/observe`.
 
-The RALPH browser opens the saved conversation in a background tab and keeps it available for up to two minutes. If the agent completes `sync_current_thread`, the binding handshake closes the parked tab immediately. Duplicate route observations, title updates, and ordinary reactivations do not schedule another initial preparation tab.
+If the thread is already bound, the backend returns `synced` and does nothing else. If it is unsynced, `ThreadPreparationCoordinator` deduplicates repeated observations by thread ID and caps active parked preparations at three. It starts Chrome when no recent preparation executor is connected, then queues one `prepare_thread` command. A successful preparation is remembered for the rest of that server run so repeated route observations cannot keep opening parked tabs.
+
+The Chrome profile with **Thread preparation executor** enabled parks the thread in a background tab for up to two minutes. A successful Thread Sync binding closes the parked tab early. Helium can keep Thread Sync enabled to observe and report routes while **Thread preparation executor** remains off, so it never claims `threadPreparation`.
 
 ## Checks
 
@@ -120,4 +120,4 @@ Run:
 pnpm thread-sync-test
 ```
 
-The test covers thread binding, generated-extension configuration, sub-agent callback injection, request-level callback deduplication, parent-child registration, title extraction, single-shot browser sends, fixed settle timing, parked-tab release, continuous RALPH behavior, project-scoped registration, duration gating, command claiming, and MCP App routing. It does not start a real browser or network listener.
+The test covers one-time thread binding, backend preparation deduplication, generated-extension configuration, local sub-agent result files, parent wake-ups, request-level send deduplication, parent-child registration, title extraction, single-shot browser sends, fixed settle timing, parked-tab release, continuous RALPH behavior, project-scoped registration, duration gating, command claiming, and MCP App routing. It does not start a real browser or network listener.

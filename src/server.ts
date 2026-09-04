@@ -49,6 +49,7 @@ import {
   type BrowserActionInput,
   type BrowserDownloadInput,
 } from "./browser.js";
+import { launchChrome } from "./browser-launch.js";
 import {
   prepareThreadSync,
   registerThreadSync,
@@ -70,10 +71,14 @@ import {
   ralphThreadsGetHandler,
   registerChatGptAgents,
   SUBAGENT_AGENT_INSTRUCTION,
+  SubagentResultController,
   SupportCommandBus,
+  ThreadPreparationCoordinator,
+  threadObservationHandler,
   supportCommandClaimHandler,
   supportCommandResultHandler,
 } from "./chatgpt-support.js";
+import { SubagentJobRegistry } from "./subagent-jobs.js";
 
 const PORT = Number(process.env.PORT ?? 6000);
 const HOST = process.env.HOST ?? "localhost";
@@ -1607,12 +1612,15 @@ function createMcpServer(ownerId: string) {
   }, instructions.length > 0 ? { instructions: instructions.join("\n") } : {});
 
   if (threadSync) registerThreadSync(server, threadSync, ownerId);
-  if (threadSync && supportCommands && ralphRegistry) {
+  if (threadSync && supportCommands && ralphRegistry && subagentJobs && threadPreparer) {
     registerChatGptAgents(
       server,
       supportCommands,
       threadSync.registry,
       ralphRegistry,
+      subagentJobs,
+      threadPreparer,
+      () => launchChrome(),
       ownerId,
       threadSync.subagentWidgetHtml,
     );
@@ -2720,6 +2728,13 @@ const threadSync = THREAD_SYNC_ENABLED
   ? await prepareThreadSync(DATA_DIR, THREAD_SYNC_PORT)
   : undefined;
 const supportCommands = threadSync ? new SupportCommandBus() : undefined;
+const subagentJobs = threadSync ? await SubagentJobRegistry.open(DATA_DIR) : undefined;
+const threadPreparer = supportCommands && threadSync
+  ? new ThreadPreparationCoordinator(supportCommands, threadSync.registry, () => launchChrome())
+  : undefined;
+const subagentResultController = supportCommands && subagentJobs
+  ? new SubagentResultController(subagentJobs, supportCommands, () => launchChrome())
+  : undefined;
 const ralphRegistry = threadSync ? await RalphRegistry.open(DATA_DIR) : undefined;
 const ralphController = supportCommands && ralphRegistry
   ? new RalphController({
@@ -2746,10 +2761,14 @@ const threadSyncHttpServer = threadSync
       syncApp.disable("x-powered-by");
       syncApp.use(express.json({ limit: "5mb" }));
       syncApp.post("/thread-sync/bind", createRateLimiter("thread-sync", 60_000, 120),
-        threadSyncBindHandler(threadSync.registry, threadSync.extensionToken));
-      if (ralphRegistry && supportCommands) {
+        threadSyncBindHandler(
+          threadSync.registry,
+          threadSync.extensionToken,
+          (binding) => threadPreparer?.markBound(binding.threadId),
+        ));
+      if (ralphRegistry) {
         syncApp.post("/chatgpt-support/ralph/register", createRateLimiter("ralph-register", 60_000, 240),
-          ralphRegistrationHandler(ralphRegistry, supportCommands, threadSync.extensionToken));
+          ralphRegistrationHandler(ralphRegistry, threadSync.extensionToken));
         syncApp.get("/chatgpt-support/ralph/projects",
           ralphProjectsGetHandler(ralphRegistry, threadSync.extensionToken));
         syncApp.put("/chatgpt-support/ralph/projects",
@@ -2770,6 +2789,10 @@ const threadSyncHttpServer = threadSync
           syncApp.put("/chatgpt-support/ralph/threads/:threadId/check",
             ralphThreadCheckHandler(ralphRegistry, ralphController, threadSync.extensionToken));
         }
+      }
+      if (threadPreparer) {
+        syncApp.post("/chatgpt-support/threads/observe", createRateLimiter("thread-observe", 60_000, 600),
+          threadObservationHandler(threadPreparer, threadSync.extensionToken));
       }
       if (supportCommands) {
         syncApp.post("/chatgpt-support/commands/claim",
@@ -2830,6 +2853,7 @@ async function shutdown(signal: string) {
     console.error("Browser bridge shutdown failed:", error),
   );
   ralphController?.close();
+  subagentResultController?.close();
   supportCommands?.close();
 
   try {

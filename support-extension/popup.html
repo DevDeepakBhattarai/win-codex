@@ -63,6 +63,10 @@
           <span class="switch"><input id="threadSync" type="checkbox"><i aria-hidden="true"></i></span>
         </label>
         <label class="toggle">
+          <span class="toggle-text">Thread preparation executor<small>Open parked tabs for unsynced threads. Enable only in the Chrome automation profile.</small></span>
+          <span class="switch"><input id="automationExecutor" type="checkbox"><i aria-hidden="true"></i></span>
+        </label>
+        <label class="toggle">
           <span class="toggle-text">RALPH automation<small>Poll registered threads and continue stalled runs.</small></span>
           <span class="switch"><input id="ralph" type="checkbox"><i aria-hidden="true"></i></span>
         </label>
@@ -70,7 +74,7 @@
           <span class="toggle-text">Agent thread messaging<small>Let agents open and post to ChatGPT threads.</small></span>
           <span class="switch"><input id="threadMessaging" type="checkbox"><i aria-hidden="true"></i></span>
         </label>
-        <p class="note">Enable RALPH and agent messaging only in the browser you want Local Codex to automate.</p>
+        <p class="note">Enable the preparation executor, RALPH, and agent messaging only in the Chrome profile you want Local Codex to automate.</p>
       </div>
 
       <div class="card">

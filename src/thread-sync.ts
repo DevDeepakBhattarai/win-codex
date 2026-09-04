@@ -9,7 +9,7 @@ import { parseConversationUrl } from "./chatgpt-support.js";
 export { parseConversationUrl } from "./chatgpt-support.js";
 
 export const THREAD_SYNC_WIDGET_URI = "ui://local-codex/thread-sync-v2.html";
-export const THREAD_SYNC_AGENT_INSTRUCTION = "When the user asks for the current ChatGPT thread URL, conversation URL, or thread ID, always use this exact sequence: first call sync_current_thread, then call get_current_thread_url. Run sync_current_thread first even if the thread may already be synced; it is idempotent. get_current_thread_url is the only source of the URL. Do not infer, construct, or obtain the current thread URL with browser tools or any other tool.";
+export const THREAD_SYNC_AGENT_INSTRUCTION = "At the start of every ChatGPT conversation, call sync_current_thread once before other work. If it reports that the conversation is already synced, keep and reuse that binding; do not try to sync it again. If it reports syncing, call get_current_thread_url after the Thread Sync handshake. get_current_thread_url is the only fallback source of the current conversation URL. Never infer or construct the URL with another tool.";
 const TICKET_TTL_MS = 30 * 60 * 1000;
 const MAX_RECORDS = 2_000;
 const BROWSER_BLOCKED_PORTS = new Set([
@@ -60,13 +60,15 @@ export class ThreadSyncRegistry {
 
   async context(identity: Identity) {
     identitySchema.parse(identity);
+    await this.queue;
+    const existingBinding = this.state.bindings.find((entry) => sameIdentity(entry, identity));
+    if (existingBinding) return { status: "connected" as const, ...publicBinding(existingBinding) };
+
     return this.update((state) => {
       const binding = state.bindings.find((entry) => sameIdentity(entry, identity));
+      if (binding) return { status: "connected" as const, ...publicBinding(binding) };
+
       let ticket = state.tickets.find((entry) => sameIdentity(entry, identity));
-      if (binding && ticket?.consumed !== false) {
-        state.tickets = state.tickets.filter((entry) => !sameIdentity(entry, identity));
-        ticket = undefined;
-      }
       if (!ticket) {
         if (state.tickets.length >= MAX_RECORDS) throw new Error("Too many pending thread registrations.");
         ticket = {
@@ -77,10 +79,10 @@ export class ThreadSyncRegistry {
         };
         state.tickets.push(ticket);
       }
-      const publicTicket = { token: ticket.token, expiresAt: ticket.expiresAt };
-      return binding
-        ? { status: "connected" as const, ...publicBinding(binding), ticket: publicTicket }
-        : { status: "syncing" as const, ticket: publicTicket };
+      return {
+        status: "syncing" as const,
+        ticket: { token: ticket.token, expiresAt: ticket.expiresAt },
+      };
     });
   }
 
@@ -96,8 +98,6 @@ export class ThreadSyncRegistry {
         if (existing.threadId !== conversation.threadId) {
           throw new Error("This session is already bound to a different conversation. Refusing to rebind.");
         }
-        existing.conversationUrl = conversation.conversationUrl;
-        existing.boundAt = new Date().toISOString();
         return publicBinding(existing);
       }
       if (state.bindings.some((entry) => entry.ownerId === ticket.ownerId && entry.threadId === conversation.threadId)) {
@@ -127,15 +127,18 @@ export class ThreadSyncRegistry {
     return this.state.bindings.map(publicBinding);
   }
 
+  async hasThread(threadId: string) {
+    await this.queue;
+    return this.state.bindings.some((entry) => entry.threadId === threadId);
+  }
+
   async waitForBinding(identity: Identity, timeoutMs = 8000) {
     identitySchema.parse(identity);
     const deadline = Date.now() + timeoutMs;
     do {
       await this.queue;
       const binding = this.state.bindings.find((entry) => sameIdentity(entry, identity));
-      const ticket = this.state.tickets.find((entry) => sameIdentity(entry, identity));
-      const refreshPending = Boolean(ticket && ticket.expiresAt > Date.now() && ticket.consumed === false);
-      if (binding && !refreshPending) return publicBinding(binding);
+      if (binding) return publicBinding(binding);
       await new Promise((resolve) => setTimeout(resolve, 50));
     } while (Date.now() < deadline);
     return undefined;
@@ -209,6 +212,7 @@ export async function prepareThreadSync(dataDirectory: string, port = 6002) {
       bindUrl,
       commandClaimUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/commands/claim"),
       commandResultUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/commands/result"),
+      threadObserveUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/threads/observe"),
       ralphRegisterUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/ralph/register"),
       ralphProjectsUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/ralph/projects"),
       ralphSettingsUrl: bindUrl.replace("/thread-sync/bind", "/chatgpt-support/ralph/settings"),
@@ -284,10 +288,11 @@ export function registerThreadSync(
   }));
   server.registerTool("sync_current_thread", {
     title: "Sync Current Thread",
-    description: "Required step 1 for current-thread lookup. Whenever the user asks for the current ChatGPT thread URL, conversation URL, or thread ID, call this tool first, even if the thread may already be synced. Then call get_current_thread_url. This tool renders the Thread Sync UI in the chat and starts the extension handshake. It does not return the URL.",
+    description: "Call this once at the start of every ChatGPT conversation. If this session is already bound, it returns the saved conversation URL immediately and performs no new handshake. Otherwise it renders the Thread Sync UI and starts the one-time extension handshake; then call get_current_thread_url.",
     inputSchema: {},
     outputSchema: {
       status: z.enum(["syncing", "synced"]),
+      conversationUrl: z.string().url().optional(),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true },
     _meta: threadSyncToolMeta(),
@@ -301,11 +306,10 @@ export function registerThreadSync(
     }
     const context = await sync.registry.context({ ownerId, sessionId: session });
     if (context.status === "connected") {
-      const structuredContent = { status: "synced" as const };
+      const structuredContent = { status: "synced" as const, conversationUrl: context.conversationUrl };
       return {
-        content: [{ type: "text", text: "Refreshing the current thread binding. Now call get_current_thread_url." }],
+        content: [{ type: "text", text: context.conversationUrl }],
         structuredContent,
-        _meta: { "local-codex/thread-binding": context.ticket },
       };
     }
     const structuredContent = { status: context.status };
@@ -317,7 +321,7 @@ export function registerThreadSync(
   });
   server.registerTool("get_current_thread_url", {
     title: "Get Current Thread URL",
-    description: "Required step 2 for current-thread lookup. Call sync_current_thread first in the same request, then call this tool. It waits briefly for the Thread Sync UI and extension handshake and returns the exact ChatGPT conversation URL. This is the only tool that returns the current thread URL; do not infer or construct it elsewhere.",
+    description: "Use this after sync_current_thread reports syncing. It waits briefly for the one-time Thread Sync UI and extension handshake and returns the exact ChatGPT conversation URL. If the conversation was already synced, sync_current_thread already returns the saved URL.",
     inputSchema: {},
     outputSchema: { conversationUrl: z.string() },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },

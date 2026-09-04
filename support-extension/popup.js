@@ -2,6 +2,7 @@ const extensionApi = globalThis.browser ?? globalThis.chrome;
 const config = globalThis.LOCAL_CODEX_THREAD_SYNC;
 const DEFAULT_SETTINGS = {
   threadSync: true,
+  automationExecutor: false,
   ralph: false,
   threadMessaging: false,
 };
@@ -91,6 +92,11 @@ let threadFilter = "active";
 let loadedThreads = [];
 let currentConversationUrl;
 
+function canonicalProjectId(value) {
+  const known = value.match(/^(g-p-[0-9a-f]{32})(?:-[A-Za-z0-9_-]+)?$/i);
+  return known ? known[1].toLowerCase() : value;
+}
+
 function conversationUrl(value) {
   if (typeof value !== "string") return undefined;
   let url;
@@ -99,9 +105,12 @@ function conversationUrl(value) {
   } catch {
     return undefined;
   }
-  if (url.origin !== "https://chatgpt.com" || url.username || url.password ||
-      !/^(?:\/g\/[A-Za-z0-9_-]+)?\/c\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\/?$/i.test(url.pathname)) return undefined;
-  return `${url.origin}${url.pathname.replace(/\/$/, "")}`;
+  const match = url.pathname.match(/^(?:\/g\/([A-Za-z0-9_-]+))?\/c\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/?$/i);
+  if (url.origin !== "https://chatgpt.com" || url.username || url.password || !match) return undefined;
+  const threadId = match[2].toLowerCase();
+  return match[1]
+    ? `https://chatgpt.com/g/${canonicalProjectId(match[1])}/c/${threadId}`
+    : `https://chatgpt.com/c/${threadId}`;
 }
 
 async function loadCurrentThread() {
@@ -144,6 +153,19 @@ function formatRelative(timestamp) {
   return relativeTime.format(Math.round(deltaSeconds / size), unit);
 }
 
+async function openConversation(conversation) {
+  const tabs = await extensionApi.tabs.query({});
+  const existing = tabs.find((tab) => Number.isInteger(tab.id) && conversationUrl(tab.url) === conversation);
+  if (existing) {
+    await extensionApi.tabs.update(existing.id, { active: true });
+    if (Number.isInteger(existing.windowId) && extensionApi.windows?.update) {
+      await extensionApi.windows.update(existing.windowId, { focused: true });
+    }
+  } else {
+    await extensionApi.tabs.create({ url: conversation, active: true });
+  }
+  globalThis.close();
+}
 function threadState(thread) {
   if (thread.state === "complete") return "complete";
   return thread.lastError ? "retrying" : "active";
@@ -163,7 +185,14 @@ function renderThread(thread) {
   link.className = "thread-link";
   link.target = "_blank";
   link.rel = "noreferrer";
-  if (thread.conversationUrl.startsWith("https://chatgpt.com/")) link.href = thread.conversationUrl;
+  if (thread.conversationUrl.startsWith("https://chatgpt.com/")) {
+    link.href = thread.conversationUrl;
+    link.addEventListener("click", (event) => {
+      if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      void openConversation(thread.conversationUrl);
+    });
+  }
 
   const state = threadState(thread);
   const head = document.createElement("div");

@@ -2,38 +2,49 @@
 
 ## Status
 
-Accepted on 2026-08-27. Extended through 2026-09-02 with first-class sub-agent tools, parent-child tracking, readable thread titles, explicit continuous RALPH mode, single-shot browser delivery, and request-level callback deduplication.
+Accepted on 2026-08-27. Extended through 2026-09-04 with one-time thread binding, backend-owned thread preparation, local-file sub-agent results, parent wake-ups, parent-child tracking, readable thread titles, explicit continuous RALPH mode, and single-shot browser delivery.
 
 ## Context
 
 ChatGPT gives Local Codex an opaque `openai/session`, while the browser knows the visible conversation URL. Thread sync must connect those two identities without guessing from titles, project routes, or browser history.
 
-Sub-agents run in separate ChatGPT conversations. A normal assistant reply in a child conversation does not return to the parent. Child creation and callback delivery therefore need an explicit browser automation path.
+Sub-agents run in separate ChatGPT conversations. Their result must survive long-running work without depending on a child-to-parent browser callback. The local backend therefore owns result storage and parent notification.
 
 The support extension can also run in more than one browser. Any command that changes a ChatGPT thread must execute at most once even when multiple extension instances are online.
 
 ## Decision
 
-### Keep URL binding explicit
+### Keep URL binding explicit and one-time
 
 Thread Sync exposes two narrow MCP tools:
 
-- `sync_current_thread` mounts the Thread Sync MCP App and starts the browser binding handshake for the calling `openai/session`.
-- `get_current_thread_url` reads the stored binding. It never infers or constructs a conversation URL.
+- `sync_current_thread` is the required first MCP action in a ChatGPT conversation. It creates the initial browser binding ticket only when the current `openai/session` is not already bound. A repeated call returns the saved conversation URL immediately.
+- `get_current_thread_url` waits for the initial binding when `sync_current_thread` reports `syncing`. It never infers or constructs a conversation URL.
+
+The binding is permanent for the lifetime of that stored session mapping. Repeating `sync_current_thread` does not refresh the URL, create another ticket, or mount another handshake.
 
 The extension credential grants only the local binding and support routes. It does not grant MCP terminal or browser-control access.
 
-### Keep delegation server-routed
+### Prepare observed threads below the agent
 
-Delegation uses three MCP tools:
+Thread preparation is independent from RALPH registration. The support extension reports every observed ChatGPT `/c/...` route to the local backend.
 
-- `start_subagent` requires a freshly synced parent. The server reads the parent URL from the caller's `openai/session`, chooses the configured **Sub-agent project** or `https://chatgpt.com/`, and adds a mandatory callback procedure to the child prompt.
-- `send_thread_message` sends to an existing `/c/...` conversation only.
-- `list_subagents` returns the children created by the current parent and renders the Sub-agent MCP App.
+`ThreadPreparationCoordinator` checks the stored bindings by thread ID. It returns immediately for a bound thread and deduplicates repeated observations for an unsynced thread. The command bus tracks recent executor polls and commands currently owned by a browser, so a busy Chrome instance still counts as connected. If no recent preparation executor exists, the backend deduplicates the launch and starts Chrome through the existing browser launcher. It queues `prepare_thread` commands with a maximum of three parked preparations at once. A successful preparation is remembered for the rest of the server run so an unsynced thread cannot repeatedly open parked tabs.
 
-The browser extension executes a resolved target. It does not choose a project or infer a parent.
+The support extension has an explicit **Thread preparation executor** setting. Enable it only in the Chrome automation profile. That profile opens the conversation in a parked background tab. A successful Thread Sync handshake releases the tab early. Helium only observes routes and reports them to the backend with the executor setting off, so it does not launch Chrome or claim preparation work.
 
-The child callback instruction requires `send_thread_message` before the child's final assistant response. A normal child response is explicitly described as local to that child and not as delivery to the parent.
+### Keep delegation server-routed and file-backed
+
+Delegation uses four MCP tools:
+
+- `start_subagent` requires a synced parent. The server resolves the parent from `openai/session`, chooses the configured **Sub-agent project** or `https://chatgpt.com/`, creates a local result job, and starts the child.
+- `submit_subagent_result` stores the child report in the job's local `.md` file.
+- `send_thread_message` sends an explicit message to an existing `/c/...` conversation only. It is not the sub-agent return channel.
+- `list_subagents` returns the children created by the current parent and includes their result path and result state.
+
+The child receives its job ID and result path. It does not receive the parent URL. The child starts by syncing its own thread once, performs the bounded task, and finishes with `submit_subagent_result`. Nested delegation is not part of the default child behavior.
+
+Before `start_subagent` reports normal startup success, the backend confirms that the child has a prepared Thread Sync tab. A preparation failure after child creation is stored on the job and returned to the parent without retrying child creation. The backend then watches completed jobs that have not notified their parent. Once a result file contains data, it sends the parent a small wake-up message containing only the job ID and local result path. Wake-up failures back off exponentially and become terminal after five attempts, with the error retained on the job. The parent reads the file for the report. This keeps browser messaging out of the result transport while preserving automatic parent continuation.
 
 ### Hide transport idempotency from the model
 
@@ -60,8 +71,6 @@ The extension does not wait for an assistant turn before typing. It does not use
 
 Agent-created children are registered for RALPH immediately and store their parent thread ID. Their registration does not depend on the normal RALPH project allowlist.
 
-A fresh RALPH registration schedules a `prepare_thread` command on the browser that owns RALPH automation. This applies to normal allowlisted project threads, manually registered threads, and agent-created sub-agents. The browser opens the conversation in a parked background tab for up to two minutes. A successful `sync_current_thread` handshake releases the tab early.
-
 The extension reports readable ChatGPT titles during route updates, sends, and inspections so operator views do not need to identify threads by UUID alone.
 
 RALPH stores two independent fields:
@@ -73,13 +82,13 @@ Normal mode uses the worked-duration gate and completion classifier. Continuous 
 
 ### Claim automation commands atomically
 
-The authenticated loopback command bus assigns each queued support command to one enabled browser instance. Thread sync may stay enabled in multiple browsers because binding is idempotent. RALPH automation and agent thread messaging should normally be enabled only in the browser intended to execute those commands.
+The authenticated loopback command bus assigns each queued support command to one enabled browser instance. Thread sync may stay enabled in multiple browsers because binding is idempotent. Thread preparation has a separate executor setting so route observation does not imply permission to open parked tabs. RALPH automation and agent thread messaging should normally be enabled only in the browser intended to execute those commands.
 
 ## Consequences
 
-The parent agent has one required setup sequence before delegation: `sync_current_thread`, then `get_current_thread_url`, then `start_subagent`. The server owns target resolution and callback instructions.
+The parent calls `sync_current_thread` once at the start of the conversation. If the initial binding is still pending, it follows with `get_current_thread_url`. After that, `start_subagent` can resolve the parent without refreshing the binding.
 
-Sub-agents do not need to manage callback UUIDs. Transport retries are an implementation concern rather than part of the model-facing tool API.
+Sub-agents return reports through local files. The browser is used only to create child conversations and to wake parents after a result becomes available. Transport retries remain an implementation concern rather than part of the model-facing tool API.
 
 Browser delivery favors duplicate prevention over speculative recovery. A prompt is inserted once and the send button is clicked once after explicit settle periods.
 

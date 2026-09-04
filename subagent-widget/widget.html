@@ -173,7 +173,7 @@
     }
 
     function stateLabel(agent) {
-      if (agent.lastError) return "Needs attention";
+      if (agent.lastError || agent.preparationError || agent.notificationAbandonedAt) return "Needs attention";
       if (agent.state === "complete") return "Done";
       return agent.mode === "continuous" ? "Continuous" : "Working";
     }
@@ -219,7 +219,8 @@
         row.rel = "noreferrer";
 
         const dot = document.createElement("span");
-        dot.className = `status-dot ${agent.lastError ? "error" : agent.state === "active" ? "active" : ""}`;
+        const hasError = Boolean(agent.lastError || agent.preparationError || agent.notificationAbandonedAt);
+        dot.className = `status-dot ${hasError ? "error" : agent.state === "active" ? "active" : ""}`;
         dot.setAttribute("aria-hidden", "true");
 
         const copy = document.createElement("div");
@@ -232,14 +233,27 @@
         const meta = document.createElement("div");
         meta.className = "meta";
         const activity = relative(agent.lastContinuationAt || agent.lastCheckedAt || agent.registeredAt);
-        if (agent.lastError) {
-          meta.append(Object.assign(document.createElement("span"), { className: "error-text", textContent: agent.lastError }));
+        const error = agent.preparationError
+          || (agent.notificationAbandonedAt ? agent.notificationError || "Parent wake-up was abandoned." : agent.lastError);
+        if (error) {
+          meta.append(Object.assign(document.createElement("span"), { className: "error-text", textContent: error }));
         } else if (activity) {
           meta.append(Object.assign(document.createElement("span"), { textContent: `Activity ${activity}` }));
         }
-        if (!agent.lastError && agent.state === "active") {
+        if (!error && agent.state === "active") {
           const next = relative(agent.nextCheckAt);
           if (next) meta.append(Object.assign(document.createElement("span"), { textContent: `RALPH ${next}` }));
+        }
+        if (agent.resultState) {
+          meta.append(Object.assign(document.createElement("span"), {
+            textContent: agent.resultState === "complete" ? "Result ready" : "Result pending",
+          }));
+        }
+        if (agent.resultPath) {
+          meta.append(Object.assign(document.createElement("span"), {
+            textContent: agent.resultPath,
+            title: agent.resultPath,
+          }));
         }
         copy.append(meta);
 

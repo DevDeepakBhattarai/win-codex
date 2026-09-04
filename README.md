@@ -51,13 +51,14 @@ A normal browser workflow is `browser_open`, or `browser_tabs` followed by `brow
 
 When `THREAD_SYNC_ENABLED` is not `false`, the server also exposes:
 
-- `sync_current_thread` mounts the Thread Sync MCP App and binds the current `openai/session` to the visible ChatGPT conversation.
-- `get_current_thread_url` returns the URL from that binding. It never guesses or constructs a conversation URL.
-- `start_subagent` starts a separate ChatGPT child conversation. The parent must be synced first. Transport retries of the same MCP request are deduplicated internally.
-- `send_thread_message` sends one message to an existing ChatGPT conversation. Its public inputs are only `targetUrl` and `message`; transport retries of the same MCP request are deduplicated internally.
-- `list_subagents` shows the children created by the current synced parent, including their title and RALPH state.
+- `sync_current_thread` performs the one-time binding between the current `openai/session` and its ChatGPT conversation. Repeated calls return the saved URL without another handshake.
+- `get_current_thread_url` waits for the initial binding when `sync_current_thread` reports `syncing`. It never guesses or constructs a conversation URL.
+- `start_subagent` starts a separate ChatGPT child conversation and creates a local result job. The parent must already be synced. Transport retries of the same MCP request are deduplicated internally.
+- `submit_subagent_result` stores the child report in the local result file for that job. It does not send the report through ChatGPT.
+- `send_thread_message` sends one explicit user-requested message to an existing ChatGPT conversation. Its public inputs are only `targetUrl` and `message`; transport retries of the same MCP request are deduplicated internally.
+- `list_subagents` shows the children created by the current synced parent, including their title, RALPH state, and local result status.
 
-`start_subagent` uses the Sub-agent project configured in the Local Codex Support extension settings. If no project is configured, it starts from `https://chatgpt.com/`. The server injects the parent conversation URL and a mandatory callback procedure into the child prompt. The child must call `send_thread_message` before its final response in the child conversation.
+`start_subagent` uses the Sub-agent project configured in the Local Codex Support extension settings. If no project is configured, it starts from `https://chatgpt.com/`. The server gives the child a local job ID and result path. The child finishes with `submit_subagent_result`. The backend then sends the parent a short result-ready wake-up that points to the file. The parent reads the local file for the actual report.
 
 ## OAuth and MCP flow
 
@@ -189,9 +190,10 @@ This writes `.data/support-extension` with the local support endpoint and privat
 
 Load `.data/support-extension` as an unpacked extension. Do not load the source `support-extension` directory.
 
-The popup lets you configure three browser responsibilities:
+The popup lets you configure four browser responsibilities:
 
 - Thread sync. This can be enabled in more than one compatible browser because binding is idempotent.
+- Thread preparation executor. Enable this only in the Chrome automation profile. It owns parked tabs for unsynced threads.
 - RALPH automation. Normally enable this in only one browser.
 - Agent thread messaging. Normally enable this in only one browser.
 
@@ -199,11 +201,13 @@ Automation commands are claimed atomically by one enabled browser instance. This
 
 See [support-extension/README.md](support-extension/README.md) for the exact support-extension behavior.
 
-## Sub-agent message delivery
+## Sub-agent result delivery
 
-The parent must call `sync_current_thread` and then `get_current_thread_url` before `start_subagent`.
+Call `sync_current_thread` once at the start of the parent conversation. If it reports `syncing`, finish the initial handshake with `get_current_thread_url`. Later `sync_current_thread` calls return the stored URL and do not start another handshake.
 
-For both new child creation and messages to existing conversations, the support extension uses a single-send path. It gives the ChatGPT page a fixed five-second settle period before typing, types the message once, waits another five seconds, waits for an actionable send button, and clicks once. For an existing conversation, it first waits for a loaded user turn. It does not wait for an assistant turn and does not use DOM-stability or post-send acknowledgement heuristics.
+`start_subagent` creates a job under `<DATA_DIR>/subagents/`. The child receives the job ID and result path, not the parent URL. Before reporting startup success, the backend confirms that the child's parked Thread Sync tab was prepared. If automatic preparation fails after the child was already created, the tool returns the child and result path with the preparation error instead of retrying into a duplicate child. When the child finishes, `submit_subagent_result` writes the report to the assigned `.md` file. The backend sends the parent only a result-ready message with that path. Parent wake-up failures use exponential backoff and stop after five failed attempts, with the error retained in the sub-agent status. The parent reads the file as the authoritative result.
+
+The browser path is still used to create the child and to wake the parent. It uses the existing single-send behavior: wait for the page, insert once, and click Send once. The sub-agent report itself does not travel through browser messaging.
 
 `start_subagent` and `send_thread_message` keep transport idempotency internal. The server deduplicates retries of the same MCP request by tool, request identity, session, and payload fingerprint. `send_thread_message` also fingerprints its normalized target. A new logical tool call remains a new send or a new child.
 
@@ -213,7 +217,7 @@ RALPH is the support-extension continuation runtime. It tracks registered ChatGP
 
 Normal project threads are registered only when their project is in the RALPH project allowlist. Manually registered threads and agent-created sub-agents remain registered independently of that allowlist.
 
-A fresh registration schedules a `prepare_thread` command in the browser that owns RALPH automation. That browser opens the conversation in a background tab for up to two minutes so the agent can run Thread Sync. A successful sync closes the parked tab early.
+Thread preparation is independent from RALPH registration. Every observed unsynced ChatGPT `/c/...` route is sent to the local backend. The backend starts Chrome when no recent preparation executor is connected and queues one `prepare_thread`. The Chrome profile with **Thread preparation executor** enabled opens parked background tabs, with at most three preparations active at once. A successful preparation is attempted only once per thread during that server run, and a successful one-time Thread Sync handshake closes the tab early. Already-synced threads do not open another preparation tab.
 
 RALPH has two modes:
 

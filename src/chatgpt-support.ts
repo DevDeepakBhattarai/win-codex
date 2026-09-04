@@ -6,6 +6,7 @@ import type { Request, RequestHandler, Response } from "express";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { SubagentJobRegistry } from "./subagent-jobs.js";
 
 const MAX_RALPH_THREADS = 2_000;
 const MAX_RALPH_PROJECTS = 100;
@@ -19,7 +20,14 @@ const FAILURE_RETRY_MS = 2 * 60 * 1000;
 const COMMAND_TIMEOUT_MS = 20 * 60 * 1000;
 const INSPECT_CLAIM_LEASE_MS = 5 * 60 * 1000;
 const CLAIM_WAIT_MS = 20_000;
+const SUPPORT_BROWSER_HEARTBEAT_GRACE_MS = CLAIM_WAIT_MS + 5_000;
+const SUPPORT_BROWSER_LAUNCH_COOLDOWN_MS = 5_000;
+const SUBAGENT_RESULT_MISSING_RETRY_MS = 30_000;
+const MAX_SUBAGENT_NOTIFICATION_ATTEMPTS = 5;
+const MAX_SUBAGENT_NOTIFICATION_RETRY_MS = 10 * 60_000;
+const MAX_CONCURRENT_THREAD_PREPARATIONS = 3;
 const RALPH_PREPARE_TIMEOUT_MS = 3 * 60 * 1000;
+const THREAD_PREPARATION_HOLD_MS = 2 * 60 * 1000;
 const MAX_CONTINUATION_CHARS = 500;
 const TOOL_REQUEST_REPLAY_TTL_MS = 30 * 60 * 1000;
 const MAX_TOOL_REQUEST_REPLAYS = 1_000;
@@ -53,14 +61,14 @@ function replayToolRequest(replayKey: string, createResult: () => Promise<CallTo
 
 export const SUBAGENT_WIDGET_URI = "ui://local-codex/subagents-v1.html";
 export const SUBAGENT_AGENT_INSTRUCTION = [
-  "For delegated coding or research work, first call sync_current_thread and then get_current_thread_url so this parent conversation has a fresh binding.",
-  "Use start_subagent to create a child. The server uses the configured Sub-agent project when present and otherwise starts from chatgpt.com. start_subagent automatically gives the child this parent thread URL and tells it to report back with send_thread_message.",
-  "Use send_thread_message only to post into an existing ChatGPT conversation. Sub-agents are independent conversations and have no implicit return channel.",
-  "Use list_subagents to inspect the children created by the current thread.",
+  "For delegated work, call start_subagent only after this conversation has completed its one-time thread sync.",
+  "start_subagent returns a local resultPath. Do not expect the child to message this conversation. When the application later posts a result-ready notice, read that resultPath from the local filesystem and continue from the file.",
+  "If you are a child created by start_subagent, treat yourself as a sub-agent: complete the assigned bounded task, do not start another sub-agent unless the user explicitly asked for nested delegation, and finish by calling submit_subagent_result exactly once. submit_subagent_result stores the report locally; do not call send_thread_message to report to the parent.",
+  "Use send_thread_message only when the user explicitly asks to post a message into an existing ChatGPT conversation. Use list_subagents to inspect child jobs created by the current parent.",
 ].join(" ");
 const CONTINUOUS_RALPH_INSTRUCTION = "Continue the continuous run toward the existing user goal. Re-read the conversation and current state, choose the next highest-value improvement, experiment, verification, or cleanup that advances that goal, execute it end to end, and keep working autonomously until this turn ends. Do not stop because the previous step appears complete and do not ask the user what to do next.";
 
-export const supportFeatureSchema = z.enum(["ralph", "threadMessaging"]);
+export const supportFeatureSchema = z.enum(["ralph", "threadMessaging", "threadPreparation"]);
 export type SupportFeature = z.infer<typeof supportFeatureSchema>;
 
 const threadMessageSchema = z.object({
@@ -101,7 +109,7 @@ const supportCommandSchema = z.union([
   }),
   z.object({
     id: z.string(),
-    feature: z.literal("ralph"),
+    feature: z.literal("threadPreparation"),
     kind: z.literal("prepare_thread"),
     conversationUrl: z.string().url(),
   }),
@@ -183,6 +191,9 @@ export class SupportCommandBus {
   private readonly queued: PendingCommand[] = [];
   private readonly pending = new Map<string, PendingCommand>();
   private readonly waiters = new Set<ClaimWaiter>();
+  private readonly browsers = new Map<string, { features: Set<SupportFeature>; lastSeenAt: number }>();
+  private launchInFlight?: Promise<void>;
+  private lastLaunchAt = 0;
 
   constructor(private readonly inspectClaimLeaseMs = INSPECT_CLAIM_LEASE_MS) {}
 
@@ -216,8 +227,42 @@ export class SupportCommandBus {
     });
   }
 
+  hasBrowser(feature: SupportFeature) {
+    const now = Date.now();
+    for (const [browserId, browser] of this.browsers) {
+      const hasClaimedCommand = [...this.pending.values()].some((pending) => pending.claimedBy === browserId);
+      if (now - browser.lastSeenAt > SUPPORT_BROWSER_HEARTBEAT_GRACE_MS && !hasClaimedCommand) {
+        this.browsers.delete(browserId);
+        continue;
+      }
+      if (browser.features.has(feature) && (hasClaimedCommand || now - browser.lastSeenAt <= SUPPORT_BROWSER_HEARTBEAT_GRACE_MS)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async ensureBrowser(feature: SupportFeature, launchBrowser: () => Promise<void>) {
+    if (this.hasBrowser(feature)) return;
+    if (this.launchInFlight) {
+      await this.launchInFlight;
+      return;
+    }
+    if (Date.now() - this.lastLaunchAt < SUPPORT_BROWSER_LAUNCH_COOLDOWN_MS) return;
+
+    const launch = launchBrowser();
+    this.launchInFlight = launch;
+    try {
+      await launch;
+      this.lastLaunchAt = Date.now();
+    } finally {
+      if (this.launchInFlight === launch) this.launchInFlight = undefined;
+    }
+  }
+
   claim(browserId: string, features: SupportFeature[], waitMs = CLAIM_WAIT_MS, signal?: AbortSignal) {
     const featureSet = new Set(features);
+    this.browsers.set(browserId, { features: featureSet, lastSeenAt: Date.now() });
     const resumable = [...this.pending.values()].find((pending) =>
       (pending.command.kind === "inspect_thread" || pending.command.kind === "prepare_thread") &&
       featureSet.has(pending.command.feature) &&
@@ -259,6 +304,8 @@ export class SupportCommandBus {
     if (pending.claimedBy !== result.browserId) throw new Error("Support command belongs to another browser instance.");
     if (pending.command.kind !== result.kind) throw new Error("Support command result kind does not match the request.");
 
+    const browser = this.browsers.get(result.browserId);
+    if (browser) browser.lastSeenAt = Date.now();
     this.removePending(result.commandId);
     pending.resolve(result);
   }
@@ -271,6 +318,7 @@ export class SupportCommandBus {
     }
     this.pending.clear();
     this.queued.length = 0;
+    this.browsers.clear();
   }
 
   private resolveWaiter(waiter: ClaimWaiter, command: SupportCommand | undefined) {
@@ -972,7 +1020,7 @@ function authenticateSupportExtension(req: Request, res: Response, extensionToke
 export function supportCommandClaimHandler(commands: SupportCommandBus, extensionToken: string): RequestHandler {
   const bodySchema = z.object({
     browserId: z.string().min(1).max(200),
-    features: z.array(supportFeatureSchema).max(2),
+    features: z.array(supportFeatureSchema).max(3),
   }).strict();
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
@@ -1001,20 +1049,8 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
   };
 }
 
-function prepareFreshRalphThread(commands: SupportCommandBus, conversationUrl: string) {
-  void commands.execute({
-    feature: "ralph",
-    kind: "prepare_thread",
-    conversationUrl: parseConversationUrl(conversationUrl).conversationUrl,
-  }, RALPH_PREPARE_TIMEOUT_MS).catch((error) => {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(`[ralph] initial thread sync preparation failed thread=${JSON.stringify(conversationUrl)}: ${message}`);
-  });
-}
-
 export function ralphRegistrationHandler(
   registry: RalphRegistry,
-  commands: SupportCommandBus,
   extensionToken: string,
 ): RequestHandler {
   const bodySchema = z.object({
@@ -1038,7 +1074,6 @@ export function ralphRegistrationHandler(
         agentCreated: parsed.data.agentCreated === true,
         title: parsed.data.title,
       });
-      if (registration === "registered") prepareFreshRalphThread(commands, parsed.data.conversationUrl);
       res.setHeader("Cache-Control", "no-store");
       res.json({ status: registration === "ignored" ? "ignored" : "registered" });
     } catch (error) {
@@ -1221,36 +1256,198 @@ interface ThreadBindingLookup {
     conversationUrl: string;
     boundAt: string;
   } | undefined>;
+  hasThread(threadId: string): Promise<boolean>;
 }
 
-function subagentPrompt(message: string, parentConversationUrl: string) {
+export class ThreadPreparationCoordinator {
+  private readonly inFlight = new Map<string, { ready: Promise<void>; done: Promise<void> }>();
+  private readonly prepared = new Set<string>();
+  private readonly boundWaiters = new Map<string, () => void>();
+  private readonly slotWaiters: Array<() => void> = [];
+  private activePreparations = 0;
+
+  constructor(
+    private readonly commands: SupportCommandBus,
+    private readonly bindings: ThreadBindingLookup,
+    private readonly launchBrowser: () => Promise<void>,
+  ) {}
+
+  markBound(threadId: string) {
+    this.boundWaiters.get(threadId)?.();
+  }
+
+  async schedule(conversationUrl: string, observerCanPrepare = false): Promise<"synced" | "preparing" | "prepared"> {
+    const conversation = parseConversationUrl(conversationUrl);
+    if (await this.bindings.hasThread(conversation.threadId)) return "synced";
+    if (this.prepared.has(conversation.threadId)) return "prepared";
+    if (this.inFlight.has(conversation.threadId)) return "preparing";
+
+    this.start(conversation.conversationUrl, conversation.threadId, observerCanPrepare);
+    return "preparing";
+  }
+
+  async ensurePrepared(conversationUrl: string, observerCanPrepare = false): Promise<"synced" | "prepared"> {
+    const conversation = parseConversationUrl(conversationUrl);
+    if (await this.bindings.hasThread(conversation.threadId)) return "synced";
+    if (this.prepared.has(conversation.threadId)) return "prepared";
+
+    const task = this.inFlight.get(conversation.threadId)
+      ?? this.start(conversation.conversationUrl, conversation.threadId, observerCanPrepare);
+    await task.ready;
+    if (await this.bindings.hasThread(conversation.threadId)) return "synced";
+    if (this.prepared.has(conversation.threadId)) return "prepared";
+    throw new Error("Thread preparation finished without creating a parked sync tab.");
+  }
+
+  private start(conversationUrl: string, threadId: string, observerCanPrepare: boolean) {
+    let slotHeld = false;
+    const ready = (async () => {
+      await this.acquireSlot();
+      slotHeld = true;
+      if (!observerCanPrepare) await this.commands.ensureBrowser("threadPreparation", this.launchBrowser);
+      if (await this.bindings.hasThread(threadId)) return;
+
+      const result = await this.commands.execute({
+        feature: "threadPreparation",
+        kind: "prepare_thread",
+        conversationUrl,
+      }, RALPH_PREPARE_TIMEOUT_MS);
+      if (!result.ok) throw new Error(result.error);
+      if (result.kind !== "prepare_thread") throw new Error("Thread preparation received the wrong support command result.");
+      this.prepared.add(threadId);
+    })();
+
+    const done = ready
+      .then(async () => {
+        if (!this.prepared.has(threadId) || await this.bindings.hasThread(threadId)) return;
+        await this.waitForBindingRelease(threadId);
+      })
+      .finally(() => {
+        if (slotHeld) this.releaseSlot();
+        this.inFlight.delete(threadId);
+      });
+
+    void done.catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[thread-sync] preparation failed thread=${JSON.stringify(conversationUrl)}: ${message}`);
+    });
+    const task = { ready, done };
+    this.inFlight.set(threadId, task);
+    return task;
+  }
+
+  private acquireSlot() {
+    if (this.activePreparations < MAX_CONCURRENT_THREAD_PREPARATIONS) {
+      this.activePreparations += 1;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => this.slotWaiters.push(resolve));
+  }
+
+  private releaseSlot() {
+    const next = this.slotWaiters.shift();
+    if (next) {
+      next();
+      return;
+    }
+    this.activePreparations -= 1;
+  }
+
+  private async waitForBindingRelease(threadId: string) {
+    let timeout: NodeJS.Timeout;
+    const released = new Promise<void>((resolve) => {
+      const finish = () => {
+        if (this.boundWaiters.get(threadId) !== finish) return;
+        this.boundWaiters.delete(threadId);
+        clearTimeout(timeout);
+        resolve();
+      };
+      timeout = setTimeout(finish, THREAD_PREPARATION_HOLD_MS);
+      timeout.unref();
+      this.boundWaiters.set(threadId, finish);
+    });
+    if (await this.bindings.hasThread(threadId)) this.markBound(threadId);
+    await released;
+  }
+}
+
+export function threadObservationHandler(
+  preparer: ThreadPreparationCoordinator,
+  extensionToken: string,
+): RequestHandler {
+  const bodySchema = z.object({
+    conversationUrl: z.string().max(2048),
+    canPrepare: z.boolean().optional(),
+  }).strict();
+  return async (req, res) => {
+    if (!authenticateSupportExtension(req, res, extensionToken)) return;
+    const parsed = bodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Invalid thread observation request." });
+      return;
+    }
+    try {
+      const status = await preparer.schedule(
+        parsed.data.conversationUrl,
+        parsed.data.canPrepare === true,
+      );
+      res.setHeader("Cache-Control", "no-store");
+      res.json({ status });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : "Thread observation failed." });
+    }
+  };
+}
+
+function subagentPrompt(message: string, jobId: string, resultPath: string) {
   return [
     message.trim(),
     "",
     "You are a sub-agent working in a separate ChatGPT conversation.",
-    "MANDATORY CALLBACK PROCEDURE:",
-    "1. Complete the assigned task in this child conversation.",
-    `2. BEFORE you produce your final assistant response here, you MUST call send_thread_message exactly once with targetUrl ${JSON.stringify(parentConversationUrl)}. Put your complete final report in the tool's message argument.`,
-    "3. A normal assistant reply in this child conversation is NOT delivered to the parent and does NOT count as reporting back. Do not merely write the result here.",
-    "4. After the send_thread_message call returns, do not call it again. If it reports an error or uncertain outcome, do not retry it because the first delivery may already have succeeded.",
-    "5. Only after that tool call may you end this child turn with a brief acknowledgement.",
-    "The callback message should contain the useful result, findings, changed files or commits, and verification status.",
+    "Your first MCP action must be sync_current_thread. If it reports syncing, follow it with get_current_thread_url; if it reports synced, do not sync again.",
+    "Complete only the bounded task above. Do not start another sub-agent unless the user explicitly asked for nested delegation.",
+    "Your parent does not expect a browser message from you. Do not call send_thread_message to report back.",
+    `When your work is complete, call submit_subagent_result exactly once with jobId ${JSON.stringify(jobId)} and put your complete final report in its result argument.`,
+    `The application stores that report locally at ${JSON.stringify(resultPath)} and wakes the parent automatically.`,
+    "After submit_subagent_result succeeds, end this child turn with only a brief acknowledgement.",
   ].join("\n");
 }
 
-function subagentView(thread: z.infer<typeof ralphThreadSchema>) {
-  return {
-    conversationUrl: thread.conversationUrl,
-    threadId: thread.threadId,
-    title: thread.title,
-    state: thread.state,
-    mode: thread.mode,
-    registeredAt: thread.registeredAt,
-    nextCheckAt: thread.nextCheckAt,
-    lastCheckedAt: thread.lastCheckedAt,
-    lastContinuationAt: thread.lastContinuationAt,
-    lastError: thread.lastError,
-  };
+async function subagentViews(
+  parentThreadId: string,
+  registry: RalphRegistry,
+  jobs: SubagentJobRegistry,
+) {
+  const [threads, parentJobs] = await Promise.all([
+    registry.subagents(parentThreadId),
+    jobs.forParent(parentThreadId),
+  ]);
+  const jobsByChild = new Map(parentJobs.flatMap((job) => job.childThreadId ? [[job.childThreadId, job] as const] : []));
+  return threads.map((thread) => {
+    const job = jobsByChild.get(thread.threadId);
+    return {
+      conversationUrl: thread.conversationUrl,
+      threadId: thread.threadId,
+      title: thread.title,
+      state: thread.state,
+      mode: thread.mode,
+      registeredAt: thread.registeredAt,
+      nextCheckAt: thread.nextCheckAt,
+      lastCheckedAt: thread.lastCheckedAt,
+      lastContinuationAt: thread.lastContinuationAt,
+      lastError: thread.lastError,
+      ...(job ? {
+        jobId: job.jobId,
+        resultPath: job.resultPath,
+        resultState: job.state,
+        notifiedAt: job.notifiedAt,
+        notificationAttempts: job.notificationAttempts,
+        notificationAbandonedAt: job.notificationAbandonedAt,
+        notificationError: job.notificationError,
+        preparationError: job.preparationError,
+      } : {}),
+    };
+  });
 }
 
 const subagentOutputSchema = {
@@ -1266,6 +1463,14 @@ const subagentOutputSchema = {
     lastCheckedAt: z.string().optional(),
     lastContinuationAt: z.string().optional(),
     lastError: z.string().optional(),
+    jobId: z.string().uuid().optional(),
+    resultPath: z.string().optional(),
+    resultState: z.enum(["pending", "complete"]).optional(),
+    notifiedAt: z.string().optional(),
+    notificationAttempts: z.number().int().nonnegative().optional(),
+    notificationAbandonedAt: z.string().optional(),
+    notificationError: z.string().optional(),
+    preparationError: z.string().optional(),
   })),
 };
 
@@ -1279,6 +1484,9 @@ export function registerChatGptAgents(
   commands: SupportCommandBus,
   bindings: ThreadBindingLookup,
   registry: RalphRegistry,
+  jobs: SubagentJobRegistry,
+  preparer: ThreadPreparationCoordinator,
+  launchBrowser: () => Promise<void>,
   ownerId: string,
   widgetHtml: string,
 ) {
@@ -1288,9 +1496,9 @@ export function registerChatGptAgents(
 
   server.registerTool("start_subagent", {
     title: "Start Sub-agent",
-    description: "Start an independent ChatGPT sub-agent. Transport retries of the same MCP request are deduplicated internally. The server uses the configured Sub-agent project when one is set and otherwise starts from chatgpt.com. Before calling this tool, call sync_current_thread and then get_current_thread_url so the parent thread is freshly bound. The child cannot implicitly return to this conversation, so this tool automatically appends the bound parent URL and instructs the child to report back with send_thread_message. The new child is registered for RALPH automatically.",
+    description: "Start an independent ChatGPT sub-agent. Transport retries of the same MCP request are deduplicated internally. The parent must already have completed its one-time thread sync. The server uses the configured Sub-agent project when present and otherwise starts from chatgpt.com. The child receives a local sub-agent job and reports by submit_subagent_result, which stores the result in a local file. The application later wakes this parent with only the result-file path; the child does not message the parent directly. The new child is registered for RALPH automatically.",
     inputSchema: {
-      message: z.string().min(1).max(190_000).describe("Complete bounded task for the sub-agent. Do not include callback plumbing; it is added automatically."),
+      message: z.string().min(1).max(190_000).describe("Complete bounded task for the sub-agent. Do not include result transport or parent callback instructions; the server adds them."),
     },
     outputSchema: subagentOutputSchema,
     _meta: subagentToolMeta,
@@ -1300,14 +1508,14 @@ export function registerChatGptAgents(
     if (typeof session !== "string" || !session || session.length > 2048) {
       return {
         isError: true,
-        content: [{ type: "text", text: "The client did not provide a valid openai/session. Call sync_current_thread, then get_current_thread_url, before starting a sub-agent." }],
+        content: [{ type: "text", text: "The client did not provide a valid openai/session. Call sync_current_thread at the start of this conversation before starting a sub-agent." }],
       };
     }
     const parent = await bindings.binding({ ownerId, sessionId: session });
     if (!parent) {
       return {
         isError: true,
-        content: [{ type: "text", text: "This parent conversation is not synced. Call sync_current_thread, then get_current_thread_url, and retry start_subagent." }],
+        content: [{ type: "text", text: "This parent conversation is not synced. Call sync_current_thread first. If it reports syncing, finish with get_current_thread_url, then retry start_subagent." }],
       };
     }
 
@@ -1316,38 +1524,98 @@ export function registerChatGptAgents(
       .digest("base64url");
     const replayKey = `start_subagent:${ownerId}:${session}:${String(extra.requestId)}:${fingerprint}`;
     return await replayToolRequest(replayKey, async () => {
+      const job = await jobs.create(parent);
+      let result: SupportCommandResult;
       try {
         const { subagentProjectUrl } = await registry.settings();
-        const result = await commands.execute({
+        await commands.ensureBrowser("threadMessaging", launchBrowser);
+        result = await commands.execute({
           feature: "threadMessaging",
           kind: "send_message",
           targetUrl: subagentProjectUrl ?? "https://chatgpt.com/",
-          message: subagentPrompt(message, parent.conversationUrl),
+          message: subagentPrompt(message, job.jobId, job.resultPath),
         });
         if (!result.ok) throw new Error(result.error);
         if (result.kind !== "send_message") throw new Error("Sub-agent creation received the wrong support command result.");
-        const child = parseConversationUrl(result.result.conversationUrl);
-        const registration = await registry.register(child.conversationUrl, {
-          agentCreated: true,
-          parentThreadId: parent.threadId,
-          title: result.result.title,
-        });
-        if (registration === "registered") prepareFreshRalphThread(commands, child.conversationUrl);
-        const structuredContent = {
-          parentConversationUrl: parent.conversationUrl,
-          subagents: (await registry.subagents(parent.threadId)).map(subagentView),
-        };
-        return {
-          content: [{ type: "text", text: child.conversationUrl }],
-          structuredContent,
-        };
       } catch (error) {
+        await jobs.discard(job.jobId);
         return {
           isError: true,
           content: [{ type: "text", text: error instanceof Error ? error.message : "Sub-agent creation failed." }],
         };
       }
+
+      const child = parseConversationUrl(result.result.conversationUrl);
+      await jobs.assignChild(job.jobId, {
+        threadId: child.threadId,
+        conversationUrl: child.conversationUrl,
+        title: result.result.title,
+      });
+      await registry.register(child.conversationUrl, {
+        agentCreated: true,
+        parentThreadId: parent.threadId,
+        title: result.result.title,
+      });
+      let preparationError: string | undefined;
+      try {
+        await preparer.ensurePrepared(child.conversationUrl);
+      } catch (error) {
+        preparationError = error instanceof Error ? error.message : String(error);
+        await jobs.recordPreparationFailure(job.jobId, preparationError);
+      }
+      const structuredContent = {
+        parentConversationUrl: parent.conversationUrl,
+        subagents: await subagentViews(parent.threadId, registry, jobs),
+      };
+      return {
+        content: [{ type: "text", text: preparationError
+          ? `${child.conversationUrl}\nResult file: ${job.resultPath}\nAutomatic thread preparation failed: ${preparationError}`
+          : `${child.conversationUrl}\nResult file: ${job.resultPath}` }],
+        structuredContent,
+      };
     });
+  });
+
+  server.registerTool("submit_subagent_result", {
+    title: "Submit Sub-agent Result",
+    description: "Finish a sub-agent job by storing its complete report in the local result file assigned by start_subagent. This does not message the parent. The Local Codex application wakes the parent after the file is stored.",
+    inputSchema: {
+      jobId: z.string().uuid(),
+      result: z.string().trim().min(1).max(200_000),
+    },
+    outputSchema: {
+      resultPath: z.string(),
+      status: z.literal("stored"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  }, async ({ jobId, result }, extra) => {
+    const session = extra._meta?.["openai/session"];
+    if (typeof session !== "string" || !session || session.length > 2048) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "The client did not provide a valid openai/session. Sync this child conversation before submitting its result." }],
+      };
+    }
+    const child = await bindings.binding({ ownerId, sessionId: session });
+    if (!child) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "This child conversation is not synced. Call sync_current_thread first, then finish the one-time sync before submitting the result." }],
+      };
+    }
+    const job = await jobs.job(jobId);
+    if (!job || job.childThreadId !== child.threadId) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "This sub-agent job does not belong to the current child conversation." }],
+      };
+    }
+    const completed = await jobs.complete(jobId, result);
+    const structuredContent = { resultPath: completed.job.resultPath, status: "stored" as const };
+    return {
+      content: [{ type: "text", text: completed.job.resultPath }],
+      structuredContent,
+    };
   });
 
   server.registerTool("send_thread_message", {
@@ -1381,6 +1649,7 @@ export function registerChatGptAgents(
     const replayKey = `send_thread_message:${ownerId}:${session}:${String(extra.requestId)}:${fingerprint}`;
     return await replayToolRequest(replayKey, async (): Promise<CallToolResult> => {
       try {
+        await commands.ensureBrowser("threadMessaging", launchBrowser);
         const result = await commands.execute({
           feature: "threadMessaging",
           kind: "send_message",
@@ -1423,16 +1692,90 @@ export function registerChatGptAgents(
     if (!parent) {
       return {
         isError: true,
-        content: [{ type: "text", text: "This conversation is not synced. Call sync_current_thread, then get_current_thread_url, and retry list_subagents." }],
+        content: [{ type: "text", text: "This conversation is not synced. Call sync_current_thread first. If it reports syncing, finish the one-time binding with get_current_thread_url, then retry list_subagents." }],
       };
     }
     const structuredContent = {
       parentConversationUrl: parent.conversationUrl,
-      subagents: (await registry.subagents(parent.threadId)).map(subagentView),
+      subagents: await subagentViews(parent.threadId, registry, jobs),
     };
     return {
       content: [{ type: "text", text: structuredContent.subagents.length === 0 ? "No sub-agents." : `${structuredContent.subagents.length} sub-agent(s).` }],
       structuredContent,
     };
   });
+}
+
+export class SubagentResultController {
+  private readonly inFlight = new Set<string>();
+  private readonly retryAfter = new Map<string, number>();
+  private readonly timer: NodeJS.Timeout;
+
+  constructor(
+    private readonly jobs: SubagentJobRegistry,
+    private readonly commands: SupportCommandBus,
+    private readonly launchBrowser: () => Promise<void>,
+    checkEveryMs = 1_000,
+  ) {
+    this.timer = setInterval(() => void this.tick(), checkEveryMs);
+    this.timer.unref();
+  }
+
+  async tick() {
+    const jobs = await this.jobs.jobsNeedingNotification();
+    const now = Date.now();
+    for (const job of jobs) {
+      if (this.inFlight.has(job.jobId) || (this.retryAfter.get(job.jobId) ?? 0) > now) continue;
+      this.inFlight.add(job.jobId);
+      void this.check(job).finally(() => this.inFlight.delete(job.jobId));
+    }
+  }
+
+  close() {
+    clearInterval(this.timer);
+  }
+
+  private async check(job: Awaited<ReturnType<SubagentJobRegistry["job"]>> & {}) {
+    if (!job) return;
+    try {
+      const result = await readFile(job.resultPath, "utf8");
+      if (!result.trim()) {
+        this.retryAfter.set(job.jobId, Date.now() + SUBAGENT_RESULT_MISSING_RETRY_MS);
+        return;
+      }
+      if (job.state !== "complete") await this.jobs.markFileComplete(job.jobId);
+
+      await this.commands.ensureBrowser("threadMessaging", this.launchBrowser);
+      const wake = await this.commands.execute({
+        feature: "threadMessaging",
+        kind: "send_message",
+        targetUrl: job.parentConversationUrl,
+        message: `Sub-agent result ready for job ${job.jobId}. Read the local result file at ${JSON.stringify(job.resultPath)} now and continue the parent task from that file. The file is the authoritative result; this message is only a wake-up.`,
+      });
+      if (!wake.ok) throw new Error(wake.error);
+      if (wake.kind !== "send_message") throw new Error("Sub-agent wake-up received the wrong support command result.");
+      await this.jobs.markNotified(job.jobId);
+      this.retryAfter.delete(job.jobId);
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+        this.retryAfter.set(job.jobId, Date.now() + SUBAGENT_RESULT_MISSING_RETRY_MS);
+        return;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      const failed = await this.jobs.recordNotificationFailure(
+        job.jobId,
+        message,
+        MAX_SUBAGENT_NOTIFICATION_ATTEMPTS,
+      );
+      if (failed.notificationAbandonedAt) {
+        this.retryAfter.delete(job.jobId);
+        return;
+      }
+      const retryMs = Math.min(
+        SUBAGENT_RESULT_MISSING_RETRY_MS * 2 ** Math.max(0, failed.notificationAttempts - 1),
+        MAX_SUBAGENT_NOTIFICATION_RETRY_MS,
+      );
+      this.retryAfter.set(job.jobId, Date.now() + retryMs);
+    }
+  }
 }

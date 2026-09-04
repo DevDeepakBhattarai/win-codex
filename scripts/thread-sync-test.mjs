@@ -8,7 +8,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { THREAD_SYNC_AGENT_INSTRUCTION, THREAD_SYNC_WIDGET_URI, ThreadSyncRegistry, parseConversationUrl, prepareThreadSync, registerThreadSync, threadSyncBindHandler, threadSyncBindUrl } from "../dist/thread-sync.js";
-import { RalphController, RalphRegistry, SUBAGENT_WIDGET_URI, SupportCommandBus, parseRalphProjectId, ralphRegistrationHandler, ralphSettingsGetHandler, ralphSettingsPutHandler, ralphThreadActiveHandler, ralphThreadCheckHandler, ralphThreadCompleteHandler, ralphThreadModeHandler, ralphThreadsGetHandler, registerChatGptAgents, supportCommandClaimHandler } from "../dist/chatgpt-support.js";
+import { RalphController, RalphRegistry, SUBAGENT_WIDGET_URI, SubagentResultController, SupportCommandBus, ThreadPreparationCoordinator, parseRalphProjectId, ralphRegistrationHandler, ralphSettingsGetHandler, ralphSettingsPutHandler, ralphThreadActiveHandler, ralphThreadCheckHandler, ralphThreadCompleteHandler, ralphThreadModeHandler, ralphThreadsGetHandler, registerChatGptAgents, supportCommandClaimHandler, threadObservationHandler } from "../dist/chatgpt-support.js";
+import { SubagentJobRegistry } from "../dist/subagent-jobs.js";
 
 const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "win-codex-thread-sync-test-"));
 const projectId = "g-p-6a87fafd6d948191ab3338e485c07c39";
@@ -24,11 +25,16 @@ let client;
 let server;
 let supportCommands;
 let ralphRegistry;
+let subagentJobs;
+let threadPreparer;
+let automationLaunches = 0;
+const launchSupportBrowser = async () => { automationLaunches += 1; };
 
 try {
   assert.equal(threadSyncBindUrl(), "http://127.0.0.1:6002/thread-sync/bind");
-  assert.match(THREAD_SYNC_AGENT_INSTRUCTION, /first call sync_current_thread, then call get_current_thread_url/);
-  assert.match(THREAD_SYNC_AGENT_INSTRUCTION, /get_current_thread_url is the only source of the URL/);
+  assert.match(THREAD_SYNC_AGENT_INSTRUCTION, /At the start of every ChatGPT conversation/);
+  assert.match(THREAD_SYNC_AGENT_INSTRUCTION, /do not try to sync it again/);
+  assert.match(THREAD_SYNC_AGENT_INSTRUCTION, /get_current_thread_url is the only fallback source/);
   assert.equal(threadSyncBindUrl(7002), "http://127.0.0.1:7002/thread-sync/bind");
   for (const port of [6000, 22, 5060, 6667, 10080]) {
     assert.throws(() => threadSyncBindUrl(port), /blocked by browsers/);
@@ -49,7 +55,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.3.13");
+  assert.equal(manifest.version, "1.4.0");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -82,6 +88,12 @@ try {
   assert.match(preparedPopup, /data-thread-filter="complete"/);
   assert.doesNotMatch(preparedPopup, /id="(?:threadCount|completeCount)"/,
     "the popup does not count all or completed threads");
+  assert.match(preparedPopupScript, /canonicalProjectId\(match\[1\]\)/,
+    "popup thread matching canonicalizes project-name slugs before reusing an existing tab");
+  assert.match(preparedPopupScript, /tabs\.query\(\{\}\)/, "thread links search existing ChatGPT tabs");
+  assert.match(preparedPopupScript, /tabs\.update\(existing\.id, \{ active: true \}\)/, "thread links reuse an existing tab instead of duplicating it");
+  assert.match(preparedPopupScript, /windows\?\.update|windows\.update/, "reused tabs focus their existing browser window");
+  assert.match(preparedPopupScript, /event\.ctrlKey.*event\.shiftKey/, "modified thread-link clicks keep normal browser link behavior");
   assert.match(preparedPopupScript, /textContent: thread\.conversationUrl/,
     "thread cards show their full ChatGPT URL");
   assert.match(preparedPopupScript,
@@ -91,10 +103,24 @@ try {
   vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), preparedConfig);
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.commandClaimUrl, "http://127.0.0.1:6002/chatgpt-support/commands/claim");
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.commandResultUrl, "http://127.0.0.1:6002/chatgpt-support/commands/result");
+  assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.threadObserveUrl, "http://127.0.0.1:6002/chatgpt-support/threads/observe");
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralphRegisterUrl, "http://127.0.0.1:6002/chatgpt-support/ralph/register");
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralphProjectsUrl, "http://127.0.0.1:6002/chatgpt-support/ralph/projects");
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralphSettingsUrl, "http://127.0.0.1:6002/chatgpt-support/ralph/settings");
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralphThreadsUrl, "http://127.0.0.1:6002/chatgpt-support/ralph/threads");
+  const preparedServiceWorker = await readFile(path.join(sync.extensionDirectory, "service-worker.js"), "utf8");
+  assert.match(preparedPopup, /id="automationExecutor"/,
+    "the extension exposes an explicit thread-preparation executor setting");
+  assert.match(preparedServiceWorker, /if \(settings\.threadSync && settings\.automationExecutor\) features\.push\("threadPreparation"\)/,
+    "only the explicitly designated automation browser claims thread preparation");
+  assert.match(preparedServiceWorker, /canPrepare: settings\.automationExecutor/,
+    "route observations declare whether their browser is the preparation executor");
+  assert.match(preparedServiceWorker, /observingConversations\.get\(currentUrl\)/,
+    "simultaneous duplicate route observations share one backend request");
+  assert.match(preparedServiceWorker, /canonicalProjectId\(match\[1\]\)/,
+    "service-worker thread matching canonicalizes project-name slugs");
+  assert.doesNotMatch(preparedServiceWorker, /threadMessaging\) features\.push\("threadPreparation"\)/,
+    "a thread-messaging observer such as Helium never implicitly claims thread preparation");
   const preparedContentScript = await readFile(path.join(sync.extensionDirectory, "content-script.js"), "utf8");
   assert.doesNotMatch(preparedContentScript, /Run RALPH now|installManualRalphButton/,
     "the content script does not inject a RALPH button into ChatGPT");
@@ -108,7 +134,7 @@ try {
     "thread sending does not use acknowledgement or DOM-stability heuristics");
   assert.match(preparedContentScript, /const SEND_SETTLE_MS = 5_000;/,
     "thread sending uses the fixed five-second settle requested for typing and sending");
-  assert.match(preparedContentScript, /contentScriptVersion = "1\.3\.13"/,
+  assert.match(preparedContentScript, /contentScriptVersion = "1\.4\.0"/,
     "extension reloads can replace a stale page script with the current content-script version");
   assert.equal(parseRalphProjectId(namedProjectHome), projectId);
   assert.equal(parseRalphProjectId(urlA), projectId);
@@ -117,6 +143,8 @@ try {
   ralphRegistry = await RalphRegistry.open(temporaryRoot, 20);
   await ralphRegistry.setProjects([projectId]);
   supportCommands = new SupportCommandBus();
+  subagentJobs = await SubagentJobRegistry.open(path.join(temporaryRoot, "subagent-jobs"));
+  threadPreparer = new ThreadPreparationCoordinator(supportCommands, registry, async () => undefined);
   const [a, b, againA] = await Promise.all([registry.context(idA), registry.context(idB), registry.context(idA)]);
   assert.equal(a.ticket.token, againA.ticket.token, "repeated sync calls reuse the pending ticket");
   assert.notEqual(a.ticket.token, b.ticket.token);
@@ -146,19 +174,14 @@ try {
   await routeRefreshRegistry.bind(routeRefreshTicket.ticket.token, bareUrlA);
   const refreshContext = await routeRefreshRegistry.context(routeRefreshIdentity);
   assert.equal(refreshContext.status, "connected");
-  assert.notEqual(refreshContext.ticket.token, routeRefreshTicket.ticket.token);
-  let refreshResolved = false;
-  const waitingRefresh = routeRefreshRegistry.waitForBinding(routeRefreshIdentity, 1_000).then(binding => {
-    refreshResolved = true;
-    return binding;
-  });
-  await new Promise(resolve => setTimeout(resolve, 25));
-  assert.equal(refreshResolved, false, "URL lookup waits for the fresh browser observation after a repeated sync");
-  await routeRefreshRegistry.bind(refreshContext.ticket.token, urlA);
-  const refreshedBinding = await waitingRefresh;
-  assert.equal(refreshedBinding.conversationUrl, urlA,
-    "rebinding the same thread refreshes its exact ChatGPT route");
-  assert.equal((await routeRefreshRegistry.binding(routeRefreshIdentity)).conversationUrl, urlA);
+  assert.equal(refreshContext.conversationUrl, bareUrlA);
+  assert.equal(refreshContext.ticket, undefined,
+    "a bound thread never creates a second sync ticket");
+  assert.equal((await routeRefreshRegistry.waitForBinding(routeRefreshIdentity, 1_000)).conversationUrl, bareUrlA,
+    "repeated lookup returns the permanent binding immediately");
+  assert.equal((await routeRefreshRegistry.bind(routeRefreshTicket.ticket.token, urlA)).conversationUrl, bareUrlA,
+    "replaying the original ticket cannot refresh or mutate an established binding");
+  assert.equal((await routeRefreshRegistry.binding(routeRefreshIdentity)).conversationUrl, bareUrlA);
   const projectScopedRegistry = await RalphRegistry.open(routeRefreshRoot, 20);
   assert.equal(await projectScopedRegistry.register(urlA), "ignored",
     "RALPH ignores project threads until their project is explicitly configured");
@@ -268,12 +291,17 @@ try {
     "completed RALPH threads cannot be checked without reactivation");
   assert.equal((await checkThread("22222222-2222-4222-8222-222222222222")).code, 404);
   assert.equal((await checkThread(parseConversationUrl(urlA).threadId, "Bearer wrong")).code, 401);
-  const preparationRoot = path.join(temporaryRoot, "ralph-preparation");
-  const preparationRegistry = await RalphRegistry.open(preparationRoot, 20);
-  await preparationRegistry.setProjects([projectId]);
+  const preparationRoot = path.join(temporaryRoot, "thread-preparation");
+  const preparationBindings = await ThreadSyncRegistry.open(preparationRoot);
   const preparationCommands = new SupportCommandBus();
-  const preparationHandler = ralphRegistrationHandler(preparationRegistry, preparationCommands, sync.extensionToken);
-  const requestPreparationRegistration = (body) => new Promise(resolve => {
+  let preparationLaunches = 0;
+  const preparationCoordinator = new ThreadPreparationCoordinator(
+    preparationCommands,
+    preparationBindings,
+    async () => { preparationLaunches += 1; },
+  );
+  const preparationHandler = threadObservationHandler(preparationCoordinator, sync.extensionToken);
+  const requestPreparation = (body, authorization = `Bearer ${sync.extensionToken}`) => new Promise(resolve => {
     const response = {
       status(code) { response.code = code; return response; },
       json(responseBody) { resolve({ code: response.code ?? 200, body: responseBody }); },
@@ -281,34 +309,118 @@ try {
     };
     preparationHandler({
       body,
-      get: name => (name === "authorization" ? `Bearer ${sync.extensionToken}` : undefined),
+      get: name => (name === "authorization" ? authorization : undefined),
     }, response);
   });
-  assert.deepEqual(await requestPreparationRegistration({ conversationUrl: urlC }), {
+  assert.equal((await requestPreparation({ conversationUrl: urlC }, "Bearer wrong")).code, 401);
+  assert.deepEqual(await requestPreparation({ conversationUrl: urlC }), {
     code: 200,
-    body: { status: "registered" },
+    body: { status: "preparing" },
   });
-  const freshPreparation = await preparationCommands.claim("chrome-ralph", ["ralph"], 1000);
+  assert.deepEqual(await requestPreparation({ conversationUrl: urlC }), {
+    code: 200,
+    body: { status: "preparing" },
+  });
+  assert.equal(preparationLaunches, 1,
+    "duplicate observations share one backend Chrome launch while preparation is in flight");
+  const freshPreparation = await preparationCommands.claim("chrome-preparer", ["threadPreparation"], 1000);
   assert.equal(freshPreparation.kind, "prepare_thread");
-  assert.equal(freshPreparation.conversationUrl, urlC,
-    "every fresh RALPH registration schedules a background sync tab in the RALPH browser");
+  assert.equal(freshPreparation.conversationUrl, urlC);
+  assert.equal(await preparationCommands.claim("helium-observer", ["threadPreparation"], 0), undefined,
+    "only one automation browser can claim the preparation command");
   preparationCommands.complete({
     commandId: freshPreparation.id,
-    browserId: "chrome-ralph",
+    browserId: "chrome-preparer",
     kind: "prepare_thread",
     ok: true,
     result: { status: "prepared", conversationUrl: urlC },
   });
-  assert.deepEqual(await requestPreparationRegistration({ conversationUrl: urlC, title: "Updated title" }), {
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(await requestPreparation({ conversationUrl: urlC }), {
     code: 200,
-    body: { status: "registered" },
+    body: { status: "prepared" },
+  }, "a successfully parked unsynced thread is prepared only once per server run");
+  assert.equal(await preparationCommands.claim("chrome-preparer", ["threadPreparation"], 0), undefined,
+    "re-observing a prepared but still-unsynced thread does not open another parked tab");
+  const preparedIdentity = { ownerId: "prepared-grant", sessionId: "prepared-session" };
+  const preparedTicket = await preparationBindings.context(preparedIdentity);
+  await preparationBindings.bind(preparedTicket.ticket.token, urlC);
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.deepEqual(await requestPreparation({ conversationUrl: urlC }), {
+    code: 200,
+    body: { status: "synced" },
   });
-  assert.equal(await preparationCommands.claim("chrome-ralph", ["ralph"], 0), undefined,
-    "an already-active RALPH thread does not open another sync tab for title updates or duplicate observations");
+  assert.equal(preparationLaunches, 1,
+    "an already-synced thread never starts Chrome or prepares again");
+  assert.equal(await preparationCommands.claim("chrome-preparer", ["threadPreparation"], 0), undefined);
+
+  assert.deepEqual(await requestPreparation({ conversationUrl: urlD, canPrepare: true }), {
+    code: 200,
+    body: { status: "preparing" },
+  });
+  assert.equal(preparationLaunches, 1,
+    "an observation from an automation executor does not launch Chrome again during extension startup");
+  const executorPreparation = await preparationCommands.claim("chrome-preparer", ["threadPreparation"], 1000);
+  assert.equal(executorPreparation.conversationUrl, urlD);
+  preparationCommands.complete({
+    commandId: executorPreparation.id,
+    browserId: "chrome-preparer",
+    kind: "prepare_thread",
+    ok: true,
+    result: { status: "prepared", conversationUrl: urlD },
+  });
+  const executorIdentity = { ownerId: "executor-grant", sessionId: "executor-session" };
+  const executorTicket = await preparationBindings.context(executorIdentity);
+  await preparationBindings.bind(executorTicket.ticket.token, urlD);
+  preparationCoordinator.markBound(parseConversationUrl(urlD).threadId);
   preparationCommands.close();
 
-  const registrationCommands = new SupportCommandBus();
-  const registerThreadHandler = ralphRegistrationHandler(projectScopedRegistry, registrationCommands, sync.extensionToken);
+  const boundedPreparationRoot = path.join(temporaryRoot, "bounded-thread-preparation");
+  const boundedPreparationBindings = await ThreadSyncRegistry.open(boundedPreparationRoot);
+  const boundedPreparationCommands = new SupportCommandBus();
+  const boundedPreparer = new ThreadPreparationCoordinator(
+    boundedPreparationCommands,
+    boundedPreparationBindings,
+    async () => undefined,
+  );
+  const boundedUrls = [
+    `https://chatgpt.com/g/${projectId}/c/d1111111-1111-4111-8111-111111111111`,
+    `https://chatgpt.com/g/${projectId}/c/d2222222-2222-4222-8222-222222222222`,
+    `https://chatgpt.com/g/${projectId}/c/d3333333-3333-4333-8333-333333333333`,
+    `https://chatgpt.com/g/${projectId}/c/d4444444-4444-4444-8444-444444444444`,
+  ];
+  for (const conversationUrl of boundedUrls) await boundedPreparer.schedule(conversationUrl, true);
+  const parkedCommands = [];
+  for (let index = 0; index < 3; index += 1) {
+    const command = await boundedPreparationCommands.claim("bounded-preparer", ["threadPreparation"], 1000);
+    parkedCommands.push(command);
+    boundedPreparationCommands.complete({
+      commandId: command.id,
+      browserId: "bounded-preparer",
+      kind: "prepare_thread",
+      ok: true,
+      result: { status: "prepared", conversationUrl: command.conversationUrl },
+    });
+  }
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(await boundedPreparationCommands.claim("bounded-preparer", ["threadPreparation"], 0), undefined,
+    "at most three parked thread preparations can be active at once");
+  boundedPreparer.markBound(parseConversationUrl(parkedCommands[0].conversationUrl).threadId);
+  await new Promise(resolve => setImmediate(resolve));
+  const fourthPreparation = await boundedPreparationCommands.claim("bounded-preparer", ["threadPreparation"], 1000);
+  assert.equal(fourthPreparation.conversationUrl, boundedUrls[3],
+    "the next queued preparation starts when a parked slot is released");
+  boundedPreparationCommands.complete({
+    commandId: fourthPreparation.id,
+    browserId: "bounded-preparer",
+    kind: "prepare_thread",
+    ok: true,
+    result: { status: "prepared", conversationUrl: fourthPreparation.conversationUrl },
+  });
+  for (const conversationUrl of boundedUrls) boundedPreparer.markBound(parseConversationUrl(conversationUrl).threadId);
+  await new Promise(resolve => setImmediate(resolve));
+  boundedPreparationCommands.close();
+  const registerThreadHandler = ralphRegistrationHandler(projectScopedRegistry, sync.extensionToken);
   const registerThread = (body) => new Promise(resolve => {
     const response = {
       status(code) { response.code = code; return response; },
@@ -342,16 +454,6 @@ try {
     code: 200,
     body: { status: "registered" },
   });
-  const manualPreparation = await registrationCommands.claim("chrome-ralph", ["ralph"], 1000);
-  assert.equal(manualPreparation.kind, "prepare_thread");
-  assert.equal(manualPreparation.conversationUrl, urlA);
-  registrationCommands.complete({
-    commandId: manualPreparation.id,
-    browserId: "chrome-ralph",
-    kind: "prepare_thread",
-    ok: true,
-    result: { status: "prepared", conversationUrl: urlA },
-  });
   assert.deepEqual((await projectScopedRegistry.threads()).map(thread => ({
     conversationUrl: thread.conversationUrl,
     manuallyRegistered: thread.manuallyRegistered,
@@ -364,16 +466,6 @@ try {
   assert.deepEqual(await registerThread({ conversationUrl: urlB, agentCreated: true, title: "Review auth refresh - ChatGPT" }), {
     code: 200,
     body: { status: "registered" },
-  });
-  const agentPreparation = await registrationCommands.claim("chrome-ralph", ["ralph"], 1000);
-  assert.equal(agentPreparation.kind, "prepare_thread");
-  assert.equal(agentPreparation.conversationUrl, urlB);
-  registrationCommands.complete({
-    commandId: agentPreparation.id,
-    browserId: "chrome-ralph",
-    kind: "prepare_thread",
-    ok: true,
-    result: { status: "prepared", conversationUrl: urlB },
   });
   const agentCreatedThread = (await projectScopedRegistry.threads()).find(thread => thread.conversationUrl === urlB);
   assert.deepEqual(agentCreatedThread && {
@@ -416,9 +508,6 @@ try {
   await registerThread({ conversationUrl: urlA, reactivate: true });
   assert.equal(await projectScopedRegistry.isActive(parseConversationUrl(urlA).threadId), true,
     "new messages can reactivate a manually registered thread outside the project allowlist");
-  assert.equal(await registrationCommands.claim("chrome-ralph", ["ralph"], 0), undefined,
-    "reactivation does not create a duplicate initial sync tab");
-  registrationCommands.close();
 
   const timingRoot = path.join(temporaryRoot, "ralph-timing");
   const timingRegistry = await RalphRegistry.open(timingRoot);
@@ -512,7 +601,7 @@ try {
   // Exercise actual MCP metadata forwarding without opening an HTTP listener.
   server = new McpServer({ name: "thread-sync-test", version: "1" });
   registerThreadSync(server, sync, "mcp-grant");
-  registerChatGptAgents(server, supportCommands, registry, ralphRegistry, "mcp-grant", sync.subagentWidgetHtml);
+  registerChatGptAgents(server, supportCommands, registry, ralphRegistry, subagentJobs, threadPreparer, launchSupportBrowser, "mcp-grant", sync.subagentWidgetHtml);
   client = new Client({ name: "thread-sync-test", version: "1" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -521,19 +610,20 @@ try {
   const syncDefinition = tools.find(tool => tool.name === "sync_current_thread");
   const getDefinition = tools.find(tool => tool.name === "get_current_thread_url");
   const startSubagentDefinition = tools.find(tool => tool.name === "start_subagent");
+  const submitSubagentDefinition = tools.find(tool => tool.name === "submit_subagent_result");
   const sendThreadDefinition = tools.find(tool => tool.name === "send_thread_message");
   const listSubagentsDefinition = tools.find(tool => tool.name === "list_subagents");
   assert.equal(syncDefinition._meta.ui.resourceUri, THREAD_SYNC_WIDGET_URI);
-  assert.match(syncDefinition.description, /Required step 1/);
-  assert.match(syncDefinition.description, /call this tool first/);
+  assert.match(syncDefinition.description, /Call this once at the start of every ChatGPT conversation/);
+  assert.match(syncDefinition.description, /returns the saved conversation URL immediately/);
   assert.equal(getDefinition._meta?.ui, undefined, "URL lookup must not mount UI");
-  assert.match(getDefinition.description, /Required step 2/);
-  assert.match(getDefinition.description, /Call sync_current_thread first/);
+  assert.match(getDefinition.description, /after sync_current_thread reports syncing/);
   assert.match(startSubagentDefinition.description, /Sub-agent project/);
-  assert.match(startSubagentDefinition.description, /sync_current_thread and then get_current_thread_url/);
-  assert.match(startSubagentDefinition.description, /send_thread_message/);
+  assert.match(startSubagentDefinition.description, /one-time thread sync/);
+  assert.match(startSubagentDefinition.description, /local file/);
   assert.match(startSubagentDefinition.description, /deduplicated internally/);
   assert.equal(startSubagentDefinition._meta.ui.resourceUri, SUBAGENT_WIDGET_URI);
+  assert.match(submitSubagentDefinition.description, /does not message the parent/);
   assert.match(sendThreadDefinition.description, /deduplicated internally/);
   assert.deepEqual([...sendThreadDefinition.inputSchema.required].sort(), ["message", "targetUrl"],
     "send_thread_message keeps the public API to targetUrl and message only");
@@ -554,14 +644,10 @@ try {
     "lookup waits for the hidden extension handshake instead of racing it");
   assert.equal((await getCall("mcp-A")).structuredContent.conversationUrl, urlA);
   assert.equal((await getCall("mcp-B")).structuredContent.conversationUrl, urlB);
-  const refreshSync = await syncCall("mcp-A");
-  assert.equal(refreshSync.structuredContent.status, "synced");
-  const refreshToken = refreshSync._meta["local-codex/thread-binding"].token;
-  const refreshedLookup = getCall("mcp-A");
-  await new Promise(resolve => setTimeout(resolve, 25));
-  await registry.bind(refreshToken, bareUrlA);
-  assert.equal((await refreshedLookup).structuredContent.conversationUrl, bareUrlA,
-    "repeated sync/get returns the newly observed route instead of a stale binding");
+  const repeatedSync = await syncCall("mcp-A");
+  assert.deepEqual(repeatedSync.structuredContent, { status: "synced", conversationUrl: urlA });
+  assert.equal(repeatedSync._meta?.["local-codex/thread-binding"], undefined,
+    "a synced thread returns its saved URL without issuing another handshake ticket");
   assert.equal((await client.callTool({ name: "sync_current_thread", arguments: {} })).isError, true);
   assert.equal((await client.callTool({ name: "get_current_thread_url", arguments: {} })).isError, true);
   const commandResult = supportCommands.execute({
@@ -583,6 +669,48 @@ try {
     result: { status: "sent", conversationUrl: urlB },
   });
   assert.equal((await commandResult).result.conversationUrl, urlB);
+
+  const browserPresenceBus = new SupportCommandBus();
+  let browserPresenceLaunches = 0;
+  assert.equal(await browserPresenceBus.claim("recent-browser", ["threadMessaging"], 0), undefined);
+  await browserPresenceBus.ensureBrowser("threadMessaging", async () => { browserPresenceLaunches += 1; });
+  assert.equal(browserPresenceLaunches, 0,
+    "a recently polling messaging browser counts as online even between long-poll requests");
+  const busyResult = browserPresenceBus.execute({
+    feature: "threadMessaging",
+    kind: "send_message",
+    targetUrl: urlA,
+    message: "busy browser heartbeat test",
+  });
+  const busyCommand = await browserPresenceBus.claim("recent-browser", ["threadMessaging"], 0);
+  await browserPresenceBus.ensureBrowser("threadMessaging", async () => { browserPresenceLaunches += 1; });
+  assert.equal(browserPresenceLaunches, 0,
+    "a browser that currently owns a support command counts as online while automation is running");
+  browserPresenceBus.complete({
+    commandId: busyCommand.id,
+    browserId: "recent-browser",
+    kind: "send_message",
+    ok: true,
+    result: { status: "sent", conversationUrl: urlA },
+  });
+  await busyResult;
+  browserPresenceBus.close();
+
+  const launchDedupBus = new SupportCommandBus();
+  let deduplicatedLaunches = 0;
+  let releaseLaunch;
+  const launchGate = new Promise(resolve => { releaseLaunch = resolve; });
+  const launchBrowserOnce = async () => { deduplicatedLaunches += 1; await launchGate; };
+  const launchRequests = [
+    launchDedupBus.ensureBrowser("threadMessaging", launchBrowserOnce),
+    launchDedupBus.ensureBrowser("threadPreparation", launchBrowserOnce),
+  ];
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(deduplicatedLaunches, 1, "concurrent backend Chrome launch requests are deduplicated");
+  releaseLaunch();
+  await Promise.all(launchRequests);
+  launchDedupBus.close();
+
   const unsyncedSubagent = await client.callTool({
     name: "start_subagent",
     arguments: { message: "should fail without parent sync" },
@@ -599,15 +727,12 @@ try {
   assert.equal(startSubagentCommand.targetUrl, "https://chatgpt.com/",
     "an unset Sub-agent project falls back to the normal ChatGPT new-chat page");
   assert.match(startSubagentCommand.message, /Review the implementation independently/);
-  assert.match(startSubagentCommand.message, /MANDATORY CALLBACK PROCEDURE/);
-  assert.match(startSubagentCommand.message, /BEFORE you produce your final assistant response here, you MUST call send_thread_message exactly once/);
-  assert.match(startSubagentCommand.message, /normal assistant reply.*NOT delivered to the parent/i);
-  assert.match(startSubagentCommand.message, /does NOT count as reporting back/i);
-  assert.match(startSubagentCommand.message, /do not retry it because the first delivery may already have succeeded/i);
-  assert.doesNotMatch(startSubagentCommand.message, /deliveryId/,
-    "sub-agents do not manage transport idempotency tokens themselves");
-  assert.match(startSubagentCommand.message, new RegExp(bareUrlA.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
-    "the callback URL is injected from the parent session binding");
+  assert.match(startSubagentCommand.message, /Your first MCP action must be sync_current_thread/);
+  assert.match(startSubagentCommand.message, /Do not start another sub-agent unless the user explicitly asked/);
+  assert.match(startSubagentCommand.message, /submit_subagent_result exactly once/);
+  assert.match(startSubagentCommand.message, /Do not call send_thread_message to report back/);
+  assert.doesNotMatch(startSubagentCommand.message, new RegExp(urlA.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+    "the child prompt does not receive the parent URL or callback transport details");
   supportCommands.complete({
     commandId: startSubagentCommand.id,
     browserId: "chrome-browser",
@@ -615,18 +740,10 @@ try {
     ok: true,
     result: { status: "sent", conversationUrl: urlC, title: "Independent implementation review" },
   });
-  const startSubagentResult = await startSubagentCall;
-  assert.equal(startSubagentResult.structuredContent.parentConversationUrl, bareUrlA);
-  assert.equal(startSubagentResult.structuredContent.subagents.length, 1);
-  assert.equal(startSubagentResult.structuredContent.subagents[0].conversationUrl, urlC);
-  assert.equal(startSubagentResult.structuredContent.subagents[0].title, "Independent implementation review");
-  const registeredChild = (await ralphRegistry.threads()).find(thread => thread.conversationUrl === urlC);
-  assert.equal(registeredChild.parentThreadId, parseConversationUrl(bareUrlA).threadId);
-  assert.equal(registeredChild.agentCreated, true);
-  const childPreparation = await supportCommands.claim("chrome-browser", ["ralph"], 1000);
+  const childPreparation = await supportCommands.claim("chrome-browser", ["threadPreparation"], 1000);
   assert.equal(childPreparation.kind, "prepare_thread");
   assert.equal(childPreparation.conversationUrl, urlC,
-    "sub-agent creation uses the same RALPH preparation path as every other fresh thread");
+    "sub-agent creation prepares the new child before reporting startup success");
   supportCommands.complete({
     commandId: childPreparation.id,
     browserId: "chrome-browser",
@@ -634,6 +751,86 @@ try {
     ok: true,
     result: { status: "prepared", conversationUrl: urlC },
   });
+  const startSubagentResult = await startSubagentCall;
+  assert.equal(startSubagentResult.structuredContent.parentConversationUrl, urlA);
+  assert.equal(startSubagentResult.structuredContent.subagents.length, 1);
+  const firstSubagent = startSubagentResult.structuredContent.subagents[0];
+  assert.equal(firstSubagent.conversationUrl, urlC);
+  assert.equal(firstSubagent.title, "Independent implementation review");
+  assert.match(firstSubagent.jobId, /^[0-9a-f-]{36}$/i);
+  assert.equal(firstSubagent.resultState, "pending");
+  assert.equal(path.dirname(firstSubagent.resultPath), path.resolve(path.join(temporaryRoot, "subagent-jobs", "subagents")));
+  assert.match(startSubagentCommand.message, new RegExp(firstSubagent.jobId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.ok(startSubagentCommand.message.includes(JSON.stringify(firstSubagent.resultPath)),
+    "the child prompt receives the exact local result path");
+  const registeredChild = (await ralphRegistry.threads()).find(thread => thread.conversationUrl === urlC);
+  assert.equal(registeredChild.parentThreadId, parseConversationUrl(urlA).threadId);
+  assert.equal(registeredChild.agentCreated, true);
+  const childSync = await syncCall("mcp-child-C");
+  const childToken = childSync._meta["local-codex/thread-binding"].token;
+  await registry.bind(childToken, urlC);
+  threadPreparer.markBound(parseConversationUrl(urlC).threadId);
+
+  const resultController = new SubagentResultController(subagentJobs, supportCommands, launchSupportBrowser, 60_000);
+  const whitespaceSubmit = await client.callTool({
+    name: "submit_subagent_result",
+    arguments: { jobId: firstSubagent.jobId, result: "   " },
+    _meta: { "openai/session": "mcp-child-C" },
+  });
+  assert.equal(whitespaceSubmit.isError, true, "a whitespace-only sub-agent report is rejected");
+  const childReport = "Independent review complete. No blocking defects found.";
+  const [submitResult, duplicateSubmit] = await Promise.all([
+    client.callTool({
+      name: "submit_subagent_result",
+      arguments: { jobId: firstSubagent.jobId, result: childReport },
+      _meta: { "openai/session": "mcp-child-C" },
+    }),
+    client.callTool({
+      name: "submit_subagent_result",
+      arguments: { jobId: firstSubagent.jobId, result: "Transport retry must not replace the first report." },
+      _meta: { "openai/session": "mcp-child-C" },
+    }),
+  ]);
+  assert.equal(submitResult.structuredContent.status, "stored");
+  assert.equal(duplicateSubmit.structuredContent.status, "stored");
+  assert.equal(submitResult.structuredContent.resultPath, firstSubagent.resultPath);
+  assert.equal((await readFile(firstSubagent.resultPath, "utf8")).trim(), childReport,
+    "concurrent result submissions are idempotent and the first complete report wins");
+  await resultController.tick();
+  const wakeCommand = await supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
+  assert.equal(wakeCommand.targetUrl, urlA);
+  assert.ok(wakeCommand.message.includes(JSON.stringify(firstSubagent.resultPath)),
+    "the wake-up points the parent at the exact local result file");
+  assert.doesNotMatch(wakeCommand.message, /Independent review complete/,
+    "the application wake-up carries only the result location, not the sub-agent report");
+  supportCommands.complete({
+    commandId: wakeCommand.id,
+    browserId: "chrome-browser",
+    kind: "send_message",
+    ok: true,
+    result: { status: "sent", conversationUrl: urlA },
+  });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.ok((await subagentJobs.job(firstSubagent.jobId)).notifiedAt,
+    "the application marks the local result as notified only after waking the parent");
+  resultController.close();
+
+  const retryRegistryRoot = path.join(temporaryRoot, "notification-retry-cap");
+  const retryRegistry = await SubagentJobRegistry.open(retryRegistryRoot);
+  const retryJob = await retryRegistry.create({ threadId: parseConversationUrl(urlA).threadId, conversationUrl: urlA });
+  let failedRetryJob;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    failedRetryJob = await retryRegistry.recordNotificationFailure(retryJob.jobId, "parent unavailable", 5);
+  }
+  assert.equal(failedRetryJob.notificationAttempts, 5);
+  assert.ok(failedRetryJob.notificationAbandonedAt, "parent wake-up retries enter a persisted terminal state after five failures");
+  assert.equal((await retryRegistry.jobsNeedingNotification()).some(job => job.jobId === retryJob.jobId), false,
+    "an abandoned wake-up job is no longer retried forever");
+  await retryRegistry.close();
+  const reopenedRetryRegistry = await SubagentJobRegistry.open(retryRegistryRoot);
+  assert.ok((await reopenedRetryRegistry.job(retryJob.jobId)).notificationAbandonedAt,
+    "wake-up abandonment survives backend restarts");
+  await reopenedRetryRegistry.close();
 
   await ralphRegistry.setSubagentProjectUrl(namedProjectHome);
   const configuredSubagentCall = client.callTool({
@@ -651,8 +848,7 @@ try {
     ok: true,
     result: { status: "sent", conversationUrl: urlD, title: "Configured project child" },
   });
-  await configuredSubagentCall;
-  const configuredPreparation = await supportCommands.claim("chrome-browser", ["ralph"], 1000);
+  const configuredPreparation = await supportCommands.claim("chrome-browser", ["threadPreparation"], 1000);
   assert.equal(configuredPreparation.conversationUrl, urlD);
   supportCommands.complete({
     commandId: configuredPreparation.id,
@@ -661,6 +857,7 @@ try {
     ok: true,
     result: { status: "prepared", conversationUrl: urlD },
   });
+  await configuredSubagentCall;
 
   const listSubagents = await client.callTool({
     name: "list_subagents",
@@ -679,13 +876,18 @@ try {
   assert.equal(projectMessage.isError, true, "send_thread_message cannot create a thread");
 
 
+  const launchesBeforeReadyExecutor = automationLaunches;
+  const waitingMessageCommand = supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
+  await new Promise(resolve => setImmediate(resolve));
   const messageCall = client.callTool({
     name: "send_thread_message",
-    arguments: { targetUrl: urlB, message: "Sub-agent result is ready." },
+    arguments: { targetUrl: urlB, message: "Explicit thread message." },
   });
-  const messageCommand = await supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
+  const messageCommand = await waitingMessageCommand;
+  assert.equal(automationLaunches, launchesBeforeReadyExecutor,
+    "an already-waiting messaging executor prevents an unnecessary Chrome launch");
   assert.equal(messageCommand.targetUrl, urlB);
-  assert.equal(messageCommand.message, "Sub-agent result is ready.");
+  assert.equal(messageCommand.message, "Explicit thread message.");
   supportCommands.complete({
     commandId: messageCommand.id,
     browserId: "chrome-browser",
@@ -704,7 +906,7 @@ try {
       if (name === "send_thread_message") firstReplayHandler = handler;
     },
   };
-  registerChatGptAgents(firstReplayServer, supportCommands, registry, ralphRegistry, "mcp-grant", sync.subagentWidgetHtml);
+  registerChatGptAgents(firstReplayServer, supportCommands, registry, ralphRegistry, subagentJobs, threadPreparer, launchSupportBrowser, "mcp-grant", sync.subagentWidgetHtml);
   assert.equal(typeof firstReplayHandler, "function");
   const retryArguments = { targetUrl: urlB, message: "Transport retry probe." };
   const retryExtra = { requestId: "same-mcp-request", _meta: { "openai/session": "mcp-A" } };
@@ -728,7 +930,7 @@ try {
       if (name === "send_thread_message") secondReplayHandler = handler;
     },
   };
-  registerChatGptAgents(secondReplayServer, supportCommands, registry, ralphRegistry, "mcp-grant", sync.subagentWidgetHtml);
+  registerChatGptAgents(secondReplayServer, supportCommands, registry, ralphRegistry, subagentJobs, threadPreparer, launchSupportBrowser, "mcp-grant", sync.subagentWidgetHtml);
   const replayedRetryResult = await secondReplayHandler(retryArguments, retryExtra);
   assert.equal(replayedRetryResult.structuredContent.conversationUrl, urlB);
   assert.equal(await supportCommands.claim("chrome-browser", ["threadMessaging"], 0), undefined,
@@ -740,7 +942,7 @@ try {
       if (name === "start_subagent") firstSubagentReplayHandler = handler;
     },
   };
-  registerChatGptAgents(firstSubagentReplayServer, supportCommands, registry, ralphRegistry, "mcp-grant", sync.subagentWidgetHtml);
+  registerChatGptAgents(firstSubagentReplayServer, supportCommands, registry, ralphRegistry, subagentJobs, threadPreparer, launchSupportBrowser, "mcp-grant", sync.subagentWidgetHtml);
   let secondSubagentReplayHandler;
   const secondSubagentReplayServer = {
     registerResource() {},
@@ -748,7 +950,7 @@ try {
       if (name === "start_subagent") secondSubagentReplayHandler = handler;
     },
   };
-  registerChatGptAgents(secondSubagentReplayServer, supportCommands, registry, ralphRegistry, "mcp-grant", sync.subagentWidgetHtml);
+  registerChatGptAgents(secondSubagentReplayServer, supportCommands, registry, ralphRegistry, subagentJobs, threadPreparer, launchSupportBrowser, "mcp-grant", sync.subagentWidgetHtml);
   assert.equal(typeof firstSubagentReplayHandler, "function");
   assert.equal(typeof secondSubagentReplayHandler, "function");
   const subagentRetryArguments = { message: "Start exactly one child for this transport request." };
@@ -767,14 +969,7 @@ try {
     ok: true,
     result: { status: "sent", conversationUrl: urlE, title: "Replay-safe child" },
   });
-  const [firstSubagentRetryResult, secondSubagentRetryResult] = await Promise.all([
-    firstSubagentRetryCall,
-    secondSubagentRetryCall,
-  ]);
-  assert.equal(firstSubagentRetryResult.structuredContent.subagents.at(-1).conversationUrl, urlE);
-  assert.deepEqual(secondSubagentRetryResult, firstSubagentRetryResult,
-    "the retried MCP request reuses the original start_subagent result");
-  const replayPreparation = await supportCommands.claim("chrome-browser", ["ralph"], 1000);
+  const replayPreparation = await supportCommands.claim("chrome-browser", ["threadPreparation"], 1000);
   assert.equal(replayPreparation.conversationUrl, urlE);
   supportCommands.complete({
     commandId: replayPreparation.id,
@@ -783,6 +978,54 @@ try {
     ok: true,
     result: { status: "prepared", conversationUrl: urlE },
   });
+  const [firstSubagentRetryResult, secondSubagentRetryResult] = await Promise.all([
+    firstSubagentRetryCall,
+    secondSubagentRetryCall,
+  ]);
+  assert.equal(firstSubagentRetryResult.structuredContent.subagents.at(-1).conversationUrl, urlE);
+  assert.deepEqual(secondSubagentRetryResult, firstSubagentRetryResult,
+    "the retried MCP request reuses the original start_subagent result");
+
+  let preparationFailureHandler;
+  const preparationFailureServer = {
+    registerResource() {},
+    registerTool(name, _definition, handler) {
+      if (name === "start_subagent") preparationFailureHandler = handler;
+    },
+  };
+  const preparationFailureChild = `https://chatgpt.com/g/${projectId}/c/f1111111-1111-4111-8111-111111111111`;
+  registerChatGptAgents(
+    preparationFailureServer,
+    supportCommands,
+    registry,
+    ralphRegistry,
+    subagentJobs,
+    { ensurePrepared: async () => { throw new Error("synthetic preparation failure"); } },
+    launchSupportBrowser,
+    "mcp-grant",
+    sync.subagentWidgetHtml,
+  );
+  const preparationFailureCall = preparationFailureHandler(
+    { message: "Verify preparation failure reporting." },
+    { requestId: "preparation-failure-request", _meta: { "openai/session": "mcp-A" } },
+  );
+  const preparationFailureSend = await supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
+  supportCommands.complete({
+    commandId: preparationFailureSend.id,
+    browserId: "chrome-browser",
+    kind: "send_message",
+    ok: true,
+    result: { status: "sent", conversationUrl: preparationFailureChild, title: "Preparation failure child" },
+  });
+  const preparationFailureResult = await preparationFailureCall;
+  assert.notEqual(preparationFailureResult.isError, true,
+    "a created child is not retried into a duplicate merely because automatic preparation failed");
+  assert.match(preparationFailureResult.content[0].text, /Automatic thread preparation failed: synthetic preparation failure/,
+    "start_subagent surfaces automatic preparation failure to the parent");
+  const failedPreparationView = preparationFailureResult.structuredContent.subagents
+    .find(agent => agent.conversationUrl === preparationFailureChild);
+  assert.match(failedPreparationView.preparationError, /synthetic preparation failure/,
+    "the child job persists its preparation failure for later inspection");
 
   const abandonedController = new AbortController();
   const abandonedClaim = supportCommands.claim("chrome-browser", ["ralph"], 1000, abandonedController.signal);
@@ -1274,6 +1517,8 @@ try {
     "only the Sub-agent list is scrollable");
   assert.match(subagentHtml, /No sub-agents yet/,
     "the Sub-agent app renders a designed empty state");
+  assert.match(subagentHtml, /agent\.resultState/, "the Sub-agent app renders local result state");
+  assert.match(subagentHtml, /agent\.resultPath/, "the Sub-agent app exposes the local result path");
   await testContentScript(a.ticket.token, b.ticket.token);
   await testWorkerKeepsLongAutomationAlive(sync);
   await testWorkerNeverRedispatchesAfterLostResponse(sync);
@@ -1301,7 +1546,7 @@ try {
   await writeFile(storePath, "not valid json");
   await assert.rejects(ThreadSyncRegistry.open(temporaryRoot), SyntaxError, "corrupt state must not be silently reset");
 
-  console.log("Thread sync passed: required sync/get sequencing, handshake waiting, long automation keepalive, blank-project composer discovery, React-tracked textarea input, browser-neutral WebExtension APIs, DOM-independent MCP UI routing, persistence, auth, real Fetch port checks, and CSP.");
+  console.log("Thread sync passed: one-time binding, backend thread preparation, local sub-agent results, browser launch gating, long automation keepalive, single-shot sends, RALPH behavior, persistence, auth, and MCP App routing.");
   console.log("All tests were isolated. No network listener or browser was started.");
 } finally {
   await client?.close();
