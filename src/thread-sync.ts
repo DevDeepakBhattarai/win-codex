@@ -9,7 +9,7 @@ import { parseConversationUrl } from "./chatgpt-support.js";
 export { parseConversationUrl } from "./chatgpt-support.js";
 
 export const THREAD_SYNC_WIDGET_URI = "ui://local-codex/thread-sync-v2.html";
-export const THREAD_SYNC_AGENT_INSTRUCTION = "At the start of every ChatGPT conversation, call sync_current_thread once before other work. If it reports that the conversation is already synced, keep and reuse that binding; do not try to sync it again. If it reports syncing, call get_current_thread_url after the Thread Sync handshake. get_current_thread_url is the only fallback source of the current conversation URL. Never infer or construct the URL with another tool.";
+export const THREAD_SYNC_AGENT_INSTRUCTION = "Your first MCP action in every ChatGPT conversation must be sync_current_thread. Call it before any other MCP tool or delegated work. If it reports that the conversation is already synced, keep and reuse that binding; do not sync again. If it reports syncing, immediately call get_current_thread_url to finish the one-time handshake before continuing. get_current_thread_url is the only fallback source of the current conversation URL. Never infer or construct the URL with another tool.";
 const TICKET_TTL_MS = 30 * 60 * 1000;
 const MAX_RECORDS = 2_000;
 const BROWSER_BLOCKED_PORTS = new Set([
@@ -288,7 +288,7 @@ export function registerThreadSync(
   }));
   server.registerTool("sync_current_thread", {
     title: "Sync Current Thread",
-    description: "Call this once at the start of every ChatGPT conversation. If this session is already bound, it returns the saved conversation URL immediately and performs no new handshake. Otherwise it renders the Thread Sync UI and starts the one-time extension handshake; then call get_current_thread_url.",
+    description: "This must be the first MCP tool call in every ChatGPT conversation. If this session is already bound, it returns the saved conversation URL immediately and performs no new handshake. Otherwise it renders the Thread Sync UI and starts the one-time extension handshake; immediately follow with get_current_thread_url before other MCP work.",
     inputSchema: {},
     outputSchema: {
       status: z.enum(["syncing", "synced"]),

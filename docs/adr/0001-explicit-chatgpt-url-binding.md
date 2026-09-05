@@ -41,11 +41,11 @@ Delegation uses five MCP tools:
 - `submit_subagent_result` stores the child report in the job's local `.md` file.
 - `send_thread_message` sends an explicit message to an existing `/c/...` conversation only. It is not the sub-agent return channel.
 - `list_subagents` returns the children created by the current parent and includes their result path and result state.
-- `cancel_subagent` releases a parent's abandoned job after any running child has been stopped in the browser. It disables future RALPH continuation and rejects late results.
+- `cancel_subagent` cancels a parent's abandoned job. For a known child URL, the backend opens the child thread through the support extension, stops an active ChatGPT run, confirms the stop, and only then releases the slot. It disables future RALPH continuation and rejects late results.
 
-The child receives its job ID and result path. It does not receive the parent URL. The child syncs its own thread once, performs the bounded task, and finishes with `submit_subagent_result`. Nested delegation is rejected by the backend. The registry reserves at most two pending jobs across all parents inside its serialized update, before browser delivery. Reservations survive restart and are released by completion or explicit cancellation. Unconfirmed startup keeps its reservation because delivery may have occurred. On restart, the registry marks a reservation without a known child as interrupted so that the parent can inspect the browser and cancel it.
+The child receives its job ID and result path. It does not receive the parent URL. The child syncs its own thread once, performs the bounded task, and finishes with `submit_subagent_result`. Nested delegation is rejected by the backend. The registry reserves at most two pending jobs per parent inside its serialized update, before browser delivery. Different roots have independent limits. Reservations survive restart and are released by completion or confirmed cancellation. Unconfirmed startup keeps its reservation because delivery may have occurred. On restart, the registry marks a reservation without a known child as interrupted so that the parent can inspect the browser and cancel it.
 
-The review policy defaults to one independent reviewer. Follow-up reviews focus on behavior changed by fixes. Capacity refusals direct the parent to wait for results or continue independent work, with no automatic queue or polling loop.
+The review policy defaults to one independent reviewer. A reviewer reports findings and evidence without choosing implementation or follow-up work; the root owns those decisions. A second reviewer is only for a distinct concern. Capacity refusals direct that parent to wait for results or continue independent work, with no start retry or status polling loop.
 
 Before `start_subagent` reports normal startup success, the backend confirms that the child has a prepared Thread Sync tab. A preparation failure after child creation is stored on the job and returned to the parent without retrying child creation. The backend then watches completed jobs that have not notified their parent. It groups ready jobs for the same parent during a one-second window and sends one notice with their paths. Wake-up failures back off exponentially and become terminal after five attempts, with each error retained on its job. The parent reads the files for the reports. This keeps browser messaging out of the result transport while preserving automatic parent continuation.
 
@@ -81,9 +81,11 @@ RALPH stores two independent fields:
 - `state` is `active` or `complete`.
 - `mode` is `normal` or `continuous`.
 
-Normal mode uses the worked-duration gate and completion classifier. Continuous mode is explicit per thread, skips completion classification, and sends a fixed continuation instruction when the thread is idle and due. Continuous mode never starts automatically.
+Normal mode repeatedly inspects active threads. The default check interval is 180 seconds (3 minutes), and configured intervals below 120 seconds are rejected. Registration, running/loading observations, and continuations use the same interval. Loading and running only reschedule inspection. For a settled idle normal turn, an unavailable worked duration or a duration at or below 1200 seconds marks the thread complete locally; only a duration strictly above 20 minutes reaches the completion classifier. Continuous mode is explicit per thread, uses the same inspection loop, skips completion classification, and sends a fixed continuation instruction when the thread is settled, idle, and due. Continuous mode never starts automatically.
 
-Both modes defer parents while children are pending or results await notification. Finished and cancelled child jobs suppress further continuation. Ready files for a parent share a one-second collection window and one wake-up. Visible recognized ChatGPT rate-limit notices trigger a shared 15-minute message cooldown in the command bus. Queued sends are rejected and schedulers defer. Already claimed sends cannot be recalled, and cooldown state is not persisted across service restarts.
+Continuous mode is operator-controlled. The agent has no MCP action that disables it. Ending a turn does not change the mode. The popup can switch the thread back to normal mode with **Stop continuous** or stop RALPH checks with **Mark complete**.
+
+Both modes defer parents while children are pending or results await notification. Finished and cancelled child jobs suppress further continuation. Ready files for a parent share a one-second collection window and one wake-up. Visible recognized ChatGPT rate-limit notices trigger a shared 15-minute message cooldown. The failed rate-limited send and other queued sends remain queued. A sub-agent start requested during cooldown also waits in that queue after reserving its parent slot. After cooldown the deferred backlog is claimed at least five seconds apart, and pacing turns off when the backlog is empty. Stop-thread commands bypass message cooldown. Cooldown state is not persisted across service restarts.
 
 ### Claim automation commands atomically
 
@@ -91,7 +93,7 @@ The authenticated loopback command bus assigns each queued support command to on
 
 ## Consequences
 
-The parent calls `sync_current_thread` once at the start of the conversation. If the initial binding is still pending, it follows with `get_current_thread_url`. After that, `start_subagent` can resolve the parent without refreshing the binding.
+The parent uses `sync_current_thread` as its first MCP action. If the initial binding is still pending, it immediately follows with `get_current_thread_url` before other MCP work. After that, `start_subagent` can resolve the parent without refreshing the binding.
 
 Sub-agents return reports through local files. The browser is used only to create child conversations and to wake parents after a result becomes available. Transport retries remain an implementation concern rather than part of the model-facing tool API.
 

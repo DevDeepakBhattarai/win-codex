@@ -29,7 +29,7 @@ Keep `.data` private. It contains the support-extension credential, thread bindi
 
 Thread Sync is a one-time binding for each ChatGPT conversation session.
 
-1. The agent calls `sync_current_thread` at the start of the conversation.
+1. The agent calls `sync_current_thread` as its first MCP action in the conversation.
 2. If the tool reports `syncing`, the Thread Sync MCP App performs the browser handshake and the agent follows with `get_current_thread_url`.
 3. If the tool reports `synced`, it returns the saved URL immediately. No second handshake starts.
 
@@ -43,11 +43,11 @@ The Chrome profile with **Thread preparation executor** enabled opens the conver
 
 The server resolves the parent from `openai/session`, chooses the configured **Sub-agent project**, or falls back to `https://chatgpt.com/`. It creates a local job under `<DATA_DIR>/subagents/` and gives the child the job ID and result path. The child prompt does not contain the parent URL.
 
-A child syncs its conversation once, performs its bounded task without delegation, and finishes with `submit_subagent_result`. That tool stores the report in the assigned local `.md` file and releases the job's slot. Reviewers remain read-only. Default to one reviewer, with a second only for a distinct concern.
+A child syncs its conversation before other MCP work, performs its bounded task without delegation, and finishes with `submit_subagent_result`. That tool stores the report in the assigned local `.md` file and releases the job's slot. Reviewers remain read-only and report findings as evidence for the root to judge. Default to one reviewer, with a second only for a distinct concern.
 
-The backend reserves at most two pending children across all parents, including startups, and rejects nested delegation. Capacity refusals name the active jobs. Wait for result notices or continue independent work instead of polling or retrying. Reservations survive restart. Unconfirmed startup keeps its slot until the parent inspects the browser and resolves the job. To abandon a job, stop any running child in the browser, then call `cancel_subagent`. Cancellation releases the slot and disables future RALPH continuation, but does not interrupt a running browser turn.
+The backend reserves at most two pending children per parent, including startups, and rejects nested delegation. Different root parents have independent limits. Capacity refusals name that parent's active jobs. Wait for result notices or continue independent work instead of polling or retrying. Reservations survive restart. Unconfirmed startup keeps its slot until the parent resolves the job. For a known child URL, `cancel_subagent` opens the thread, stops an active ChatGPT run, confirms the stop, closes the automation tab, and then releases the slot. If stopping fails, the job stays pending.
 
-Ready results for the same parent are collected for one second and delivered in one notice. RALPH defers parents with pending children or results awaiting notification, and skips further continuation for finished or cancelled children. Recognized visible English ChatGPT rate-limit alerts, dialogs, or toasts trigger a 15-minute cooldown shared by browser message commands in the running backend. Restart clears that cooldown. The delay does not represent the account's actual quota.
+Ready results for the same parent are collected for one second and delivered in one notice. RALPH defers parents with pending children or results awaiting notification, and skips further continuation for finished or cancelled children. Recognized visible English ChatGPT rate-limit alerts, dialogs, or toasts trigger a 15-minute cooldown shared by browser message commands. Rate-limited and already queued sends remain queued. A sub-agent start requested during cooldown reserves its parent slot and waits in the same message queue. After cooldown the deferred backlog drains at least five seconds apart; normal sends are no longer paced once that backlog is empty. Stop-thread cancellation remains available during cooldown. Restart clears the cooldown. The delay does not represent the account's actual quota.
 
 The backend watches unfinished jobs. `start_subagent` waits until the child has a prepared Thread Sync tab before returning normal startup success. If preparation fails after the child already exists, the job records the error and the tool surfaces it without creating another child. After a service restart, the registry marks a startup without a known child as interrupted so that the parent can resolve it. When result files contain data, the backend groups ready jobs by parent and sends one notice with their paths. The reports never travel through browser messaging. Failed parent wake-ups use exponential backoff and stop after five attempts; the terminal errors remain visible in `list_subagents`. The parent reads every listed file before continuing.
 
@@ -89,14 +89,14 @@ The **RALPH threads** tab has Active and Completed views. An active row can be c
 
 ### Normal mode
 
-Normal RALPH uses a worked-duration gate and, when required, an OpenAI completion classifier.
+Normal RALPH uses a repeated inspection loop and an OpenAI completion classifier.
 
-- The first check defaults to 1500 seconds after registration or reactivation.
-- A still-running thread is checked again after 300 seconds.
-- The default **RALPH minimum worked time** is 1140 seconds.
-- When an idle thread reports more than the configured minimum, the server sends the compact transcript to the classifier.
-- `COMPLETE` marks the thread complete. Any other valid classifier result becomes the short continuation instruction.
-- A short or unavailable worked duration completes a normal thread without a classifier call.
+- The default **RALPH check interval** is 180 seconds (3 minutes), and the UI/server reject intervals below 120 seconds.
+- Registration, reactivation, running turns, loading pages, and successful continuations all schedule the next inspection with that same interval.
+- `loading` and `running` inspection results never call the classifier; they only schedule another check.
+- The default **RALPH classifier worked-time threshold** is 1200 seconds (20 minutes). A settled idle turn at or below the threshold, or with no usable worked duration, is marked complete without a classifier call.
+- Only a settled idle turn strictly above the threshold reaches the classifier. `COMPLETE` marks it complete; any other valid classifier result becomes the short continuation instruction.
+- Actual inspection or classifier failures use a separate failure backoff instead of the rapid normal loop.
 
 Normal classification requires `OPENAI_API_KEY`. The model defaults to `gpt-5.6-terra` and can be changed with `RALPH_MODEL`.
 
@@ -104,9 +104,9 @@ Classification requests and results are written to `<DATA_DIR>/ralph-openai.log`
 
 ### Continuous mode
 
-Continuous mode must be selected explicitly per thread. When an idle continuous thread is due, RALPH skips the worked-duration completion gate and the OpenAI completion classifier. It sends a fixed continuation instruction that tells the agent to reread the current state and execute the next useful improvement, experiment, verification, or cleanup toward the existing goal.
+Continuous mode must be selected explicitly per thread. It uses the same repeated inspection interval. When a settled idle continuous thread is due, RALPH skips the OpenAI completion classifier and sends a fixed continuation instruction that tells the agent to reread the current state and execute the next useful improvement, experiment, verification, or cleanup toward the existing goal.
 
-**Stop continuous** restores normal completion checks. Marking the thread complete stops its scheduled checks.
+**Stop continuous** restores normal completion checks. Marking the thread complete stops its scheduled checks. The running agent has no tool that disables continuous mode itself. Ending its turn leaves continuous mode enabled, so RALPH can wake it again when the thread is idle and due.
 
 ## Initial thread preparation
 
@@ -124,4 +124,4 @@ Run:
 pnpm thread-sync-test
 ```
 
-The test covers one-time thread binding, backend preparation deduplication, generated-extension configuration, local sub-agent result files, parent wake-ups, request-level send deduplication, parent-child registration, title extraction, single-shot browser sends, fixed settle timing, parked-tab release, continuous RALPH behavior, project-scoped registration, duration gating, command claiming, and MCP App routing. It does not start a real browser or network listener.
+The test covers one-time thread binding, backend preparation deduplication, generated-extension configuration, local sub-agent result files, parent wake-ups, request-level send deduplication, parent-child registration, title extraction, single-shot browser sends, fixed settle timing, parked-tab release, continuous RALPH behavior, project-scoped registration, settled-idle classification gating, recurring check timing, command claiming, and MCP App routing. It does not start a real browser or network listener.

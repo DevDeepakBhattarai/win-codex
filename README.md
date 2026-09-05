@@ -55,15 +55,15 @@ When `THREAD_SYNC_ENABLED` is not `false`, the server also exposes:
 - `get_current_thread_url` waits for the initial binding when `sync_current_thread` reports `syncing`. It never guesses or constructs a conversation URL.
 - `start_subagent` starts a separate ChatGPT child conversation and creates a local result job. The parent must already be synced. Transport retries of the same MCP request are deduplicated internally.
 - `submit_subagent_result` stores the child report in the local result file for that job. It does not send the report through ChatGPT.
-- `cancel_subagent` releases an abandoned job owned by the current parent and disables future RALPH continuation. Stop any running child in the browser first.
+- `cancel_subagent` cancels an abandoned job owned by the current parent. When the child URL is known, the service opens that thread, clicks ChatGPT Stop if it is running, confirms it stopped, closes the automation tab, and then releases the slot.
 - `send_thread_message` sends one explicit user-requested message to an existing ChatGPT conversation. Its public inputs are only `targetUrl` and `message`; transport retries of the same MCP request are deduplicated internally.
 - `list_subagents` shows the children created by the current synced parent, including their title, RALPH state, and local result status.
 
 `start_subagent` uses the Sub-agent project configured in the Local Codex Support extension settings. If no project is configured, it starts from `https://chatgpt.com/`. The server gives the child a local job ID and result path. The child finishes with `submit_subagent_result`. The backend groups results that become ready together and sends the parent one notice with their paths. The parent reads every listed file.
 
-The service allows two pending sub-agents total across all parents, including startups. Only root conversations can delegate. Use one reviewer by default and a second only for a distinct concern. A capacity refusal includes the occupied job IDs. Continue independent work or wait for a result notice instead of retrying starts or polling status.
+Each root parent may have at most two pending sub-agents, including startups. Different parents have independent two-child limits. Nested delegation remains blocked. Use one reviewer by default and a second only for a distinct concern. Reviewers report findings and evidence; the root decides what to change. A capacity refusal includes that parent's occupied job IDs. Continue independent work or wait for a result notice instead of retrying starts or polling status.
 
-Slot reservations survive service restarts. Result submission releases a slot. An unconfirmed startup retains its slot because the browser may already have sent the prompt. After a restart, the registry marks an unresolved startup as interrupted so that it can be cancelled. Inspect the browser, stop any running child, then use `cancel_subagent` for an abandoned job. Cancellation cannot interrupt an existing browser turn and rejects late result submissions. Jobs do not expire automatically.
+Slot reservations survive service restarts. Result submission releases a slot. An unconfirmed startup retains its slot because the browser may already have sent the prompt. After a restart, the registry marks an unresolved startup as interrupted so that it can be cancelled. For a known child URL, `cancel_subagent` performs the browser stop before releasing the slot. If the stop cannot be confirmed, the job stays pending. Jobs without a known child URL can still be cancelled after startup is known to have failed or been interrupted. Late result submissions are rejected. Jobs do not expire automatically.
 
 ## OAuth and MCP flow
 
@@ -208,7 +208,7 @@ See [support-extension/README.md](support-extension/README.md) for the exact sup
 
 ## Sub-agent result delivery
 
-Call `sync_current_thread` once at the start of the parent conversation. If it reports `syncing`, finish the initial handshake with `get_current_thread_url`. Later `sync_current_thread` calls return the stored URL and do not start another handshake.
+Make `sync_current_thread` the first MCP action in the parent conversation. If it reports `syncing`, immediately finish the initial handshake with `get_current_thread_url` before other MCP work. Later `sync_current_thread` calls return the stored URL and do not start another handshake.
 
 `start_subagent` creates a job under `<DATA_DIR>/subagents/`. The child receives the job ID and result path, not the parent URL. Before reporting startup success, the backend confirms that the child's parked Thread Sync tab was prepared. If automatic preparation fails after the child was already created, the tool returns the child and result path with the preparation error instead of retrying into a duplicate child. When the child finishes, `submit_subagent_result` writes the report to the assigned `.md` file. The backend sends the parent only a result-ready message with that path. Parent wake-up failures use exponential backoff and stop after five failed attempts, with the error retained in the sub-agent status. The parent reads the file as the authoritative result.
 
@@ -216,7 +216,7 @@ The browser path is still used to create the child and to wake the parent. It us
 
 Result notifications use a one-second collection window and combine ready files for the same parent into one message. RALPH defers inspection and continuation while that parent has pending children or completed results awaiting notification. Finished and cancelled children receive no further RALPH continuation through their job. Notification failures remain bounded to five attempts; when delivery is abandoned, the parent can inspect `list_subagents` and read the result files.
 
-Recognized visible ChatGPT rate-limit notices pause all new browser message commands for 15 minutes in the running service. Queued sends are rejected, and RALPH and result notifications defer while the cooldown is active. Already claimed browser commands cannot be recalled. The cooldown is a conservative retry delay, not a claim about the account's quota, and resets when the service restarts. Detection currently covers English rate-limit notices in visible alerts, dialogs, and toasts. The exact notice and command errors help distinguish this from other failures.
+Recognized visible ChatGPT rate-limit notices start a 15-minute message cooldown in the running service. The rate-limited send and other queued sends stay queued instead of being discarded. A `start_subagent` call made during cooldown also reserves its parent slot and waits for its child-start message to drain instead of failing only because of the cooldown. After cooldown, the deferred message backlog is claimed at least five seconds apart, then normal unpaced sending resumes. Stop-thread commands are not blocked by the message cooldown. The cooldown is a conservative retry delay, not a claim about the account's quota, and resets when the service restarts. Detection currently covers English rate-limit notices in visible alerts, dialogs, and toasts.
 
 `start_subagent` and `send_thread_message` keep transport idempotency internal. The server deduplicates retries of the same MCP request by tool, request identity, session, and payload fingerprint. `send_thread_message` also fingerprints its normalized target. A new logical tool call remains a new send or a new child.
 
@@ -230,8 +230,10 @@ Thread preparation is independent from RALPH registration. Every observed unsync
 
 RALPH has two modes:
 
-- `normal` uses the worked-duration gate and the OpenAI completion classifier. The first check defaults to 1500 seconds after registration or reactivation, and later checks use a 300-second interval. The default minimum reported work duration is 1140 seconds.
-- `continuous` is explicit. It skips completion classification and sends a fixed continuation instruction whenever the thread is idle and due. It stays active until the user stops continuous mode or marks the thread complete.
+- `normal` checks active threads repeatedly. The default interval is 180 seconds (3 minutes), with a minimum configurable interval of 120 seconds. Registration, running/loading observations, and continuations all use that interval. `loading` and `running` never call the classifier. Once a turn is settled and idle, a worked duration at or below 1200 seconds (20 minutes), or an unavailable duration, marks the thread complete locally. Only a worked duration strictly above 20 minutes reaches the OpenAI completion classifier.
+- `continuous` is explicit. It uses the same repeated inspection loop but skips completion classification and sends a fixed continuation instruction whenever the thread is settled, idle, and due. It stays active until the user stops continuous mode or marks the thread complete.
+
+Continuous mode does not give the agent a self-stop tool. Ending a ChatGPT turn only makes the thread idle; it does not disable continuous mode. Use **Stop continuous** in the support-extension popup to return that thread to normal RALPH behavior, or **Mark complete** to stop scheduled RALPH checks for the thread.
 
 Normal-mode classification uses `OPENAI_API_KEY` and defaults to `gpt-5.6-terra`. Classification requests and results are written to `.data/ralph-openai.log`; the API key is not written to that log.
 

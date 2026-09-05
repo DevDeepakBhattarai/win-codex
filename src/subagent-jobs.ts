@@ -6,14 +6,14 @@ import { z } from "zod";
 
 const MAX_JOBS = 2_000;
 const RETAINED_NOTIFIED_JOBS = 1_000;
-export const MAX_ACTIVE_SUBAGENTS = 2;
+export const MAX_ACTIVE_SUBAGENTS_PER_PARENT = 2;
 const INTERRUPTED_STARTUP_ERROR = "Child startup was interrupted by a service restart. Inspect the browser, stop any running child, then cancel this job if it is abandoned.";
 
 export class SubagentAdmissionError extends Error {
   constructor(readonly reason: "capacity" | "nested", readonly activeJobIds: string[] = []) {
     super(reason === "nested"
       ? "Only root conversations can start sub-agents. Complete your assigned work and submit its result."
-      : `The service already has two active sub-agents. Active jobs: ${activeJobIds.join(", ")}. Continue independent work or wait for a result notification. Do not retry or poll for capacity.`);
+      : `This parent already has two active sub-agents. Active jobs: ${activeJobIds.join(", ")}. Continue independent work or wait for a result notification. Do not retry or poll for capacity.`);
   }
 }
 
@@ -89,8 +89,8 @@ export class SubagentJobRegistry {
       if (state.jobs.some((job) => job.childThreadId === parent.threadId)) {
         throw new SubagentAdmissionError("nested");
       }
-      const active = state.jobs.filter((job) => job.state === "pending");
-      if (active.length >= MAX_ACTIVE_SUBAGENTS) {
+      const active = state.jobs.filter((job) => job.state === "pending" && job.parentThreadId === parent.threadId);
+      if (active.length >= MAX_ACTIVE_SUBAGENTS_PER_PARENT) {
         throw new SubagentAdmissionError("capacity", active.map((job) => job.jobId));
       }
       if (state.jobs.length >= MAX_JOBS) throw new Error("Sub-agent job limit reached.");

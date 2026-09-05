@@ -10,12 +10,12 @@ import { SubagentAdmissionError, SubagentJobRegistry } from "./subagent-jobs.js"
 
 const MAX_RALPH_THREADS = 2_000;
 const MAX_RALPH_PROJECTS = 100;
-const DEFAULT_RALPH_INITIAL_DELAY_MS = 25 * 60 * 1000;
-const RALPH_RECHECK_INTERVAL_MS = 5 * 60 * 1000;
-const MIN_RALPH_INTERVAL_SECONDS = 1;
+const LEGACY_RALPH_DEFAULT_INTERVAL_MS = 25 * 60 * 1000;
+const INTERIM_RALPH_DEFAULT_INTERVAL_MS = 10 * 1000;
+const DEFAULT_RALPH_CHECK_INTERVAL_MS = 3 * 60 * 1000;
+const MIN_RALPH_INTERVAL_SECONDS = 2 * 60;
 const MAX_RALPH_INTERVAL_SECONDS = 24 * 60 * 60;
 const RALPH_SCHEDULER_TICK_MS = 1_000;
-const LOADING_RETRY_MS = 60 * 1000;
 const FAILURE_RETRY_MS = 2 * 60 * 1000;
 const COMMAND_TIMEOUT_MS = 20 * 60 * 1000;
 const INSPECT_CLAIM_LEASE_MS = 5 * 60 * 1000;
@@ -32,6 +32,7 @@ const MAX_CONTINUATION_CHARS = 500;
 const TOOL_REQUEST_REPLAY_TTL_MS = 30 * 60 * 1000;
 const MAX_TOOL_REQUEST_REPLAYS = 1_000;
 const MESSAGE_COOLDOWN_MS = 15 * 60_000;
+const MESSAGE_SEND_SPACING_MS = 5_000;
 
 type ToolRequestReplay = {
   expiresAt: number;
@@ -62,15 +63,15 @@ function replayToolRequest(replayKey: string, createResult: () => Promise<CallTo
 
 export const SUBAGENT_WIDGET_URI = "ui://local-codex/subagents-v1.html";
 export const SUBAGENT_AGENT_INSTRUCTION = [
-  "Keep implementation in the root conversation. Use one independent reviewer by default; add a second only for a distinct concern. After fixes, review the affected behavior instead of launching another group.",
-  "Only synced root conversations can call start_subagent. The service permits two pending children total, including startups across all parents. Nested delegation is disabled.",
-  "If capacity is full, continue independent work or end the turn while waiting for results. Do not retry starts or poll list_subagents for capacity. Use list_subagents only when a status snapshot changes your next decision.",
+  "Keep implementation and decisions in the root conversation. Use one independent reviewer by default; add a second only for a distinct concern. A reviewer reports findings and evidence only. The root decides what is valid and what to change.",
+  "Only synced root conversations can call start_subagent. Each root parent may have at most two pending children, including startups. Nested delegation is disabled.",
+  "If this parent's capacity is full, continue independent work or end the turn while waiting for results. Do not retry starts or poll list_subagents for capacity. Use list_subagents only when a status snapshot changes your next action.",
   "Read all local resultPath files named in a result-ready notice before continuing. Notifications may combine several results. Reports stay in local files.",
-  "For an abandoned job, stop any running child in the browser before calling cancel_subagent. Cancellation releases its slot and disables future RALPH continuation; it cannot interrupt a running browser turn.",
-  "A child completes its bounded assignment without delegation and calls submit_subagent_result exactly once. Reviewers remain read-only. If a submit response is lost, inspect job status before resubmitting.",
-  "Use send_thread_message only when the user explicitly asks to post into an existing conversation. Respect message cooldowns. After uncertain delivery, inspect the target before deciding whether to send again.",
+  "Use cancel_subagent for an abandoned child. Cancellation opens the known child thread, stops an active ChatGPT run, and only then releases the slot. If the stop cannot be confirmed, cancellation fails and keeps the job pending.",
+  "A child completes its bounded assignment without delegation and calls submit_subagent_result exactly once. Reviewers remain read-only and do not choose implementation or follow-up work. If a submit response is lost, inspect job status before resubmitting.",
+  "Use send_thread_message only when the user explicitly asks to post into an existing conversation. Rate-limited message commands remain queued and resume in a paced sequence after cooldown. After uncertain delivery for another error, inspect the target before deciding whether to send again.",
 ].join(" ");
-const CONTINUOUS_RALPH_INSTRUCTION = "Continue the authorized continuous run toward the existing user goal. Read the conversation and current state, choose useful unfinished work, and verify the result. Use completed child reports before requesting further review. If progress depends on a pending child, user input, or a message cooldown, state the blocker and end this turn. Otherwise continue within the agreed scope.";
+const CONTINUOUS_RALPH_INSTRUCTION = "Continue the user-authorized continuous run toward the existing goal. You own all decisions about what to do next. Read the conversation and current state, use completed child reports as evidence, choose useful unfinished work, and verify the result. If progress depends on a pending child, user input, or a message cooldown, state the blocker and end this turn. Do not poll. Continuous RALPH will wake the thread again while the user keeps continuous mode enabled.";
 
 export const supportFeatureSchema = z.enum(["ralph", "threadMessaging", "threadPreparation"]);
 export type SupportFeature = z.infer<typeof supportFeatureSchema>;
@@ -104,6 +105,11 @@ const sendMessageResultSchema = z.object({
 });
 export type SendMessageResult = z.infer<typeof sendMessageResultSchema>;
 
+const stopThreadResultSchema = z.object({
+  status: z.enum(["stopped", "idle"]),
+  conversationUrl: z.string().url(),
+});
+
 const supportCommandSchema = z.union([
   z.object({
     id: z.string(),
@@ -131,12 +137,19 @@ const supportCommandSchema = z.union([
     targetUrl: z.string().url(),
     message: z.string(),
   }),
+  z.object({
+    id: z.string(),
+    feature: z.literal("threadMessaging"),
+    kind: z.literal("stop_thread"),
+    targetUrl: z.string().url(),
+  }),
 ]);
 export type SupportCommand = z.infer<typeof supportCommandSchema>;
 type SupportCommandInput =
   | Omit<Extract<SupportCommand, { kind: "inspect_thread" }>, "id">
   | Omit<Extract<SupportCommand, { kind: "prepare_thread" }>, "id">
-  | Omit<Extract<SupportCommand, { kind: "send_message" }>, "id">;
+  | Omit<Extract<SupportCommand, { kind: "send_message" }>, "id">
+  | Omit<Extract<SupportCommand, { kind: "stop_thread" }>, "id">;
 
 const commandResultSchema = z.union([
   z.object({
@@ -166,7 +179,14 @@ const commandResultSchema = z.union([
   z.object({
     commandId: z.string(),
     browserId: z.string(),
-    kind: z.union([z.literal("inspect_thread"), z.literal("prepare_thread"), z.literal("send_message")]),
+    kind: z.literal("stop_thread"),
+    ok: z.literal(true),
+    result: stopThreadResultSchema,
+  }),
+  z.object({
+    commandId: z.string(),
+    browserId: z.string(),
+    kind: z.union([z.literal("inspect_thread"), z.literal("prepare_thread"), z.literal("send_message"), z.literal("stop_thread")]),
     ok: z.literal(false),
     error: z.string().min(1).max(2_000),
   }),
@@ -178,6 +198,7 @@ interface PendingCommand {
   resolve: (result: SupportCommandResult) => void;
   reject: (error: Error) => void;
   timeout: NodeJS.Timeout;
+  timeoutMs: number;
   claimedBy?: string;
   claimedAt?: number;
 }
@@ -199,20 +220,23 @@ export class SupportCommandBus {
   private launchInFlight?: Promise<void>;
   private lastLaunchAt = 0;
   private cooldownUntil = 0;
+  private nextMessageClaimAt = 0;
+  private messagePacingActive = false;
 
   messageCooldownUntil() {
     return this.cooldownUntil > Date.now() ? this.cooldownUntil : 0;
   }
 
-  constructor(private readonly inspectClaimLeaseMs = INSPECT_CLAIM_LEASE_MS) {}
+  constructor(
+    private readonly inspectClaimLeaseMs = INSPECT_CLAIM_LEASE_MS,
+    private readonly messageCooldownMs = MESSAGE_COOLDOWN_MS,
+    private readonly messageSendSpacingMs = MESSAGE_SEND_SPACING_MS,
+  ) {}
 
   execute(
     command: SupportCommandInput,
     timeoutMs = COMMAND_TIMEOUT_MS,
   ) {
-    if (command.kind === "send_message" && this.messageCooldownUntil()) {
-      return Promise.reject(new Error(`ChatGPT message cooldown until ${new Date(this.cooldownUntil).toISOString()}. Wait for the cooldown; do not retry now.`));
-    }
     const fullCommand = supportCommandSchema.parse({ ...command, id: randomUUID() });
     return new Promise<SupportCommandResult>((resolve, reject) => {
       const pending: PendingCommand = {
@@ -223,14 +247,15 @@ export class SupportCommandBus {
           this.removePending(fullCommand.id);
           reject(new Error(`ChatGPT support command timed out: ${fullCommand.kind}`));
         }, timeoutMs),
+        timeoutMs,
       };
       pending.timeout.unref();
       this.pending.set(fullCommand.id, pending);
 
-      const waiter = [...this.waiters].find((candidate) => candidate.features.has(fullCommand.feature));
+      const waiter = [...this.waiters].find((candidate) =>
+        candidate.features.has(fullCommand.feature) && this.canClaim(fullCommand));
       if (waiter) {
-        pending.claimedBy = waiter.browserId;
-        pending.claimedAt = Date.now();
+        this.markClaimed(pending, waiter.browserId);
         this.resolveWaiter(waiter, fullCommand);
         return;
       }
@@ -286,11 +311,11 @@ export class SupportCommandBus {
       return Promise.resolve(resumable.command);
     }
 
-    const queuedIndex = this.queued.findIndex((pending) => featureSet.has(pending.command.feature));
+    const queuedIndex = this.queued.findIndex((pending) =>
+      featureSet.has(pending.command.feature) && this.canClaim(pending.command));
     if (queuedIndex >= 0) {
       const [pending] = this.queued.splice(queuedIndex, 1);
-      pending.claimedBy = browserId;
-      pending.claimedAt = Date.now();
+      this.markClaimed(pending, browserId);
       return Promise.resolve(pending.command);
     }
 
@@ -316,19 +341,32 @@ export class SupportCommandBus {
     if (pending.claimedBy !== result.browserId) throw new Error("Support command belongs to another browser instance.");
     if (pending.command.kind !== result.kind) throw new Error("Support command result kind does not match the request.");
 
-    if (!result.ok && result.error.startsWith("CHATGPT_RATE_LIMITED:")) {
-      this.cooldownUntil = Date.now() + MESSAGE_COOLDOWN_MS;
+    if (!result.ok && result.kind === "send_message" && result.error.startsWith("CHATGPT_RATE_LIMITED:")) {
+      this.cooldownUntil = Date.now() + this.messageCooldownMs;
+      this.messagePacingActive = true;
+      this.nextMessageClaimAt = Math.max(this.nextMessageClaimAt, this.cooldownUntil);
       console.warn(`[chatgpt-support] message_cooldown until=${new Date(this.cooldownUntil).toISOString()}`);
-      for (const queued of [...this.queued]) {
-        if (queued.command.kind !== "send_message") continue;
-        this.removePending(queued.command.id);
-        queued.reject(new Error(`ChatGPT message cooldown until ${new Date(this.cooldownUntil).toISOString()}. Wait before sending again.`));
-      }
+      const browser = this.browsers.get(result.browserId);
+      if (browser) browser.lastSeenAt = Date.now();
+      pending.claimedBy = undefined;
+      pending.claimedAt = undefined;
+      clearTimeout(pending.timeout);
+      pending.timeout = setTimeout(() => {
+        this.removePending(pending.command.id);
+        pending.reject(new Error(`ChatGPT support command timed out after rate-limit cooldown: ${pending.command.kind}`));
+      }, this.messageCooldownMs + pending.timeoutMs);
+      pending.timeout.unref();
+      if (!this.queued.includes(pending)) this.queued.unshift(pending);
+      return;
     }
 
     const browser = this.browsers.get(result.browserId);
     if (browser) browser.lastSeenAt = Date.now();
     this.removePending(result.commandId);
+    if (this.messagePacingActive && ![...this.pending.values()].some((entry) => entry.command.kind === "send_message")) {
+      this.messagePacingActive = false;
+      this.nextMessageClaimAt = 0;
+    }
     pending.resolve(result);
   }
 
@@ -341,6 +379,20 @@ export class SupportCommandBus {
     this.pending.clear();
     this.queued.length = 0;
     this.browsers.clear();
+  }
+
+  private canClaim(command: SupportCommand) {
+    if (command.kind !== "send_message") return true;
+    if (this.messageCooldownUntil()) return false;
+    return !this.messagePacingActive || Date.now() >= this.nextMessageClaimAt;
+  }
+
+  private markClaimed(pending: PendingCommand, browserId: string) {
+    pending.claimedBy = browserId;
+    pending.claimedAt = Date.now();
+    if (pending.command.kind === "send_message" && this.messagePacingActive) {
+      this.nextMessageClaimAt = Date.now() + this.messageSendSpacingMs;
+    }
   }
 
   private resolveWaiter(waiter: ClaimWaiter, command: SupportCommand | undefined) {
@@ -388,7 +440,7 @@ const ralphStoreSchema = z.object({
   version: z.literal(2),
   projects: z.array(z.string()).max(MAX_RALPH_PROJECTS),
   threads: z.array(ralphThreadSchema).max(MAX_RALPH_THREADS),
-  loopIntervalMs: z.number().int().positive().max(MAX_RALPH_INTERVAL_SECONDS * 1000).default(DEFAULT_RALPH_INITIAL_DELAY_MS),
+  loopIntervalMs: z.number().int().positive().max(MAX_RALPH_INTERVAL_SECONDS * 1000).default(DEFAULT_RALPH_CHECK_INTERVAL_MS),
   subagentProjectUrl: z.string().url().optional(),
 });
 type RalphStore = z.infer<typeof ralphStoreSchema>;
@@ -411,7 +463,7 @@ export class RalphRegistry {
       version: 2,
       projects: [],
       threads: [],
-      loopIntervalMs: DEFAULT_RALPH_INITIAL_DELAY_MS,
+      loopIntervalMs: DEFAULT_RALPH_CHECK_INTERVAL_MS,
     };
     let migrated = false;
     try {
@@ -435,6 +487,16 @@ export class RalphRegistry {
       migrated = true;
       if (title) thread.title = title;
       else delete thread.title;
+    }
+    if (intervalMs === undefined &&
+        (state.loopIntervalMs === LEGACY_RALPH_DEFAULT_INTERVAL_MS ||
+         state.loopIntervalMs === INTERIM_RALPH_DEFAULT_INTERVAL_MS)) {
+      state.loopIntervalMs = DEFAULT_RALPH_CHECK_INTERVAL_MS;
+      const nextCheckAt = Date.now() + DEFAULT_RALPH_CHECK_INTERVAL_MS;
+      for (const thread of state.threads) {
+        if (thread.state === "active") thread.nextCheckAt = nextCheckAt;
+      }
+      migrated = true;
     }
     if (migrated) {
       await writeFile(filePath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
@@ -581,12 +643,12 @@ export class RalphRegistry {
       if (!thread) return;
       thread.lastCheckedAt = new Date().toISOString();
       thread.lastError = undefined;
-      thread.nextCheckAt = Date.now() + RALPH_RECHECK_INTERVAL_MS;
+      thread.nextCheckAt = Date.now() + state.loopIntervalMs;
     });
   }
 
   async recordLoading(threadId: string) {
-    await this.reschedule(threadId, LOADING_RETRY_MS);
+    await this.reschedule(threadId);
   }
 
   async recordFailure(threadId: string, error: string) {
@@ -654,17 +716,17 @@ export class RalphRegistry {
       thread.lastCheckedAt = now;
       thread.lastContinuationAt = now;
       thread.lastError = undefined;
-      thread.nextCheckAt = Date.now() + RALPH_RECHECK_INTERVAL_MS;
+      thread.nextCheckAt = Date.now() + state.loopIntervalMs;
     });
   }
 
-  private async reschedule(threadId: string, delayMs: number) {
+  private async reschedule(threadId: string, delayMs?: number) {
     await this.update((state) => {
       const thread = state.threads.find((entry) => entry.threadId === threadId && entry.state === "active");
       if (!thread) return;
       thread.lastCheckedAt = new Date().toISOString();
       thread.lastError = undefined;
-      thread.nextCheckAt = Date.now() + delayMs;
+      thread.nextCheckAt = Date.now() + (delayMs ?? state.loopIntervalMs);
     });
   }
 
@@ -1440,7 +1502,7 @@ function subagentPrompt(message: string, jobId: string, resultPath: string) {
     "",
     "You are a sub-agent working in a separate ChatGPT conversation.",
     "Your first MCP action must be sync_current_thread. If it reports syncing, follow it with get_current_thread_url; if it reports synced, do not sync again.",
-    "Complete only the bounded task above. Nested delegation is disabled. Perform the work yourself. If assigned a review, remain read-only and report actionable defects with evidence.",
+    "Complete only the bounded task above. Nested delegation is disabled. Perform the work yourself. If assigned a review, remain read-only and report findings with evidence. Do not decide what the parent should change or what follow-up work it should do.",
     "Your parent does not expect a browser message from you. Do not call send_thread_message to report back.",
     `When your work is complete, call submit_subagent_result exactly once with jobId ${JSON.stringify(jobId)} and put your complete final report in its result argument.`,
     `The application stores that report locally at ${JSON.stringify(resultPath)} and wakes the parent automatically.`,
@@ -1544,7 +1606,7 @@ export function registerChatGptAgents(
 
   server.registerTool("start_subagent", {
     title: "Start Sub-agent",
-    description: "Start an independent ChatGPT sub-agent from a synced root. Use one reviewer by default. Two pending children are allowed service-wide, with slots reserved before startup; nested delegation is disabled. On capacity refusal, continue independent work or wait for a result notice without polling or retrying. The configured Sub-agent project is used, or chatgpt.com otherwise. Complete one-time thread sync first. Transport retries of the same MCP request are deduplicated internally; a new logical call creates another job. Reports are stored in a local file and parent notices may be batched. An unconfirmed startup keeps its slot until resolved through cancel_subagent.",
+    description: "Start an independent ChatGPT sub-agent from a synced root. Use one reviewer by default. Each parent may have two pending children, with slots reserved before startup; nested delegation is disabled. On this parent's capacity refusal, continue independent work or wait for a result notice without polling or retrying. If ChatGPT is in a message cooldown, the reserved child start waits in the paced message queue instead of being discarded. The configured Sub-agent project is used, or chatgpt.com otherwise. Complete one-time thread sync first. Transport retries of the same MCP request are deduplicated internally; a new logical call creates another job. Reports are stored in a local file and parent notices may be batched. An unconfirmed startup keeps its slot until resolved through cancel_subagent.",
     inputSchema: {
       message: z.string().min(1).max(190_000).describe("Complete bounded task for the sub-agent. Do not include result transport or parent callback instructions; the server adds them."),
     },
@@ -1576,9 +1638,6 @@ export function registerChatGptAgents(
       try {
         if ((await registry.threads()).some((thread) => thread.threadId === parent.threadId && thread.parentThreadId)) {
           throw new SubagentAdmissionError("nested");
-        }
-        if (commands.messageCooldownUntil()) {
-          throw new Error(`ChatGPT message cooldown until ${new Date(commands.messageCooldownUntil()).toISOString()}. Wait before starting a child.`);
         }
         job = await jobs.create(parent);
       } catch (error) {
@@ -1681,9 +1740,9 @@ export function registerChatGptAgents(
 
   server.registerTool("cancel_subagent", {
     title: "Cancel Sub-agent",
-    description: "Release an abandoned pending job owned by this synced parent and disable its RALPH continuation. First stop any running child in the browser and confirm it is no longer working. This tool does not stop an already running browser turn. Use the job ID from start_subagent or list_subagents. Cancellation is permanent; late results are rejected.",
+    description: "Cancel an abandoned pending job owned by this synced parent. When the child URL is known, the service opens that ChatGPT thread in the automation browser, clicks Stop if the child is running, confirms the run stopped, closes the automation tab, and then releases the slot. If stopping cannot be confirmed, cancellation fails and keeps the job pending. Cancellation is permanent; late results are rejected.",
     inputSchema: { jobId: z.string().uuid() },
-    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   }, async ({ jobId }, extra) => {
     const session = extra._meta?.["openai/session"];
     const parent = typeof session === "string" ? await bindings.binding({ ownerId, sessionId: session }) : undefined;
@@ -1694,6 +1753,26 @@ export function registerChatGptAgents(
     if (job.state === "pending" && !job.childThreadId && !job.preparationError) {
       return { isError: true, content: [{ type: "text", text: "Child startup is still in progress. Wait for its startup result before cancelling this job." }] };
     }
+    if (job.state === "pending" && job.childThreadId && !job.childConversationUrl) {
+      return { isError: true, content: [{ type: "text", text: "This child has a thread ID but no stored conversation URL, so cancellation cannot open and stop it safely. The job remains pending." }] };
+    }
+    if (job.state === "pending" && job.childConversationUrl) {
+      try {
+        await commands.ensureBrowser("threadMessaging", launchBrowser);
+        const stopped = await commands.execute({
+          feature: "threadMessaging",
+          kind: "stop_thread",
+          targetUrl: job.childConversationUrl,
+        });
+        if (!stopped.ok) throw new Error(stopped.error);
+        if (stopped.kind !== "stop_thread") throw new Error("Sub-agent cancellation received the wrong support command result.");
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Could not confirm that the child stopped. Job ${jobId} remains pending. ${error instanceof Error ? error.message : String(error)}` }],
+        };
+      }
+    }
     if (job.childThreadId) await registry.recordComplete(job.childThreadId);
     const cancelled = await jobs.cancel(jobId);
     return { content: [{ type: "text", text: `Job ${jobId}: ${cancelled.state}.` }] };
@@ -1701,7 +1780,7 @@ export function registerChatGptAgents(
 
   server.registerTool("send_thread_message", {
     title: "Send Thread Message",
-    description: "Send one message to an existing ChatGPT conversation only when the user explicitly requests that post. Transport retries of the same MCP request are deduplicated internally. This tool never creates a new thread. Respect a returned cooldown. If delivery is uncertain, inspect the target before making a new send request.",
+    description: "Send one message to an existing ChatGPT conversation only when the user explicitly requests that post. Transport retries of the same MCP request are deduplicated internally. This tool never creates a new thread. If ChatGPT rate-limits delivery, the command stays queued and resumes after cooldown with global send pacing. For other uncertain delivery errors, inspect the target before making a new send request.",
     inputSchema: {
       targetUrl: z.string().url().describe("Exact existing ChatGPT /c/... conversation URL."),
       message: z.string().min(1).max(200_000).describe("Message to send to that conversation."),

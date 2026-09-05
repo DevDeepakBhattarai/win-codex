@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.4.1";
+  const contentScriptVersion = "1.4.3";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -24,7 +24,8 @@
   const THREAD_UNCERTAIN_SETTLE_MS = 2 * 60_000;
   const THREAD_SETTLE_TIMEOUT_MS = 2.5 * 60_000;
   const RALPH_MIN_WORKED_SECONDS_KEY = "ralphMinWorkedSeconds";
-  const DEFAULT_RALPH_MIN_WORKED_SECONDS = 19 * 60;
+  const LEGACY_RALPH_MIN_WORKED_SECONDS = 19 * 60;
+  const DEFAULT_RALPH_MIN_WORKED_SECONDS = 20 * 60;
 
   function conversationUrl() {
     const match = location.pathname.match(/^(?:\/g\/([A-Za-z0-9_-]+))?\/c\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/?$/i);
@@ -107,10 +108,62 @@
   });
 
   async function runAutomation(command) {
+    if (command.kind === "stop_thread") return await stopThread();
     assertNotRateLimited();
     if (command.kind === "inspect_thread") return await inspectThread();
     if (command.kind === "send_message") return await sendMessage(command.message);
     throw new Error("Unsupported ChatGPT support command.");
+  }
+
+  async function stopThread() {
+    const ready = await waitForCancellationState(30_000);
+    if (!ready) throw new Error("ChatGPT child state did not become ready for cancellation.");
+
+    const currentUrl = conversationUrl();
+    if (!currentUrl) throw new Error("ChatGPT cancellation is not on a saved conversation.");
+    if (!ready.stopButton) return { status: "idle", conversationUrl: currentUrl };
+
+    ready.stopButton.click();
+    const stopped = await waitForStableStop(30_000);
+    if (!stopped) throw new Error("ChatGPT did not confirm that the child run stopped.");
+    return { status: "stopped", conversationUrl: conversationUrl() ?? currentUrl };
+  }
+
+  async function waitForCancellationState(timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    let idleSince = 0;
+    while (Date.now() < deadline) {
+      const ready = getComposer();
+      const hasUserTurn = Boolean(document.querySelector('section[data-turn="user"]'));
+      if (!ready || document.readyState === "loading" || !hasUserTurn) {
+        idleSince = 0;
+        await sleep(100);
+        continue;
+      }
+      const stopButton = ready.composer.querySelector('button[data-testid="stop-button"]');
+      if (stopButton) return { ...ready, stopButton };
+      if (!idleSince) idleSince = Date.now();
+      if (Date.now() - idleSince >= 1_500) return { ...ready, stopButton: null };
+      await sleep(100);
+    }
+    return null;
+  }
+
+  async function waitForStableStop(timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    let stoppedSince = 0;
+    while (Date.now() < deadline) {
+      const ready = getComposer();
+      const stopButton = ready?.composer.querySelector('button[data-testid="stop-button"]');
+      if (!ready || stopButton) {
+        stoppedSince = 0;
+      } else {
+        if (!stoppedSince) stoppedSince = Date.now();
+        if (Date.now() - stoppedSince >= 500) return true;
+      }
+      await sleep(100);
+    }
+    return false;
   }
 
   async function inspectThread() {
@@ -480,6 +533,10 @@
       [RALPH_MIN_WORKED_SECONDS_KEY]: DEFAULT_RALPH_MIN_WORKED_SECONDS,
     });
     const value = stored[RALPH_MIN_WORKED_SECONDS_KEY];
+    if (value === LEGACY_RALPH_MIN_WORKED_SECONDS) {
+      await extensionApi.storage.local.set?.({ [RALPH_MIN_WORKED_SECONDS_KEY]: DEFAULT_RALPH_MIN_WORKED_SECONDS });
+      return DEFAULT_RALPH_MIN_WORKED_SECONDS;
+    }
     return Number.isInteger(value) && value >= 0 ? value : DEFAULT_RALPH_MIN_WORKED_SECONDS;
   }
 

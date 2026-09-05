@@ -8,8 +8,9 @@ const DEFAULT_SETTINGS = {
 };
 const SUBAGENT_PROJECT_KEY = "subagentProjectUrl";
 const RALPH_MIN_WORKED_SECONDS_KEY = "ralphMinWorkedSeconds";
-const DEFAULT_RALPH_MIN_WORKED_SECONDS = 19 * 60;
-const DEFAULT_RALPH_LOOP_INTERVAL_SECONDS = 25 * 60;
+const LEGACY_RALPH_MIN_WORKED_SECONDS = 19 * 60;
+const DEFAULT_RALPH_MIN_WORKED_SECONDS = 20 * 60;
+const DEFAULT_RALPH_LOOP_INTERVAL_SECONDS = 3 * 60;
 
 function validateLoopbackEndpoint(value, pathname) {
   const endpoint = new URL(value);
@@ -324,11 +325,18 @@ async function setThreadState(thread, button) {
   }
 }
 
-function renderEmptyState() {
+function renderEmptyState(kind) {
   const item = document.createElement("li");
   const empty = document.createElement("div");
   empty.className = "empty";
-  if (threadFilter === "active") {
+  if (kind === "subagent") {
+    empty.append(
+      Object.assign(document.createElement("strong"), { textContent: threadFilter === "active" ? "No active sub-agents" : "No completed sub-agents" }),
+      threadFilter === "active"
+        ? "Automatically registered sub-agent threads appear here while they are running."
+        : "Completed sub-agent threads remain separated from your normal RALPH list.",
+    );
+  } else if (threadFilter === "active") {
     empty.append(
       Object.assign(document.createElement("strong"), { textContent: "No active threads" }),
       "Completed threads remain available under Completed and can be marked active again.",
@@ -343,16 +351,26 @@ function renderEmptyState() {
   return item;
 }
 
-function renderThreads() {
-  const list = element("threadList");
+function renderThreadList(list, threads, kind) {
   list.replaceChildren();
-  const threads = loadedThreads.filter((thread) => thread.state === threadFilter);
   if (threads.length === 0) {
-    list.append(renderEmptyState());
+    list.append(renderEmptyState(kind));
     return;
   }
   const ordered = [...threads].sort((left, right) => Date.parse(right.registeredAt) - Date.parse(left.registeredAt));
   list.append(...ordered.map(renderThread));
+}
+
+function renderThreads() {
+  const regular = loadedThreads.filter((thread) => !thread.agentCreated && thread.state === threadFilter);
+  const subagents = loadedThreads.filter((thread) => thread.agentCreated && thread.state === threadFilter);
+  renderThreadList(element("threadList"), regular, "regular");
+
+  const allSubagents = loadedThreads.filter((thread) => thread.agentCreated);
+  const section = element("subagentThreadsSection");
+  section.hidden = allSubagents.length === 0;
+  element("subagentCount").textContent = String(subagents.length);
+  if (!section.hidden) renderThreadList(element("subagentThreadList"), subagents, "subagent");
 }
 
 function selectThreadFilter(filter) {
@@ -370,7 +388,7 @@ async function loadThreads() {
   try {
     const { threads } = await callServer(ralphThreadsEndpoint);
     loadedThreads = threads;
-    const active = threads.filter((thread) => thread.state === "active").length;
+    const active = threads.filter((thread) => !thread.agentCreated && thread.state === "active").length;
     element("activeCount").textContent = String(active);
     renderThreads();
     setNote(status, "");
@@ -394,6 +412,10 @@ async function load() {
   });
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     element(key).checked = Boolean(settings[key]);
+  }
+  if (settings[RALPH_MIN_WORKED_SECONDS_KEY] === LEGACY_RALPH_MIN_WORKED_SECONDS) {
+    settings[RALPH_MIN_WORKED_SECONDS_KEY] = DEFAULT_RALPH_MIN_WORKED_SECONDS;
+    await extensionApi.storage.local.set({ [RALPH_MIN_WORKED_SECONDS_KEY]: DEFAULT_RALPH_MIN_WORKED_SECONDS });
   }
   element(RALPH_MIN_WORKED_SECONDS_KEY).value = String(settings[RALPH_MIN_WORKED_SECONDS_KEY]);
   await Promise.all([loadCurrentThread(), loadRalphProjects(), loadRalphSettings(settings[SUBAGENT_PROJECT_KEY]), loadThreads()]);
@@ -457,7 +479,7 @@ async function saveRalphTime() {
   button.disabled = true;
   try {
     await extensionApi.storage.local.set({ [RALPH_MIN_WORKED_SECONDS_KEY]: seconds });
-    setNote(status, `Saved ${seconds} second${seconds === 1 ? "" : "s"}.`);
+    setNote(status, `Saved ${seconds} second${seconds === 1 ? "" : "s"}. Only settled turns above this worked time are classified.`);
     await notifySettingsChanged();
   } finally {
     button.disabled = false;
@@ -497,8 +519,8 @@ async function saveRalphLoopInterval() {
   const input = element("ralphLoopIntervalSeconds");
   const status = element("ralphLoopIntervalStatus");
   const loopIntervalSeconds = Number(input.value);
-  if (!Number.isInteger(loopIntervalSeconds) || loopIntervalSeconds < 1 || loopIntervalSeconds > 86_400) {
-    setNote(status, "Enter a whole number from 1 to 86400 seconds.", "error");
+  if (!Number.isInteger(loopIntervalSeconds) || loopIntervalSeconds < 120 || loopIntervalSeconds > 86_400) {
+    setNote(status, "Enter a whole number from 120 to 86400 seconds.", "error");
     return;
   }
 
@@ -510,10 +532,10 @@ async function saveRalphLoopInterval() {
       body: JSON.stringify({ loopIntervalSeconds }),
     });
     input.value = String(settings.loopIntervalSeconds);
-    setNote(status, `Saved ${settings.loopIntervalSeconds} second${settings.loopIntervalSeconds === 1 ? "" : "s"}. Active threads were rescheduled; later checks remain 5 minutes apart.`);
+    setNote(status, `Saved ${settings.loopIntervalSeconds} second${settings.loopIntervalSeconds === 1 ? "" : "s"}. Active threads now use this interval for repeated checks.`);
     await loadThreads();
   } catch (error) {
-    setNote(status, errorMessage(error, "Could not save the RALPH initial check delay."), "error");
+    setNote(status, errorMessage(error, "Could not save the RALPH check interval."), "error");
   } finally {
     button.disabled = false;
   }

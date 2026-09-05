@@ -9,12 +9,17 @@ import { RalphController, RalphRegistry, SubagentResultController, SupportComman
 const directory = await mkdtemp(path.join(os.tmpdir(), "subagent-limits-"));
 try {
   const jobs = await SubagentJobRegistry.open(directory);
-  const attempts = await Promise.allSettled(Array.from({ length: 8 }, (_, index) => jobs.create({
-    threadId: `parent-${index}`, conversationUrl: `https://chatgpt.com/c/parent-${index}`,
-  })));
-  assert.equal(attempts.filter(result => result.status === "fulfilled").length, 2,
-    "simultaneous starts across different parents must reserve only two slots");
+  const attempts = await Promise.allSettled(Array.from({ length: 8 }, (_, index) => {
+    const parentIndex = index < 4 ? "a" : "b";
+    return jobs.create({
+      threadId: `parent-${parentIndex}`,
+      conversationUrl: `https://chatgpt.com/c/parent-${parentIndex}`,
+    });
+  }));
   const admitted = attempts.filter(result => result.status === "fulfilled").map(result => result.value);
+  assert.equal(admitted.length, 4, "two different parents may each reserve two child slots");
+  assert.equal(admitted.filter(job => job.parentThreadId === "parent-a").length, 2);
+  assert.equal(admitted.filter(job => job.parentThreadId === "parent-b").length, 2);
   const restartRoot = path.join(directory, "restart");
   const beforeRestart = await SubagentJobRegistry.open(restartRoot);
   const interrupted = await beforeRestart.create({ threadId: "restart-parent", conversationUrl: "https://chatgpt.com/c/restart-parent" });
@@ -78,19 +83,57 @@ try {
     assert.ok((await damagedJobs.job(healthy.jobId)).notifiedAt);
   } finally { damagedController.close(); damagedBus.close(); }
 
-  const cooldownBus = new SupportCommandBus();
+  const cooldownBus = new SupportCommandBus(undefined, 30, 15);
   try {
-    const send = cooldownBus.execute({ feature: "threadMessaging", kind: "send_message", targetUrl: parent.conversationUrl, message: "start" });
+    const firstSend = cooldownBus.execute(
+      { feature: "threadMessaging", kind: "send_message", targetUrl: parent.conversationUrl, message: "first" },
+      20,
+    );
     const claimed = await cooldownBus.claim("browser", ["threadMessaging"], 0);
-    const queued = cooldownBus.execute({ feature: "ralph", kind: "send_message", targetUrl: parent.conversationUrl, message: "continue" });
-    const queuedRefusal = assert.rejects(queued, /cooldown/);
+    const secondSend = cooldownBus.execute({ feature: "ralph", kind: "send_message", targetUrl: parent.conversationUrl, message: "second" });
     cooldownBus.complete({ commandId: claimed.id, browserId: "browser", kind: "send_message", ok: false,
       error: "CHATGPT_RATE_LIMITED: Too many messages" });
-    await send;
-    await queuedRefusal;
-    await assert.rejects(cooldownBus.execute({ feature: "threadMessaging", kind: "send_message", targetUrl: parent.conversationUrl, message: "retry" }), /cooldown/);
-    assert.equal(await cooldownBus.claim("browser", ["ralph", "threadMessaging"], 0), undefined);
+    const thirdSend = cooldownBus.execute({ feature: "threadMessaging", kind: "send_message", targetUrl: parent.conversationUrl, message: "third" });
     assert.ok(cooldownBus.messageCooldownUntil() > Date.now());
+    assert.equal(await cooldownBus.claim("browser", ["ralph", "threadMessaging"], 0), undefined,
+      "rate-limited sends stay queued during cooldown");
+
+    const stop = cooldownBus.execute({ feature: "threadMessaging", kind: "stop_thread", targetUrl: parent.conversationUrl });
+    const stopCommand = await cooldownBus.claim("browser", ["threadMessaging"], 0);
+    assert.equal(stopCommand.kind, "stop_thread", "cancellation is not blocked by message cooldown");
+    cooldownBus.complete({ commandId: stopCommand.id, browserId: "browser", kind: "stop_thread", ok: true,
+      result: { status: "idle", conversationUrl: parent.conversationUrl } });
+    await stop;
+
+    await new Promise(resolve => setTimeout(resolve, 35));
+    const retryFirst = await cooldownBus.claim("browser", ["ralph", "threadMessaging"], 0);
+    assert.equal(retryFirst.id, claimed.id, "the rate-limited command is retried before later queued sends");
+    cooldownBus.complete({ commandId: retryFirst.id, browserId: "browser", kind: "send_message", ok: true,
+      result: { status: "sent", conversationUrl: parent.conversationUrl } });
+    await firstSend;
+
+    assert.equal(await cooldownBus.claim("browser", ["ralph", "threadMessaging"], 0), undefined,
+      "message pacing prevents an immediate second send");
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const second = await cooldownBus.claim("browser", ["ralph", "threadMessaging"], 0);
+    assert.equal(second.message, "second");
+    cooldownBus.complete({ commandId: second.id, browserId: "browser", kind: "send_message", ok: true,
+      result: { status: "sent", conversationUrl: parent.conversationUrl } });
+    await secondSend;
+
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const third = await cooldownBus.claim("browser", ["ralph", "threadMessaging"], 0);
+    assert.equal(third.message, "third");
+    cooldownBus.complete({ commandId: third.id, browserId: "browser", kind: "send_message", ok: true,
+      result: { status: "sent", conversationUrl: parent.conversationUrl } });
+    await thirdSend;
+
+    const normalSend = cooldownBus.execute({ feature: "threadMessaging", kind: "send_message", targetUrl: parent.conversationUrl, message: "normal" });
+    const normal = await cooldownBus.claim("browser", ["threadMessaging"], 0);
+    assert.equal(normal.message, "normal", "pacing turns off after the deferred backlog is drained");
+    cooldownBus.complete({ commandId: normal.id, browserId: "browser", kind: "send_message", ok: true,
+      result: { status: "sent", conversationUrl: parent.conversationUrl } });
+    await normalSend;
   } finally { cooldownBus.close(); }
 
   const registry = await RalphRegistry.open(path.join(directory, "ralph"), 1);
@@ -108,7 +151,7 @@ try {
   } finally { ralph.close(); ralphBus.close(); }
 
   const handlers = new Map();
-  const toolBus = new SupportCommandBus();
+  const toolBus = new SupportCommandBus(undefined, 30, 15);
   registerChatGptAgents({ registerResource() {}, registerTool(name, definition, handler) { handlers.set(name, handler); } },
     toolBus, { async binding({ sessionId }) { return sessionId === "owner" ? parent : { threadId: "other" }; } },
     registry, batchJobs, { async ensurePrepared() {} }, async () => {}, "grant", "");
@@ -121,6 +164,59 @@ try {
     await batchJobs.recordPreparationFailure(waiting.jobId, "startup could not be confirmed");
     await cancel({ jobId: waiting.jobId }, { _meta: { "openai/session": "owner" } });
     assert.equal((await batchJobs.job(waiting.jobId)).state, "cancelled");
+
+    const childThreadId = "22222222-2222-4222-8222-222222222222";
+    const childUrl = `https://chatgpt.com/c/${childThreadId}`;
+    const cancellable = await batchJobs.create(parent);
+    await batchJobs.assignChild(cancellable.jobId, { threadId: childThreadId, conversationUrl: childUrl });
+    await registry.register(childUrl, { agentCreated: true, parentThreadId: parent.threadId });
+    const cancellation = cancel({ jobId: cancellable.jobId }, { _meta: { "openai/session": "owner" } });
+    const stopCommand = await toolBus.claim("browser", ["threadMessaging"], 1000);
+    assert.equal(stopCommand.kind, "stop_thread");
+    assert.equal(stopCommand.targetUrl, childUrl);
+    assert.equal((await batchJobs.job(cancellable.jobId)).state, "pending",
+      "the slot remains reserved until browser cancellation succeeds");
+    toolBus.complete({ commandId: stopCommand.id, browserId: "browser", kind: "stop_thread", ok: true,
+      result: { status: "stopped", conversationUrl: childUrl } });
+    assert.equal((await cancellation).isError, undefined);
+    assert.equal((await batchJobs.job(cancellable.jobId)).state, "cancelled");
+    assert.equal((await registry.threads()).find(thread => thread.threadId === childThreadId).state, "complete");
+
+    const limiter = toolBus.execute(
+      { feature: "threadMessaging", kind: "send_message", targetUrl: parent.conversationUrl, message: "trigger cooldown" },
+      200,
+    );
+    const limiterCommand = await toolBus.claim("browser", ["threadMessaging"], 0);
+    toolBus.complete({ commandId: limiterCommand.id, browserId: "browser", kind: "send_message", ok: false,
+      error: "CHATGPT_RATE_LIMITED: Too many messages" });
+    const queuedStart = handlers.get("start_subagent")({ message: "queued child start" },
+      { requestId: "cooldown-child", _meta: { "openai/session": "owner" } });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const queuedJob = (await batchJobs.forParent(parent.threadId)).find(job =>
+      job.state === "pending" && !job.childThreadId && job.jobId !== waiting.jobId);
+    assert.ok(queuedJob, "a child start during cooldown reserves its parent slot instead of being discarded");
+    assert.equal(await toolBus.claim("browser", ["threadMessaging"], 0), undefined,
+      "the child-start browser message waits during cooldown");
+
+    await new Promise(resolve => setTimeout(resolve, 35));
+    const limiterRetry = await toolBus.claim("browser", ["threadMessaging"], 0);
+    assert.equal(limiterRetry.id, limiterCommand.id);
+    toolBus.complete({ commandId: limiterRetry.id, browserId: "browser", kind: "send_message", ok: true,
+      result: { status: "sent", conversationUrl: parent.conversationUrl } });
+    await limiter;
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const queuedChildCommand = await toolBus.claim("browser", ["threadMessaging"], 0);
+    assert.match(queuedChildCommand.message, /queued child start/);
+    const queuedChildThreadId = "33333333-3333-4333-8333-333333333333";
+    const queuedChildUrl = `https://chatgpt.com/c/${queuedChildThreadId}`;
+    toolBus.complete({ commandId: queuedChildCommand.id, browserId: "browser", kind: "send_message", ok: true,
+      result: { status: "sent", conversationUrl: queuedChildUrl, title: "Queued child" } });
+    const queuedStartResult = await queuedStart;
+    assert.equal(queuedStartResult.isError, undefined);
+    assert.equal((await batchJobs.job(queuedJob.jobId)).childConversationUrl, queuedChildUrl);
+    await registry.recordComplete(queuedChildThreadId);
+    await batchJobs.cancel(queuedJob.jobId);
+
     const pending = [await batchJobs.create(parent), await batchJobs.create(parent)];
     const refused = await handlers.get("start_subagent")({ message: "third child" }, { requestId: "capacity", _meta: { "openai/session": "owner" } });
     assert.equal(refused.isError, true);
@@ -151,6 +247,42 @@ try {
     else assert.match(response.error, /non-empty ChatGPT message/,
       "hidden notices must not trigger account cooldowns");
   }
+
+  let stopListener;
+  let running = false;
+  let stopClicks = 0;
+  const stopButton = { click() { stopClicks += 1; running = false; } };
+  setTimeout(() => { running = true; }, 200);
+  const editor = {};
+  const composer = {
+    querySelector(selector) {
+      if (selector.includes("prompt-textarea")) return editor;
+      if (selector.includes("stop-button")) return running ? stopButton : null;
+      return null;
+    },
+  };
+  const stopDocument = {
+    title: "Running child - ChatGPT",
+    readyState: "complete",
+    documentElement: null,
+    querySelector(selector) {
+      if (selector === 'form[data-type="unified-composer"]') return composer;
+      if (selector === 'section[data-turn="user"]') return {};
+      return null;
+    },
+    querySelectorAll: () => [],
+  };
+  vm.runInNewContext(contentScript, {
+    document: stopDocument, location: new URL(parent.conversationUrl), window: { addEventListener() {} }, setTimeout,
+    browser: { runtime: { async sendMessage() {}, onMessage: { addListener(value) { stopListener = value; } } } },
+  });
+  const stopped = await new Promise(resolve => stopListener({ type: "local-codex-support/automation-v1",
+    command: { kind: "stop_thread" } }, {}, resolve));
+  assert.equal(stopped.ok, true);
+  assert.equal(stopped.result.status, "stopped");
+  assert.equal(stopClicks, 1,
+    "cancellation waits through hydration and clicks a stop button that appears after the composer");
+
   console.log("Sub-agent limits tests passed.");
 } finally {
   assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));

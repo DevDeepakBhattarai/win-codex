@@ -51,7 +51,19 @@
         </div>
         <button id="refreshThreads" class="button button-ghost" type="button">Refresh</button>
       </div>
-      <ul id="threadList" class="threads"></ul>
+      <div class="thread-section">
+        <div class="thread-section-head">
+          <strong>Your RALPH threads</strong>
+        </div>
+        <ul id="threadList" class="threads"></ul>
+      </div>
+      <section id="subagentThreadsSection" class="thread-section" hidden>
+        <div class="thread-section-head">
+          <strong>Sub-agent RALPH</strong>
+          <span id="subagentCount" class="section-count">0</span>
+        </div>
+        <ul id="subagentThreadList" class="threads"></ul>
+      </section>
       <p id="threadsStatus" class="note"></p>
     </section>
 
@@ -87,20 +99,20 @@
       </div>
 
       <div class="card">
-        <h2><label for="ralphLoopIntervalSeconds">RALPH initial check delay (seconds)</label></h2>
-        <input id="ralphLoopIntervalSeconds" type="number" min="1" max="86400" step="1" inputmode="numeric">
+        <h2><label for="ralphLoopIntervalSeconds">RALPH check interval (seconds)</label></h2>
+        <input id="ralphLoopIntervalSeconds" type="number" min="120" max="86400" step="1" inputmode="numeric">
         <div class="card-footer">
-          <button id="saveRalphLoopInterval" class="button" type="button">Save delay</button>
-          <p id="ralphLoopIntervalStatus" class="note">Default is 1500 seconds (25 minutes). Later checks run every 300 seconds (5 minutes).</p>
+          <button id="saveRalphLoopInterval" class="button" type="button">Save interval</button>
+          <p id="ralphLoopIntervalStatus" class="note">Default is 180 seconds (3 minutes). Active, running, and loading threads are checked repeatedly at this interval.</p>
         </div>
       </div>
 
       <div class="card">
-        <h2><label for="ralphMinWorkedSeconds">RALPH minimum worked time (seconds)</label></h2>
+        <h2><label for="ralphMinWorkedSeconds">RALPH classifier worked-time threshold (seconds)</label></h2>
         <input id="ralphMinWorkedSeconds" type="number" min="0" max="86400" step="1" inputmode="numeric">
         <div class="card-footer">
-          <button id="saveRalphTime" class="button" type="button">Save time</button>
-          <p id="ralphTimeStatus" class="note">Default is 1140 seconds (19 minutes). RALPH continues only when ChatGPT reports more than this.</p>
+          <button id="saveRalphTime" class="button" type="button">Save threshold</button>
+          <p id="ralphTimeStatus" class="note">Default is 1200 seconds (20 minutes). Settled turns at or below this are marked complete without spending classifier tokens; only turns above it are classified.</p>
         </div>
       </div>
 
