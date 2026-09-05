@@ -337,7 +337,7 @@ export function registerThreadSync(
     if (!binding) {
       return {
         isError: true,
-        content: [{ type: "text", text: "Thread Sync did not finish in time. Call sync_current_thread again, then call get_current_thread_url again. Do not use another tool to guess the URL." }],
+        content: [{ type: "text", text: "Thread Sync did not finish in time. Check that the support extension is connected and Thread Sync is enabled. After correcting connectivity, retry sync_current_thread and get_current_thread_url once. If that fails, report the sync blocker. Do not guess the URL or keep retrying." }],
       };
     }
     const structuredContent = { conversationUrl: binding.conversationUrl };

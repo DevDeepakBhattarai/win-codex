@@ -6,7 +6,7 @@ import type { Request, RequestHandler, Response } from "express";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { SubagentJobRegistry } from "./subagent-jobs.js";
+import { SubagentAdmissionError, SubagentJobRegistry } from "./subagent-jobs.js";
 
 const MAX_RALPH_THREADS = 2_000;
 const MAX_RALPH_PROJECTS = 100;
@@ -31,6 +31,7 @@ const THREAD_PREPARATION_HOLD_MS = 2 * 60 * 1000;
 const MAX_CONTINUATION_CHARS = 500;
 const TOOL_REQUEST_REPLAY_TTL_MS = 30 * 60 * 1000;
 const MAX_TOOL_REQUEST_REPLAYS = 1_000;
+const MESSAGE_COOLDOWN_MS = 15 * 60_000;
 
 type ToolRequestReplay = {
   expiresAt: number;
@@ -61,12 +62,15 @@ function replayToolRequest(replayKey: string, createResult: () => Promise<CallTo
 
 export const SUBAGENT_WIDGET_URI = "ui://local-codex/subagents-v1.html";
 export const SUBAGENT_AGENT_INSTRUCTION = [
-  "For delegated work, call start_subagent only after this conversation has completed its one-time thread sync.",
-  "start_subagent returns a local resultPath. Do not expect the child to message this conversation. When the application later posts a result-ready notice, read that resultPath from the local filesystem and continue from the file.",
-  "If you are a child created by start_subagent, treat yourself as a sub-agent: complete the assigned bounded task, do not start another sub-agent unless the user explicitly asked for nested delegation, and finish by calling submit_subagent_result exactly once. submit_subagent_result stores the report locally; do not call send_thread_message to report to the parent.",
-  "Use send_thread_message only when the user explicitly asks to post a message into an existing ChatGPT conversation. Use list_subagents to inspect child jobs created by the current parent.",
+  "Keep implementation in the root conversation. Use one independent reviewer by default; add a second only for a distinct concern. After fixes, review the affected behavior instead of launching another group.",
+  "Only synced root conversations can call start_subagent. The service permits two pending children total, including startups across all parents. Nested delegation is disabled.",
+  "If capacity is full, continue independent work or end the turn while waiting for results. Do not retry starts or poll list_subagents for capacity. Use list_subagents only when a status snapshot changes your next decision.",
+  "Read all local resultPath files named in a result-ready notice before continuing. Notifications may combine several results. Reports stay in local files.",
+  "For an abandoned job, stop any running child in the browser before calling cancel_subagent. Cancellation releases its slot and disables future RALPH continuation; it cannot interrupt a running browser turn.",
+  "A child completes its bounded assignment without delegation and calls submit_subagent_result exactly once. Reviewers remain read-only. If a submit response is lost, inspect job status before resubmitting.",
+  "Use send_thread_message only when the user explicitly asks to post into an existing conversation. Respect message cooldowns. After uncertain delivery, inspect the target before deciding whether to send again.",
 ].join(" ");
-const CONTINUOUS_RALPH_INSTRUCTION = "Continue the continuous run toward the existing user goal. Re-read the conversation and current state, choose the next highest-value improvement, experiment, verification, or cleanup that advances that goal, execute it end to end, and keep working autonomously until this turn ends. Do not stop because the previous step appears complete and do not ask the user what to do next.";
+const CONTINUOUS_RALPH_INSTRUCTION = "Continue the authorized continuous run toward the existing user goal. Read the conversation and current state, choose useful unfinished work, and verify the result. Use completed child reports before requesting further review. If progress depends on a pending child, user input, or a message cooldown, state the blocker and end this turn. Otherwise continue within the agreed scope.";
 
 export const supportFeatureSchema = z.enum(["ralph", "threadMessaging", "threadPreparation"]);
 export type SupportFeature = z.infer<typeof supportFeatureSchema>;
@@ -194,6 +198,11 @@ export class SupportCommandBus {
   private readonly browsers = new Map<string, { features: Set<SupportFeature>; lastSeenAt: number }>();
   private launchInFlight?: Promise<void>;
   private lastLaunchAt = 0;
+  private cooldownUntil = 0;
+
+  messageCooldownUntil() {
+    return this.cooldownUntil > Date.now() ? this.cooldownUntil : 0;
+  }
 
   constructor(private readonly inspectClaimLeaseMs = INSPECT_CLAIM_LEASE_MS) {}
 
@@ -201,6 +210,9 @@ export class SupportCommandBus {
     command: SupportCommandInput,
     timeoutMs = COMMAND_TIMEOUT_MS,
   ) {
+    if (command.kind === "send_message" && this.messageCooldownUntil()) {
+      return Promise.reject(new Error(`ChatGPT message cooldown until ${new Date(this.cooldownUntil).toISOString()}. Wait for the cooldown; do not retry now.`));
+    }
     const fullCommand = supportCommandSchema.parse({ ...command, id: randomUUID() });
     return new Promise<SupportCommandResult>((resolve, reject) => {
       const pending: PendingCommand = {
@@ -303,6 +315,16 @@ export class SupportCommandBus {
     if (!pending) throw new Error("Support command is unknown or already finished.");
     if (pending.claimedBy !== result.browserId) throw new Error("Support command belongs to another browser instance.");
     if (pending.command.kind !== result.kind) throw new Error("Support command result kind does not match the request.");
+
+    if (!result.ok && result.error.startsWith("CHATGPT_RATE_LIMITED:")) {
+      this.cooldownUntil = Date.now() + MESSAGE_COOLDOWN_MS;
+      console.warn(`[chatgpt-support] message_cooldown until=${new Date(this.cooldownUntil).toISOString()}`);
+      for (const queued of [...this.queued]) {
+        if (queued.command.kind !== "send_message") continue;
+        this.removePending(queued.command.id);
+        queued.reject(new Error(`ChatGPT message cooldown until ${new Date(this.cooldownUntil).toISOString()}. Wait before sending again.`));
+      }
+    }
 
     const browser = this.browsers.get(result.browserId);
     if (browser) browser.lastSeenAt = Date.now();
@@ -725,6 +747,7 @@ interface RalphControllerOptions {
   model: string;
   auditLogPath: string;
   checkEveryMs?: number;
+  jobs?: SubagentJobRegistry;
 }
 
 class RalphOpenAiAuditLog {
@@ -784,6 +807,10 @@ export class RalphController {
 
   private async check(thread: z.infer<typeof ralphThreadSchema>) {
     try {
+      if (this.options.commands.messageCooldownUntil() || await this.options.jobs?.blocksContinuation(thread.threadId)) {
+        await this.options.registry.recordRunning(thread.threadId);
+        return;
+      }
       const commandResult = await this.options.commands.execute({
         feature: "ralph",
         kind: "inspect_thread",
@@ -813,6 +840,10 @@ export class RalphController {
 
       const currentMode = await this.options.registry.activeMode(thread.threadId);
       if (currentMode === undefined) return;
+      if (await this.options.jobs?.blocksContinuation(thread.threadId)) {
+        await this.options.registry.recordRunning(thread.threadId);
+        return;
+      }
       if (currentMode === "continuous") {
         if (await this.options.registry.activeMode(thread.threadId) !== "continuous") return;
         const sendResult = await this.options.commands.execute({
@@ -849,6 +880,10 @@ export class RalphController {
         ? CONTINUOUS_RALPH_INSTRUCTION
         : decision.instruction;
       if (await this.options.registry.activeMode(thread.threadId) !== modeBeforeSend) return;
+      if (await this.options.jobs?.blocksContinuation(thread.threadId)) {
+        await this.options.registry.recordRunning(thread.threadId);
+        return;
+      }
 
       const sendResult = await this.options.commands.execute({
         feature: "ralph",
@@ -896,7 +931,7 @@ async function decideRalphContinuation(
   ].join("\n\n");
   const instruction = [
     "You classify whether another agent has finished the user's request.",
-    "Its tool access expires after 25 minutes in each turn, and a new message starts a fresh turn with tool access restored.",
+    "An idle turn may be finished or waiting for input. Judge the transcript without assuming a fixed tool-access time limit.",
     "The working agent is more capable than you and already has the full conversation, so do not plan or choose how it should work.",
     "Based only on all user messages and the final assistant message below, reply with exactly COMPLETE if the request is finished.",
     "If work remains, reply in English with one short sentence that tells the agent to continue and names only the unfinished work stated or clearly implied by the transcript.",
@@ -1405,7 +1440,7 @@ function subagentPrompt(message: string, jobId: string, resultPath: string) {
     "",
     "You are a sub-agent working in a separate ChatGPT conversation.",
     "Your first MCP action must be sync_current_thread. If it reports syncing, follow it with get_current_thread_url; if it reports synced, do not sync again.",
-    "Complete only the bounded task above. Do not start another sub-agent unless the user explicitly asked for nested delegation.",
+    "Complete only the bounded task above. Nested delegation is disabled. Perform the work yourself. If assigned a review, remain read-only and report actionable defects with evidence.",
     "Your parent does not expect a browser message from you. Do not call send_thread_message to report back.",
     `When your work is complete, call submit_subagent_result exactly once with jobId ${JSON.stringify(jobId)} and put your complete final report in its result argument.`,
     `The application stores that report locally at ${JSON.stringify(resultPath)} and wakes the parent automatically.`,
@@ -1423,7 +1458,7 @@ async function subagentViews(
     jobs.forParent(parentThreadId),
   ]);
   const jobsByChild = new Map(parentJobs.flatMap((job) => job.childThreadId ? [[job.childThreadId, job] as const] : []));
-  return threads.map((thread) => {
+  const views = threads.map((thread) => {
     const job = jobsByChild.get(thread.threadId);
     return {
       conversationUrl: thread.conversationUrl,
@@ -1448,13 +1483,26 @@ async function subagentViews(
       } : {}),
     };
   });
+  return [...views, ...parentJobs.filter((job) => !job.childThreadId || !threads.some((thread) => thread.threadId === job.childThreadId)).map((job) => ({
+    conversationUrl: job.childConversationUrl,
+    threadId: job.childThreadId,
+    title: job.title ?? "Child startup unconfirmed",
+    state: job.state === "pending" ? "active" as const : "complete" as const,
+    mode: "normal" as const,
+    registeredAt: job.createdAt,
+    nextCheckAt: 0,
+    jobId: job.jobId,
+    resultPath: job.resultPath,
+    resultState: job.state,
+    preparationError: job.preparationError,
+  }))];
 }
 
 const subagentOutputSchema = {
   parentConversationUrl: z.string().url(),
   subagents: z.array(z.object({
-    conversationUrl: z.string().url(),
-    threadId: z.string(),
+    conversationUrl: z.string().url().optional(),
+    threadId: z.string().optional(),
     title: z.string().optional(),
     state: z.enum(["active", "complete"]),
     mode: z.enum(["normal", "continuous"]),
@@ -1465,7 +1513,7 @@ const subagentOutputSchema = {
     lastError: z.string().optional(),
     jobId: z.string().uuid().optional(),
     resultPath: z.string().optional(),
-    resultState: z.enum(["pending", "complete"]).optional(),
+    resultState: z.enum(["pending", "complete", "cancelled"]).optional(),
     notifiedAt: z.string().optional(),
     notificationAttempts: z.number().int().nonnegative().optional(),
     notificationAbandonedAt: z.string().optional(),
@@ -1496,7 +1544,7 @@ export function registerChatGptAgents(
 
   server.registerTool("start_subagent", {
     title: "Start Sub-agent",
-    description: "Start an independent ChatGPT sub-agent. Transport retries of the same MCP request are deduplicated internally. The parent must already have completed its one-time thread sync. The server uses the configured Sub-agent project when present and otherwise starts from chatgpt.com. The child receives a local sub-agent job and reports by submit_subagent_result, which stores the result in a local file. The application later wakes this parent with only the result-file path; the child does not message the parent directly. The new child is registered for RALPH automatically.",
+    description: "Start an independent ChatGPT sub-agent from a synced root. Use one reviewer by default. Two pending children are allowed service-wide, with slots reserved before startup; nested delegation is disabled. On capacity refusal, continue independent work or wait for a result notice without polling or retrying. The configured Sub-agent project is used, or chatgpt.com otherwise. Complete one-time thread sync first. Transport retries of the same MCP request are deduplicated internally; a new logical call creates another job. Reports are stored in a local file and parent notices may be batched. An unconfirmed startup keeps its slot until resolved through cancel_subagent.",
     inputSchema: {
       message: z.string().min(1).max(190_000).describe("Complete bounded task for the sub-agent. Do not include result transport or parent callback instructions; the server adds them."),
     },
@@ -1524,7 +1572,18 @@ export function registerChatGptAgents(
       .digest("base64url");
     const replayKey = `start_subagent:${ownerId}:${session}:${String(extra.requestId)}:${fingerprint}`;
     return await replayToolRequest(replayKey, async () => {
-      const job = await jobs.create(parent);
+      let job: Awaited<ReturnType<SubagentJobRegistry["create"]>>;
+      try {
+        if ((await registry.threads()).some((thread) => thread.threadId === parent.threadId && thread.parentThreadId)) {
+          throw new SubagentAdmissionError("nested");
+        }
+        if (commands.messageCooldownUntil()) {
+          throw new Error(`ChatGPT message cooldown until ${new Date(commands.messageCooldownUntil()).toISOString()}. Wait before starting a child.`);
+        }
+        job = await jobs.create(parent);
+      } catch (error) {
+        return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] };
+      }
       let result: SupportCommandResult;
       try {
         const { subagentProjectUrl } = await registry.settings();
@@ -1538,10 +1597,11 @@ export function registerChatGptAgents(
         if (!result.ok) throw new Error(result.error);
         if (result.kind !== "send_message") throw new Error("Sub-agent creation received the wrong support command result.");
       } catch (error) {
-        await jobs.discard(job.jobId);
+        // Delivery can fail after Send was clicked. Keep the reservation until the parent resolves it.
+        await jobs.recordPreparationFailure(job.jobId, error instanceof Error ? error.message : String(error));
         return {
           isError: true,
-          content: [{ type: "text", text: error instanceof Error ? error.message : "Sub-agent creation failed." }],
+          content: [{ type: "text", text: `Child startup could not be confirmed. Job ${job.jobId} still reserves a slot. ${error instanceof Error ? error.message : "Sub-agent creation failed."} Inspect the browser before using cancel_subagent to release it. Do not repeat the start request.` }],
         };
       }
 
@@ -1578,7 +1638,7 @@ export function registerChatGptAgents(
 
   server.registerTool("submit_subagent_result", {
     title: "Submit Sub-agent Result",
-    description: "Finish a sub-agent job by storing its complete report in the local result file assigned by start_subagent. This does not message the parent. The Local Codex application wakes the parent after the file is stored.",
+    description: "Finish this child's job by storing its complete report in the local result file. This releases its slot and stops future RALPH continuation. This does not message the parent directly; the application sends a delayed, possibly batched result notice. Submit once. A cancelled job rejects late results.",
     inputSchema: {
       jobId: z.string().uuid(),
       result: z.string().trim().min(1).max(200_000),
@@ -1611,6 +1671,7 @@ export function registerChatGptAgents(
       };
     }
     const completed = await jobs.complete(jobId, result);
+    await registry.recordComplete(child.threadId);
     const structuredContent = { resultPath: completed.job.resultPath, status: "stored" as const };
     return {
       content: [{ type: "text", text: completed.job.resultPath }],
@@ -1618,9 +1679,29 @@ export function registerChatGptAgents(
     };
   });
 
+  server.registerTool("cancel_subagent", {
+    title: "Cancel Sub-agent",
+    description: "Release an abandoned pending job owned by this synced parent and disable its RALPH continuation. First stop any running child in the browser and confirm it is no longer working. This tool does not stop an already running browser turn. Use the job ID from start_subagent or list_subagents. Cancellation is permanent; late results are rejected.",
+    inputSchema: { jobId: z.string().uuid() },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+  }, async ({ jobId }, extra) => {
+    const session = extra._meta?.["openai/session"];
+    const parent = typeof session === "string" ? await bindings.binding({ ownerId, sessionId: session }) : undefined;
+    const job = await jobs.job(jobId);
+    if (!parent || !job || job.parentThreadId !== parent.threadId) {
+      return { isError: true, content: [{ type: "text", text: "This job does not belong to the current synced parent." }] };
+    }
+    if (job.state === "pending" && !job.childThreadId && !job.preparationError) {
+      return { isError: true, content: [{ type: "text", text: "Child startup is still in progress. Wait for its startup result before cancelling this job." }] };
+    }
+    if (job.childThreadId) await registry.recordComplete(job.childThreadId);
+    const cancelled = await jobs.cancel(jobId);
+    return { content: [{ type: "text", text: `Job ${jobId}: ${cancelled.state}.` }] };
+  });
+
   server.registerTool("send_thread_message", {
     title: "Send Thread Message",
-    description: "Send one message to an existing ChatGPT conversation. Transport retries of the same MCP request are deduplicated internally. This tool never creates a new thread.",
+    description: "Send one message to an existing ChatGPT conversation only when the user explicitly requests that post. Transport retries of the same MCP request are deduplicated internally. This tool never creates a new thread. Respect a returned cooldown. If delivery is uncertain, inspect the target before making a new send request.",
     inputSchema: {
       targetUrl: z.string().url().describe("Exact existing ChatGPT /c/... conversation URL."),
       message: z.string().min(1).max(200_000).describe("Message to send to that conversation."),
@@ -1675,7 +1756,7 @@ export function registerChatGptAgents(
 
   server.registerTool("list_subagents", {
     title: "List Sub-agents",
-    description: "Show the sub-agents created by this ChatGPT conversation, including their title, RALPH state, continuous mode, last activity, and errors. The current parent thread must be synced.",
+    description: "Inspect jobs owned by this synced parent, including pending or cancelled jobs, unconfirmed startups, local result paths, RALPH state, and notification errors. Use a snapshot when it changes your next action. This is not a waiting mechanism; wait for result notices instead of polling.",
     inputSchema: {},
     outputSchema: subagentOutputSchema,
     _meta: subagentToolMeta,
@@ -1709,6 +1790,8 @@ export function registerChatGptAgents(
 export class SubagentResultController {
   private readonly inFlight = new Set<string>();
   private readonly retryAfter = new Map<string, number>();
+  private readonly batchAfter = new Map<string, number>();
+  private readonly fileRetryAfter = new Map<string, number>();
   private readonly timer: NodeJS.Timeout;
 
   constructor(
@@ -1716,18 +1799,23 @@ export class SubagentResultController {
     private readonly commands: SupportCommandBus,
     private readonly launchBrowser: () => Promise<void>,
     checkEveryMs = 1_000,
+    private readonly batchWindowMs = 1_000,
   ) {
     this.timer = setInterval(() => void this.tick(), checkEveryMs);
     this.timer.unref();
   }
 
   async tick() {
+    if (this.commands.messageCooldownUntil()) return;
     const jobs = await this.jobs.jobsNeedingNotification();
     const now = Date.now();
-    for (const job of jobs) {
-      if (this.inFlight.has(job.jobId) || (this.retryAfter.get(job.jobId) ?? 0) > now) continue;
-      this.inFlight.add(job.jobId);
-      void this.check(job).finally(() => this.inFlight.delete(job.jobId));
+    for (const parentId of new Set(jobs.map((job) => job.parentThreadId))) {
+      if (this.inFlight.has(parentId) || (this.retryAfter.get(parentId) ?? 0) > now) continue;
+      this.inFlight.add(parentId);
+      void this.check(parentId).catch((error: unknown) => {
+        console.error(`[subagents] notification_check_failed parent=${parentId} error=${String(error)}`);
+        this.retryAfter.set(parentId, Date.now() + SUBAGENT_RESULT_MISSING_RETRY_MS);
+      }).finally(() => this.inFlight.delete(parentId));
     }
   }
 
@@ -1735,47 +1823,57 @@ export class SubagentResultController {
     clearInterval(this.timer);
   }
 
-  private async check(job: Awaited<ReturnType<SubagentJobRegistry["job"]>> & {}) {
-    if (!job) return;
-    try {
-      const result = await readFile(job.resultPath, "utf8");
-      if (!result.trim()) {
-        this.retryAfter.set(job.jobId, Date.now() + SUBAGENT_RESULT_MISSING_RETRY_MS);
-        return;
+  private async check(parentId: string) {
+    const ready: Awaited<ReturnType<SubagentJobRegistry["forParent"]>> = [];
+    for (const job of await this.jobs.forParent(parentId)) {
+      if (job.state === "cancelled" || job.notifiedAt || job.notificationAbandonedAt) continue;
+      if ((this.fileRetryAfter.get(job.jobId) ?? 0) > Date.now()) continue;
+      try {
+        if (!(await readFile(job.resultPath, "utf8")).trim()) continue;
+        if (job.state === "pending") await this.jobs.markFileComplete(job.jobId);
+        if ((await this.jobs.job(job.jobId))?.state === "complete") ready.push(job);
+      } catch (error) {
+        if (error instanceof Error && "code" in error && error.code === "ENOENT") continue;
+        const failed = await this.jobs.recordNotificationFailure(job.jobId, String(error), MAX_SUBAGENT_NOTIFICATION_ATTEMPTS);
+        this.fileRetryAfter.set(job.jobId, Date.now() + Math.min(
+          SUBAGENT_RESULT_MISSING_RETRY_MS * 2 ** Math.max(0, failed.notificationAttempts - 1),
+          MAX_SUBAGENT_NOTIFICATION_RETRY_MS,
+        ));
       }
-      if (job.state !== "complete") await this.jobs.markFileComplete(job.jobId);
-
+    }
+    if (!ready.length) return;
+    const batchAfter = this.batchAfter.get(parentId) ?? Date.now() + this.batchWindowMs;
+    this.batchAfter.set(parentId, batchAfter);
+    if (Date.now() < batchAfter || this.commands.messageCooldownUntil()) return;
+    try {
       await this.commands.ensureBrowser("threadMessaging", this.launchBrowser);
       const wake = await this.commands.execute({
         feature: "threadMessaging",
         kind: "send_message",
-        targetUrl: job.parentConversationUrl,
-        message: `Sub-agent result ready for job ${job.jobId}. Read the local result file at ${JSON.stringify(job.resultPath)} now and continue the parent task from that file. The file is the authoritative result; this message is only a wake-up.`,
+        targetUrl: ready[0].parentConversationUrl,
+        message: `Sub-agent results ready. Read these local files and continue the parent task:\n${ready.map((job) => `Job ${job.jobId}: ${JSON.stringify(job.resultPath)}`).join("\n")}\nThe files contain the reports. Use these results before deciding whether further review is needed.`,
       });
       if (!wake.ok) throw new Error(wake.error);
       if (wake.kind !== "send_message") throw new Error("Sub-agent wake-up received the wrong support command result.");
-      await this.jobs.markNotified(job.jobId);
-      this.retryAfter.delete(job.jobId);
+      await this.jobs.markNotified(ready.map((job) => job.jobId));
+      this.retryAfter.delete(parentId);
+      this.batchAfter.delete(parentId);
     } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-        this.retryAfter.set(job.jobId, Date.now() + SUBAGENT_RESULT_MISSING_RETRY_MS);
+      if (this.commands.messageCooldownUntil()) {
+        if (error instanceof Error && error.message.startsWith("CHATGPT_RATE_LIMITED:")) {
+          for (const job of ready) await this.jobs.recordNotificationFailure(job.jobId, error.message, MAX_SUBAGENT_NOTIFICATION_ATTEMPTS);
+        }
+        this.retryAfter.set(parentId, this.commands.messageCooldownUntil());
         return;
       }
       const message = error instanceof Error ? error.message : String(error);
-      const failed = await this.jobs.recordNotificationFailure(
-        job.jobId,
-        message,
-        MAX_SUBAGENT_NOTIFICATION_ATTEMPTS,
-      );
-      if (failed.notificationAbandonedAt) {
-        this.retryAfter.delete(job.jobId);
-        return;
-      }
+      const failures = [];
+      for (const job of ready) failures.push(await this.jobs.recordNotificationFailure(job.jobId, message, MAX_SUBAGENT_NOTIFICATION_ATTEMPTS));
       const retryMs = Math.min(
-        SUBAGENT_RESULT_MISSING_RETRY_MS * 2 ** Math.max(0, failed.notificationAttempts - 1),
+        SUBAGENT_RESULT_MISSING_RETRY_MS * 2 ** Math.max(0, ...failures.map((job) => job.notificationAttempts - 1)),
         MAX_SUBAGENT_NOTIFICATION_RETRY_MS,
       );
-      this.retryAfter.set(job.jobId, Date.now() + retryMs);
+      this.retryAfter.set(parentId, Date.now() + retryMs);
     }
   }
 }

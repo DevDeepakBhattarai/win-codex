@@ -55,10 +55,15 @@ When `THREAD_SYNC_ENABLED` is not `false`, the server also exposes:
 - `get_current_thread_url` waits for the initial binding when `sync_current_thread` reports `syncing`. It never guesses or constructs a conversation URL.
 - `start_subagent` starts a separate ChatGPT child conversation and creates a local result job. The parent must already be synced. Transport retries of the same MCP request are deduplicated internally.
 - `submit_subagent_result` stores the child report in the local result file for that job. It does not send the report through ChatGPT.
+- `cancel_subagent` releases an abandoned job owned by the current parent and disables future RALPH continuation. Stop any running child in the browser first.
 - `send_thread_message` sends one explicit user-requested message to an existing ChatGPT conversation. Its public inputs are only `targetUrl` and `message`; transport retries of the same MCP request are deduplicated internally.
 - `list_subagents` shows the children created by the current synced parent, including their title, RALPH state, and local result status.
 
-`start_subagent` uses the Sub-agent project configured in the Local Codex Support extension settings. If no project is configured, it starts from `https://chatgpt.com/`. The server gives the child a local job ID and result path. The child finishes with `submit_subagent_result`. The backend then sends the parent a short result-ready wake-up that points to the file. The parent reads the local file for the actual report.
+`start_subagent` uses the Sub-agent project configured in the Local Codex Support extension settings. If no project is configured, it starts from `https://chatgpt.com/`. The server gives the child a local job ID and result path. The child finishes with `submit_subagent_result`. The backend groups results that become ready together and sends the parent one notice with their paths. The parent reads every listed file.
+
+The service allows two pending sub-agents total across all parents, including startups. Only root conversations can delegate. Use one reviewer by default and a second only for a distinct concern. A capacity refusal includes the occupied job IDs. Continue independent work or wait for a result notice instead of retrying starts or polling status.
+
+Slot reservations survive service restarts. Result submission releases a slot. An unconfirmed startup retains its slot because the browser may already have sent the prompt. After a restart, the registry marks an unresolved startup as interrupted so that it can be cancelled. Inspect the browser, stop any running child, then use `cancel_subagent` for an abandoned job. Cancellation cannot interrupt an existing browser turn and rejects late result submissions. Jobs do not expire automatically.
 
 ## OAuth and MCP flow
 
@@ -208,6 +213,10 @@ Call `sync_current_thread` once at the start of the parent conversation. If it r
 `start_subagent` creates a job under `<DATA_DIR>/subagents/`. The child receives the job ID and result path, not the parent URL. Before reporting startup success, the backend confirms that the child's parked Thread Sync tab was prepared. If automatic preparation fails after the child was already created, the tool returns the child and result path with the preparation error instead of retrying into a duplicate child. When the child finishes, `submit_subagent_result` writes the report to the assigned `.md` file. The backend sends the parent only a result-ready message with that path. Parent wake-up failures use exponential backoff and stop after five failed attempts, with the error retained in the sub-agent status. The parent reads the file as the authoritative result.
 
 The browser path is still used to create the child and to wake the parent. It uses the existing single-send behavior: wait for the page, insert once, and click Send once. The sub-agent report itself does not travel through browser messaging.
+
+Result notifications use a one-second collection window and combine ready files for the same parent into one message. RALPH defers inspection and continuation while that parent has pending children or completed results awaiting notification. Finished and cancelled children receive no further RALPH continuation through their job. Notification failures remain bounded to five attempts; when delivery is abandoned, the parent can inspect `list_subagents` and read the result files.
+
+Recognized visible ChatGPT rate-limit notices pause all new browser message commands for 15 minutes in the running service. Queued sends are rejected, and RALPH and result notifications defer while the cooldown is active. Already claimed browser commands cannot be recalled. The cooldown is a conservative retry delay, not a claim about the account's quota, and resets when the service restarts. Detection currently covers English rate-limit notices in visible alerts, dialogs, and toasts. The exact notice and command errors help distinguish this from other failures.
 
 `start_subagent` and `send_thread_message` keep transport idempotency internal. The server deduplicates retries of the same MCP request by tool, request identity, session, and payload fingerprint. `send_thread_message` also fingerprints its normalized target. A new logical tool call remains a new send or a new child.
 

@@ -6,6 +6,16 @@ import { z } from "zod";
 
 const MAX_JOBS = 2_000;
 const RETAINED_NOTIFIED_JOBS = 1_000;
+export const MAX_ACTIVE_SUBAGENTS = 2;
+const INTERRUPTED_STARTUP_ERROR = "Child startup was interrupted by a service restart. Inspect the browser, stop any running child, then cancel this job if it is abandoned.";
+
+export class SubagentAdmissionError extends Error {
+  constructor(readonly reason: "capacity" | "nested", readonly activeJobIds: string[] = []) {
+    super(reason === "nested"
+      ? "Only root conversations can start sub-agents. Complete your assigned work and submit its result."
+      : `The service already has two active sub-agents. Active jobs: ${activeJobIds.join(", ")}. Continue independent work or wait for a result notification. Do not retry or poll for capacity.`);
+  }
+}
 
 const subagentJobSchema = z.object({
   jobId: z.string().uuid(),
@@ -15,7 +25,8 @@ const subagentJobSchema = z.object({
   childConversationUrl: z.string().url().optional(),
   title: z.string().optional(),
   resultPath: z.string(),
-  state: z.enum(["pending", "complete"]),
+  state: z.enum(["pending", "complete", "cancelled"]),
+  cancelledAt: z.string().optional(),
   createdAt: z.string(),
   completedAt: z.string().optional(),
   notifiedAt: z.string().optional(),
@@ -47,14 +58,26 @@ export class SubagentJobRegistry {
     await mkdir(resultDirectory, { recursive: true });
     const filePath = path.join(resultDirectory, "jobs.json");
     let state: SubagentStore = { version: 1, jobs: [] };
+    let recoveredInterruptedStartup = false;
     try {
       state = subagentStoreSchema.parse(JSON.parse(await readFile(filePath, "utf8")));
+      for (const job of state.jobs) {
+        if (job.state === "pending" && !job.childThreadId && !job.preparationError) {
+          job.preparationError = INTERRUPTED_STARTUP_ERROR;
+          recoveredInterruptedStartup = true;
+        }
+      }
       const unfinished = state.jobs.filter((job) => !job.notifiedAt);
       const notified = state.jobs
         .filter((job) => job.notifiedAt)
         .sort((left, right) => Date.parse(right.notifiedAt ?? right.createdAt) - Date.parse(left.notifiedAt ?? left.createdAt))
         .slice(0, RETAINED_NOTIFIED_JOBS);
       state.jobs = [...unfinished, ...notified];
+      if (recoveredInterruptedStartup) {
+        const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
+        await writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+        await rename(temporaryPath, filePath);
+      }
     } catch (error) {
       if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
     }
@@ -63,6 +86,13 @@ export class SubagentJobRegistry {
 
   async create(parent: { threadId: string; conversationUrl: string }) {
     return await this.update((state) => {
+      if (state.jobs.some((job) => job.childThreadId === parent.threadId)) {
+        throw new SubagentAdmissionError("nested");
+      }
+      const active = state.jobs.filter((job) => job.state === "pending");
+      if (active.length >= MAX_ACTIVE_SUBAGENTS) {
+        throw new SubagentAdmissionError("capacity", active.map((job) => job.jobId));
+      }
       if (state.jobs.length >= MAX_JOBS) throw new Error("Sub-agent job limit reached.");
       const jobId = randomUUID();
       const job: SubagentJob = {
@@ -98,10 +128,32 @@ export class SubagentJobRegistry {
     });
   }
 
+  async cancel(jobId: string) {
+    return await this.update((state) => {
+      const job = state.jobs.find((entry) => entry.jobId === jobId);
+      if (!job) throw new Error("Sub-agent job not found.");
+      if (job.state === "pending") {
+        job.state = "cancelled";
+        job.cancelledAt = new Date().toISOString();
+        job.notifiedAt = job.cancelledAt;
+      }
+      return { ...job };
+    });
+  }
+
+  async blocksContinuation(threadId: string) {
+    await this.queue;
+    return this.state.jobs.some((job) =>
+      (job.childThreadId === threadId && job.state !== "pending") ||
+      (job.parentThreadId === threadId && (job.state === "pending" ||
+        (job.state === "complete" && !job.notifiedAt && !job.notificationAbandonedAt))));
+  }
+
   complete(jobId: string, result: string) {
     const operation = this.queue.then(async () => {
       const current = this.state.jobs.find((entry) => entry.jobId === jobId);
       if (!current) throw new Error("Sub-agent job not found.");
+      if (current.state === "cancelled") throw new Error("This sub-agent job was cancelled. End this child task.");
       if (current.state === "complete") return { job: { ...current }, newlyCompleted: false };
 
       const temporaryResultPath = `${current.resultPath}.${randomUUID()}.tmp`;
@@ -123,14 +175,14 @@ export class SubagentJobRegistry {
     return operation;
   }
 
-  async markNotified(jobId: string) {
+  async markNotified(jobId: string | string[]) {
     return await this.update((state) => {
-      const job = state.jobs.find((entry) => entry.jobId === jobId);
-      if (!job) throw new Error("Sub-agent job not found.");
-      job.notifiedAt = new Date().toISOString();
-      job.notificationAbandonedAt = undefined;
-      job.notificationError = undefined;
-      return { ...job };
+      const ids = new Set(typeof jobId === "string" ? [jobId] : jobId);
+      for (const job of state.jobs.filter((entry) => ids.has(entry.jobId))) {
+        job.notifiedAt = new Date().toISOString();
+        job.notificationAbandonedAt = undefined;
+        job.notificationError = undefined;
+      }
     });
   }
 
@@ -163,7 +215,7 @@ export class SubagentJobRegistry {
   async jobsNeedingNotification() {
     await this.queue;
     return this.state.jobs
-      .filter((entry) => !entry.notifiedAt && !entry.notificationAbandonedAt)
+      .filter((entry) => entry.state !== "cancelled" && !entry.notifiedAt && !entry.notificationAbandonedAt)
       .map((entry) => ({ ...entry }));
   }
 
@@ -171,7 +223,7 @@ export class SubagentJobRegistry {
     return await this.update((state) => {
       const job = state.jobs.find((entry) => entry.jobId === jobId);
       if (!job) throw new Error("Sub-agent job not found.");
-      if (job.state !== "complete") {
+      if (job.state === "pending") {
         job.state = "complete";
         job.completedAt = new Date().toISOString();
       }

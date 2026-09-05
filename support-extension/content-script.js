@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.4.0";
+  const contentScriptVersion = "1.4.1";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -107,6 +107,7 @@
   });
 
   async function runAutomation(command) {
+    assertNotRateLimited();
     if (command.kind === "inspect_thread") return await inspectThread();
     if (command.kind === "send_message") return await sendMessage(command.message);
     throw new Error("Unsupported ChatGPT support command.");
@@ -212,11 +213,13 @@
 
     const ready = await waitForComposer(SEND_READY_TIMEOUT_MS);
     if (!ready) throw new Error("ChatGPT composer did not become available.");
+    assertNotRateLimited();
     insertMessage(ready.editor, message);
 
     await sleep(SEND_SETTLE_MS);
 
     const current = await waitFor(() => {
+      assertNotRateLimited();
       const composer = getComposer();
       if (!composer) return null;
       const button = getSendButton(composer.composer);
@@ -225,12 +228,25 @@
     if (!current) throw new Error("ChatGPT send button did not become actionable.");
 
     current.button.click();
+    await sleep(SEND_SETTLE_MS);
+    assertNotRateLimited();
 
-    const savedUrl = existingConversationUrl ?? await waitFor(() => conversationUrl(), SEND_NAVIGATION_TIMEOUT_MS);
+    const savedUrl = existingConversationUrl ?? await waitFor(() => {
+      assertNotRateLimited();
+      return conversationUrl();
+    }, SEND_NAVIGATION_TIMEOUT_MS);
     if (!savedUrl) throw new Error("ChatGPT did not navigate to the newly created conversation after sending.");
 
     const title = threadTitle();
     return { status: "sent", conversationUrl: savedUrl, ...(title ? { title } : {}) };
+  }
+
+  function assertNotRateLimited() {
+    // Read visible provider notices, never conversation content that may quote an error.
+    const notices = [...document.querySelectorAll('[role="alert"], [role="dialog"], [data-testid="toast"]')];
+    const notice = notices.find((element) => element.getClientRects?.().length &&
+      /too many (?:messages|requests)|rate limit|message limit|usage limit|you(?:'ve| have) reached.{0,60}limit/i.test(element.textContent ?? ""));
+    if (notice) throw new Error(`CHATGPT_RATE_LIMITED: ${(notice.textContent ?? "").trim().slice(0, 500)}`);
   }
 
   function insertMessage(editor, message) {
@@ -436,6 +452,7 @@
     let previousSignature = null;
     let stableSince = 0;
     while (Date.now() < deadline) {
+      assertNotRateLimited();
       const state = sample();
       if (!state) {
         previousSignature = null;
@@ -500,6 +517,7 @@
   async function waitFor(getElement, timeoutMs) {
     const deadline = timeoutMs === undefined ? Infinity : Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+      assertNotRateLimited();
       const value = getElement();
       if (value) return value;
       await sleep(50);

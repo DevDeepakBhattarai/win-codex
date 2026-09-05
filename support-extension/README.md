@@ -43,9 +43,13 @@ The Chrome profile with **Thread preparation executor** enabled opens the conver
 
 The server resolves the parent from `openai/session`, chooses the configured **Sub-agent project**, or falls back to `https://chatgpt.com/`. It creates a local job under `<DATA_DIR>/subagents/` and gives the child the job ID and result path. The child prompt does not contain the parent URL.
 
-A child behaves as a bounded sub-agent. It starts by syncing its own conversation once, avoids nested delegation unless the user explicitly requested it, and finishes with `submit_subagent_result`. That tool stores the complete report in the assigned local `.md` file.
+A child syncs its conversation once, performs its bounded task without delegation, and finishes with `submit_subagent_result`. That tool stores the report in the assigned local `.md` file and releases the job's slot. Reviewers remain read-only. Default to one reviewer, with a second only for a distinct concern.
 
-The backend watches unfinished jobs. `start_subagent` waits until the child has a prepared Thread Sync tab before returning normal startup success. If preparation fails after the child already exists, the job records the error and the tool surfaces it without creating another child. When the result file contains data, the backend sends the parent a short wake-up message with the job ID and result path. The report itself never travels through browser messaging. Failed parent wake-ups use exponential backoff and stop after five attempts; the terminal error remains visible in `list_subagents`. The parent reads the file and continues from that content.
+The backend reserves at most two pending children across all parents, including startups, and rejects nested delegation. Capacity refusals name the active jobs. Wait for result notices or continue independent work instead of polling or retrying. Reservations survive restart. Unconfirmed startup keeps its slot until the parent inspects the browser and resolves the job. To abandon a job, stop any running child in the browser, then call `cancel_subagent`. Cancellation releases the slot and disables future RALPH continuation, but does not interrupt a running browser turn.
+
+Ready results for the same parent are collected for one second and delivered in one notice. RALPH defers parents with pending children or results awaiting notification, and skips further continuation for finished or cancelled children. Recognized visible English ChatGPT rate-limit alerts, dialogs, or toasts trigger a 15-minute cooldown shared by browser message commands in the running backend. Restart clears that cooldown. The delay does not represent the account's actual quota.
+
+The backend watches unfinished jobs. `start_subagent` waits until the child has a prepared Thread Sync tab before returning normal startup success. If preparation fails after the child already exists, the job records the error and the tool surfaces it without creating another child. After a service restart, the registry marks a startup without a known child as interrupted so that the parent can resolve it. When result files contain data, the backend groups ready jobs by parent and sends one notice with their paths. The reports never travel through browser messaging. Failed parent wake-ups use exponential backoff and stop after five attempts; the terminal errors remain visible in `list_subagents`. The parent reads every listed file before continuing.
 
 The child is registered for RALPH immediately and stores its parent thread ID.
 
@@ -102,7 +106,7 @@ Classification requests and results are written to `<DATA_DIR>/ralph-openai.log`
 
 Continuous mode must be selected explicitly per thread. When an idle continuous thread is due, RALPH skips the worked-duration completion gate and the OpenAI completion classifier. It sends a fixed continuation instruction that tells the agent to reread the current state and execute the next useful improvement, experiment, verification, or cleanup toward the existing goal.
 
-The thread stays active until the user selects **Stop continuous** or marks it complete.
+**Stop continuous** restores normal completion checks. Marking the thread complete stops its scheduled checks.
 
 ## Initial thread preparation
 

@@ -55,7 +55,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.4.0");
+  assert.equal(manifest.version, "1.4.1");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -134,7 +134,7 @@ try {
     "thread sending does not use acknowledgement or DOM-stability heuristics");
   assert.match(preparedContentScript, /const SEND_SETTLE_MS = 5_000;/,
     "thread sending uses the fixed five-second settle requested for typing and sending");
-  assert.match(preparedContentScript, /contentScriptVersion = "1\.4\.0"/,
+  assert.match(preparedContentScript, /contentScriptVersion = "1\.4\.1"/,
     "extension reloads can replace a stale page script with the current content-script version");
   assert.equal(parseRalphProjectId(namedProjectHome), projectId);
   assert.equal(parseRalphProjectId(urlA), projectId);
@@ -728,7 +728,7 @@ try {
     "an unset Sub-agent project falls back to the normal ChatGPT new-chat page");
   assert.match(startSubagentCommand.message, /Review the implementation independently/);
   assert.match(startSubagentCommand.message, /Your first MCP action must be sync_current_thread/);
-  assert.match(startSubagentCommand.message, /Do not start another sub-agent unless the user explicitly asked/);
+  assert.match(startSubagentCommand.message, /Nested delegation is disabled/);
   assert.match(startSubagentCommand.message, /submit_subagent_result exactly once/);
   assert.match(startSubagentCommand.message, /Do not call send_thread_message to report back/);
   assert.doesNotMatch(startSubagentCommand.message, new RegExp(urlA.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
@@ -771,7 +771,7 @@ try {
   await registry.bind(childToken, urlC);
   threadPreparer.markBound(parseConversationUrl(urlC).threadId);
 
-  const resultController = new SubagentResultController(subagentJobs, supportCommands, launchSupportBrowser, 60_000);
+  const resultController = new SubagentResultController(subagentJobs, supportCommands, launchSupportBrowser, 60_000, 0);
   const whitespaceSubmit = await client.callTool({
     name: "submit_subagent_result",
     arguments: { jobId: firstSubagent.jobId, result: "   " },
@@ -987,6 +987,10 @@ try {
     "the retried MCP request reuses the original start_subagent result");
 
   let preparationFailureHandler;
+  // Finish the previous independent scenarios before requesting another child.
+  for (const job of await subagentJobs.forParent(urlA.split("/").at(-1))) {
+    if (job.state === "pending") await subagentJobs.complete(job.jobId, "Previous scenario complete.");
+  }
   const preparationFailureServer = {
     registerResource() {},
     registerTool(name, _definition, handler) {
@@ -1226,7 +1230,7 @@ try {
     assert.equal("max_output_tokens" in apiRequest, false,
       "RALPH must not impose an output-token budget on classification");
     const classifierInstruction = apiRequest.input[0].content[0].text;
-    assert.match(classifierInstruction, /tool access expires after 25 minutes in each turn/);
+    assert.doesNotMatch(classifierInstruction, /tool access expires after 25 minutes/);
     assert.match(classifierInstruction, /working agent is more capable than you/);
     assert.match(classifierInstruction, /reply in English with one short sentence/);
     assert.match(classifierInstruction, /names only the unfinished work stated or clearly implied by the transcript/);
@@ -1316,8 +1320,8 @@ try {
     const continuousCommand = await ralphCommands.claim("chrome-browser", ["ralph"], 1000);
     assert.equal(continuousCommand.kind, "send_message");
     assert.equal(continuousCommand.targetUrl, continuousRalphUrl);
-    assert.match(continuousCommand.message, /Continue the continuous run/);
-    assert.match(continuousCommand.message, /Do not stop because the previous step appears complete/);
+    assert.match(continuousCommand.message, /Continue the authorized continuous run/);
+    assert.match(continuousCommand.message, /continue within the agreed scope/);
     assert.equal(apiRequestCount, 1, "continuous RALPH does not use the completion classifier");
     ralphCommands.complete({
       commandId: continuousCommand.id,

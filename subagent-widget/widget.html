@@ -173,6 +173,7 @@
     }
 
     function stateLabel(agent) {
+      if (agent.resultState === "cancelled") return "Cancelled";
       if (agent.lastError || agent.preparationError || agent.notificationAbandonedAt) return "Needs attention";
       if (agent.state === "complete") return "Done";
       return agent.mode === "continuous" ? "Continuous" : "Working";
@@ -214,7 +215,7 @@
       for (const agent of agents) {
         const row = document.createElement("a");
         row.className = "agent";
-        row.href = agent.conversationUrl;
+        if (agent.conversationUrl) row.href = agent.conversationUrl;
         row.target = "_blank";
         row.rel = "noreferrer";
 
@@ -227,7 +228,7 @@
         copy.className = "copy";
         copy.append(Object.assign(document.createElement("div"), {
           className: "name",
-          textContent: agent.title || `Sub-agent ${String(agent.threadId).slice(0, 8)}`,
+          textContent: agent.title || `Sub-agent ${String(agent.threadId ?? agent.jobId).slice(0, 8)}`,
         }));
 
         const meta = document.createElement("div");
@@ -246,7 +247,7 @@
         }
         if (agent.resultState) {
           meta.append(Object.assign(document.createElement("span"), {
-            textContent: agent.resultState === "complete" ? "Result ready" : "Result pending",
+            textContent: agent.resultState === "cancelled" ? "Cancelled" : agent.resultState === "complete" ? "Result ready" : "Result pending",
           }));
         }
         if (agent.resultPath) {

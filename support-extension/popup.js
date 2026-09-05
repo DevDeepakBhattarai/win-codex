@@ -524,7 +524,7 @@ async function loadRalphProjects() {
   try {
     const { projects } = await callServer(ralphProjectsEndpoint);
     element("ralphProjects").value = projects.join("\n");
-    setNote(status, "Only threads inside these projects are registered for RALPH.");
+    setNote(status, "These projects are registered automatically. Manual registrations and sub-agents are also retained.");
   } catch (error) {
     setNote(status, errorMessage(error, "Could not load RALPH projects."), "error");
   }

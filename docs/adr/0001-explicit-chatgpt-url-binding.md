@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted on 2026-08-27. Extended through 2026-09-04 with one-time thread binding, backend-owned thread preparation, local-file sub-agent results, parent wake-ups, parent-child tracking, readable thread titles, explicit continuous RALPH mode, and single-shot browser delivery.
+Accepted on 2026-08-27. Extended through 2026-09-05 with one-time thread binding, backend-owned thread preparation, local-file sub-agent results, parent wake-ups, parent-child tracking, bounded flat delegation, readable thread titles, explicit continuous RALPH mode, and single-shot browser delivery.
 
 ## Context
 
@@ -35,16 +35,19 @@ The support extension has an explicit **Thread preparation executor** setting. E
 
 ### Keep delegation server-routed and file-backed
 
-Delegation uses four MCP tools:
+Delegation uses five MCP tools:
 
 - `start_subagent` requires a synced parent. The server resolves the parent from `openai/session`, chooses the configured **Sub-agent project** or `https://chatgpt.com/`, creates a local result job, and starts the child.
 - `submit_subagent_result` stores the child report in the job's local `.md` file.
 - `send_thread_message` sends an explicit message to an existing `/c/...` conversation only. It is not the sub-agent return channel.
 - `list_subagents` returns the children created by the current parent and includes their result path and result state.
+- `cancel_subagent` releases a parent's abandoned job after any running child has been stopped in the browser. It disables future RALPH continuation and rejects late results.
 
-The child receives its job ID and result path. It does not receive the parent URL. The child starts by syncing its own thread once, performs the bounded task, and finishes with `submit_subagent_result`. Nested delegation is not part of the default child behavior.
+The child receives its job ID and result path. It does not receive the parent URL. The child syncs its own thread once, performs the bounded task, and finishes with `submit_subagent_result`. Nested delegation is rejected by the backend. The registry reserves at most two pending jobs across all parents inside its serialized update, before browser delivery. Reservations survive restart and are released by completion or explicit cancellation. Unconfirmed startup keeps its reservation because delivery may have occurred. On restart, the registry marks a reservation without a known child as interrupted so that the parent can inspect the browser and cancel it.
 
-Before `start_subagent` reports normal startup success, the backend confirms that the child has a prepared Thread Sync tab. A preparation failure after child creation is stored on the job and returned to the parent without retrying child creation. The backend then watches completed jobs that have not notified their parent. Once a result file contains data, it sends the parent a small wake-up message containing only the job ID and local result path. Wake-up failures back off exponentially and become terminal after five attempts, with the error retained on the job. The parent reads the file for the report. This keeps browser messaging out of the result transport while preserving automatic parent continuation.
+The review policy defaults to one independent reviewer. Follow-up reviews focus on behavior changed by fixes. Capacity refusals direct the parent to wait for results or continue independent work, with no automatic queue or polling loop.
+
+Before `start_subagent` reports normal startup success, the backend confirms that the child has a prepared Thread Sync tab. A preparation failure after child creation is stored on the job and returned to the parent without retrying child creation. The backend then watches completed jobs that have not notified their parent. It groups ready jobs for the same parent during a one-second window and sends one notice with their paths. Wake-up failures back off exponentially and become terminal after five attempts, with each error retained on its job. The parent reads the files for the reports. This keeps browser messaging out of the result transport while preserving automatic parent continuation.
 
 ### Hide transport idempotency from the model
 
@@ -79,6 +82,8 @@ RALPH stores two independent fields:
 - `mode` is `normal` or `continuous`.
 
 Normal mode uses the worked-duration gate and completion classifier. Continuous mode is explicit per thread, skips completion classification, and sends a fixed continuation instruction when the thread is idle and due. Continuous mode never starts automatically.
+
+Both modes defer parents while children are pending or results await notification. Finished and cancelled child jobs suppress further continuation. Ready files for a parent share a one-second collection window and one wake-up. Visible recognized ChatGPT rate-limit notices trigger a shared 15-minute message cooldown in the command bus. Queued sends are rejected and schedulers defer. Already claimed sends cannot be recalled, and cooldown state is not persisted across service restarts.
 
 ### Claim automation commands atomically
 

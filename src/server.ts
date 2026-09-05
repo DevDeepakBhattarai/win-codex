@@ -2740,6 +2740,7 @@ const ralphController = supportCommands && ralphRegistry
   ? new RalphController({
       commands: supportCommands,
       registry: ralphRegistry,
+      jobs: subagentJobs,
       apiKey: process.env.OPENAI_API_KEY,
       model: RALPH_MODEL,
       auditLogPath: RALPH_OPENAI_AUDIT_LOG_PATH,
