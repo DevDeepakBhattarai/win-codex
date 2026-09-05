@@ -55,13 +55,13 @@ When `THREAD_SYNC_ENABLED` is not `false`, the server also exposes:
 - `get_current_thread_url` waits for the initial binding when `sync_current_thread` reports `syncing`. It never guesses or constructs a conversation URL.
 - `start_subagent` starts a separate ChatGPT child conversation and creates a local result job. The parent must already be synced. Transport retries of the same MCP request are deduplicated internally.
 - `submit_subagent_result` stores the child report in the local result file for that job. It does not send the report through ChatGPT.
-- `cancel_subagent` cancels an abandoned job owned by the current parent. When the child URL is known, the service opens that thread, clicks ChatGPT Stop if it is running, confirms it stopped, closes the automation tab, and then releases the slot.
+- `cancel_subagent` cancels an abandoned job owned by the current parent. When the child URL is known, the service opens that thread, clicks ChatGPT Stop if it is running, confirms it stopped, closes the tab only when it is automation-owned, and then releases the slot.
 - `send_thread_message` sends one explicit user-requested message to an existing ChatGPT conversation. Its public inputs are only `targetUrl` and `message`; transport retries of the same MCP request are deduplicated internally.
 - `list_subagents` shows the children created by the current synced parent, including their title, RALPH state, and local result status.
 
 `start_subagent` uses the Sub-agent project configured in the Local Codex Support extension settings. If no project is configured, it starts from `https://chatgpt.com/`. The server gives the child a local job ID and result path. The child finishes with `submit_subagent_result`. The backend groups results that become ready together and sends the parent one notice with their paths. The parent reads every listed file.
 
-Each root parent may have at most two pending sub-agents, including startups. Different parents have independent two-child limits. Nested delegation remains blocked. Use one reviewer by default and a second only for a distinct concern. Reviewers report findings and evidence; the root decides what to change. A capacity refusal includes that parent's occupied job IDs. Continue independent work or wait for a result notice instead of retrying starts or polling status.
+Sub-agents are opt-in: the model should call `start_subagent` only when the user explicitly asks for delegation. Each root parent may have at most two pending sub-agents, including startups. Different parents have independent two-child limits and nested delegation remains blocked. A capacity refusal includes that parent's occupied job IDs. Continue root work or wait for a result notice instead of retrying starts or polling status.
 
 Slot reservations survive service restarts. Result submission releases a slot. An unconfirmed startup retains its slot because the browser may already have sent the prompt. After a restart, the registry marks an unresolved startup as interrupted so that it can be cancelled. For a known child URL, `cancel_subagent` performs the browser stop before releasing the slot. If the stop cannot be confirmed, the job stays pending. Jobs without a known child URL can still be cancelled after startup is known to have failed or been interrupted. Late result submissions are rejected. Jobs do not expire automatically.
 
@@ -198,7 +198,7 @@ Load `.data/support-extension` as an unpacked extension. Do not load the source 
 The popup lets you configure four browser responsibilities:
 
 - Thread sync. This can be enabled in more than one compatible browser because binding is idempotent.
-- Thread preparation executor. Enable this only in the Chrome automation profile. It owns parked tabs for unsynced threads.
+- Thread preparation executor. Enable this only in the Chrome automation profile. It opens or reuses persistent thread tabs for unsynced conversations.
 - RALPH automation. Normally enable this in only one browser.
 - Agent thread messaging. Normally enable this in only one browser.
 
@@ -208,9 +208,9 @@ See [support-extension/README.md](support-extension/README.md) for the exact sup
 
 ## Sub-agent result delivery
 
-Make `sync_current_thread` the first MCP action in the parent conversation. If it reports `syncing`, immediately finish the initial handshake with `get_current_thread_url` before other MCP work. Later `sync_current_thread` calls return the stored URL and do not start another handshake.
+`sync_current_thread` is on demand, not a conversation-start requirement. Call it before an operation that needs the current conversation binding; `start_subagent` specifically requires the parent to be bound first. If it reports `syncing`, immediately finish the one-time handshake with `get_current_thread_url` before that binding-dependent operation.
 
-`start_subagent` creates a job under `<DATA_DIR>/subagents/`. The child receives the job ID and result path, not the parent URL. Before reporting startup success, the backend confirms that the child's parked Thread Sync tab was prepared. If automatic preparation fails after the child was already created, the tool returns the child and result path with the preparation error instead of retrying into a duplicate child. When the child finishes, `submit_subagent_result` writes the report to the assigned `.md` file. The backend sends the parent only a result-ready message with that path. Parent wake-up failures use exponential backoff and stop after five failed attempts, with the error retained in the sub-agent status. The parent reads the file as the authoritative result.
+`start_subagent` creates a job under `<DATA_DIR>/subagents/`. The child receives the job ID and result path, not the parent URL. Before reporting startup success, the backend confirms that the child conversation is open in the automation browser for later Thread Sync. If automatic preparation fails after the child was already created, the tool returns the child and result path with the preparation error instead of retrying into a duplicate child. When the child finishes, `submit_subagent_result` writes the report to the assigned `.md` file. The backend sends the parent only a result-ready message with that path. Parent wake-up failures use exponential backoff and stop after five failed attempts, with the error retained in the sub-agent status. The parent reads the file as the authoritative result.
 
 The browser path is still used to create the child and to wake the parent. It uses the existing single-send behavior: wait for the page, insert once, and click Send once. The sub-agent report itself does not travel through browser messaging.
 
@@ -226,7 +226,7 @@ RALPH is the support-extension continuation runtime. It tracks registered ChatGP
 
 Normal project threads are registered only when their project is in the RALPH project allowlist. Manually registered threads and agent-created sub-agents remain registered independently of that allowlist.
 
-Thread preparation is independent from RALPH registration. Every observed unsynced ChatGPT `/c/...` route is sent to the local backend. The backend starts Chrome when no recent preparation executor is connected and queues one `prepare_thread`. The Chrome profile with **Thread preparation executor** enabled opens parked background tabs, with at most three preparations active at once. A successful preparation is attempted only once per thread during that server run, and a successful one-time Thread Sync handshake closes the tab early. Already-synced threads do not open another preparation tab.
+Thread preparation is independent from RALPH registration. Every observed ChatGPT `/c/...` route is sent to the local backend, regardless of whether Thread Sync is already bound. The backend starts Chrome only when no recent preparation executor is connected and queues one `prepare_thread`. The automation profile reuses an already-open matching conversation when possible; otherwise it creates one background tab and records ownership. That same tab is then reused for Thread Sync, title observation, RALPH inspection, and thread messaging instead of reloading the conversation on every command. Running threads stay open. Automation-owned tabs are eligible for cleanup ten minutes after the registry marks the thread complete; tabs that were already open and owned by the user are never closed by this cleanup.
 
 RALPH has two modes:
 

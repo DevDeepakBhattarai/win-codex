@@ -9,7 +9,7 @@ import { parseConversationUrl } from "./chatgpt-support.js";
 export { parseConversationUrl } from "./chatgpt-support.js";
 
 export const THREAD_SYNC_WIDGET_URI = "ui://local-codex/thread-sync-v2.html";
-export const THREAD_SYNC_AGENT_INSTRUCTION = "Your first MCP action in every ChatGPT conversation must be sync_current_thread. Call it before any other MCP tool or delegated work. If it reports that the conversation is already synced, keep and reuse that binding; do not sync again. If it reports syncing, immediately call get_current_thread_url to finish the one-time handshake before continuing. get_current_thread_url is the only fallback source of the current conversation URL. Never infer or construct the URL with another tool.";
+export const THREAD_SYNC_AGENT_INSTRUCTION = "Thread sync is an on-demand prerequisite, not a startup step. Use sync_current_thread only when an action needs the current ChatGPT conversation binding or exact conversation URL. In particular, establish the binding before start_subagent. If sync_current_thread reports synced, reuse the returned binding. If it reports syncing, immediately call get_current_thread_url to finish that one-time handshake before the binding-dependent action. Never infer or construct the current conversation URL with another tool.";
 const TICKET_TTL_MS = 30 * 60 * 1000;
 const MAX_RECORDS = 2_000;
 const BROWSER_BLOCKED_PORTS = new Set([
@@ -288,7 +288,7 @@ export function registerThreadSync(
   }));
   server.registerTool("sync_current_thread", {
     title: "Sync Current Thread",
-    description: "This must be the first MCP tool call in every ChatGPT conversation. If this session is already bound, it returns the saved conversation URL immediately and performs no new handshake. Otherwise it renders the Thread Sync UI and starts the one-time extension handshake; immediately follow with get_current_thread_url before other MCP work.",
+    description: "Bind the current ChatGPT conversation to this MCP session when a later action requires that binding or the exact conversation URL. This is not a required startup call. If the session is already bound, it returns the saved URL without another handshake. Otherwise it starts the one-time Thread Sync handshake; if it reports syncing, immediately follow with get_current_thread_url before the binding-dependent action.",
     inputSchema: {},
     outputSchema: {
       status: z.enum(["syncing", "synced"]),

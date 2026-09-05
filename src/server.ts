@@ -74,6 +74,7 @@ import {
   SubagentResultController,
   SupportCommandBus,
   ThreadPreparationCoordinator,
+  ThreadTabCleanupController,
   threadObservationHandler,
   supportCommandClaimHandler,
   supportCommandResultHandler,
@@ -2746,6 +2747,12 @@ const ralphController = supportCommands && ralphRegistry
       auditLogPath: RALPH_OPENAI_AUDIT_LOG_PATH,
     })
   : undefined;
+const threadTabCleanupController = supportCommands && ralphRegistry
+  ? new ThreadTabCleanupController({
+      commands: supportCommands,
+      registry: ralphRegistry,
+    })
+  : undefined;
 
 const browserService = BROWSER_BRIDGE_ENABLED
   ? await createBrowserService({
@@ -2854,6 +2861,7 @@ async function shutdown(signal: string) {
     console.error("Browser bridge shutdown failed:", error),
   );
   ralphController?.close();
+  threadTabCleanupController?.close();
   subagentResultController?.close();
   supportCommands?.close();
 

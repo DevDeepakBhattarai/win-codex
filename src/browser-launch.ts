@@ -12,6 +12,7 @@ export async function launchChrome(input: {
   const profileDirectory = input.profileDirectory ?? process.env.BROWSER_PROFILE_DIRECTORY;
   const userDataDirectory = input.userDataDirectory ?? process.env.BROWSER_USER_DATA_DIRECTORY;
   const args = [
+    "--new-tab",
     ...(profileDirectory ? [`--profile-directory=${profileDirectory}`] : []),
     ...(userDataDirectory ? [`--user-data-dir=${path.resolve(userDataDirectory)}`] : []),
   ];

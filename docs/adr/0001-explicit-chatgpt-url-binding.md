@@ -18,7 +18,7 @@ The support extension can also run in more than one browser. Any command that ch
 
 Thread Sync exposes two narrow MCP tools:
 
-- `sync_current_thread` is the required first MCP action in a ChatGPT conversation. It creates the initial browser binding ticket only when the current `openai/session` is not already bound. A repeated call returns the saved conversation URL immediately.
+- `sync_current_thread` is an on-demand prerequisite when an operation needs the current conversation binding. It creates the initial browser binding ticket only when the current `openai/session` is not already bound. `start_subagent` requires that binding before delegation begins. A repeated call returns the saved conversation URL immediately.
 - `get_current_thread_url` waits for the initial binding when `sync_current_thread` reports `syncing`. It never infers or constructs a conversation URL.
 
 The binding is permanent for the lifetime of that stored session mapping. Repeating `sync_current_thread` does not refresh the URL, create another ticket, or mount another handshake.
@@ -29,9 +29,9 @@ The extension credential grants only the local binding and support routes. It do
 
 Thread preparation is independent from RALPH registration. The support extension reports every observed ChatGPT `/c/...` route to the local backend.
 
-`ThreadPreparationCoordinator` checks the stored bindings by thread ID. It returns immediately for a bound thread and deduplicates repeated observations for an unsynced thread. The command bus tracks recent executor polls and commands currently owned by a browser, so a busy Chrome instance still counts as connected. If no recent preparation executor exists, the backend deduplicates the launch and starts Chrome through the existing browser launcher. It queues `prepare_thread` commands with a maximum of three parked preparations at once. A successful preparation is remembered for the rest of the server run so an unsynced thread cannot repeatedly open parked tabs.
+`ThreadPreparationCoordinator` treats browser presence as independent from stored Thread Sync bindings. It deduplicates repeated observations by thread ID and prepares an observed thread even when that conversation was already bound earlier, because RALPH still needs the automation browser to keep the page available. The command bus tracks recent executor polls and commands currently owned by a browser, so a busy Chrome instance still counts as connected. If no recent preparation executor exists, the backend deduplicates the launch and starts Chrome through the existing browser launcher. It queues `prepare_thread` commands with a maximum of three active preparations at once. A successful preparation is remembered for the rest of the server run. The automation browser reuses an existing matching conversation tab or creates one persistent owned tab, avoiding repeated ChatGPT reloads for the same thread.
 
-The support extension has an explicit **Thread preparation executor** setting. Enable it only in the Chrome automation profile. That profile opens the conversation in a parked background tab. A successful Thread Sync handshake releases the tab early. Helium only observes routes and reports them to the backend with the executor setting off, so it does not launch Chrome or claim preparation work.
+The support extension has an explicit **Thread preparation executor** setting. Enable it only in the Chrome automation profile. That profile opens or reuses a persistent conversation tab. A successful Thread Sync handshake leaves that tab in place for title observation, RALPH, and later messaging. Helium only observes routes and reports them to the backend with the executor setting off, so it does not launch Chrome or claim preparation work.
 
 ### Keep delegation server-routed and file-backed
 
@@ -43,11 +43,11 @@ Delegation uses five MCP tools:
 - `list_subagents` returns the children created by the current parent and includes their result path and result state.
 - `cancel_subagent` cancels a parent's abandoned job. For a known child URL, the backend opens the child thread through the support extension, stops an active ChatGPT run, confirms the stop, and only then releases the slot. It disables future RALPH continuation and rejects late results.
 
-The child receives its job ID and result path. It does not receive the parent URL. The child syncs its own thread once, performs the bounded task, and finishes with `submit_subagent_result`. Nested delegation is rejected by the backend. The registry reserves at most two pending jobs per parent inside its serialized update, before browser delivery. Different roots have independent limits. Reservations survive restart and are released by completion or confirmed cancellation. Unconfirmed startup keeps its reservation because delivery may have occurred. On restart, the registry marks a reservation without a known child as interrupted so that the parent can inspect the browser and cancel it.
+The child receives its job ID and result path. It does not receive the parent URL. The child performs the bounded task, binds its own thread before result submission when needed, and finishes with `submit_subagent_result`. Nested delegation is rejected by the backend. The registry reserves at most two pending jobs per parent inside its serialized update, before browser delivery. Different roots have independent limits. Reservations survive restart and are released by completion or confirmed cancellation. Unconfirmed startup keeps its reservation because delivery may have occurred. On restart, the registry marks a reservation without a known child as interrupted so that the parent can inspect the browser and cancel it.
 
-The review policy defaults to one independent reviewer. A reviewer reports findings and evidence without choosing implementation or follow-up work; the root owns those decisions. A second reviewer is only for a distinct concern. Capacity refusals direct that parent to wait for results or continue independent work, with no start retry or status polling loop.
+Delegation is opt-in. The model does not create sub-agents, reviewers, or parallel agents automatically; `start_subagent` is used only when the user explicitly requests delegation. Capacity refusals direct that parent to wait for results or continue root work, with no start retry or status polling loop.
 
-Before `start_subagent` reports normal startup success, the backend confirms that the child has a prepared Thread Sync tab. A preparation failure after child creation is stored on the job and returned to the parent without retrying child creation. The backend then watches completed jobs that have not notified their parent. It groups ready jobs for the same parent during a one-second window and sends one notice with their paths. Wake-up failures back off exponentially and become terminal after five attempts, with each error retained on its job. The parent reads the files for the reports. This keeps browser messaging out of the result transport while preserving automatic parent continuation.
+Before `start_subagent` reports normal startup success, the backend confirms that the child conversation is prepared in the automation browser. A preparation failure after child creation is stored on the job and returned to the parent without retrying child creation. The backend then watches completed jobs that have not notified their parent. It groups ready jobs for the same parent during a one-second window and sends one notice with their paths. Wake-up failures back off exponentially and become terminal after five attempts, with each error retained on its job. The parent reads the files for the reports. This keeps browser messaging out of the result transport while preserving automatic parent continuation.
 
 ### Hide transport idempotency from the model
 
@@ -89,14 +89,16 @@ Both modes defer parents while children are pending or results await notificatio
 
 ### Claim automation commands atomically
 
-The authenticated loopback command bus assigns each queued support command to one enabled browser instance. Thread sync may stay enabled in multiple browsers because binding is idempotent. Thread preparation has a separate executor setting so route observation does not imply permission to open parked tabs. RALPH automation and agent thread messaging should normally be enabled only in the browser intended to execute those commands.
+The authenticated loopback command bus assigns each queued support command to one enabled browser instance. Thread sync may stay enabled in multiple browsers because binding is idempotent. Thread preparation has a separate executor setting so route observation does not imply permission to open or retain automation tabs. RALPH automation and agent thread messaging should normally be enabled only in the browser intended to execute those commands.
 
 ## Consequences
 
-The parent uses `sync_current_thread` as its first MCP action. If the initial binding is still pending, it immediately follows with `get_current_thread_url` before other MCP work. After that, `start_subagent` can resolve the parent without refreshing the binding.
+The parent does not sync merely because a conversation started. Before `start_subagent` or another binding-dependent operation, it calls `sync_current_thread`; if the binding is still pending, it immediately follows with `get_current_thread_url` and then continues the requested operation.
 
 Sub-agents return reports through local files. The browser is used only to create child conversations and to wake parents after a result becomes available. Transport retries remain an implementation concern rather than part of the model-facing tool API.
 
 Browser delivery favors duplicate prevention over speculative recovery. A prompt is inserted once and the send button is clicked once after explicit settle periods.
+
+Automation-owned conversation tabs are persistent working state. Creation, preparation, Thread Sync, title capture, RALPH inspection, and existing-thread messaging reuse the same tab. Active threads are never closed by lifecycle cleanup. Ten minutes after a RALPH thread becomes complete, the backend requests cleanup; only tabs recorded as automation-owned are closed, while pre-existing user tabs are left alone. Chrome launches request a new tab so an already-running profile is reused instead of intentionally creating a new window.
 
 RALPH remains a continuation runtime. Normal work can complete. Continuous execution exists only after the user explicitly selects **Run continuously**.

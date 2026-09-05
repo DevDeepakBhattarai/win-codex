@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Local Codex Support",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "description": "Supports one-time ChatGPT thread sync, RALPH monitoring, and sub-agent automation for Local Codex.",
   "permissions": ["scripting", "storage", "tabs", "webNavigation"],
   "host_permissions": ["https://chatgpt.com/*", "http://127.0.0.1/*"],

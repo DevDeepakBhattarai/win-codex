@@ -28,6 +28,8 @@ const MAX_SUBAGENT_NOTIFICATION_RETRY_MS = 10 * 60_000;
 const MAX_CONCURRENT_THREAD_PREPARATIONS = 3;
 const RALPH_PREPARE_TIMEOUT_MS = 3 * 60 * 1000;
 const THREAD_PREPARATION_HOLD_MS = 2 * 60 * 1000;
+const COMPLETED_THREAD_TAB_RETENTION_MS = 10 * 60 * 1000;
+const THREAD_TAB_CLEANUP_TICK_MS = 60 * 1000;
 const MAX_CONTINUATION_CHARS = 500;
 const TOOL_REQUEST_REPLAY_TTL_MS = 30 * 60 * 1000;
 const MAX_TOOL_REQUEST_REPLAYS = 1_000;
@@ -63,17 +65,16 @@ function replayToolRequest(replayKey: string, createResult: () => Promise<CallTo
 
 export const SUBAGENT_WIDGET_URI = "ui://local-codex/subagents-v1.html";
 export const SUBAGENT_AGENT_INSTRUCTION = [
-  "Keep implementation and decisions in the root conversation. Use one independent reviewer by default; add a second only for a distinct concern. A reviewer reports findings and evidence only. The root decides what is valid and what to change.",
-  "Only synced root conversations can call start_subagent. Each root parent may have at most two pending children, including startups. Nested delegation is disabled.",
-  "If this parent's capacity is full, continue independent work or end the turn while waiting for results. Do not retry starts or poll list_subagents for capacity. Use list_subagents only when a status snapshot changes your next action.",
+  "Sub-agent capability is opt-in. Use start_subagent only when the user explicitly asks for a sub-agent or delegated agent. Do not create reviewers or parallel agents automatically as part of ordinary engineering or review work.",
+  "Before start_subagent, ensure the current parent conversation is bound with sync_current_thread. If that call reports syncing, finish the one-time handshake with get_current_thread_url, then start the child. Thread sync is otherwise on demand rather than a required first action.",
+  "Each root parent may have at most two pending children, including startups. Nested delegation is disabled. If this parent's capacity is full, continue root work or end the turn while waiting for a result notice. Do not retry starts or poll list_subagents for capacity.",
   "Read all local resultPath files named in a result-ready notice before continuing. Notifications may combine several results. Reports stay in local files.",
-  "Use cancel_subagent for an abandoned child. Cancellation opens the known child thread, stops an active ChatGPT run, and only then releases the slot. If the stop cannot be confirmed, cancellation fails and keeps the job pending.",
-  "A child completes its bounded assignment without delegation and calls submit_subagent_result exactly once. Reviewers remain read-only and do not choose implementation or follow-up work. If a submit response is lost, inspect job status before resubmitting.",
+  "Use cancel_subagent for an abandoned child. Cancellation stops a known active child before releasing its slot. A child completes its bounded assignment without delegation and calls submit_subagent_result exactly once.",
   "Use send_thread_message only when the user explicitly asks to post into an existing conversation. Rate-limited message commands remain queued and resume in a paced sequence after cooldown. After uncertain delivery for another error, inspect the target before deciding whether to send again.",
 ].join(" ");
 const CONTINUOUS_RALPH_INSTRUCTION = "Continue the user-authorized continuous run toward the existing goal. You own all decisions about what to do next. Read the conversation and current state, use completed child reports as evidence, choose useful unfinished work, and verify the result. If progress depends on a pending child, user input, or a message cooldown, state the blocker and end this turn. Do not poll. Continuous RALPH will wake the thread again while the user keeps continuous mode enabled.";
 
-export const supportFeatureSchema = z.enum(["ralph", "threadMessaging", "threadPreparation"]);
+export const supportFeatureSchema = z.enum(["ralph", "threadMessaging", "threadPreparation", "threadLifecycle"]);
 export type SupportFeature = z.infer<typeof supportFeatureSchema>;
 
 const threadMessageSchema = z.object({
@@ -125,6 +126,12 @@ const supportCommandSchema = z.union([
   }),
   z.object({
     id: z.string(),
+    feature: z.literal("threadLifecycle"),
+    kind: z.literal("close_thread"),
+    conversationUrl: z.string().url(),
+  }),
+  z.object({
+    id: z.string(),
     feature: z.literal("ralph"),
     kind: z.literal("send_message"),
     targetUrl: z.string().url(),
@@ -148,6 +155,7 @@ export type SupportCommand = z.infer<typeof supportCommandSchema>;
 type SupportCommandInput =
   | Omit<Extract<SupportCommand, { kind: "inspect_thread" }>, "id">
   | Omit<Extract<SupportCommand, { kind: "prepare_thread" }>, "id">
+  | Omit<Extract<SupportCommand, { kind: "close_thread" }>, "id">
   | Omit<Extract<SupportCommand, { kind: "send_message" }>, "id">
   | Omit<Extract<SupportCommand, { kind: "stop_thread" }>, "id">;
 
@@ -172,6 +180,16 @@ const commandResultSchema = z.union([
   z.object({
     commandId: z.string(),
     browserId: z.string(),
+    kind: z.literal("close_thread"),
+    ok: z.literal(true),
+    result: z.object({
+      status: z.enum(["closed", "not_owned"]),
+      conversationUrl: z.string().url(),
+    }),
+  }),
+  z.object({
+    commandId: z.string(),
+    browserId: z.string(),
     kind: z.literal("send_message"),
     ok: z.literal(true),
     result: sendMessageResultSchema,
@@ -186,7 +204,7 @@ const commandResultSchema = z.union([
   z.object({
     commandId: z.string(),
     browserId: z.string(),
-    kind: z.union([z.literal("inspect_thread"), z.literal("prepare_thread"), z.literal("send_message"), z.literal("stop_thread")]),
+    kind: z.union([z.literal("inspect_thread"), z.literal("prepare_thread"), z.literal("close_thread"), z.literal("send_message"), z.literal("stop_thread")]),
     ok: z.literal(false),
     error: z.string().min(1).max(2_000),
   }),
@@ -964,6 +982,64 @@ export class RalphController {
   }
 }
 
+export class ThreadTabCleanupController {
+  private readonly inFlight = new Set<string>();
+  private readonly closed = new Set<string>();
+  private readonly timer: NodeJS.Timeout;
+
+  constructor(private readonly options: {
+    commands: SupportCommandBus;
+    registry: RalphRegistry;
+    retentionMs?: number;
+    checkEveryMs?: number;
+  }) {
+    this.timer = setInterval(() => void this.tick(), options.checkEveryMs ?? THREAD_TAB_CLEANUP_TICK_MS);
+    this.timer.unref();
+  }
+
+  async tick(now = Date.now()) {
+    const retentionMs = this.options.retentionMs ?? COMPLETED_THREAD_TAB_RETENTION_MS;
+    const threads = await this.options.registry.threads();
+    for (const thread of threads) {
+      if (thread.state === "active") {
+        this.closed.delete(thread.threadId);
+        continue;
+      }
+      if (this.closed.has(thread.threadId) || this.inFlight.has(thread.threadId) || !thread.lastCheckedAt) continue;
+      const completedAt = Date.parse(thread.lastCheckedAt);
+      if (!Number.isFinite(completedAt) || completedAt + retentionMs > now) continue;
+
+      this.inFlight.add(thread.threadId);
+      void this.closeThread(thread.threadId, thread.conversationUrl, thread.lastCheckedAt)
+        .finally(() => this.inFlight.delete(thread.threadId));
+    }
+  }
+
+  close() {
+    clearInterval(this.timer);
+  }
+
+  private async closeThread(threadId: string, conversationUrl: string, expectedCompletedAt: string) {
+    try {
+      // Never launch Chrome just to close a tab. If the automation browser is gone, its tabs are gone too.
+      if (!this.options.commands.hasBrowser("threadLifecycle")) return;
+      const current = (await this.options.registry.threads()).find((thread) => thread.threadId === threadId);
+      if (!current || current.state !== "complete" || current.lastCheckedAt !== expectedCompletedAt) return;
+      const result = await this.options.commands.execute({
+        feature: "threadLifecycle",
+        kind: "close_thread",
+        conversationUrl,
+      }, 60_000);
+      if (!result.ok) throw new Error(result.error);
+      if (result.kind !== "close_thread") throw new Error("Thread cleanup received the wrong support command result.");
+      this.closed.add(threadId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[chatgpt-support] thread_tab_cleanup_failed thread=${JSON.stringify(conversationUrl)}: ${message}`);
+    }
+  }
+}
+
 function responseTokenUsage(value: unknown) {
   if (!value || typeof value !== "object") return {};
   const usage = Reflect.get(value, "usage");
@@ -1117,7 +1193,7 @@ function authenticateSupportExtension(req: Request, res: Response, extensionToke
 export function supportCommandClaimHandler(commands: SupportCommandBus, extensionToken: string): RequestHandler {
   const bodySchema = z.object({
     browserId: z.string().min(1).max(200),
-    features: z.array(supportFeatureSchema).max(3),
+    features: z.array(supportFeatureSchema).max(4),
   }).strict();
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
@@ -1373,9 +1449,8 @@ export class ThreadPreparationCoordinator {
     this.boundWaiters.get(threadId)?.();
   }
 
-  async schedule(conversationUrl: string, observerCanPrepare = false): Promise<"synced" | "preparing" | "prepared"> {
+  async schedule(conversationUrl: string, observerCanPrepare = false): Promise<"preparing" | "prepared"> {
     const conversation = parseConversationUrl(conversationUrl);
-    if (await this.bindings.hasThread(conversation.threadId)) return "synced";
     if (this.prepared.has(conversation.threadId)) return "prepared";
     if (this.inFlight.has(conversation.threadId)) return "preparing";
 
@@ -1383,17 +1458,15 @@ export class ThreadPreparationCoordinator {
     return "preparing";
   }
 
-  async ensurePrepared(conversationUrl: string, observerCanPrepare = false): Promise<"synced" | "prepared"> {
+  async ensurePrepared(conversationUrl: string, observerCanPrepare = false): Promise<"prepared"> {
     const conversation = parseConversationUrl(conversationUrl);
-    if (await this.bindings.hasThread(conversation.threadId)) return "synced";
     if (this.prepared.has(conversation.threadId)) return "prepared";
 
     const task = this.inFlight.get(conversation.threadId)
       ?? this.start(conversation.conversationUrl, conversation.threadId, observerCanPrepare);
     await task.ready;
-    if (await this.bindings.hasThread(conversation.threadId)) return "synced";
     if (this.prepared.has(conversation.threadId)) return "prepared";
-    throw new Error("Thread preparation finished without creating a parked sync tab.");
+    throw new Error("Thread preparation finished without opening the thread in the automation browser.");
   }
 
   private start(conversationUrl: string, threadId: string, observerCanPrepare: boolean) {
@@ -1402,7 +1475,6 @@ export class ThreadPreparationCoordinator {
       await this.acquireSlot();
       slotHeld = true;
       if (!observerCanPrepare) await this.commands.ensureBrowser("threadPreparation", this.launchBrowser);
-      if (await this.bindings.hasThread(threadId)) return;
 
       const result = await this.commands.execute({
         feature: "threadPreparation",
@@ -1501,8 +1573,8 @@ function subagentPrompt(message: string, jobId: string, resultPath: string) {
     message.trim(),
     "",
     "You are a sub-agent working in a separate ChatGPT conversation.",
-    "Your first MCP action must be sync_current_thread. If it reports syncing, follow it with get_current_thread_url; if it reports synced, do not sync again.",
     "Complete only the bounded task above. Nested delegation is disabled. Perform the work yourself. If assigned a review, remain read-only and report findings with evidence. Do not decide what the parent should change or what follow-up work it should do.",
+    "Before submit_subagent_result, bind this child conversation with sync_current_thread. If it reports syncing, follow with get_current_thread_url; if it reports synced, reuse that binding.",
     "Your parent does not expect a browser message from you. Do not call send_thread_message to report back.",
     `When your work is complete, call submit_subagent_result exactly once with jobId ${JSON.stringify(jobId)} and put your complete final report in its result argument.`,
     `The application stores that report locally at ${JSON.stringify(resultPath)} and wakes the parent automatically.`,
@@ -1606,7 +1678,7 @@ export function registerChatGptAgents(
 
   server.registerTool("start_subagent", {
     title: "Start Sub-agent",
-    description: "Start an independent ChatGPT sub-agent from a synced root. Use one reviewer by default. Each parent may have two pending children, with slots reserved before startup; nested delegation is disabled. On this parent's capacity refusal, continue independent work or wait for a result notice without polling or retrying. If ChatGPT is in a message cooldown, the reserved child start waits in the paced message queue instead of being discarded. The configured Sub-agent project is used, or chatgpt.com otherwise. Complete one-time thread sync first. Transport retries of the same MCP request are deduplicated internally; a new logical call creates another job. Reports are stored in a local file and parent notices may be batched. An unconfirmed startup keeps its slot until resolved through cancel_subagent.",
+    description: "Start a ChatGPT sub-agent only when the user explicitly requested delegation. The parent must be synced before this call; sync_current_thread is an on-demand prerequisite rather than a required conversation startup step. Each parent may have two pending children, and nested delegation is disabled. If capacity is full, continue root work or wait for a result notice without polling or retrying. The configured Sub-agent project is used, or chatgpt.com otherwise. Transport retries are deduplicated internally. Reports are stored in local files and parent notices may be batched.",
     inputSchema: {
       message: z.string().min(1).max(190_000).describe("Complete bounded task for the sub-agent. Do not include result transport or parent callback instructions; the server adds them."),
     },
@@ -1618,14 +1690,14 @@ export function registerChatGptAgents(
     if (typeof session !== "string" || !session || session.length > 2048) {
       return {
         isError: true,
-        content: [{ type: "text", text: "The client did not provide a valid openai/session. Call sync_current_thread at the start of this conversation before starting a sub-agent." }],
+        content: [{ type: "text", text: "The client did not provide a valid openai/session. Call sync_current_thread before starting a sub-agent." }],
       };
     }
     const parent = await bindings.binding({ ownerId, sessionId: session });
     if (!parent) {
       return {
         isError: true,
-        content: [{ type: "text", text: "This parent conversation is not synced. Call sync_current_thread first. If it reports syncing, finish with get_current_thread_url, then retry start_subagent." }],
+        content: [{ type: "text", text: "This parent conversation is not synced. Call sync_current_thread now. If it reports syncing, finish with get_current_thread_url, then retry start_subagent." }],
       };
     }
 
@@ -1719,7 +1791,7 @@ export function registerChatGptAgents(
     if (!child) {
       return {
         isError: true,
-        content: [{ type: "text", text: "This child conversation is not synced. Call sync_current_thread first, then finish the one-time sync before submitting the result." }],
+        content: [{ type: "text", text: "This child conversation is not synced. Call sync_current_thread now and finish the one-time sync before submitting the result." }],
       };
     }
     const job = await jobs.job(jobId);
@@ -1740,7 +1812,7 @@ export function registerChatGptAgents(
 
   server.registerTool("cancel_subagent", {
     title: "Cancel Sub-agent",
-    description: "Cancel an abandoned pending job owned by this synced parent. When the child URL is known, the service opens that ChatGPT thread in the automation browser, clicks Stop if the child is running, confirms the run stopped, closes the automation tab, and then releases the slot. If stopping cannot be confirmed, cancellation fails and keeps the job pending. Cancellation is permanent; late results are rejected.",
+    description: "Cancel an abandoned pending job owned by this synced parent. When the child URL is known, the service opens that ChatGPT thread in the automation browser, clicks Stop if the child is running, confirms the run stopped, closes the tab only when it is automation-owned, and then releases the slot. If stopping cannot be confirmed, cancellation fails and keeps the job pending. Cancellation is permanent; late results are rejected.",
     inputSchema: { jobId: z.string().uuid() },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   }, async ({ jobId }, extra) => {
@@ -1852,7 +1924,7 @@ export function registerChatGptAgents(
     if (!parent) {
       return {
         isError: true,
-        content: [{ type: "text", text: "This conversation is not synced. Call sync_current_thread first. If it reports syncing, finish the one-time binding with get_current_thread_url, then retry list_subagents." }],
+        content: [{ type: "text", text: "This conversation is not synced. Call sync_current_thread now. If it reports syncing, finish the one-time binding with get_current_thread_url, then retry list_subagents." }],
       };
     }
     const structuredContent = {

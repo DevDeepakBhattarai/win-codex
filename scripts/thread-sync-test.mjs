@@ -8,7 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { THREAD_SYNC_AGENT_INSTRUCTION, THREAD_SYNC_WIDGET_URI, ThreadSyncRegistry, parseConversationUrl, prepareThreadSync, registerThreadSync, threadSyncBindHandler, threadSyncBindUrl } from "../dist/thread-sync.js";
-import { RalphController, RalphRegistry, SUBAGENT_WIDGET_URI, SubagentResultController, SupportCommandBus, ThreadPreparationCoordinator, parseRalphProjectId, ralphRegistrationHandler, ralphSettingsGetHandler, ralphSettingsPutHandler, ralphThreadActiveHandler, ralphThreadCheckHandler, ralphThreadCompleteHandler, ralphThreadModeHandler, ralphThreadsGetHandler, registerChatGptAgents, supportCommandClaimHandler, threadObservationHandler } from "../dist/chatgpt-support.js";
+import { RalphController, RalphRegistry, SUBAGENT_WIDGET_URI, SubagentResultController, SupportCommandBus, ThreadPreparationCoordinator, ThreadTabCleanupController, parseRalphProjectId, ralphRegistrationHandler, ralphSettingsGetHandler, ralphSettingsPutHandler, ralphThreadActiveHandler, ralphThreadCheckHandler, ralphThreadCompleteHandler, ralphThreadModeHandler, ralphThreadsGetHandler, registerChatGptAgents, supportCommandClaimHandler, threadObservationHandler } from "../dist/chatgpt-support.js";
 import { SubagentJobRegistry } from "../dist/subagent-jobs.js";
 
 const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "win-codex-thread-sync-test-"));
@@ -32,9 +32,10 @@ const launchSupportBrowser = async () => { automationLaunches += 1; };
 
 try {
   assert.equal(threadSyncBindUrl(), "http://127.0.0.1:6002/thread-sync/bind");
-  assert.match(THREAD_SYNC_AGENT_INSTRUCTION, /first MCP action in every ChatGPT conversation/);
-  assert.match(THREAD_SYNC_AGENT_INSTRUCTION, /do not sync again/);
-  assert.match(THREAD_SYNC_AGENT_INSTRUCTION, /get_current_thread_url is the only fallback source/);
+  assert.match(THREAD_SYNC_AGENT_INSTRUCTION, /on-demand prerequisite/);
+  assert.match(THREAD_SYNC_AGENT_INSTRUCTION, /before start_subagent/);
+  assert.doesNotMatch(THREAD_SYNC_AGENT_INSTRUCTION, /first MCP action/);
+  assert.match(THREAD_SYNC_AGENT_INSTRUCTION, /Never infer or construct/);
   assert.equal(threadSyncBindUrl(7002), "http://127.0.0.1:7002/thread-sync/bind");
   for (const port of [6000, 22, 5060, 6667, 10080]) {
     assert.throws(() => threadSyncBindUrl(port), /blocked by browsers/);
@@ -55,7 +56,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.4.3");
+  assert.equal(manifest.version, "1.4.4");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -345,20 +346,36 @@ try {
   assert.deepEqual(await requestPreparation({ conversationUrl: urlC }), {
     code: 200,
     body: { status: "prepared" },
-  }, "a successfully parked unsynced thread is prepared only once per server run");
+  }, "a successfully prepared unsynced thread is prepared only once per server run");
   assert.equal(await preparationCommands.claim("chrome-preparer", ["threadPreparation"], 0), undefined,
-    "re-observing a prepared but still-unsynced thread does not open another parked tab");
+    "re-observing a prepared but still-unsynced thread does not schedule another preparation");
   const preparedIdentity = { ownerId: "prepared-grant", sessionId: "prepared-session" };
   const preparedTicket = await preparationBindings.context(preparedIdentity);
   await preparationBindings.bind(preparedTicket.ticket.token, urlC);
   await new Promise(resolve => setTimeout(resolve, 25));
   assert.deepEqual(await requestPreparation({ conversationUrl: urlC }), {
     code: 200,
-    body: { status: "synced" },
-  });
-  assert.equal(preparationLaunches, 1,
-    "an already-synced thread never starts Chrome or prepares again");
+    body: { status: "prepared" },
+  }, "binding status does not discard the persistent preparation state");
   assert.equal(await preparationCommands.claim("chrome-preparer", ["threadPreparation"], 0), undefined);
+
+  const alreadyBoundIdentity = { ownerId: "already-bound-grant", sessionId: "already-bound-session" };
+  const alreadyBoundTicket = await preparationBindings.context(alreadyBoundIdentity);
+  await preparationBindings.bind(alreadyBoundTicket.ticket.token, urlE);
+  assert.deepEqual(await requestPreparation({ conversationUrl: urlE }), {
+    code: 200,
+    body: { status: "preparing" },
+  }, "an already-bound observed thread is still opened in the automation browser");
+  const alreadyBoundPreparation = await preparationCommands.claim("chrome-preparer", ["threadPreparation"], 1000);
+  assert.equal(alreadyBoundPreparation.conversationUrl, urlE);
+  preparationCommands.complete({
+    commandId: alreadyBoundPreparation.id,
+    browserId: "chrome-preparer",
+    kind: "prepare_thread",
+    ok: true,
+    result: { status: "prepared", conversationUrl: urlE },
+  });
+  await new Promise(resolve => setImmediate(resolve));
 
   assert.deepEqual(await requestPreparation({ conversationUrl: urlD, canPrepare: true }), {
     code: 200,
@@ -396,10 +413,10 @@ try {
     `https://chatgpt.com/g/${projectId}/c/d4444444-4444-4444-8444-444444444444`,
   ];
   for (const conversationUrl of boundedUrls) await boundedPreparer.schedule(conversationUrl, true);
-  const parkedCommands = [];
+  const boundedPreparationBatch = [];
   for (let index = 0; index < 3; index += 1) {
     const command = await boundedPreparationCommands.claim("bounded-preparer", ["threadPreparation"], 1000);
-    parkedCommands.push(command);
+    boundedPreparationBatch.push(command);
     boundedPreparationCommands.complete({
       commandId: command.id,
       browserId: "bounded-preparer",
@@ -410,12 +427,12 @@ try {
   }
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(await boundedPreparationCommands.claim("bounded-preparer", ["threadPreparation"], 0), undefined,
-    "at most three parked thread preparations can be active at once");
-  boundedPreparer.markBound(parseConversationUrl(parkedCommands[0].conversationUrl).threadId);
+    "at most three thread preparations can be active at once");
+  boundedPreparer.markBound(parseConversationUrl(boundedPreparationBatch[0].conversationUrl).threadId);
   await new Promise(resolve => setImmediate(resolve));
   const fourthPreparation = await boundedPreparationCommands.claim("bounded-preparer", ["threadPreparation"], 1000);
   assert.equal(fourthPreparation.conversationUrl, boundedUrls[3],
-    "the next queued preparation starts when a parked slot is released");
+    "the next queued preparation starts when a preparation slot is released");
   boundedPreparationCommands.complete({
     commandId: fourthPreparation.id,
     browserId: "bounded-preparer",
@@ -668,12 +685,13 @@ try {
   const sendThreadDefinition = tools.find(tool => tool.name === "send_thread_message");
   const listSubagentsDefinition = tools.find(tool => tool.name === "list_subagents");
   assert.equal(syncDefinition._meta.ui.resourceUri, THREAD_SYNC_WIDGET_URI);
-  assert.match(syncDefinition.description, /first MCP tool call in every ChatGPT conversation/);
-  assert.match(syncDefinition.description, /returns the saved conversation URL immediately/);
+  assert.match(syncDefinition.description, /not a required startup call/);
+  assert.match(syncDefinition.description, /returns the saved URL without another handshake/);
   assert.equal(getDefinition._meta?.ui, undefined, "URL lookup must not mount UI");
   assert.match(getDefinition.description, /after sync_current_thread reports syncing/);
   assert.match(startSubagentDefinition.description, /Sub-agent project/);
-  assert.match(startSubagentDefinition.description, /one-time thread sync/);
+  assert.match(startSubagentDefinition.description, /on-demand prerequisite/);
+  assert.match(startSubagentDefinition.description, /only when the user explicitly requested delegation/);
   assert.match(startSubagentDefinition.description, /local file/);
   assert.match(startSubagentDefinition.description, /deduplicated internally/);
   assert.equal(startSubagentDefinition._meta.ui.resourceUri, SUBAGENT_WIDGET_URI);
@@ -781,7 +799,8 @@ try {
   assert.equal(startSubagentCommand.targetUrl, "https://chatgpt.com/",
     "an unset Sub-agent project falls back to the normal ChatGPT new-chat page");
   assert.match(startSubagentCommand.message, /Review the implementation independently/);
-  assert.match(startSubagentCommand.message, /Your first MCP action must be sync_current_thread/);
+  assert.match(startSubagentCommand.message, /Before submit_subagent_result, bind this child conversation with sync_current_thread/);
+  assert.doesNotMatch(startSubagentCommand.message, /first MCP action/);
   assert.match(startSubagentCommand.message, /Nested delegation is disabled/);
   assert.match(startSubagentCommand.message, /submit_subagent_result exactly once/);
   assert.match(startSubagentCommand.message, /Do not call send_thread_message to report back/);
@@ -1608,6 +1627,54 @@ try {
     console.error = originalConsoleError;
   }
 
+  const cleanupRoot = path.join(temporaryRoot, "thread-tab-cleanup");
+  const cleanupRegistry = await RalphRegistry.open(cleanupRoot, 20);
+  await cleanupRegistry.setProjects([projectId]);
+  const cleanupUrl = `https://chatgpt.com/g/${projectId}/c/77777777-7777-4777-8777-777777777777`;
+  const cleanupThreadId = parseConversationUrl(cleanupUrl).threadId;
+  await cleanupRegistry.register(cleanupUrl);
+  const cleanupCommands = new SupportCommandBus();
+  const cleanupController = new ThreadTabCleanupController({
+    commands: cleanupCommands,
+    registry: cleanupRegistry,
+    retentionMs: 1_000,
+    checkEveryMs: 60_000,
+  });
+  try {
+    await cleanupController.tick(Date.now() + 60_000);
+    assert.equal(await cleanupCommands.claim("cleanup-browser", ["threadLifecycle"], 0), undefined,
+      "an active thread is never scheduled for tab cleanup regardless of age");
+
+    await cleanupRegistry.recordComplete(cleanupThreadId);
+    const completedThread = (await cleanupRegistry.threads()).find(thread => thread.threadId === cleanupThreadId);
+    const completedAt = Date.parse(completedThread.lastCheckedAt);
+    await cleanupController.tick(completedAt + 999);
+    assert.equal(await cleanupCommands.claim("cleanup-browser", ["threadLifecycle"], 0), undefined,
+      "completed automation tabs stay available throughout the retention window");
+
+    await cleanupController.tick(completedAt + 1_001);
+    await new Promise(resolve => setImmediate(resolve));
+    const closeCommand = await cleanupCommands.claim("cleanup-browser", ["threadLifecycle"], 1_000);
+    assert.equal(closeCommand.kind, "close_thread");
+    assert.equal(closeCommand.conversationUrl, cleanupUrl);
+    assert.equal(cleanupCommands.hasBrowser("threadLifecycle"), true,
+      "cleanup uses the already-connected automation browser instead of launching another Chrome window");
+    cleanupCommands.complete({
+      commandId: closeCommand.id,
+      browserId: "cleanup-browser",
+      kind: "close_thread",
+      ok: true,
+      result: { status: "closed", conversationUrl: cleanupUrl },
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    await cleanupController.tick(completedAt + 60_000);
+    assert.equal(await cleanupCommands.claim("cleanup-browser", ["threadLifecycle"], 0), undefined,
+      "a completed thread is cleaned once rather than producing repeated close commands");
+  } finally {
+    cleanupController.close();
+    cleanupCommands.close();
+  }
+
   const resource = await client.readResource({ uri: THREAD_SYNC_WIDGET_URI });
   assert.match(resource.contents[0].mimeType, /profile=mcp-app/);
   assert.equal(resource.contents[0]._meta.ui.prefersBorder, true);
@@ -2385,7 +2452,8 @@ async function testRalphAutoRegistration(sync) {
   const commandResults = [];
   const createdUrls = [];
   const removedTabs = [];
-  let automationUrl = namedProjectHome;
+  const tabs = new Map();
+  let nextTabId = 11;
   let historyListener;
   let updatedListener;
   const storage = {};
@@ -2403,17 +2471,38 @@ async function testRalphAutoRegistration(sync) {
     browser: {
       runtime: {
         id: "a".repeat(32),
+        getPlatformInfo: async () => {},
         onMessage: { addListener() {} },
         onInstalled: { addListener() {} },
         onStartup: { addListener() {} },
       },
       tabs: {
         onUpdated: { addListener: fn => { updatedListener = fn; } },
-        query: async () => [],
-        create: async ({ url }) => { automationUrl = url; createdUrls.push(url); return { id: 11 }; },
-        get: async () => ({ id: 11, status: "complete", url: automationUrl }),
-        sendMessage: async () => ({ ok: true, result: { status: "sent", conversationUrl: urlB } }),
-        remove: async tabId => { removedTabs.push(tabId); },
+        query: async () => [...tabs.values()],
+        create: async ({ url }) => {
+          const tab = { id: nextTabId++, status: "complete", url };
+          tabs.set(tab.id, tab);
+          createdUrls.push(url);
+          return tab;
+        },
+        get: async tabId => {
+          const tab = tabs.get(tabId);
+          if (!tab) throw new Error("tab missing");
+          return tab;
+        },
+        sendMessage: async (tabId, payload) => {
+          const tab = tabs.get(tabId);
+          if (!tab) throw new Error("tab missing");
+          if (payload.command.kind === "send_message" && payload.command.targetUrl === namedProjectHome) {
+            tab.url = urlB;
+            return { ok: true, result: { status: "sent", conversationUrl: urlB, title: "Persistent child" } };
+          }
+          if (payload.command.kind === "inspect_thread") {
+            return { ok: true, result: { status: "running", title: "Persistent child" } };
+          }
+          throw new Error(`Unexpected automation command: ${payload.command.kind}`);
+        },
+        remove: async tabId => { removedTabs.push(tabId); tabs.delete(tabId); },
       },
       webNavigation: {
         onHistoryStateUpdated: { addListener: fn => { historyListener = fn; } },
@@ -2463,11 +2552,6 @@ async function testRalphAutoRegistration(sync) {
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(registrationBodies.length, 1, "normal non-project conversations are never offered to RALPH");
 
-  historyListener({ frameId: 0, url: urlB });
-  await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(registrationBodies.at(-1), { conversationUrl: urlB },
-    "SPA navigation may observe the new sub-agent thread before the send command finishes");
-
   const registrationsBeforeAgentSend = registrationBodies.length;
   await context.executeCommand({
     id: "agent-project-thread",
@@ -2476,36 +2560,63 @@ async function testRalphAutoRegistration(sync) {
     targetUrl: namedProjectHome,
     message: "spawn the project sub-agent",
   }, "browser-a");
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(createdUrls.at(-1), namedProjectHome,
-    "the extension opens the new-thread target already resolved by the server");
+  assert.deepEqual(createdUrls, [namedProjectHome],
+    "sub-agent creation opens one new tab in the existing automation browser");
   assert.equal(registrationBodies.length, registrationsBeforeAgentSend,
-    "new sub-agent sends leave RALPH registration to the server so generic preparation opens exactly one sync tab");
+    "new sub-agent sends leave RALPH registration to the server");
   assert.equal(commandResults.at(-1).ok, true);
-  assert.equal(removedTabs.at(-1), 11, "the creation tab closes normally instead of owning the sync parking lifecycle");
+  assert.equal(JSON.stringify(storage.automationThreadTabsV1), JSON.stringify({ [urlB]: 11 }),
+    "the new child tab becomes the durable automation-owned tab for that conversation");
+  assert.deepEqual(removedTabs, [], "a running child tab stays open after creation");
 
-  const removalsBeforePreparation = removedTabs.length;
   await context.executeCommand({
-    id: "prepare-ralph-thread",
-    feature: "ralph",
+    id: "prepare-child-thread",
+    feature: "threadPreparation",
     kind: "prepare_thread",
+    conversationUrl: urlB,
+  }, "browser-a");
+  assert.equal(createdUrls.length, 1,
+    "thread preparation reuses the child creation tab instead of opening another ChatGPT page");
+  assert.equal(commandResults.at(-1).result.status, "prepared");
+  assert.deepEqual(removedTabs, [], "thread sync does not close the persistent child tab");
+
+  await context.executeCommand({
+    id: "inspect-child-thread",
+    feature: "ralph",
+    kind: "inspect_thread",
+    conversationUrl: urlB,
+  }, "browser-a");
+  assert.equal(createdUrls.length, 1,
+    "RALPH inspection reuses the same persistent tab instead of reloading the thread");
+  assert.equal(commandResults.at(-1).result.status, "running");
+  assert.deepEqual(removedTabs, [], "a running RALPH thread remains open");
+
+  tabs.set(90, { id: 90, status: "complete", url: urlA });
+  await context.executeCommand({
+    id: "inspect-user-thread",
+    feature: "ralph",
+    kind: "inspect_thread",
     conversationUrl: urlA,
   }, "browser-a");
-  assert.equal(createdUrls.at(-1), urlA,
-    "RALPH preparation opens the registered conversation in the RALPH browser");
-  assert.deepEqual(commandResults.at(-1), {
-    commandId: "prepare-ralph-thread",
-    browserId: "browser-a",
-    kind: "prepare_thread",
-    ok: true,
-    result: { status: "prepared", conversationUrl: urlA },
-  });
-  assert.equal(removedTabs.length, removalsBeforePreparation,
-    "the generic RALPH preparation tab stays parked after the command result returns");
-  context.finishParkedSyncTab(11);
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(removedTabs.length, removalsBeforePreparation + 1,
-    "the parked RALPH preparation tab closes after the thread sync handshake finishes");
+  assert.equal(createdUrls.length, 1, "an already-open user thread is reused rather than duplicated");
+  await context.executeCommand({
+    id: "close-user-thread",
+    feature: "threadLifecycle",
+    kind: "close_thread",
+    conversationUrl: urlA,
+  }, "browser-a");
+  assert.equal(commandResults.at(-1).result.status, "not_owned");
+  assert.equal(tabs.has(90), true, "cleanup never closes a user-owned ChatGPT tab");
+
+  await context.executeCommand({
+    id: "close-child-thread",
+    feature: "threadLifecycle",
+    kind: "close_thread",
+    conversationUrl: urlB,
+  }, "browser-a");
+  assert.equal(commandResults.at(-1).result.status, "closed");
+  assert.deepEqual(removedTabs, [11], "completed automation-owned threads can be closed explicitly");
+  assert.equal(JSON.stringify(storage.automationThreadTabsV1), JSON.stringify({}), "closed automation tabs are removed from persistent ownership state");
 }
 
 async function testRalphWorkerReactivation(sync) {
@@ -2851,7 +2962,8 @@ async function testWorkerTimesOutHungAutomation(sync) {
   assert.equal(postedResults.length, 1);
   assert.equal(postedResults[0].ok, false);
   assert.match(postedResults[0].error, /Timed out waiting for ChatGPT page automation/);
-  assert.equal(removedTab, true, "a timed-out automation closes its background tab");
+  assert.equal(removedTab, false, "a timed-out RALPH inspection keeps the owned thread tab available for retry and inspection");
+  assert.equal(JSON.stringify(storage.automationThreadTabsV1), JSON.stringify({ [urlA]: 11 }));
 }
 
 async function testAutomationRedirectGuard(sync) {
@@ -2986,10 +3098,8 @@ async function testWorker(sync, token, request) {
   assert.equal(typeof lifecycle.startup, "function");
   const sender = { id: extensionId, frameId: 0, tab: { id: 1 }, url: "https://chatgpt.com/" };
   const send = (source = sender) => new Promise(resolve => listener({ type: "local-codex-thread-sync/bind-v1", token, conversationUrl: urlA }, source, resolve));
-  const parkedBind = context.parkSyncTab(1, 1_000);
   const delivered = await send();
   assert.equal(delivered.status, "bound", delivered.error);
-  await parkedBind;
   assert.equal(fetches, 1);
   // Prove this transport seam catches the original blocked-port bug.
   await assert.rejects(fetch("http://127.0.0.1:6000/thread-sync/bind", {
