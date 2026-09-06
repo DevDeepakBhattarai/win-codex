@@ -20,8 +20,9 @@ const FAILURE_RETRY_MS = 2 * 60 * 1000;
 const COMMAND_TIMEOUT_MS = 20 * 60 * 1000;
 const INSPECT_CLAIM_LEASE_MS = 5 * 60 * 1000;
 const CLAIM_WAIT_MS = 20_000;
-const SUPPORT_BROWSER_HEARTBEAT_GRACE_MS = CLAIM_WAIT_MS + 5_000;
-const SUPPORT_BROWSER_LAUNCH_COOLDOWN_MS = 5_000;
+const SUPPORT_BROWSER_HEARTBEAT_GRACE_MS = 90_000;
+const SUPPORT_BROWSER_LAUNCH_COOLDOWN_MS = 60_000;
+const SUPPORT_BROWSER_CONNECT_TIMEOUT_MS = 10_000;
 const SUBAGENT_RESULT_MISSING_RETRY_MS = 30_000;
 const MAX_SUBAGENT_NOTIFICATION_ATTEMPTS = 5;
 const MAX_SUBAGENT_NOTIFICATION_RETRY_MS = 10 * 60_000;
@@ -249,6 +250,7 @@ export class SupportCommandBus {
     private readonly inspectClaimLeaseMs = INSPECT_CLAIM_LEASE_MS,
     private readonly messageCooldownMs = MESSAGE_COOLDOWN_MS,
     private readonly messageSendSpacingMs = MESSAGE_SEND_SPACING_MS,
+    private readonly browserConnectWaitMs = SUPPORT_BROWSER_CONNECT_TIMEOUT_MS,
   ) {}
 
   execute(
@@ -301,9 +303,15 @@ export class SupportCommandBus {
     if (this.hasBrowser(feature)) return;
     if (this.launchInFlight) {
       await this.launchInFlight;
-      return;
+      if (await this.waitForBrowser(feature)) return;
+      throw this.executorUnavailableError(feature);
     }
-    if (Date.now() - this.lastLaunchAt < SUPPORT_BROWSER_LAUNCH_COOLDOWN_MS) return;
+
+    const sinceLastLaunch = Date.now() - this.lastLaunchAt;
+    if (sinceLastLaunch < SUPPORT_BROWSER_LAUNCH_COOLDOWN_MS) {
+      if (await this.waitForBrowser(feature)) return;
+      throw this.executorUnavailableError(feature);
+    }
 
     const launch = launchBrowser();
     this.launchInFlight = launch;
@@ -313,6 +321,24 @@ export class SupportCommandBus {
     } finally {
       if (this.launchInFlight === launch) this.launchInFlight = undefined;
     }
+    if (await this.waitForBrowser(feature)) return;
+    throw this.executorUnavailableError(feature);
+  }
+
+  private async waitForBrowser(feature: SupportFeature) {
+    const deadline = Date.now() + this.browserConnectWaitMs;
+    while (Date.now() < deadline) {
+      if (this.hasBrowser(feature)) return true;
+      await new Promise<void>((resolve) => setTimeout(resolve, Math.min(50, Math.max(1, deadline - Date.now()))));
+    }
+    return this.hasBrowser(feature);
+  }
+
+  private executorUnavailableError(feature: SupportFeature) {
+    return new Error(
+      `Chrome is running, but Local Codex Support did not connect as a ${feature} executor. ` +
+      "In the Chrome automation profile, reload the generated .data/support-extension and enable the designated preparation/automation executor plus the required support feature.",
+    );
   }
 
   claim(browserId: string, features: SupportFeature[], waitMs = CLAIM_WAIT_MS, signal?: AbortSignal) {
