@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.4.3";
+  const contentScriptVersion = "1.5.0";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -400,12 +400,13 @@
         : getSendButton(composer) ? "send" : null;
       if (!action) return;
 
-      if (action === "stop" && previousComposerAction === "send" &&
-          currentUrl?.startsWith("https://chatgpt.com/g/")) {
+      if (currentUrl && ((action === "stop" && previousComposerAction === "send") ||
+          (action === "send" && previousComposerAction === "stop"))) {
         try {
           const delivery = extensionApi.runtime.sendMessage({
             type: reactivateRalphType,
             conversationUrl: currentUrl,
+            ...(action === "send" ? { completed: true } : {}),
           });
           void Promise.resolve(delivery).catch(() => undefined);
         } catch {

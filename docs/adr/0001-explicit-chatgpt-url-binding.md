@@ -2,15 +2,19 @@
 
 ## Status
 
-Accepted on 2026-08-27. Extended through 2026-09-05 with one-time thread binding, backend-owned thread preparation, local-file sub-agent results, parent wake-ups, parent-child tracking, bounded flat delegation, readable thread titles, explicit continuous RALPH mode, and single-shot browser delivery.
+Accepted on 2026-08-27. Extended through 2026-09-06 with one-time thread binding, backend-owned thread preparation, file-backed reviewer reports, parent wake-ups, reviewer tracking, readable thread titles, explicit continuous RALPH mode, and single-shot browser delivery.
 
 ## Context
 
 ChatGPT gives Local Codex an opaque `openai/session`, while the browser knows the visible conversation URL. Thread sync must connect those two identities without guessing from titles, project routes, or browser history.
 
-Sub-agents run in separate ChatGPT conversations. Their result must survive long-running work without depending on a child-to-parent browser callback. The local backend therefore owns result storage and parent notification.
+Independent reviewers run in separate ChatGPT conversations. Their reports must survive long-running work without depending on a reviewer-to-implementer browser callback. The local backend therefore owns report storage and parent notification.
 
 The support extension can also run in more than one browser. Any command that changes a ChatGPT thread must execute at most once even when multiple extension instances are online.
+
+## Current review workflow
+
+The public workflow is reviewer-specific. ChatGPT receives `start_reviewer`, `list_reviewers`, and `review_done`; it does not receive generic delegation tools. The implementation keeps the existing flat local job registry underneath that API because its reservation, persistence, and parent-notification behavior still fits the reviewer lifecycle.
 
 ## Decision
 
@@ -18,7 +22,7 @@ The support extension can also run in more than one browser. Any command that ch
 
 Thread Sync exposes two narrow MCP tools:
 
-- `sync_current_thread` is an on-demand prerequisite when an operation needs the current conversation binding. It creates the initial browser binding ticket only when the current `openai/session` is not already bound. `start_subagent` requires that binding before delegation begins. A repeated call returns the saved conversation URL immediately.
+- `sync_current_thread` is an on-demand prerequisite when an operation needs the current conversation binding. It creates the initial browser binding ticket only when the current `openai/session` is not already bound. `start_reviewer` requires that binding before the review begins. A repeated call returns the saved conversation URL immediately.
 - `get_current_thread_url` waits for the initial binding when `sync_current_thread` reports `syncing`. It never infers or constructs a conversation URL.
 
 The binding is permanent for the lifetime of that stored session mapping. Repeating `sync_current_thread` does not refresh the URL, create another ticket, or mount another handshake.
@@ -33,33 +37,35 @@ Thread preparation is independent from RALPH registration. The support extension
 
 The support extension has an explicit **Thread preparation executor** setting. Enable it only in the Chrome automation profile. That profile opens or reuses a persistent conversation tab. A successful Thread Sync handshake leaves that tab in place for title observation, RALPH, and later messaging. Helium only observes routes and reports them to the backend with the executor setting off, so it does not launch Chrome or claim preparation work.
 
-### Keep delegation server-routed and file-backed
+### Keep reviews server-routed and file-backed
 
-Delegation uses five MCP tools:
+The reviewer workflow exposes three reviewer-specific MCP tools:
 
-- `start_subagent` requires a synced parent. The server resolves the parent from `openai/session`, chooses the configured **Sub-agent project** or `https://chatgpt.com/`, creates a local result job, and starts the child.
-- `submit_subagent_result` stores the child report in the job's local `.md` file.
-- `send_thread_message` sends an explicit message to an existing `/c/...` conversation only. It is not the sub-agent return channel.
-- `list_subagents` returns the children created by the current parent and includes their result path and result state.
-- `cancel_subagent` cancels a parent's abandoned job. For a known child URL, the backend opens the child thread through the support extension, stops an active ChatGPT run, confirms the stop, and only then releases the slot. It disables future RALPH continuation and rejects late results.
+- `start_reviewer` requires a synced implementer conversation, reserves one review job, starts the reviewer, and returns the exact ChatGPT review-thread URL.
+- `list_reviewers` returns one status snapshot for reviews owned by the current synced implementer, including each known review-thread URL. Its contract explicitly forbids completion polling because the backend wakes the implementer after completion.
+- `review_done` stores the reviewer's final report and completes the review job.
 
-The child receives its job ID and result path. It does not receive the parent URL. The child performs the bounded task, binds its own thread before result submission when needed, and finishes with `submit_subagent_result`. Nested delegation is rejected by the backend. The registry reserves at most two pending jobs per parent inside its serialized update, before browser delivery. Different roots have independent limits. Reservations survive restart and are released by completion or confirmed cancellation. Unconfirmed startup keeps its reservation because delivery may have occurred. On restart, the registry marks a reservation without a known child as interrupted so that the parent can inspect the browser and cancel it.
+`start_thread` and `send_thread_message` remain separate, explicit user-requested conversation tools. They are not delegation or review APIs. Generic delegation start, list, cancel, or result tools are not exposed to ChatGPT.
 
-Delegation is opt-in. The model does not create sub-agents, reviewers, or parallel agents automatically; `start_subagent` is used only when the user explicitly requests delegation. Capacity refusals direct that parent to wait for results or continue root work, with no start retry or status polling loop.
+Internally, the existing `SubagentJobRegistry` remains the persistence and reservation mechanism. That implementation detail does not appear in reviewer tool names, descriptions, MCP App identity, or normal operator status. Each implementer can have one unfinished review. A reviewer cannot start another reviewer or create another task thread. Repeated identical briefs reuse the saved job, and an uncertain startup keeps its reservation until the operator resolves it.
 
-Before `start_subagent` reports normal startup success, the backend confirms that the child conversation is prepared in the automation browser. A preparation failure after child creation is stored on the job and returned to the parent without retrying child creation. The backend then watches completed jobs that have not notified their parent. It groups ready jobs for the same parent during a one-second window and sends one notice with their paths. Wake-up failures back off exponentially and become terminal after five attempts, with each error retained on its job. The parent reads the files for the reports. This keeps browser messaging out of the result transport while preserving automatic parent continuation.
+New jobs and report files use `<DATA_DIR>/reviews/`. When only the historical `<DATA_DIR>/subagents/` store exists, the registry reads it once, copies any existing reports into `reviews/`, rewrites the saved paths, and persists the canonical reviewer store. The old files are left in place so migration does not destroy rollback data. The historical `subagentProjectUrl` setting key remains accepted for compatibility.
+
+The reviewer receives its job ID and result path, but not the implementer's conversation URL or callback transport. It binds its own reviewer conversation before `review_done` when needed. The backend then waits until the reviewer is idle before sending the implementer a notice that points at the local report. Failed wake-ups back off and retain their errors for operator recovery.
+
+The review-thread URL is first-class status, not hidden metadata. `start_reviewer` and `list_reviewers` include it in visible tool output, the reviewer MCP App displays it, and the RALPH popup Reviews section displays and opens the same URL. Local result paths remain report transport, not the primary review navigation UI.
 
 ### Hide transport idempotency from the model
 
-`start_subagent` and `send_thread_message` keep transport idempotency below the model-facing API. `send_thread_message` exposes only `targetUrl` and `message`; the model does not create or manage a `deliveryId`.
+`start_reviewer` and `send_thread_message` keep transport idempotency below the model-facing API. `send_thread_message` exposes only `targetUrl` and `message`; the model does not create or manage a `deliveryId`.
 
-The server deduplicates retries of the same MCP request internally using the tool name, request identity, `openai/session`, and payload fingerprint. `send_thread_message` also fingerprints the normalized target. The replay cache is shared across stateless MCP server instances in the process. A new logical tool call remains a new send or a new child.
+The server deduplicates retries of the same MCP request internally using the tool name, request identity, `openai/session`, and payload fingerprint. `send_thread_message` also fingerprints the normalized target. The replay cache is shared across stateless MCP server instances in the process. A new logical tool call remains a new send or a new review.
 
 This keeps transport retry handling below the tool contract instead of requiring the model to preserve an idempotency token across attempts.
 
 ### Use one conservative browser send path
 
-The support extension uses one single-shot send procedure for new child prompts and messages to existing threads:
+The support extension uses one single-shot send procedure for new reviewer prompts and messages to existing threads:
 
 1. Existing conversations wait for a loaded user turn.
 2. The page settles for five seconds.
@@ -72,7 +78,7 @@ The extension does not wait for an assistant turn before typing. It does not use
 
 ### Keep RALPH state separate from thread binding
 
-Agent-created children are registered for RALPH immediately and store their parent thread ID. Their registration does not depend on the normal RALPH project allowlist.
+Reviewer threads are registered for RALPH immediately and store their implementer thread ID. Their registration does not depend on the normal RALPH project allowlist.
 
 The extension reports readable ChatGPT titles during route updates, sends, and inspections so operator views do not need to identify threads by UUID alone.
 
@@ -85,7 +91,7 @@ Normal mode repeatedly inspects active threads. The default check interval is 18
 
 Continuous mode is operator-controlled. The agent has no MCP action that disables it. Ending a turn does not change the mode. The popup can switch the thread back to normal mode with **Stop continuous** or stop RALPH checks with **Mark complete**.
 
-Both modes defer parents while children are pending or results await notification. Finished and cancelled child jobs suppress further continuation. Ready files for a parent share a one-second collection window and one wake-up. Visible recognized ChatGPT rate-limit notices trigger a shared 15-minute message cooldown. The failed rate-limited send and other queued sends remain queued. A sub-agent start requested during cooldown also waits in that queue after reserving its parent slot. After cooldown the deferred backlog is claimed at least five seconds apart, and pacing turns off when the backlog is empty. Stop-thread commands bypass message cooldown. Cooldown state is not persisted across service restarts.
+Both modes defer implementer threads while a review is pending or its report awaits notification. Finished and cancelled reviewer jobs suppress further reviewer continuation. Ready reports for an implementer share a one-second collection window and one wake-up. Visible recognized ChatGPT rate-limit notices trigger a shared 15-minute message cooldown. The failed rate-limited send and other queued sends remain queued. A reviewer start requested during cooldown also waits in that queue after reserving its parent slot. After cooldown the deferred backlog is claimed at least five seconds apart, and pacing turns off when the backlog is empty. Stop-thread commands bypass message cooldown. Cooldown state is not persisted across service restarts.
 
 ### Claim automation commands atomically
 
@@ -93,9 +99,9 @@ The authenticated loopback command bus assigns each queued support command to on
 
 ## Consequences
 
-The parent does not sync merely because a conversation started. Before `start_subagent` or another binding-dependent operation, it calls `sync_current_thread`; if the binding is still pending, it immediately follows with `get_current_thread_url` and then continues the requested operation.
+The parent does not sync merely because a conversation started. Before `start_reviewer` or another binding-dependent operation, it calls `sync_current_thread`; if the binding is still pending, it immediately follows with `get_current_thread_url` and then continues the requested operation.
 
-Sub-agents return reports through local files. The browser is used only to create child conversations and to wake parents after a result becomes available. Transport retries remain an implementation concern rather than part of the model-facing tool API.
+Reviewers return reports through local files. The browser creates reviewer conversations, exposes their URLs for navigation, and wakes implementers after a result becomes available. Transport retries remain an implementation concern rather than part of the model-facing tool API.
 
 Browser delivery favors duplicate prevention over speculative recovery. A prompt is inserted once and the send button is clicked once after explicit settle periods.
 

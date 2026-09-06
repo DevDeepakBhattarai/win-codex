@@ -9,7 +9,7 @@ import { parseConversationUrl } from "./chatgpt-support.js";
 export { parseConversationUrl } from "./chatgpt-support.js";
 
 export const THREAD_SYNC_WIDGET_URI = "ui://local-codex/thread-sync-v2.html";
-export const THREAD_SYNC_AGENT_INSTRUCTION = "Thread sync is an on-demand prerequisite, not a startup step. Use sync_current_thread only when an action needs the current ChatGPT conversation binding or exact conversation URL. In particular, establish the binding before start_subagent. If sync_current_thread reports synced, reuse the returned binding. If it reports syncing, immediately call get_current_thread_url to finish that one-time handshake before the binding-dependent action. Never infer or construct the current conversation URL with another tool.";
+export const THREAD_SYNC_AGENT_INSTRUCTION = "Work in the current conversation without a Thread Sync startup step. Ordinary tasks, reviews, and reading local result files require no syncing. Call sync_current_thread only when a user-requested action needs the current conversation binding and its tool requires one. Reuse an existing binding across turns. Follow that tool's binding instructions only when needed.";
 const TICKET_TTL_MS = 30 * 60 * 1000;
 const MAX_RECORDS = 2_000;
 const BROWSER_BLOCKED_PORTS = new Set([
