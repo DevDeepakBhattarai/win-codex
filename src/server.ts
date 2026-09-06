@@ -69,6 +69,7 @@ import {
   ralphThreadCompleteHandler,
   ralphThreadModeHandler,
   ralphThreadsGetHandler,
+  reviewActionHandler,
   registerChatGptAgents,
   SUBAGENT_AGENT_INSTRUCTION,
   SubagentResultController,
@@ -2728,15 +2729,15 @@ await initializeAuthStore();
 const threadSync = THREAD_SYNC_ENABLED
   ? await prepareThreadSync(DATA_DIR, THREAD_SYNC_PORT)
   : undefined;
-const supportCommands = threadSync ? new SupportCommandBus() : undefined;
+const ralphRegistry = threadSync ? await RalphRegistry.open(DATA_DIR) : undefined;
 const subagentJobs = threadSync ? await SubagentJobRegistry.open(DATA_DIR) : undefined;
+const supportCommands = threadSync ? new SupportCommandBus(undefined, undefined, undefined, ralphRegistry, subagentJobs) : undefined;
 const threadPreparer = supportCommands && threadSync
   ? new ThreadPreparationCoordinator(supportCommands, threadSync.registry, () => launchChrome())
   : undefined;
 const subagentResultController = supportCommands && subagentJobs
   ? new SubagentResultController(subagentJobs, supportCommands, () => launchChrome())
   : undefined;
-const ralphRegistry = threadSync ? await RalphRegistry.open(DATA_DIR) : undefined;
 const ralphController = supportCommands && ralphRegistry
   ? new RalphController({
       commands: supportCommands,
@@ -2786,7 +2787,11 @@ const threadSyncHttpServer = threadSync
         syncApp.put("/chatgpt-support/ralph/settings",
           ralphSettingsPutHandler(ralphRegistry, threadSync.extensionToken));
         syncApp.get("/chatgpt-support/ralph/threads",
-          ralphThreadsGetHandler(ralphRegistry, threadSync.extensionToken));
+          ralphThreadsGetHandler(ralphRegistry, threadSync.extensionToken, subagentJobs));
+        if (subagentJobs && supportCommands) {
+          syncApp.put("/chatgpt-support/reviews/:jobId", reviewActionHandler(
+            subagentJobs, ralphRegistry, supportCommands, () => launchChrome(), threadSync.extensionToken));
+        }
         syncApp.put("/chatgpt-support/ralph/threads/:threadId/complete",
           ralphThreadCompleteHandler(ralphRegistry, threadSync.extensionToken));
         syncApp.put("/chatgpt-support/ralph/threads/:threadId/active",
@@ -2798,9 +2803,9 @@ const threadSyncHttpServer = threadSync
             ralphThreadCheckHandler(ralphRegistry, ralphController, threadSync.extensionToken));
         }
       }
-      if (threadPreparer) {
+      if (threadPreparer && ralphRegistry) {
         syncApp.post("/chatgpt-support/threads/observe", createRateLimiter("thread-observe", 60_000, 600),
-          threadObservationHandler(threadPreparer, threadSync.extensionToken));
+          threadObservationHandler(threadPreparer, threadSync.extensionToken, ralphRegistry));
       }
       if (supportCommands) {
         syncApp.post("/chatgpt-support/commands/claim",
