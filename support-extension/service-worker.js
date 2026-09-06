@@ -27,6 +27,8 @@ const TITLE_OBSERVED_MESSAGE = "local-codex-support/title-observed-v1";
 const SYNC_MESSAGE = "local-codex-thread-sync/bind-v1";
 const WORKER_KEEPALIVE_INTERVAL_MS = 20_000;
 const AUTOMATION_RESPONSE_TIMEOUT_MS = 8 * 60_000;
+const SUPPORT_POLL_ALARM = "local-codex-support/poll";
+const SUPPORT_POLL_PERIOD_MINUTES = 1;
 let pollGeneration = 0;
 let pollController = null;
 const reportedRalphConversations = new Set();
@@ -509,6 +511,17 @@ function enabledAutomationFeatures(settings) {
   return features;
 }
 
+async function syncPollingAlarm() {
+  if (!extensionApi.alarms) return;
+  const settings = await getSettings();
+  if (enabledAutomationFeatures(settings).length === 0) {
+    await extensionApi.alarms.clear(SUPPORT_POLL_ALARM);
+    return;
+  }
+  if (await extensionApi.alarms.get(SUPPORT_POLL_ALARM)) return;
+  extensionApi.alarms.create(SUPPORT_POLL_ALARM, { periodInMinutes: SUPPORT_POLL_PERIOD_MINUTES });
+}
+
 async function pollCommands(generation) {
   const browserId = await getBrowserId();
   while (generation === pollGeneration) {
@@ -576,6 +589,7 @@ extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "local-codex-support/settings-changed") {
     reportedRalphConversations.clear();
     restartPolling();
+    void syncPollingAlarm();
     void scanExistingTabs();
     sendResponse({ ok: true });
   }
@@ -618,13 +632,19 @@ extensionApi.webNavigation?.onCommitted?.addListener((details) => {
   }
 });
 
+extensionApi.alarms?.onAlarm?.addListener((alarm) => {
+  if (alarm.name === SUPPORT_POLL_ALARM) restartPolling();
+});
 extensionApi.runtime.onInstalled.addListener(() => {
+  void syncPollingAlarm();
   void scanExistingTabs();
   restartPolling();
 });
 extensionApi.runtime.onStartup.addListener(() => {
+  void syncPollingAlarm();
   void scanExistingTabs();
   restartPolling();
 });
+void syncPollingAlarm();
 void scanExistingTabs();
 restartPolling();

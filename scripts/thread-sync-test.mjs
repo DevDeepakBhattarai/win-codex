@@ -56,9 +56,9 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.4.4");
+  assert.equal(manifest.version, "1.4.5");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
-  assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs", "webNavigation"]);
+  assert.deepEqual(manifest.permissions, ["alarms", "scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
   assert.equal(manifest.content_security_policy.extension_pages,
     "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:*");
@@ -128,6 +128,10 @@ try {
     "service-worker thread matching canonicalizes project-name slugs");
   assert.doesNotMatch(preparedServiceWorker, /threadMessaging\) features\.push\("threadPreparation"\)/,
     "a thread-messaging observer such as Helium never implicitly claims thread preparation");
+  assert.match(preparedServiceWorker, /SUPPORT_POLL_PERIOD_MINUTES = 1/,
+    "the automation executor has a periodic MV3 wake-up instead of relying on an immortal service worker");
+  assert.match(preparedServiceWorker, /alarms\?\.onAlarm\?\.addListener/,
+    "the polling alarm wakes command claiming after the extension worker is suspended");
   const preparedContentScript = await readFile(path.join(sync.extensionDirectory, "content-script.js"), "utf8");
   assert.doesNotMatch(preparedContentScript, /Run RALPH now|installManualRalphButton/,
     "the content script does not inject a RALPH button into ChatGPT");
@@ -768,11 +772,45 @@ try {
   await busyResult;
   browserPresenceBus.close();
 
+  const sleepingWorkerBus = new SupportCommandBus();
+  let sleepingWorkerLaunches = 0;
+  const realDateNow = Date.now;
+  let presenceNow = realDateNow();
+  Date.now = () => presenceNow;
+  try {
+    assert.equal(await sleepingWorkerBus.claim("sleeping-chrome", ["threadPreparation"], 0), undefined);
+    presenceNow += 70_000;
+    await sleepingWorkerBus.ensureBrowser("threadPreparation", async () => { sleepingWorkerLaunches += 1; });
+    assert.equal(sleepingWorkerLaunches, 0,
+      "one MV3 sleep/alarm interval does not cause the backend to launch another Chrome window");
+  } finally {
+    Date.now = realDateNow;
+    sleepingWorkerBus.close();
+  }
+
+  const missingExecutorBus = new SupportCommandBus(undefined, undefined, undefined, 25);
+  let missingExecutorLaunches = 0;
+  const launchWithoutExecutor = async () => { missingExecutorLaunches += 1; };
+  await assert.rejects(
+    missingExecutorBus.ensureBrowser("threadPreparation", launchWithoutExecutor),
+    /did not connect as a threadPreparation executor/,
+    "spawning chrome.exe is not treated as proof that the support executor connected");
+  await assert.rejects(
+    missingExecutorBus.ensureBrowser("threadPreparation", launchWithoutExecutor),
+    /did not connect as a threadPreparation executor/,
+    "a missing executor fails explicitly during the launch cooldown instead of opening Chrome again");
+  assert.equal(missingExecutorLaunches, 1, "a missing executor does not create a Chrome launch loop");
+  missingExecutorBus.close();
+
   const launchDedupBus = new SupportCommandBus();
   let deduplicatedLaunches = 0;
   let releaseLaunch;
   const launchGate = new Promise(resolve => { releaseLaunch = resolve; });
-  const launchBrowserOnce = async () => { deduplicatedLaunches += 1; await launchGate; };
+  const launchBrowserOnce = async () => {
+    deduplicatedLaunches += 1;
+    await launchGate;
+    await launchDedupBus.claim("dedup-browser", ["threadMessaging", "threadPreparation"], 0);
+  };
   const launchRequests = [
     launchDedupBus.ensureBrowser("threadMessaging", launchBrowserOnce),
     launchDedupBus.ensureBrowser("threadPreparation", launchBrowserOnce),
