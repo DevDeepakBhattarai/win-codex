@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.4.3";
+  const contentScriptVersion = "1.6.0";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -108,9 +108,22 @@
   });
 
   async function runAutomation(command) {
+    if (command.kind === "page_health") return pageHealth();
+    if (command.kind === "dismiss_rate_limit") {
+      const notice = rateLimitNotice();
+      const button = notice && [...notice.querySelectorAll("button")].find(element =>
+        /^got it$/i.test((element.textContent ?? "").trim()) && isActionableButton(element));
+      if (button) button.click();
+      return { status: button ? "dismissed" : "not_found" };
+    }
     if (command.kind === "stop_thread") return await stopThread();
     assertNotRateLimited();
-    if (command.kind === "inspect_thread") return await inspectThread();
+    if (command.kind === "inspect_thread") {
+      const url = conversationUrl();
+      const result = await inspectThread();
+      if (url !== conversationUrl()) throw new Error("The observed thread navigated away during inspection.");
+      return result;
+    }
     if (command.kind === "send_message") return await sendMessage(command.message);
     throw new Error("Unsupported ChatGPT support command.");
   }
@@ -294,11 +307,23 @@
     return { status: "sent", conversationUrl: savedUrl, ...(title ? { title } : {}) };
   }
 
-  function assertNotRateLimited() {
+  function rateLimitNotice() {
     // Read visible provider notices, never conversation content that may quote an error.
     const notices = [...document.querySelectorAll('[role="alert"], [role="dialog"], [data-testid="toast"]')];
-    const notice = notices.find((element) => element.getClientRects?.().length &&
+    return notices.find((element) => element.getClientRects?.().length &&
       /too many (?:messages|requests)|rate limit|message limit|usage limit|you(?:'ve| have) reached.{0,60}limit/i.test(element.textContent ?? ""));
+  }
+
+  function pageHealth() {
+    if (rateLimitNotice()) return { status: "rate_limited" };
+    const notices = [...document.querySelectorAll('[role="alert"], [role="dialog"], [data-testid="toast"]')];
+    const failed = notices.some(element => element.getClientRects?.().length &&
+      /request timed out|connection timed out|something went wrong|unable to load conversation|network error/i.test(element.textContent ?? ""));
+    return { status: failed ? "recoverable_error" : "ok" };
+  }
+
+  function assertNotRateLimited() {
+    const notice = rateLimitNotice();
     if (notice) throw new Error(`CHATGPT_RATE_LIMITED: ${(notice.textContent ?? "").trim().slice(0, 500)}`);
   }
 

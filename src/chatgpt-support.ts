@@ -33,7 +33,7 @@ const THREAD_TAB_CLEANUP_TICK_MS = 60 * 1000;
 const MAX_CONTINUATION_CHARS = 500;
 const TOOL_REQUEST_REPLAY_TTL_MS = 30 * 60 * 1000;
 const MAX_TOOL_REQUEST_REPLAYS = 1_000;
-const MESSAGE_COOLDOWN_MS = 15 * 60_000;
+const MESSAGE_COOLDOWN_MS = 10 * 60_000;
 const MESSAGE_SEND_SPACING_MS = 5_000;
 
 type ToolRequestReplay = {
@@ -234,7 +234,7 @@ export class SupportCommandBus {
   private readonly queued: PendingCommand[] = [];
   private readonly pending = new Map<string, PendingCommand>();
   private readonly waiters = new Set<ClaimWaiter>();
-  private readonly browsers = new Map<string, { features: Set<SupportFeature>; lastSeenAt: number }>();
+  private readonly browsers = new Map<string, { features: Set<SupportFeature>; lastSeenAt: number; openThreads: Set<string> }>();
   private launchInFlight?: Promise<void>;
   private lastLaunchAt = 0;
   private cooldownUntil = 0;
@@ -249,12 +249,23 @@ export class SupportCommandBus {
     private readonly inspectClaimLeaseMs = INSPECT_CLAIM_LEASE_MS,
     private readonly messageCooldownMs = MESSAGE_COOLDOWN_MS,
     private readonly messageSendSpacingMs = MESSAGE_SEND_SPACING_MS,
+    private readonly launchBrowser?: () => Promise<void>,
   ) {}
 
-  execute(
+  async execute(
     command: SupportCommandInput,
     timeoutMs = COMMAND_TIMEOUT_MS,
   ) {
+    const targetUrl = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
+    if (command.kind === "send_message" && this.launchBrowser) {
+      await this.ensureBrowser(command.feature, this.launchBrowser);
+    }
+    if (command.kind === "inspect_thread" && this.launchBrowser) {
+      const threadId = parseConversationUrl(targetUrl).threadId;
+      const observed = [...this.browsers.values()].some(browser =>
+        Date.now() - browser.lastSeenAt <= SUPPORT_BROWSER_HEARTBEAT_GRACE_MS && browser.openThreads.has(threadId));
+      if (!observed) await this.ensureBrowser(command.feature, this.launchBrowser);
+    }
     const fullCommand = supportCommandSchema.parse({ ...command, id: randomUUID() });
     return new Promise<SupportCommandResult>((resolve, reject) => {
       const pending: PendingCommand = {
@@ -271,7 +282,7 @@ export class SupportCommandBus {
       this.pending.set(fullCommand.id, pending);
 
       const waiter = [...this.waiters].find((candidate) =>
-        candidate.features.has(fullCommand.feature) && this.canClaim(fullCommand));
+        this.browserCanClaim(candidate.browserId, fullCommand) && this.canClaim(fullCommand));
       if (waiter) {
         this.markClaimed(pending, waiter.browserId);
         this.resolveWaiter(waiter, fullCommand);
@@ -315,12 +326,16 @@ export class SupportCommandBus {
     }
   }
 
-  claim(browserId: string, features: SupportFeature[], waitMs = CLAIM_WAIT_MS, signal?: AbortSignal) {
+  claim(browserId: string, features: SupportFeature[], waitMs = CLAIM_WAIT_MS, signal?: AbortSignal, openThreads: string[] = []) {
     const featureSet = new Set(features);
-    this.browsers.set(browserId, { features: featureSet, lastSeenAt: Date.now() });
+    this.browsers.set(browserId, {
+      features: featureSet,
+      lastSeenAt: Date.now(),
+      openThreads: new Set(openThreads.map(url => parseConversationUrl(url).threadId)),
+    });
     const resumable = [...this.pending.values()].find((pending) =>
       (pending.command.kind === "inspect_thread" || pending.command.kind === "prepare_thread") &&
-      featureSet.has(pending.command.feature) &&
+      this.browserCanClaim(browserId, pending.command) &&
       (pending.claimedBy === browserId ||
         (pending.claimedAt !== undefined && Date.now() - pending.claimedAt >= this.inspectClaimLeaseMs)));
     if (resumable) {
@@ -330,14 +345,14 @@ export class SupportCommandBus {
     }
 
     const queuedIndex = this.queued.findIndex((pending) =>
-      featureSet.has(pending.command.feature) && this.canClaim(pending.command));
+      this.browserCanClaim(browserId, pending.command) && this.canClaim(pending.command));
     if (queuedIndex >= 0) {
       const [pending] = this.queued.splice(queuedIndex, 1);
       this.markClaimed(pending, browserId);
       return Promise.resolve(pending.command);
     }
 
-    if (featureSet.size === 0 || waitMs <= 0 || signal?.aborted) return Promise.resolve(undefined);
+    if ((featureSet.size === 0 && openThreads.length === 0) || waitMs <= 0 || signal?.aborted) return Promise.resolve(undefined);
 
     return new Promise<SupportCommand | undefined>((resolve) => {
       let waiter: ClaimWaiter;
@@ -359,13 +374,18 @@ export class SupportCommandBus {
     if (pending.claimedBy !== result.browserId) throw new Error("Support command belongs to another browser instance.");
     if (pending.command.kind !== result.kind) throw new Error("Support command result kind does not match the request.");
 
-    if (!result.ok && result.kind === "send_message" && result.error.startsWith("CHATGPT_RATE_LIMITED:")) {
-      this.cooldownUntil = Date.now() + this.messageCooldownMs;
+    if (!result.ok && result.error.startsWith("CHATGPT_RATE_LIMITED:")) {
+      if (!this.messageCooldownUntil()) this.cooldownUntil = Date.now() + this.messageCooldownMs;
       this.messagePacingActive = true;
       this.nextMessageClaimAt = Math.max(this.nextMessageClaimAt, this.cooldownUntil);
       console.warn(`[chatgpt-support] message_cooldown until=${new Date(this.cooldownUntil).toISOString()}`);
       const browser = this.browsers.get(result.browserId);
       if (browser) browser.lastSeenAt = Date.now();
+      if (result.kind !== "send_message") {
+        this.removePending(result.commandId);
+        pending.resolve(result);
+        return;
+      }
       pending.claimedBy = undefined;
       pending.claimedAt = undefined;
       clearTimeout(pending.timeout);
@@ -397,6 +417,19 @@ export class SupportCommandBus {
     this.pending.clear();
     this.queued.length = 0;
     this.browsers.clear();
+  }
+
+  private browserCanClaim(browserId: string, command: SupportCommand) {
+    const browser = this.browsers.get(browserId);
+    if (!browser) return false;
+    if (command.kind === "inspect_thread" || command.kind === "prepare_thread") {
+      const threadId = parseConversationUrl(command.conversationUrl).threadId;
+      const owners = [...this.browsers.entries()].filter(([, candidate]) =>
+        Date.now() - candidate.lastSeenAt <= SUPPORT_BROWSER_HEARTBEAT_GRACE_MS && candidate.openThreads.has(threadId));
+      const owner = owners.find(([, candidate]) => candidate.features.size === 0) ?? owners[0];
+      if (owner) return owner[0] === browserId;
+    }
+    return browser.features.has(command.feature);
   }
 
   private canClaim(command: SupportCommand) {
@@ -1194,6 +1227,9 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
   const bodySchema = z.object({
     browserId: z.string().min(1).max(200),
     features: z.array(supportFeatureSchema).max(4),
+    openThreads: z.array(z.string().max(2048).refine(value => {
+      try { parseConversationUrl(value); return true; } catch { return false; }
+    })).max(2000).optional(),
   }).strict();
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
@@ -1207,7 +1243,7 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
     req.once("aborted", onDisconnect);
     res.once("close", onDisconnect);
     try {
-      const command = await commands.claim(parsed.data.browserId, parsed.data.features, CLAIM_WAIT_MS, abortController.signal);
+      const command = await commands.claim(parsed.data.browserId, parsed.data.features, CLAIM_WAIT_MS, abortController.signal, parsed.data.openThreads);
       if (abortController.signal.aborted) return;
       res.setHeader("Cache-Control", "no-store");
       if (!command) {
@@ -1556,6 +1592,11 @@ export function threadObservationHandler(
       return;
     }
     try {
+      if (parsed.data.canPrepare === false) {
+        res.setHeader("Cache-Control", "no-store");
+        res.json({ status: "observed" });
+        return;
+      }
       const status = await preparer.schedule(
         parsed.data.conversationUrl,
         parsed.data.canPrepare === true,
