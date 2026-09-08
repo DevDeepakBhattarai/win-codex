@@ -20,6 +20,7 @@ const FAILURE_RETRY_MS = 2 * 60 * 1000;
 const COMMAND_TIMEOUT_MS = 20 * 60 * 1000;
 const INSPECT_CLAIM_LEASE_MS = 5 * 60 * 1000;
 const CLAIM_WAIT_MS = 20_000;
+const RALPH_BROWSER_INSPECTION_TIMEOUT_MS = 30_000;
 const SUPPORT_BROWSER_HEARTBEAT_GRACE_MS = CLAIM_WAIT_MS + 5_000;
 const SUPPORT_BROWSER_LAUNCH_COOLDOWN_MS = 5_000;
 const SUBAGENT_RESULT_MISSING_RETRY_MS = 30_000;
@@ -221,6 +222,7 @@ interface PendingCommand {
   claimedBy?: string;
   claimedAt?: number;
   inspectionFallback?: NodeJS.Timeout;
+  allowBrowserLaunch: boolean;
 }
 
 interface ClaimWaiter {
@@ -239,6 +241,7 @@ export class SupportCommandBus {
   private readonly browsers = new Map<string, { features: Set<SupportFeature>; lastSeenAt: number; openThreads: Set<string> }>();
   private launchInFlight?: Promise<void>;
   private lastLaunchAt = 0;
+  private readonly backgroundLaunchPending = new Set<SupportFeature>();
   private cooldownUntil = 0;
   private nextMessageClaimAt = 0;
   private messagePacingActive = false;
@@ -257,12 +260,14 @@ export class SupportCommandBus {
   async execute(
     command: SupportCommandInput,
     timeoutMs = COMMAND_TIMEOUT_MS,
+    options: { allowBrowserLaunch?: boolean } = {},
   ) {
+    const allowBrowserLaunch = options.allowBrowserLaunch !== false;
     const targetUrl = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
-    if (command.kind === "send_message" && this.launchBrowser) {
+    if (allowBrowserLaunch && command.kind === "send_message" && this.launchBrowser) {
       await this.ensureBrowser(command.feature, this.launchBrowser);
     }
-    if (command.kind === "inspect_thread" && this.launchBrowser) {
+    if (allowBrowserLaunch && command.kind === "inspect_thread" && this.launchBrowser) {
       const threadId = parseConversationUrl(targetUrl).threadId;
       if (command.executorOnly || !this.hasOpenThreadOwner(threadId)) {
         await this.ensureBrowser(command.feature, this.launchBrowser);
@@ -279,6 +284,7 @@ export class SupportCommandBus {
           reject(new Error(`ChatGPT support command timed out: ${fullCommand.kind}`));
         }, timeoutMs),
         timeoutMs,
+        allowBrowserLaunch,
       };
       pending.timeout.unref();
       this.pending.set(fullCommand.id, pending);
@@ -329,8 +335,40 @@ export class SupportCommandBus {
     }
   }
 
+  async ensureBackgroundBrowserOnce(feature: SupportFeature) {
+    if (this.hasBrowser(feature)) {
+      this.backgroundLaunchPending.delete(feature);
+      return;
+    }
+    if (!this.launchBrowser || this.backgroundLaunchPending.has(feature)) return;
+    this.backgroundLaunchPending.add(feature);
+    try {
+      if (this.launchInFlight) {
+        await this.launchInFlight;
+        return;
+      }
+      const launch = this.launchBrowser();
+      this.launchInFlight = launch;
+      try {
+        await launch;
+        this.lastLaunchAt = Date.now();
+      } finally {
+        if (this.launchInFlight === launch) this.launchInFlight = undefined;
+      }
+    } catch (error) {
+      this.backgroundLaunchPending.delete(feature);
+      throw error;
+    }
+  }
+
+  browserHasFeature(browserId: string, feature: SupportFeature) {
+    const browser = this.browsers.get(browserId);
+    return Boolean(browser && Date.now() - browser.lastSeenAt <= SUPPORT_BROWSER_HEARTBEAT_GRACE_MS && browser.features.has(feature));
+  }
+
   claim(browserId: string, features: SupportFeature[], waitMs = CLAIM_WAIT_MS, signal?: AbortSignal, openThreads: string[] = []) {
     const featureSet = new Set(features);
+    for (const feature of featureSet) this.backgroundLaunchPending.delete(feature);
     this.browsers.set(browserId, {
       features: featureSet,
       lastSeenAt: Date.now(),
@@ -439,7 +477,7 @@ export class SupportCommandBus {
     return browser.features.has(command.feature);
   }
 
-  private hasOpenThreadOwner(threadId: string) {
+  hasOpenThreadOwner(threadId: string) {
     return [...this.browsers.values()].some((browser) =>
       Date.now() - browser.lastSeenAt <= SUPPORT_BROWSER_HEARTBEAT_GRACE_MS && browser.openThreads.has(threadId));
   }
@@ -467,7 +505,7 @@ export class SupportCommandBus {
       clearTimeout(pending.inspectionFallback);
       pending.inspectionFallback = undefined;
     }
-    if (!this.launchBrowser || pending.command.kind !== "inspect_thread") return;
+    if (!this.launchBrowser || pending.command.kind !== "inspect_thread" || !pending.allowBrowserLaunch) return;
     if (pending.command.executorOnly) {
       if (pending.claimedBy) return;
       this.dispatchQueuedCommandsToWaiters();
@@ -998,31 +1036,28 @@ export class RalphController {
         await this.options.registry.recordRunning(thread.threadId);
         return;
       }
+      if (!this.options.commands.hasOpenThreadOwner(thread.threadId)) {
+        await this.options.commands.ensureBackgroundBrowserOnce("ralph");
+      }
       const commandResult = await this.options.commands.execute({
         feature: "ralph",
         kind: "inspect_thread",
         conversationUrl: thread.conversationUrl,
-      });
+      }, RALPH_BROWSER_INSPECTION_TIMEOUT_MS, { allowBrowserLaunch: false });
       if (!commandResult.ok) throw new Error(commandResult.error);
       if (commandResult.kind !== "inspect_thread") throw new Error("RALPH received the wrong support command result.");
       if (!await this.options.registry.isActive(thread.threadId)) return;
 
-      const inspection = commandResult.result;
-      if (inspection.title) await this.options.registry.recordTitle(thread.threadId, inspection.title);
-      if (inspection.status === "loading") {
+      const observedInspection = commandResult.result;
+      const observedByExecutor = this.options.commands.browserHasFeature(commandResult.browserId, "ralph");
+      if (observedInspection.title) await this.options.registry.recordTitle(thread.threadId, observedInspection.title);
+      if (observedInspection.status === "loading") {
         await this.options.registry.recordLoading(thread.threadId);
         return;
       }
-      if (inspection.status === "running") {
+      if (observedInspection.status === "running") {
         await this.options.registry.recordRunning(thread.threadId);
         return;
-      }
-
-      if (inspection.users.length === 0 || inspection.users.some((message) => !message.text.trim())) {
-        throw new Error("RALPH could not extract every ChatGPT user message.");
-      }
-      if (!inspection.assistant.text.trim()) {
-        throw new Error("RALPH could not extract the final ChatGPT assistant message.");
       }
 
       const currentMode = await this.options.registry.activeMode(thread.threadId);
@@ -1031,10 +1066,14 @@ export class RalphController {
         await this.options.registry.recordRunning(thread.threadId);
         return;
       }
+
+      const inspection = observedByExecutor
+        ? observedInspection
+        : await this.inspectExecutorBeforeContinuation(thread);
+      if (!inspection) return;
+      if (await this.options.registry.activeMode(thread.threadId) !== currentMode) return;
+
       if (currentMode === "continuous") {
-        if (await this.options.registry.activeMode(thread.threadId) !== "continuous") return;
-        if (!await this.confirmExecutorIdle(thread)) return;
-        if (await this.options.registry.activeMode(thread.threadId) !== "continuous") return;
         const sendResult = await this.options.commands.execute({
           feature: "ralph",
           kind: "send_message",
@@ -1047,6 +1086,12 @@ export class RalphController {
         return;
       }
 
+      if (inspection.users.length === 0 || inspection.users.some((message) => !message.text.trim())) {
+        throw new Error("RALPH could not extract every ChatGPT user message.");
+      }
+      if (!inspection.assistant.text.trim()) {
+        throw new Error("RALPH could not extract the final ChatGPT assistant message.");
+      }
       if (inspection.workedSeconds === null) {
         await this.options.registry.recordComplete(thread.threadId);
         return;
@@ -1073,7 +1118,6 @@ export class RalphController {
         await this.options.registry.recordRunning(thread.threadId);
         return;
       }
-      if (!await this.confirmExecutorIdle(thread)) return;
       if (await this.options.registry.activeMode(thread.threadId) !== modeBeforeSend) return;
 
       const sendResult = await this.options.commands.execute({
@@ -1092,26 +1136,29 @@ export class RalphController {
     }
   }
 
-  private async confirmExecutorIdle(thread: z.infer<typeof ralphThreadSchema>) {
+  private async inspectExecutorBeforeContinuation(thread: z.infer<typeof ralphThreadSchema>) {
+    if (!this.options.commands.hasBrowser("ralph")) {
+      await this.options.commands.ensureBackgroundBrowserOnce("ralph");
+    }
     const result = await this.options.commands.execute({
       feature: "ralph",
       kind: "inspect_thread",
       conversationUrl: thread.conversationUrl,
       executorOnly: true,
-    });
+    }, RALPH_BROWSER_INSPECTION_TIMEOUT_MS, { allowBrowserLaunch: false });
     if (!result.ok) throw new Error(result.error);
     if (result.kind !== "inspect_thread") throw new Error("RALPH received the wrong pre-send inspection result.");
-    if (!await this.options.registry.isActive(thread.threadId)) return false;
+    if (!await this.options.registry.isActive(thread.threadId)) return undefined;
     if (result.result.title) await this.options.registry.recordTitle(thread.threadId, result.result.title);
     if (result.result.status === "loading") {
       await this.options.registry.recordLoading(thread.threadId);
-      return false;
+      return undefined;
     }
     if (result.result.status === "running") {
       await this.options.registry.recordRunning(thread.threadId);
-      return false;
+      return undefined;
     }
-    return true;
+    return result.result;
   }
 }
 

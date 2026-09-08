@@ -42,6 +42,19 @@ try {
   fallbackLaunchBus.close();
 }
 
+let backgroundLaunches = 0;
+const backgroundBus = new SupportCommandBus(undefined, undefined, undefined, async () => { backgroundLaunches += 1; });
+try {
+  await backgroundBus.ensureBackgroundBrowserOnce('ralph');
+  await backgroundBus.ensureBackgroundBrowserOnce('ralph');
+  assert.equal(backgroundLaunches, 1, 'background RALPH may launch Chrome once, but must not keep spawning windows while no executor claims it');
+  await backgroundBus.claim('chrome-background', ['ralph'], 0);
+  await backgroundBus.ensureBackgroundBrowserOnce('ralph');
+  assert.equal(backgroundLaunches, 1, 'an executor claim clears the outstanding background launch without opening another window');
+} finally {
+  backgroundBus.close();
+}
+
 const bus = new SupportCommandBus();
 try {
   await bus.claim('helium', [], 0, undefined, [url]);
