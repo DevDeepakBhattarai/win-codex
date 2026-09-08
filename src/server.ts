@@ -2728,7 +2728,7 @@ await initializeAuthStore();
 const threadSync = THREAD_SYNC_ENABLED
   ? await prepareThreadSync(DATA_DIR, THREAD_SYNC_PORT)
   : undefined;
-const supportCommands = threadSync ? new SupportCommandBus() : undefined;
+const supportCommands = threadSync ? new SupportCommandBus(undefined, undefined, undefined, () => launchChrome()) : undefined;
 const subagentJobs = threadSync ? await SubagentJobRegistry.open(DATA_DIR) : undefined;
 const threadPreparer = supportCommands && threadSync
   ? new ThreadPreparationCoordinator(supportCommands, threadSync.registry, () => launchChrome())

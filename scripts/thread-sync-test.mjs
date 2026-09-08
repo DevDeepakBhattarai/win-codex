@@ -56,7 +56,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.4.4");
+  assert.equal(manifest.version, "1.6.0");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -141,7 +141,7 @@ try {
     "thread sending does not use acknowledgement or DOM-stability heuristics");
   assert.match(preparedContentScript, /const SEND_SETTLE_MS = 5_000;/,
     "thread sending uses the fixed five-second settle requested for typing and sending");
-  assert.match(preparedContentScript, /contentScriptVersion = "1\.4\.3"/,
+  assert.match(preparedContentScript, /contentScriptVersion = "1\.6\.0"/,
     "extension reloads can replace a stale page script with the current content-script version");
   assert.equal(parseRalphProjectId(namedProjectHome), projectId);
   assert.equal(parseRalphProjectId(urlA), projectId);
@@ -320,6 +320,11 @@ try {
     }, response);
   });
   assert.equal((await requestPreparation({ conversationUrl: urlC }, "Bearer wrong")).code, 401);
+  assert.deepEqual(await requestPreparation({ conversationUrl: urlC, canPrepare: false }), {
+    code: 200,
+    body: { status: "observed" },
+  }, "a Helium observation records presence without scheduling Chrome preparation");
+  assert.equal(preparationLaunches, 0, "an observer-only route must not launch Chrome");
   assert.deepEqual(await requestPreparation({ conversationUrl: urlC }), {
     code: 200,
     body: { status: "preparing" },
@@ -2535,6 +2540,7 @@ async function testRalphAutoRegistration(sync) {
 
   vm.runInNewContext(await readFile("support-extension/service-worker.js", "utf8"), context);
   await new Promise(resolve => setImmediate(resolve));
+  configureAutomationContext(context);
   assert.equal(typeof historyListener, "function");
   assert.equal(typeof updatedListener, "function");
 
@@ -2787,6 +2793,7 @@ async function testWorkerKeepsLongAutomationAlive(sync) {
   };
   vm.runInNewContext(await readFile("support-extension/service-worker.js", "utf8"), context);
   await new Promise(resolve => setImmediate(resolve));
+  configureAutomationContext(context);
 
   const command = context.executeCommand({
     id: "long-send",
@@ -2865,6 +2872,7 @@ async function testWorkerNeverRedispatchesAfterLostResponse(sync) {
   };
   vm.runInNewContext(await readFile("support-extension/service-worker.js", "utf8"), context);
   await new Promise(resolve => setImmediate(resolve));
+  configureAutomationContext(context);
 
   await context.executeCommand({
     id: "lost-send-response",
@@ -2874,7 +2882,7 @@ async function testWorkerNeverRedispatchesAfterLostResponse(sync) {
     message: "must be dispatched once",
   }, "browser-a");
 
-  assert.equal(injected, 1, "the content script is established before the side-effecting dispatch");
+  assert.equal(injected, 2, "the health check and command content script are established before the side-effecting dispatch");
   assert.equal(automationDispatches, 1,
     "a lost tabs.sendMessage response must never cause the same side-effecting command to be dispatched again");
   assert.equal(postedResults.length, 1);
@@ -2947,6 +2955,7 @@ async function testWorkerTimesOutHungAutomation(sync) {
   };
   vm.runInNewContext(await readFile("support-extension/service-worker.js", "utf8"), context);
   await new Promise(resolve => setImmediate(resolve));
+  configureAutomationContext(context);
 
   const command = context.executeCommand({
     id: "hung-inspection",
@@ -3018,6 +3027,7 @@ async function testAutomationRedirectGuard(sync) {
   };
   vm.runInNewContext(await readFile("support-extension/service-worker.js", "utf8"), context);
   await new Promise(resolve => setImmediate(resolve));
+  configureAutomationContext(context);
   assert.equal(typeof context.executeCommand, "function");
   assert.equal(context.automationTargetMatches(namedProjectHome, `https://chatgpt.com/g/${projectId}/project`), true,
     "project display-name suffixes do not change the automation target identity");
@@ -3142,4 +3152,13 @@ async function testWidget(html, ticket) {
   assert.equal(sent.at(-1).type, "local-codex-thread-sync/bind-v1");
   listeners.get("message")({ source: top, origin: "https://chatgpt.com", data: { type: "local-codex-thread-sync/result-v1", token: ticket.token, status: "bound", conversationUrl: urlA } });
   assert.equal(cleared, true, "the URL bridge stops retrying after the extension confirms binding");
+}
+
+function configureAutomationContext(context) {
+  context.restartPolling = () => {};
+  context.getSettings = async () => ({ threadSync: true, automationExecutor: true });
+  const sendMessage = context.browser.tabs.sendMessage;
+  context.browser.tabs.sendMessage = async (tabId, payload) => payload.command.kind === "page_health"
+    ? { ok: true, result: { status: "ok" } }
+    : sendMessage(tabId, payload);
 }
