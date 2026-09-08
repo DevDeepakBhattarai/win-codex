@@ -1349,6 +1349,21 @@ try {
         assistant: { synthetic: false, id: "a1", text: "I implemented most of it, but one CI failure remains." },
       },
     });
+    const normalSafetyInspect = await ralphCommands.claim("chrome-browser", ["ralph"], 1000);
+    assert.equal(normalSafetyInspect.kind, "inspect_thread");
+    assert.equal(normalSafetyInspect.executorOnly, true);
+    ralphCommands.complete({
+      commandId: normalSafetyInspect.id,
+      browserId: "chrome-browser",
+      kind: "inspect_thread",
+      ok: true,
+      result: {
+        status: "idle",
+        workedSeconds: null,
+        users: [],
+        assistant: { synthetic: true, text: "[Safety check only.]" },
+      },
+    });
     const continueCommand = await ralphCommands.claim("chrome-browser", ["ralph"], 1000);
     assert.equal(continueCommand.kind, "send_message");
     assert.equal(continueCommand.targetUrl, ralphUrl);
@@ -1427,6 +1442,45 @@ try {
     assert.equal(await ralphControllerRegistry.isActive(parseConversationUrl(shortRalphUrl).threadId), false,
       "a short settled turn is marked complete without classification");
 
+    const staleObserverRalphUrl = `https://chatgpt.com/g/${projectId}/c/30303030-3030-4030-8030-303030303030`;
+    await ralphControllerRegistry.register(staleObserverRalphUrl);
+    await ralphControllerRegistry.setMode(parseConversationUrl(staleObserverRalphUrl).threadId, "continuous");
+    await ralphCommands.claim("helium-stale", [], 0, undefined, [staleObserverRalphUrl]);
+    await ralphCommands.claim("chrome-live", ["ralph"], 0, undefined, [staleObserverRalphUrl]);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    await ralphController.tick();
+    const staleObserverInspect = await ralphCommands.claim("helium-stale", [], 1000, undefined, [staleObserverRalphUrl]);
+    assert.equal(staleObserverInspect.kind, "inspect_thread");
+    ralphCommands.complete({
+      commandId: staleObserverInspect.id,
+      browserId: "helium-stale",
+      kind: "inspect_thread",
+      ok: true,
+      result: {
+        status: "idle",
+        title: "Stale Helium copy - ChatGPT",
+        workedSeconds: null,
+        users: [{ id: "u-stale", text: "Keep working continuously." }],
+        assistant: { synthetic: false, id: "a-stale", text: "Stale completed answer." },
+      },
+    });
+    const preSendSafetyInspect = await ralphCommands.claim("chrome-live", ["ralph"], 1000, undefined, [staleObserverRalphUrl]);
+    assert.equal(preSendSafetyInspect.kind, "inspect_thread",
+      "before any RALPH send, Chrome must be freshly inspected even when Helium reported the thread idle");
+    assert.equal(preSendSafetyInspect.executorOnly, true,
+      "the pre-send safety inspection must bypass observer precedence and run in the automation executor");
+    ralphCommands.complete({
+      commandId: preSendSafetyInspect.id,
+      browserId: "chrome-live",
+      kind: "inspect_thread",
+      ok: true,
+      result: { status: "running", title: "Live Chrome copy - ChatGPT" },
+    });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(await ralphCommands.claim("chrome-live", ["ralph"], 0, undefined, [staleObserverRalphUrl]), undefined,
+      "RALPH must not send when the fresh Chrome inspection says the thread is running");
+    await ralphControllerRegistry.recordComplete(parseConversationUrl(staleObserverRalphUrl).threadId);
+
     const continuousRalphUrl = `https://chatgpt.com/g/${projectId}/c/66666666-6666-4666-8666-666666666666`;
     await ralphControllerRegistry.register(continuousRalphUrl);
     await ralphControllerRegistry.setMode(parseConversationUrl(continuousRalphUrl).threadId, "continuous");
@@ -1445,6 +1499,21 @@ try {
         workedSeconds: null,
         users: [{ id: "u-continuous", text: "Keep improving this overnight." }],
         assistant: { synthetic: false, id: "a-continuous", text: "The current experiment is complete." },
+      },
+    });
+    const continuousSafetyInspect = await ralphCommands.claim("chrome-browser", ["ralph"], 1000);
+    assert.equal(continuousSafetyInspect.kind, "inspect_thread");
+    assert.equal(continuousSafetyInspect.executorOnly, true);
+    ralphCommands.complete({
+      commandId: continuousSafetyInspect.id,
+      browserId: "chrome-browser",
+      kind: "inspect_thread",
+      ok: true,
+      result: {
+        status: "idle",
+        workedSeconds: null,
+        users: [],
+        assistant: { synthetic: true, text: "[Safety check only.]" },
       },
     });
     const continuousCommand = await ralphCommands.claim("chrome-browser", ["ralph"], 1000);

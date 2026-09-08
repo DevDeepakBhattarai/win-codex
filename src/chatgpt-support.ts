@@ -117,6 +117,7 @@ const supportCommandSchema = z.union([
     feature: z.literal("ralph"),
     kind: z.literal("inspect_thread"),
     conversationUrl: z.string().url(),
+    executorOnly: z.boolean().optional(),
   }),
   z.object({
     id: z.string(),
@@ -263,7 +264,9 @@ export class SupportCommandBus {
     }
     if (command.kind === "inspect_thread" && this.launchBrowser) {
       const threadId = parseConversationUrl(targetUrl).threadId;
-      if (!this.hasOpenThreadOwner(threadId)) await this.ensureBrowser(command.feature, this.launchBrowser);
+      if (command.executorOnly || !this.hasOpenThreadOwner(threadId)) {
+        await this.ensureBrowser(command.feature, this.launchBrowser);
+      }
     }
     const fullCommand = supportCommandSchema.parse({ ...command, id: randomUUID() });
     return new Promise<SupportCommandResult>((resolve, reject) => {
@@ -426,6 +429,7 @@ export class SupportCommandBus {
     const browser = this.browsers.get(browserId);
     if (!browser) return false;
     if (command.kind === "inspect_thread") {
+      if (command.executorOnly) return browser.features.has(command.feature);
       const threadId = parseConversationUrl(command.conversationUrl).threadId;
       const owners = [...this.browsers.entries()].filter(([, candidate]) =>
         Date.now() - candidate.lastSeenAt <= SUPPORT_BROWSER_HEARTBEAT_GRACE_MS && candidate.openThreads.has(threadId));
@@ -464,6 +468,12 @@ export class SupportCommandBus {
       pending.inspectionFallback = undefined;
     }
     if (!this.launchBrowser || pending.command.kind !== "inspect_thread") return;
+    if (pending.command.executorOnly) {
+      if (pending.claimedBy) return;
+      this.dispatchQueuedCommandsToWaiters();
+      if (!pending.claimedBy) void this.ensureBrowser(pending.command.feature, this.launchBrowser).catch(() => undefined);
+      return;
+    }
 
     const threadId = parseConversationUrl(pending.command.conversationUrl).threadId;
     const claimant = pending.claimedBy ? this.browsers.get(pending.claimedBy) : undefined;
@@ -1023,6 +1033,8 @@ export class RalphController {
       }
       if (currentMode === "continuous") {
         if (await this.options.registry.activeMode(thread.threadId) !== "continuous") return;
+        if (!await this.confirmExecutorIdle(thread)) return;
+        if (await this.options.registry.activeMode(thread.threadId) !== "continuous") return;
         const sendResult = await this.options.commands.execute({
           feature: "ralph",
           kind: "send_message",
@@ -1061,6 +1073,8 @@ export class RalphController {
         await this.options.registry.recordRunning(thread.threadId);
         return;
       }
+      if (!await this.confirmExecutorIdle(thread)) return;
+      if (await this.options.registry.activeMode(thread.threadId) !== modeBeforeSend) return;
 
       const sendResult = await this.options.commands.execute({
         feature: "ralph",
@@ -1076,6 +1090,28 @@ export class RalphController {
       console.error(`[ralph] thread=${JSON.stringify(thread.conversationUrl)} failed: ${message}`);
       await this.options.registry.recordFailure(thread.threadId, message);
     }
+  }
+
+  private async confirmExecutorIdle(thread: z.infer<typeof ralphThreadSchema>) {
+    const result = await this.options.commands.execute({
+      feature: "ralph",
+      kind: "inspect_thread",
+      conversationUrl: thread.conversationUrl,
+      executorOnly: true,
+    });
+    if (!result.ok) throw new Error(result.error);
+    if (result.kind !== "inspect_thread") throw new Error("RALPH received the wrong pre-send inspection result.");
+    if (!await this.options.registry.isActive(thread.threadId)) return false;
+    if (result.result.title) await this.options.registry.recordTitle(thread.threadId, result.result.title);
+    if (result.result.status === "loading") {
+      await this.options.registry.recordLoading(thread.threadId);
+      return false;
+    }
+    if (result.result.status === "running") {
+      await this.options.registry.recordRunning(thread.threadId);
+      return false;
+    }
+    return true;
   }
 }
 
