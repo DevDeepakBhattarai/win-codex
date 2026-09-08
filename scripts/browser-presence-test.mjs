@@ -64,6 +64,16 @@ try {
     result: { status: 'sent', conversationUrl: url } });
   await send;
 
+  const preparation = bus.execute({ feature: 'threadPreparation', kind: 'prepare_thread', conversationUrl: url });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(await bus.claim('helium', [], 0, undefined, [url]), undefined,
+    'observer-only browsers must never claim executor preparation');
+  const preparationCommand = await bus.claim('chrome-preparer', ['threadPreparation'], 0);
+  assert.equal(preparationCommand?.kind, 'prepare_thread');
+  bus.complete({ commandId: preparationCommand.id, browserId: 'chrome-preparer', kind: preparationCommand.kind,
+    ok: true, result: { status: 'prepared', conversationUrl: url } });
+  await preparation;
+
   await bus.claim('helium', [], 0, undefined, []);
   const fallback = bus.execute({ feature: 'ralph', kind: 'inspect_thread', conversationUrl: url });
   await new Promise(resolve => setImmediate(resolve));
@@ -90,6 +100,42 @@ try {
   bus.close();
 }
 
+const ownerHandoffBus = new SupportCommandBus();
+try {
+  await ownerHandoffBus.claim('helium-handoff', [], 0, undefined, [url]);
+  const handoff = ownerHandoffBus.execute({ feature: 'ralph', kind: 'inspect_thread', conversationUrl: url });
+  await new Promise(resolve => setImmediate(resolve));
+  const chromeWait = ownerHandoffBus.claim('chrome-handoff', ['ralph'], 1000, undefined, [url]);
+  await new Promise(resolve => setImmediate(resolve));
+  await ownerHandoffBus.claim('helium-handoff', [], 0, undefined, []);
+  const handoffCommand = await chromeWait;
+  assert.equal(handoffCommand?.kind, 'inspect_thread', 'inspection moves immediately to another browser that still owns the thread');
+  ownerHandoffBus.complete({ commandId: handoffCommand.id, browserId: 'chrome-handoff', kind: handoffCommand.kind,
+    ok: true, result: { status: 'running' } });
+  await handoff;
+} finally {
+  ownerHandoffBus.close();
+}
+
+let ownershipLossLaunches = 0;
+const ownershipLossBus = new SupportCommandBus(undefined, undefined, undefined, async () => { ownershipLossLaunches += 1; });
+try {
+  await ownershipLossBus.claim('helium-race', [], 0, undefined, [url]);
+  const inspection = ownershipLossBus.execute({ feature: 'ralph', kind: 'inspect_thread', conversationUrl: url });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ownershipLossLaunches, 0, 'an observed thread does not launch Chrome while its owner is present');
+  await ownershipLossBus.claim('helium-race', [], 0, undefined, []);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ownershipLossLaunches, 1, 'losing the last observed owner launches the Chrome inspection fallback');
+  const fallbackCommand = await ownershipLossBus.claim('chrome-race', ['ralph'], 0);
+  assert.equal(fallbackCommand?.kind, 'inspect_thread');
+  ownershipLossBus.complete({ commandId: fallbackCommand.id, browserId: 'chrome-race', kind: fallbackCommand.kind,
+    ok: true, result: { status: 'running' } });
+  await inspection;
+} finally {
+  ownershipLossBus.close();
+}
+
 const source = await readFile('support-extension/service-worker.js', 'utf8');
 let now = 1_000_000;
 let health = 'ok';
@@ -97,6 +143,7 @@ let clicks = 0;
 let reloads = 0;
 let creations = 0;
 const results = [];
+const presenceClaims = [];
 const storage = {};
 const config = { extensionToken: 'x'.repeat(40) };
 for (const [key, route] of Object.entries({ bindUrl: '/thread-sync/bind', commandClaimUrl: '/chatgpt-support/commands/claim',
@@ -128,6 +175,10 @@ function worker() {
       },
     },
     async fetch(endpoint, options) {
+      if (endpoint === config.commandClaimUrl) {
+        presenceClaims.push(JSON.parse(options.body));
+        return new Response(null, { status: 204 });
+      }
       assert.equal(endpoint, config.commandResultUrl);
       results.push(JSON.parse(options.body));
       return new Response('', { status: 200 });
@@ -138,8 +189,12 @@ function worker() {
 }
 let context = worker();
 await new Promise(resolve => setImmediate(resolve));
+assert.deepEqual(presenceClaims.at(-1).openThreads, [], 'an idle observer publishes empty presence before stopping its poll loop');
 const inspect = () => context.executeCommand({ id: String(now), kind: 'inspect_thread', feature: 'ralph', conversationUrl: url,
   refreshRevision: 'external-change' }, 'helium');
+await context.executeCommand({ id: 'observer-prepare', kind: 'prepare_thread', feature: 'threadPreparation', conversationUrl: url }, 'helium');
+assert.equal(results.at(-1).ok, false, 'observer-only workers reject executor preparation commands');
+assert.match(results.at(-1).error, /only available for thread observation/);
 await inspect();
 assert.equal(results.at(-1).result.title, 'Helium title');
 assert.equal(reloads, 0, 'Helium observation never refreshes for its own external revision');

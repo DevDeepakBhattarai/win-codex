@@ -70,7 +70,7 @@ export const SUBAGENT_AGENT_INSTRUCTION = [
   "Each root parent may have at most two pending children, including startups. Nested delegation is disabled. If this parent's capacity is full, continue root work or end the turn while waiting for a result notice. Do not retry starts or poll list_subagents for capacity.",
   "Read all local resultPath files named in a result-ready notice before continuing. Notifications may combine several results. Reports stay in local files.",
   "Use cancel_subagent for an abandoned child. Cancellation stops a known active child before releasing its slot. A child completes its bounded assignment without delegation and calls submit_subagent_result exactly once.",
-  "Use send_thread_message only when the user explicitly asks to post into an existing conversation. Rate-limited message commands remain queued and resume in a paced sequence after cooldown. After uncertain delivery for another error, inspect the target before deciding whether to send again.",
+  "Use send_thread_message only when the user explicitly asks to post into an existing conversation. A rate limit known to occur before Send is clicked may resume after cooldown. If delivery is uncertain after Send was clicked, never replay it automatically; inspect the target before deciding whether to send again.",
 ].join(" ");
 const CONTINUOUS_RALPH_INSTRUCTION = "Continue the user-authorized continuous run toward the existing goal. You own all decisions about what to do next. Read the conversation and current state, use completed child reports as evidence, choose useful unfinished work, and verify the result. If progress depends on a pending child, user input, or a message cooldown, state the blocker and end this turn. Do not poll. Continuous RALPH will wake the thread again while the user keeps continuous mode enabled.";
 
@@ -219,6 +219,7 @@ interface PendingCommand {
   timeoutMs: number;
   claimedBy?: string;
   claimedAt?: number;
+  inspectionFallback?: NodeJS.Timeout;
 }
 
 interface ClaimWaiter {
@@ -262,9 +263,7 @@ export class SupportCommandBus {
     }
     if (command.kind === "inspect_thread" && this.launchBrowser) {
       const threadId = parseConversationUrl(targetUrl).threadId;
-      const observed = [...this.browsers.values()].some(browser =>
-        Date.now() - browser.lastSeenAt <= SUPPORT_BROWSER_HEARTBEAT_GRACE_MS && browser.openThreads.has(threadId));
-      if (!observed) await this.ensureBrowser(command.feature, this.launchBrowser);
+      if (!this.hasOpenThreadOwner(threadId)) await this.ensureBrowser(command.feature, this.launchBrowser);
     }
     const fullCommand = supportCommandSchema.parse({ ...command, id: randomUUID() });
     return new Promise<SupportCommandResult>((resolve, reject) => {
@@ -290,6 +289,7 @@ export class SupportCommandBus {
       }
 
       this.queued.push(pending);
+      this.scheduleInspectionFallback(pending);
     });
   }
 
@@ -333,14 +333,15 @@ export class SupportCommandBus {
       lastSeenAt: Date.now(),
       openThreads: new Set(openThreads.map(url => parseConversationUrl(url).threadId)),
     });
+    this.dispatchQueuedCommandsToWaiters();
+    for (const pending of this.pending.values()) this.scheduleInspectionFallback(pending);
     const resumable = [...this.pending.values()].find((pending) =>
       (pending.command.kind === "inspect_thread" || pending.command.kind === "prepare_thread") &&
       this.browserCanClaim(browserId, pending.command) &&
       (pending.claimedBy === browserId ||
         (pending.claimedAt !== undefined && Date.now() - pending.claimedAt >= this.inspectClaimLeaseMs)));
     if (resumable) {
-      resumable.claimedBy = browserId;
-      resumable.claimedAt = Date.now();
+      this.markClaimed(resumable, browserId);
       return Promise.resolve(resumable.command);
     }
 
@@ -374,14 +375,15 @@ export class SupportCommandBus {
     if (pending.claimedBy !== result.browserId) throw new Error("Support command belongs to another browser instance.");
     if (pending.command.kind !== result.kind) throw new Error("Support command result kind does not match the request.");
 
-    if (!result.ok && result.error.startsWith("CHATGPT_RATE_LIMITED:")) {
+    if (!result.ok && /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(result.error)) {
       if (!this.messageCooldownUntil()) this.cooldownUntil = Date.now() + this.messageCooldownMs;
       this.messagePacingActive = true;
       this.nextMessageClaimAt = Math.max(this.nextMessageClaimAt, this.cooldownUntil);
       console.warn(`[chatgpt-support] message_cooldown until=${new Date(this.cooldownUntil).toISOString()}`);
       const browser = this.browsers.get(result.browserId);
       if (browser) browser.lastSeenAt = Date.now();
-      if (result.kind !== "send_message") {
+      const retryableSend = result.kind === "send_message" && result.error.startsWith("CHATGPT_RATE_LIMITED_RETRYABLE:");
+      if (!retryableSend) {
         this.removePending(result.commandId);
         pending.resolve(result);
         return;
@@ -412,6 +414,7 @@ export class SupportCommandBus {
     for (const waiter of [...this.waiters]) this.resolveWaiter(waiter, undefined);
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timeout);
+      if (pending.inspectionFallback) clearTimeout(pending.inspectionFallback);
       pending.reject(new Error("ChatGPT support service is shutting down."));
     }
     this.pending.clear();
@@ -422,7 +425,7 @@ export class SupportCommandBus {
   private browserCanClaim(browserId: string, command: SupportCommand) {
     const browser = this.browsers.get(browserId);
     if (!browser) return false;
-    if (command.kind === "inspect_thread" || command.kind === "prepare_thread") {
+    if (command.kind === "inspect_thread") {
       const threadId = parseConversationUrl(command.conversationUrl).threadId;
       const owners = [...this.browsers.entries()].filter(([, candidate]) =>
         Date.now() - candidate.lastSeenAt <= SUPPORT_BROWSER_HEARTBEAT_GRACE_MS && candidate.openThreads.has(threadId));
@@ -430,6 +433,65 @@ export class SupportCommandBus {
       if (owner) return owner[0] === browserId;
     }
     return browser.features.has(command.feature);
+  }
+
+  private hasOpenThreadOwner(threadId: string) {
+    return [...this.browsers.values()].some((browser) =>
+      Date.now() - browser.lastSeenAt <= SUPPORT_BROWSER_HEARTBEAT_GRACE_MS && browser.openThreads.has(threadId));
+  }
+
+  private dispatchQueuedCommandsToWaiters() {
+    for (let index = 0; index < this.queued.length;) {
+      const pending = this.queued[index];
+      if (!this.canClaim(pending.command)) {
+        index += 1;
+        continue;
+      }
+      const waiter = [...this.waiters].find((candidate) => this.browserCanClaim(candidate.browserId, pending.command));
+      if (!waiter) {
+        index += 1;
+        continue;
+      }
+      this.queued.splice(index, 1);
+      this.markClaimed(pending, waiter.browserId);
+      this.resolveWaiter(waiter, pending.command);
+    }
+  }
+
+  private scheduleInspectionFallback(pending: PendingCommand) {
+    if (pending.inspectionFallback) {
+      clearTimeout(pending.inspectionFallback);
+      pending.inspectionFallback = undefined;
+    }
+    if (!this.launchBrowser || pending.command.kind !== "inspect_thread") return;
+
+    const threadId = parseConversationUrl(pending.command.conversationUrl).threadId;
+    const claimant = pending.claimedBy ? this.browsers.get(pending.claimedBy) : undefined;
+    const observerClaim = Boolean(pending.claimedBy && !claimant?.features.has(pending.command.feature));
+    if (pending.claimedBy && !observerClaim) return;
+
+    const owners = [...this.browsers.entries()].filter(([, browser]) =>
+      Date.now() - browser.lastSeenAt <= SUPPORT_BROWSER_HEARTBEAT_GRACE_MS && browser.openThreads.has(threadId));
+    const claimantStillOwnsThread = Boolean(pending.claimedBy && owners.some(([browserId]) => browserId === pending.claimedBy));
+    if (observerClaim && !claimantStillOwnsThread) {
+      pending.claimedBy = undefined;
+      pending.claimedAt = undefined;
+      if (!this.queued.includes(pending)) this.queued.unshift(pending);
+      this.dispatchQueuedCommandsToWaiters();
+      if (pending.claimedBy) return;
+    }
+    if (owners.length === 0) {
+      this.dispatchQueuedCommandsToWaiters();
+      if (!pending.claimedBy) void this.ensureBrowser(pending.command.feature, this.launchBrowser).catch(() => undefined);
+      return;
+    }
+
+    const nextExpiry = Math.max(...owners.map(([, browser]) => browser.lastSeenAt + SUPPORT_BROWSER_HEARTBEAT_GRACE_MS));
+    pending.inspectionFallback = setTimeout(() => {
+      pending.inspectionFallback = undefined;
+      if (this.pending.has(pending.command.id)) this.scheduleInspectionFallback(pending);
+    }, Math.max(1, nextExpiry - Date.now() + 1));
+    pending.inspectionFallback.unref();
   }
 
   private canClaim(command: SupportCommand) {
@@ -444,6 +506,7 @@ export class SupportCommandBus {
     if (pending.command.kind === "send_message" && this.messagePacingActive) {
       this.nextMessageClaimAt = Date.now() + this.messageSendSpacingMs;
     }
+    this.scheduleInspectionFallback(pending);
   }
 
   private resolveWaiter(waiter: ClaimWaiter, command: SupportCommand | undefined) {
@@ -457,6 +520,7 @@ export class SupportCommandBus {
     const pending = this.pending.get(commandId);
     if (!pending) return;
     clearTimeout(pending.timeout);
+    if (pending.inspectionFallback) clearTimeout(pending.inspectionFallback);
     this.pending.delete(commandId);
     const queuedIndex = this.queued.indexOf(pending);
     if (queuedIndex >= 0) this.queued.splice(queuedIndex, 1);
@@ -1893,7 +1957,7 @@ export function registerChatGptAgents(
 
   server.registerTool("send_thread_message", {
     title: "Send Thread Message",
-    description: "Send one message to an existing ChatGPT conversation only when the user explicitly requests that post. Transport retries of the same MCP request are deduplicated internally. This tool never creates a new thread. If ChatGPT rate-limits delivery, the command stays queued and resumes after cooldown with global send pacing. For other uncertain delivery errors, inspect the target before making a new send request.",
+    description: "Send one message to an existing ChatGPT conversation only when the user explicitly requests that post. Transport retries of the same MCP request are deduplicated internally. This tool never creates a new thread. A rate limit known to occur before Send is clicked stays queued and may resume after cooldown with global send pacing. If a provider notice appears after Send is clicked, delivery is uncertain and the command is never replayed automatically; inspect the target before making a new send request.",
     inputSchema: {
       targetUrl: z.string().url().describe("Exact existing ChatGPT /c/... conversation URL."),
       message: z.string().min(1).max(200_000).describe("Message to send to that conversation."),

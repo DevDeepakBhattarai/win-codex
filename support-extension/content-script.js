@@ -117,6 +117,7 @@
       return { status: button ? "dismissed" : "not_found" };
     }
     if (command.kind === "stop_thread") return await stopThread();
+    if (command.kind === "send_message") return await sendMessage(command.message);
     assertNotRateLimited();
     if (command.kind === "inspect_thread") {
       const url = conversationUrl();
@@ -124,7 +125,6 @@
       if (url !== conversationUrl()) throw new Error("The observed thread navigated away during inspection.");
       return result;
     }
-    if (command.kind === "send_message") return await sendMessage(command.message);
     throw new Error("Unsupported ChatGPT support command.");
   }
 
@@ -264,47 +264,59 @@
   }
 
   async function sendMessage(message) {
-    if (typeof message !== "string" || !message.trim()) throw new Error("A non-empty ChatGPT message is required.");
+    let sendClicked = false;
+    try {
+      assertNotRateLimited();
+      if (typeof message !== "string" || !message.trim()) throw new Error("A non-empty ChatGPT message is required.");
 
-    const existingConversationUrl = conversationUrl();
-    if (existingConversationUrl) {
-      const loadedUserTurn = await waitFor(
-        () => document.querySelector('section[data-turn="user"] [data-message-author-role="user"]'),
-        SEND_READY_TIMEOUT_MS,
-      );
-      if (!loadedUserTurn) throw new Error("The existing ChatGPT thread did not load a user message.");
+      const existingConversationUrl = conversationUrl();
+      if (existingConversationUrl) {
+        const loadedUserTurn = await waitFor(
+          () => document.querySelector('section[data-turn="user"] [data-message-author-role="user"]'),
+          SEND_READY_TIMEOUT_MS,
+        );
+        if (!loadedUserTurn) throw new Error("The existing ChatGPT thread did not load a user message.");
+      }
+
+      await sleep(SEND_SETTLE_MS);
+
+      const ready = await waitForComposer(SEND_READY_TIMEOUT_MS);
+      if (!ready) throw new Error("ChatGPT composer did not become available.");
+      assertNotRateLimited();
+      insertMessage(ready.editor, message);
+
+      await sleep(SEND_SETTLE_MS);
+
+      const current = await waitFor(() => {
+        assertNotRateLimited();
+        const composer = getComposer();
+        if (!composer) return null;
+        const button = getSendButton(composer.composer);
+        return isActionableButton(button) ? { ...composer, button } : null;
+      }, SEND_READY_TIMEOUT_MS);
+      if (!current) throw new Error("ChatGPT send button did not become actionable.");
+
+      current.button.click();
+      sendClicked = true;
+      await sleep(SEND_SETTLE_MS);
+      assertNotRateLimited();
+
+      const savedUrl = existingConversationUrl ?? await waitFor(() => {
+        assertNotRateLimited();
+        return conversationUrl();
+      }, SEND_NAVIGATION_TIMEOUT_MS);
+      if (!savedUrl) throw new Error("ChatGPT did not navigate to the newly created conversation after sending.");
+
+      const title = threadTitle();
+      return { status: "sent", conversationUrl: savedUrl, ...(title ? { title } : {}) };
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("CHATGPT_RATE_LIMITED:")) {
+        const detail = error.message.slice("CHATGPT_RATE_LIMITED:".length).trim();
+        if (!sendClicked) throw new Error(`CHATGPT_RATE_LIMITED_RETRYABLE: ${detail}`);
+        throw new Error(`CHATGPT_RATE_LIMITED: Delivery is uncertain after Send was clicked. ${detail}`);
+      }
+      throw error;
     }
-
-    await sleep(SEND_SETTLE_MS);
-
-    const ready = await waitForComposer(SEND_READY_TIMEOUT_MS);
-    if (!ready) throw new Error("ChatGPT composer did not become available.");
-    assertNotRateLimited();
-    insertMessage(ready.editor, message);
-
-    await sleep(SEND_SETTLE_MS);
-
-    const current = await waitFor(() => {
-      assertNotRateLimited();
-      const composer = getComposer();
-      if (!composer) return null;
-      const button = getSendButton(composer.composer);
-      return isActionableButton(button) ? { ...composer, button } : null;
-    }, SEND_READY_TIMEOUT_MS);
-    if (!current) throw new Error("ChatGPT send button did not become actionable.");
-
-    current.button.click();
-    await sleep(SEND_SETTLE_MS);
-    assertNotRateLimited();
-
-    const savedUrl = existingConversationUrl ?? await waitFor(() => {
-      assertNotRateLimited();
-      return conversationUrl();
-    }, SEND_NAVIGATION_TIMEOUT_MS);
-    if (!savedUrl) throw new Error("ChatGPT did not navigate to the newly created conversation after sending.");
-
-    const title = threadTitle();
-    return { status: "sent", conversationUrl: savedUrl, ...(title ? { title } : {}) };
   }
 
   function rateLimitNotice() {

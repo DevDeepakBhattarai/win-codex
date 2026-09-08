@@ -425,11 +425,12 @@ async function executeCommandOnce(command, browserId) {
   let tabId;
   let created = false;
   let keepCreatedTab = false;
+  let automationStarted = false;
 
   try {
     const settings = await getSettings();
     const observing = !settings.automationExecutor;
-    if (observing && command.kind !== "inspect_thread" && command.kind !== "prepare_thread") {
+    if (observing && command.kind !== "inspect_thread") {
       throw new Error("This browser is only available for thread observation.");
     }
     const acquired = observing
@@ -462,6 +463,7 @@ async function executeCommandOnce(command, browserId) {
       return;
     }
 
+    automationStarted = true;
     const response = await sendAutomationMessageWithTimeout(tabId, command);
     if (!response?.ok) throw new Error(response?.error || "ChatGPT page automation failed.");
 
@@ -490,7 +492,11 @@ async function executeCommandOnce(command, browserId) {
       result: response.result,
     });
   } catch (error) {
-    if (Number.isInteger(tabId) && error instanceof Error && error.message.startsWith("CHATGPT_RATE_LIMITED:")) {
+    let errorMessage = error instanceof Error ? error.message : String(error);
+    if (command.kind === "send_message" && !automationStarted && errorMessage.startsWith("CHATGPT_RATE_LIMITED:")) {
+      errorMessage = errorMessage.replace("CHATGPT_RATE_LIMITED:", "CHATGPT_RATE_LIMITED_RETRYABLE:");
+    }
+    if (Number.isInteger(tabId) && /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(errorMessage)) {
       const key = `pageRecovery:${tabId}`;
       const saved = await extensionApi.storage.local.get(key);
       if (!saved[key]?.rateLimitedAt) {
@@ -514,7 +520,7 @@ async function executeCommandOnce(command, browserId) {
       browserId,
       kind: command.kind,
       ok: false,
-      error: error instanceof Error ? error.message : String(error),
+      error: errorMessage,
     }).catch(() => undefined);
   } finally {
     if (created && Number.isInteger(tabId) && !keepCreatedTab) {
@@ -594,7 +600,7 @@ async function pollCommands(generation) {
         await recoverPage(tab.id).catch(() => undefined);
       }
     }
-    if (features.length === 0 && openThreads.length === 0) return;
+    const idleObserver = features.length === 0 && openThreads.length === 0;
 
     const controller = new AbortController();
     pollController = controller;
@@ -607,6 +613,7 @@ async function pollCommands(generation) {
         redirect: "error",
       });
       if (generation !== pollGeneration) return;
+      if (idleObserver) return;
       if (response.status === 204) continue;
       if (!response.ok) {
         await sleep(1000);
@@ -615,7 +622,7 @@ async function pollCommands(generation) {
       const command = await response.json();
       if (command?.id) await executeCommand(command, browserId);
     } catch (error) {
-      if (controller.signal.aborted || generation !== pollGeneration) return;
+      if (controller.signal.aborted || generation !== pollGeneration || idleObserver) return;
       await sleep(1000);
     } finally {
       if (pollController === controller) pollController = null;
