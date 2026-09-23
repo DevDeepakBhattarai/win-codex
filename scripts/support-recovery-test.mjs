@@ -33,7 +33,8 @@ async function runWorker(command, responses) {
         create: async () => ({ id: 11 }),
         get: async () => ({ id: 11, status: "complete", url }),
         reload: async () => { reloads += 1; },
-        sendMessage: async () => {
+        sendMessage: async (_tabId, payload) => {
+          if (payload.command.kind === "page_health") return { ok: true, result: { status: "ok" } };
           const response = responses[dispatches++];
           if (response instanceof Error) throw response;
           return response;
@@ -47,12 +48,16 @@ async function runWorker(command, responses) {
         async set(values) { Object.assign(storage, values); },
       } },
     },
-    fetch: async (_endpoint, options) => {
+    fetch: async (endpoint, options) => {
+      if (endpoint !== config.commandResultUrl) return new Response(null, { status: 204 });
       results.push(JSON.parse(options.body));
       return new Response("", { status: 200 });
     },
   };
   vm.runInNewContext(workerScript, context);
+  await new Promise(resolve => setImmediate(resolve));
+  context.restartPolling = () => {};
+  context.getSettings = async () => ({ threadSync: true, automationExecutor: true });
   await context.executeCommand(command, "browser-a");
   return { results, dispatches, reloads };
 }
