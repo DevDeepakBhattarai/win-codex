@@ -278,7 +278,7 @@ try {
     const claimed = await cooldownBus.claim("browser", ["threadMessaging"], 0);
     const secondSend = cooldownBus.execute({ feature: "ralph", kind: "send_message", targetUrl: parent.conversationUrl, message: "second" });
     cooldownBus.complete({ commandId: claimed.id, browserId: "browser", kind: "send_message", ok: false,
-      error: "CHATGPT_RATE_LIMITED: Too many messages" });
+      error: "CHATGPT_RATE_LIMITED_RETRYABLE: Too many messages" });
     const thirdSend = cooldownBus.execute({ feature: "threadMessaging", kind: "send_message", targetUrl: parent.conversationUrl, message: "third" });
     assert.ok(cooldownBus.messageCooldownUntil() > Date.now());
     assert.equal(await cooldownBus.claim("browser", ["ralph", "threadMessaging"], 0), undefined,

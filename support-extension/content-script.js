@@ -334,7 +334,10 @@
   }
 
   async function sendMessage(message, cancellation) {
-    if (typeof message !== "string" || !message.trim()) throw new Error("A non-empty ChatGPT message is required.");
+    let sendClicked = false;
+    try {
+      assertNotRateLimited();
+      if (typeof message !== "string" || !message.trim()) throw new Error("A non-empty ChatGPT message is required.");
 
     const existingConversationUrl = conversationUrl();
     if (existingConversationUrl) {
@@ -367,6 +370,7 @@
 
     assertAutomationActive(cancellation);
     current.button.click();
+    sendClicked = true;
     await sleep(SEND_SETTLE_MS, cancellation);
     assertNotRateLimited();
 
@@ -378,6 +382,14 @@
 
     const title = threadTitle();
     return { status: "sent", conversationUrl: savedUrl, ...(title ? { title } : {}) };
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("CHATGPT_RATE_LIMITED:")) {
+        const detail = error.message.slice("CHATGPT_RATE_LIMITED:".length).trim();
+        if (!sendClicked) throw new Error(`CHATGPT_RATE_LIMITED_RETRYABLE: ${detail}`);
+        throw new Error(`CHATGPT_RATE_LIMITED: Delivery is uncertain after Send was clicked. ${detail}`);
+      }
+      throw error;
+    }
   }
 
   function rateLimitNotice() {

@@ -20,8 +20,8 @@ const FAILURE_RETRY_MS = 2 * 60 * 1000;
 const COMMAND_TIMEOUT_MS = 20 * 60 * 1000;
 const INSPECT_CLAIM_LEASE_MS = 5 * 60 * 1000;
 const CLAIM_WAIT_MS = 20_000;
-const SUPPORT_BROWSER_HEARTBEAT_GRACE_MS = 90_000;
-const SUPPORT_BROWSER_LAUNCH_COOLDOWN_MS = 60_000;
+const SUPPORT_BROWSER_HEARTBEAT_GRACE_MS = CLAIM_WAIT_MS + 5_000;
+const SUPPORT_BROWSER_LAUNCH_COOLDOWN_MS = 5_000;
 const SUPPORT_BROWSER_CONNECT_TIMEOUT_MS = 10_000;
 const RALPH_BROWSER_INSPECTION_TIMEOUT_MS = 30_000;
 const SUBAGENT_RESULT_MISSING_RETRY_MS = 30_000;
@@ -241,6 +241,8 @@ interface PendingCommand {
   operation?: SupportCommandOperationMetadata;
   claimedBy?: string;
   claimedAt?: number;
+  inspectionFallback?: NodeJS.Timeout;
+  allowBrowserLaunch: boolean;
 }
 
 interface ClaimWaiter {
@@ -290,9 +292,9 @@ export class SupportCommandBus {
     }
     if (allowBrowserLaunch && command.kind === "inspect_thread" && this.launchBrowser) {
       const threadId = parseConversationUrl(targetUrl).threadId;
-      const observed = [...this.browsers.values()].some(browser =>
-        Date.now() - browser.lastSeenAt <= SUPPORT_BROWSER_HEARTBEAT_GRACE_MS && browser.openThreads.has(threadId));
-      if (!observed) await this.ensureBrowser(command.feature, this.launchBrowser);
+      if (command.executorOnly || !this.hasOpenThreadOwner(threadId)) {
+        await this.ensureBrowser(command.feature, this.launchBrowser);
+      }
     }
     const refreshRevision = this.registry ? await this.registry.externalRevision(targetUrl) : undefined;
     if (command.feature === "ralph" && this.jobs?.blocksContinuationNow(parseConversationUrl(targetUrl).threadId)) {
@@ -316,6 +318,7 @@ export class SupportCommandBus {
         timeoutMs,
         createdAt: Date.now(),
         operation: options.operation,
+        allowBrowserLaunch,
       };
       pending.timeout.unref();
       this.pending.set(fullCommand.id, pending);
@@ -329,6 +332,7 @@ export class SupportCommandBus {
       }
 
       this.queued.push(pending);
+      this.scheduleInspectionFallback(pending);
     });
   }
 
@@ -488,14 +492,15 @@ export class SupportCommandBus {
     for (const feature of featureSet) this.backgroundLaunchPending.delete(feature);
     this.browsers.set(browserId, { features: featureSet, lastSeenAt: Date.now(),
       openThreads: new Set(openThreads.map(url => parseConversationUrl(url).threadId)) });
+    this.dispatchQueuedCommandsToWaiters();
+    for (const pending of this.pending.values()) this.scheduleInspectionFallback(pending);
     const resumable = [...this.pending.values()].find((pending) =>
       (pending.command.kind === "inspect_thread" || pending.command.kind === "prepare_thread") &&
       this.browserCanClaim(browserId, pending.command) &&
       (pending.claimedBy === browserId ||
         (pending.claimedAt !== undefined && Date.now() - pending.claimedAt >= this.inspectClaimLeaseMs)));
     if (resumable) {
-      resumable.claimedBy = browserId;
-      resumable.claimedAt = Date.now();
+      this.markClaimed(resumable, browserId);
       return Promise.resolve(resumable.command);
     }
 
@@ -529,14 +534,15 @@ export class SupportCommandBus {
     if (pending.claimedBy !== result.browserId) throw new Error("Support command belongs to another browser instance.");
     if (pending.command.kind !== result.kind) throw new Error("Support command result kind does not match the request.");
 
-    if (!result.ok && result.error.startsWith("CHATGPT_RATE_LIMITED:")) {
+    if (!result.ok && /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(result.error)) {
       if (!this.messageCooldownUntil()) this.cooldownUntil = Date.now() + this.messageCooldownMs;
       this.messagePacingActive = true;
       this.nextMessageClaimAt = Math.max(this.nextMessageClaimAt, this.cooldownUntil);
       console.warn(`[chatgpt-support] message_cooldown until=${new Date(this.cooldownUntil).toISOString()}`);
       const browser = this.browsers.get(result.browserId);
       if (browser) browser.lastSeenAt = Date.now();
-      if (result.kind !== "send_message") {
+      const retryableSend = result.kind === "send_message" && result.error.startsWith("CHATGPT_RATE_LIMITED_RETRYABLE:");
+      if (!retryableSend) {
         this.removePending(result.commandId);
         pending.resolve(result);
         return;
@@ -564,6 +570,7 @@ export class SupportCommandBus {
     for (const waiter of [...this.waiters]) this.resolveWaiter(waiter, undefined);
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timeout);
+      if (pending.inspectionFallback) clearTimeout(pending.inspectionFallback);
       pending.reject(new Error("ChatGPT support service is shutting down."));
     }
     this.pending.clear();
@@ -578,6 +585,66 @@ export class SupportCommandBus {
       if (this.cancel(pending.command.id, reason)) count += 1;
     }
     return count;
+  }
+
+  private dispatchQueuedCommandsToWaiters() {
+    for (let index = 0; index < this.queued.length;) {
+      const pending = this.queued[index];
+      if (!this.canClaim(pending.command)) {
+        index += 1;
+        continue;
+      }
+      const waiter = [...this.waiters].find((candidate) => this.browserCanClaim(candidate.browserId, pending.command));
+      if (!waiter) {
+        index += 1;
+        continue;
+      }
+      this.queued.splice(index, 1);
+      this.markClaimed(pending, waiter.browserId);
+      this.resolveWaiter(waiter, pending.command);
+    }
+  }
+
+  private scheduleInspectionFallback(pending: PendingCommand) {
+    if (pending.inspectionFallback) {
+      clearTimeout(pending.inspectionFallback);
+      pending.inspectionFallback = undefined;
+    }
+    if (!this.launchBrowser || pending.command.kind !== "inspect_thread" || !pending.allowBrowserLaunch) return;
+    if (pending.command.executorOnly) {
+      if (pending.claimedBy) return;
+      this.dispatchQueuedCommandsToWaiters();
+      if (!pending.claimedBy) void this.ensureBrowser(pending.command.feature, this.launchBrowser).catch(() => undefined);
+      return;
+    }
+
+    const threadId = parseConversationUrl(pending.command.conversationUrl).threadId;
+    const claimant = pending.claimedBy ? this.browsers.get(pending.claimedBy) : undefined;
+    const observerClaim = Boolean(pending.claimedBy && !claimant?.features.has(pending.command.feature));
+    if (pending.claimedBy && !observerClaim) return;
+
+    const owners = [...this.browsers.entries()].filter(([, browser]) =>
+      Date.now() - browser.lastSeenAt <= SUPPORT_BROWSER_HEARTBEAT_GRACE_MS && browser.openThreads.has(threadId));
+    const claimantStillOwnsThread = Boolean(pending.claimedBy && owners.some(([browserId]) => browserId === pending.claimedBy));
+    if (observerClaim && !claimantStillOwnsThread) {
+      pending.claimedBy = undefined;
+      pending.claimedAt = undefined;
+      if (!this.queued.includes(pending)) this.queued.unshift(pending);
+      this.dispatchQueuedCommandsToWaiters();
+      if (pending.claimedBy) return;
+    }
+    if (owners.length === 0) {
+      this.dispatchQueuedCommandsToWaiters();
+      if (!pending.claimedBy) void this.ensureBrowser(pending.command.feature, this.launchBrowser).catch(() => undefined);
+      return;
+    }
+
+    const nextExpiry = Math.max(...owners.map(([, browser]) => browser.lastSeenAt + SUPPORT_BROWSER_HEARTBEAT_GRACE_MS));
+    pending.inspectionFallback = setTimeout(() => {
+      pending.inspectionFallback = undefined;
+      if (this.pending.has(pending.command.id)) this.scheduleInspectionFallback(pending);
+    }, Math.max(1, nextExpiry - Date.now() + 1));
+    pending.inspectionFallback.unref();
   }
 
   private defaultOperationLabel(command: SupportCommand) {
@@ -599,8 +666,9 @@ export class SupportCommandBus {
   private browserCanClaim(browserId: string, command: SupportCommand) {
     const browser = this.browsers.get(browserId);
     if (!browser) return false;
+    if (command.kind === "prepare_thread") return browser.features.has(command.feature);
     if (command.kind === "inspect_thread" && command.executorOnly) return browser.features.has(command.feature);
-    if (command.kind === "inspect_thread" || command.kind === "prepare_thread") {
+    if (command.kind === "inspect_thread") {
       const threadId = parseConversationUrl(command.conversationUrl).threadId;
       const owners = [...this.browsers.entries()].filter(([, candidate]) =>
         Date.now() - candidate.lastSeenAt <= SUPPORT_BROWSER_HEARTBEAT_GRACE_MS && candidate.openThreads.has(threadId));
@@ -623,6 +691,7 @@ export class SupportCommandBus {
     if (pending.command.kind === "send_message" && this.messagePacingActive) {
       this.nextMessageClaimAt = Date.now() + this.messageSendSpacingMs;
     }
+    this.scheduleInspectionFallback(pending);
   }
 
   private resolveWaiter(waiter: ClaimWaiter, command: SupportCommand | undefined) {
@@ -636,6 +705,7 @@ export class SupportCommandBus {
     const pending = this.pending.get(commandId);
     if (!pending) return;
     clearTimeout(pending.timeout);
+    if (pending.inspectionFallback) clearTimeout(pending.inspectionFallback);
     this.pending.delete(commandId);
     const queuedIndex = this.queued.indexOf(pending);
     if (queuedIndex >= 0) this.queued.splice(queuedIndex, 1);
@@ -1164,13 +1234,6 @@ export class RalphController {
         inspection = authoritative;
       }
 
-      if (inspection.users.length === 0 || inspection.users.some((message) => !message.text.trim())) {
-        throw new Error("RALPH could not extract every ChatGPT user message.");
-      }
-      if (!inspection.assistant.text.trim()) {
-        throw new Error("RALPH could not extract the final ChatGPT assistant message.");
-      }
-
       const currentMode = await this.options.registry.activeMode(thread.threadId);
       if (currentMode === undefined) return;
       if (await this.options.jobs?.blocksContinuation(thread.threadId)) {
@@ -1201,7 +1264,6 @@ export class RalphController {
         return;
       }
       if (currentMode === "continuous") {
-        if (await this.options.registry.activeMode(thread.threadId) !== "continuous") return;
         const sendResult = await this.options.commands.execute({
           feature: "ralph",
           kind: "send_message",
@@ -1214,6 +1276,12 @@ export class RalphController {
         return;
       }
 
+      if (inspection.users.length === 0 || inspection.users.some((message) => !message.text.trim())) {
+        throw new Error("RALPH could not extract every ChatGPT user message.");
+      }
+      if (!inspection.assistant.text.trim()) {
+        throw new Error("RALPH could not extract the final ChatGPT assistant message.");
+      }
       if (inspection.workedSeconds === null) {
         await this.options.registry.recordComplete(thread.threadId);
         return;
@@ -1240,6 +1308,7 @@ export class RalphController {
         await this.options.registry.recordRunning(thread.threadId);
         return;
       }
+      if (await this.options.registry.activeMode(thread.threadId) !== modeBeforeSend) return;
 
       const sendResult = await this.options.commands.execute({
         feature: "ralph",
@@ -2303,7 +2372,7 @@ export function registerChatGptAgents(
 
   server.registerTool("send_thread_message", {
     title: "Send Thread Message",
-    description: "Send one message to an existing ChatGPT conversation only when the user explicitly requests that post. Transport retries of the same MCP request are deduplicated internally. This tool never creates a new thread. If ChatGPT rate-limits delivery, the command stays queued and resumes after cooldown with global send pacing. For other uncertain delivery errors, inspect the target before making a new send request.",
+    description: "Send one message to an existing ChatGPT conversation only when the user explicitly requests that post. Transport retries of the same MCP request are deduplicated internally. This tool never creates a new thread. A rate limit known to occur before Send is clicked stays queued and may resume after cooldown with global send pacing. If a provider notice appears after Send is clicked, delivery is uncertain and the command is never replayed automatically; inspect the target before making a new send request.",
     inputSchema: {
       targetUrl: z.string().url().describe("Exact existing ChatGPT /c/... conversation URL."),
       message: z.string().min(1).max(200_000).describe("Message to send to that conversation."),

@@ -831,10 +831,10 @@ try {
   Date.now = () => presenceNow;
   try {
     assert.equal(await sleepingWorkerBus.claim("sleeping-chrome", ["threadPreparation"], 0), undefined);
-    presenceNow += 70_000;
+    presenceNow += 20_000;
     await sleepingWorkerBus.ensureBrowser("threadPreparation", async () => { sleepingWorkerLaunches += 1; });
     assert.equal(sleepingWorkerLaunches, 0,
-      "one MV3 sleep/alarm interval does not cause the backend to launch another Chrome window");
+      "a recent browser heartbeat does not cause the backend to launch another Chrome window");
   } finally {
     Date.now = realDateNow;
     sleepingWorkerBus.close();
@@ -1455,6 +1455,47 @@ try {
     assert.equal(await ralphCommands.claim("chrome-browser", ["ralph"], 0), undefined);
     assert.equal(await ralphControllerRegistry.isActive(parseConversationUrl(shortRalphUrl).threadId), false,
       "a short settled turn is marked complete without classification");
+
+    const staleObserverRalphUrl = `https://chatgpt.com/g/${projectId}/c/30303030-3030-4030-8030-303030303030`;
+    await ralphControllerRegistry.register(staleObserverRalphUrl);
+    const apiRequestsBeforeStaleObserver = apiRequestCount;
+    await ralphCommands.claim("helium-stale", [], 0, undefined, [staleObserverRalphUrl]);
+    await ralphCommands.claim("chrome-live", ["ralph"], 0, undefined, [staleObserverRalphUrl]);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    await ralphController.tick();
+    const staleObserverInspect = await ralphCommands.claim("helium-stale", [], 1000, undefined, [staleObserverRalphUrl]);
+    assert.equal(staleObserverInspect.kind, "inspect_thread");
+    ralphCommands.complete({
+      commandId: staleObserverInspect.id,
+      browserId: "helium-stale",
+      kind: "inspect_thread",
+      ok: true,
+      result: {
+        status: "idle",
+        title: "Stale Helium copy - ChatGPT",
+        workedSeconds: 20 * 60 + 1,
+        users: [{ id: "u-stale", text: "Finish the task without duplicate wake-ups." }],
+        assistant: { synthetic: false, id: "a-stale", text: "Stale Helium says work remains." },
+      },
+    });
+    const preSendSafetyInspect = await ralphCommands.claim("chrome-live", ["ralph"], 1000, undefined, [staleObserverRalphUrl]);
+    assert.equal(preSendSafetyInspect.kind, "inspect_thread",
+      "before any RALPH send, Chrome must be freshly inspected even when Helium reported the thread idle");
+    assert.equal(preSendSafetyInspect.executorOnly, true,
+      "the pre-send safety inspection must bypass observer precedence and run in the automation executor");
+    ralphCommands.complete({
+      commandId: preSendSafetyInspect.id,
+      browserId: "chrome-live",
+      kind: "inspect_thread",
+      ok: true,
+      result: { status: "running", title: "Live Chrome copy - ChatGPT" },
+    });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(apiRequestCount, apiRequestsBeforeStaleObserver,
+      "RALPH must not call the classifier when the fresh Chrome inspection says the thread is running");
+    assert.equal(await ralphCommands.claim("chrome-live", ["ralph"], 0, undefined, [staleObserverRalphUrl]), undefined,
+      "RALPH must not send when the fresh Chrome inspection says the thread is running");
+    await ralphControllerRegistry.recordComplete(parseConversationUrl(staleObserverRalphUrl).threadId);
 
     const continuousRalphUrl = `https://chatgpt.com/g/${projectId}/c/66666666-6666-4666-8666-666666666666`;
     await ralphControllerRegistry.register(continuousRalphUrl);
