@@ -69,6 +69,7 @@ import {
   ralphThreadCompleteHandler,
   ralphThreadModeHandler,
   ralphThreadsGetHandler,
+  reviewActionHandler,
   registerChatGptAgents,
   SUBAGENT_AGENT_INSTRUCTION,
   SubagentResultController,
@@ -77,9 +78,12 @@ import {
   ThreadTabCleanupController,
   threadObservationHandler,
   supportCommandClaimHandler,
+  supportCommandCancelHandler,
   supportCommandResultHandler,
 } from "./chatgpt-support.js";
 import { SubagentJobRegistry } from "./subagent-jobs.js";
+import { authenticateSupportExtension } from "./chatgpt-support.js";
+import { createNightlyPrScheduler } from "./nightly-pr.js";
 
 const PORT = Number(process.env.PORT ?? 6000);
 const HOST = process.env.HOST ?? "localhost";
@@ -2728,15 +2732,15 @@ await initializeAuthStore();
 const threadSync = THREAD_SYNC_ENABLED
   ? await prepareThreadSync(DATA_DIR, THREAD_SYNC_PORT)
   : undefined;
-const supportCommands = threadSync ? new SupportCommandBus() : undefined;
+const ralphRegistry = threadSync ? await RalphRegistry.open(DATA_DIR) : undefined;
 const subagentJobs = threadSync ? await SubagentJobRegistry.open(DATA_DIR) : undefined;
+const supportCommands = threadSync ? new SupportCommandBus(undefined, undefined, undefined, ralphRegistry, subagentJobs, undefined, () => launchChrome()) : undefined;
 const threadPreparer = supportCommands && threadSync
   ? new ThreadPreparationCoordinator(supportCommands, threadSync.registry, () => launchChrome())
   : undefined;
 const subagentResultController = supportCommands && subagentJobs
-  ? new SubagentResultController(subagentJobs, supportCommands, () => launchChrome())
+  ? new SubagentResultController(subagentJobs, supportCommands, () => launchChrome(), 5_000, 1_000, ralphRegistry)
   : undefined;
-const ralphRegistry = threadSync ? await RalphRegistry.open(DATA_DIR) : undefined;
 const ralphController = supportCommands && ralphRegistry
   ? new RalphController({
       commands: supportCommands,
@@ -2763,11 +2767,32 @@ const browserService = BROWSER_BRIDGE_ENABLED
 
 // The extension needs a browser-safe port. Only its authenticated binding route
 // is available here; MCP and OAuth remain on the existing main listener.
+const nightlyPrScheduler = supportCommands && ralphRegistry
+  ? await createNightlyPrScheduler(DATA_DIR, supportCommands, ralphRegistry)
+  : undefined;
+
 const threadSyncHttpServer = threadSync
   ? await new Promise<Server>((resolve, reject) => {
       const syncApp = express();
       syncApp.disable("x-powered-by");
       syncApp.use(express.json({ limit: "5mb" }));
+      if (nightlyPrScheduler) {
+        syncApp.get("/chatgpt-support/nightly-pr", (req, res) => {
+          if (!authenticateSupportExtension(req, res, threadSync.extensionToken)) return;
+          res.setHeader("Cache-Control", "no-store");
+          res.json(nightlyPrScheduler.status());
+        });
+        syncApp.post("/chatgpt-support/nightly-pr/tick", (req, res) => {
+          if (!authenticateSupportExtension(req, res, threadSync.extensionToken)) return;
+          void nightlyPrScheduler.tick().catch(error => console.error("[nightly-pr]", error));
+          res.status(202).json({ status: "accepted" });
+        });
+        syncApp.post("/chatgpt-support/nightly-pr/dismiss-started", async (req, res) => {
+          if (!authenticateSupportExtension(req, res, threadSync.extensionToken)) return;
+          try { res.json(await nightlyPrScheduler.dismissStarted()); }
+          catch (error) { res.status(409).json({ error: String(error) }); }
+        });
+      }
       syncApp.post("/thread-sync/bind", createRateLimiter("thread-sync", 60_000, 120),
         threadSyncBindHandler(
           threadSync.registry,
@@ -2786,9 +2811,13 @@ const threadSyncHttpServer = threadSync
         syncApp.put("/chatgpt-support/ralph/settings",
           ralphSettingsPutHandler(ralphRegistry, threadSync.extensionToken));
         syncApp.get("/chatgpt-support/ralph/threads",
-          ralphThreadsGetHandler(ralphRegistry, threadSync.extensionToken));
+          ralphThreadsGetHandler(ralphRegistry, threadSync.extensionToken, subagentJobs, supportCommands));
+        if (subagentJobs && supportCommands) {
+          syncApp.put("/chatgpt-support/reviews/:jobId", reviewActionHandler(
+            subagentJobs, ralphRegistry, supportCommands, () => launchChrome(), threadSync.extensionToken));
+        }
         syncApp.put("/chatgpt-support/ralph/threads/:threadId/complete",
-          ralphThreadCompleteHandler(ralphRegistry, threadSync.extensionToken));
+          ralphThreadCompleteHandler(ralphRegistry, threadSync.extensionToken, supportCommands));
         syncApp.put("/chatgpt-support/ralph/threads/:threadId/active",
           ralphThreadActiveHandler(ralphRegistry, threadSync.extensionToken));
         syncApp.put("/chatgpt-support/ralph/threads/:threadId/mode",
@@ -2798,13 +2827,15 @@ const threadSyncHttpServer = threadSync
             ralphThreadCheckHandler(ralphRegistry, ralphController, threadSync.extensionToken));
         }
       }
-      if (threadPreparer) {
+      if (threadPreparer && ralphRegistry) {
         syncApp.post("/chatgpt-support/threads/observe", createRateLimiter("thread-observe", 60_000, 600),
-          threadObservationHandler(threadPreparer, threadSync.extensionToken));
+          threadObservationHandler(threadPreparer, threadSync.extensionToken, ralphRegistry));
       }
       if (supportCommands) {
         syncApp.post("/chatgpt-support/commands/claim",
           supportCommandClaimHandler(supportCommands, threadSync.extensionToken));
+        syncApp.put("/chatgpt-support/commands/:commandId/cancel",
+          supportCommandCancelHandler(supportCommands, threadSync.extensionToken));
         syncApp.post("/chatgpt-support/commands/result",
           supportCommandResultHandler(supportCommands, threadSync.extensionToken));
       }
@@ -2815,6 +2846,7 @@ const threadSyncHttpServer = threadSync
   : undefined;
 
 const cleanupTimer = setInterval(cleanupEphemeralState, 60 * 1000);
+nightlyPrScheduler?.start();
 cleanupTimer.unref();
 
 const httpServer = app.listen(PORT, HOST, () => {
@@ -2861,6 +2893,7 @@ async function shutdown(signal: string) {
     console.error("Browser bridge shutdown failed:", error),
   );
   ralphController?.close();
+  nightlyPrScheduler?.close();
   threadTabCleanupController?.close();
   subagentResultController?.close();
   supportCommands?.close();

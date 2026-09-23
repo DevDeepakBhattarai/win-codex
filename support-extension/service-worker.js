@@ -22,16 +22,22 @@ const DEFAULT_SETTINGS = Object.freeze({
   threadMessaging: false,
 });
 const AUTOMATION_MESSAGE = "local-codex-support/automation-v1";
+const CANCEL_AUTOMATION_MESSAGE = "local-codex-support/cancel-automation-v1";
 const REACTIVATE_RALPH_MESSAGE = "local-codex-support/ralph-reactivate-v1";
 const TITLE_OBSERVED_MESSAGE = "local-codex-support/title-observed-v1";
 const SYNC_MESSAGE = "local-codex-thread-sync/bind-v1";
 const WORKER_KEEPALIVE_INTERVAL_MS = 20_000;
 const AUTOMATION_RESPONSE_TIMEOUT_MS = 8 * 60_000;
+const SUPPORT_POLL_ALARM = "local-codex-support/poll";
+const SUPPORT_POLL_PERIOD_MINUTES = 1;
 let pollGeneration = 0;
 let pollController = null;
 const reportedRalphConversations = new Set();
 const observingConversations = new Map();
+const observedAt = new Map();
 const AUTOMATION_THREAD_TABS_KEY = "automationThreadTabsV1";
+const RATE_LIMIT_WAIT_MS = 10 * 60_000;
+const ERROR_RELOAD_INTERVAL_MS = 10 * 60_000;
 
 function validateLoopbackEndpoint(value, pathname) {
   const endpoint = new URL(value);
@@ -84,7 +90,7 @@ function projectHomeId(value) {
 function automationTargetMatches(currentValue, targetValue) {
   try {
     const targetConversation = conversationUrl(targetValue);
-    if (targetConversation) return conversationUrl(currentValue) === targetConversation;
+    if (targetConversation) return conversationUrl(currentValue)?.split("/c/")[1] === targetConversation.split("/c/")[1];
 
     const targetProject = projectHomeId(targetValue);
     if (targetProject) return projectHomeId(currentValue) === targetProject;
@@ -118,6 +124,8 @@ function observeConversation(value) {
   const observation = (async () => {
     const settings = await getSettings();
     if (!settings.threadSync) return;
+    const now = Date.now();
+    if (now - (observedAt.get(currentUrl) ?? 0) < 60_000) return;
     const response = await fetch(threadObserveEndpoint.href, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${config.extensionToken}` },
@@ -129,21 +137,26 @@ function observeConversation(value) {
       redirect: "error",
     });
     if (!response.ok) throw new Error(`Thread observation returned ${response.status}.`);
+    observedAt.set(currentUrl, now);
+    for (const [url, timestamp] of observedAt) {
+      if (now - timestamp >= 60_000) observedAt.delete(url);
+    }
   })().finally(() => observingConversations.delete(currentUrl));
   observingConversations.set(currentUrl, observation);
   return observation;
 }
-async function registerRalphConversation(value, { reactivate = false, agentCreated = false, title } = {}) {
+async function registerRalphConversation(value, { reactivate = false, externalUpdate = false, agentCreated = false, title } = {}) {
   const currentUrl = conversationUrl(value);
   const currentTitle = normalizeThreadTitle(title);
-  if (!currentUrl || !currentUrl.startsWith("https://chatgpt.com/g/") ||
-      (!reactivate && !agentCreated && !currentTitle && reportedRalphConversations.has(currentUrl))) return;
+  if (!currentUrl || (!reactivate && !externalUpdate && !currentUrl.startsWith("https://chatgpt.com/g/")) ||
+      (!reactivate && !externalUpdate && !agentCreated && !currentTitle && reportedRalphConversations.has(currentUrl))) return;
   const response = await fetch(ralphRegisterEndpoint.href, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${config.extensionToken}` },
     body: JSON.stringify({
       conversationUrl: currentUrl,
       ...(reactivate ? { reactivate: true } : {}),
+      ...(externalUpdate ? { externalUpdate: true } : {}),
       ...(agentCreated ? { agentCreated: true } : {}),
       ...(currentTitle ? { title: currentTitle } : {}),
     }),
@@ -288,10 +301,11 @@ async function reactivateRalphConversation(message, sender) {
   }
   const requestedUrl = conversationUrl(message.conversationUrl);
   const currentUrl = conversationUrl((await extensionApi.tabs.get(sender.tab.id)).url);
-  if (!requestedUrl || requestedUrl !== currentUrl || !requestedUrl.startsWith("https://chatgpt.com/g/")) {
+  if (!requestedUrl || requestedUrl !== currentUrl) {
     return { ok: false, error: "RALPH no longer matches the current conversation." };
   }
-  await registerRalphConversation(currentUrl, { reactivate: true });
+  const settings = await getSettings();
+  await registerRalphConversation(currentUrl, { reactivate: message.completed !== true, externalUpdate: !settings.automationExecutor });
   return { ok: true };
 }
 
@@ -384,10 +398,46 @@ async function commandTargetUrl(command) {
   throw new Error("ChatGPT support command is missing its server-resolved target URL.");
 }
 
-async function executeCommand(command, browserId) {
+const executingCommands = new Map();
+const activeCommandTabs = new Map();
+const cancelledCommands = new Set();
+let executionTail = Promise.resolve();
+
+function executeCommand(command, browserId) {
+  const existing = executingCommands.get(command.id);
+  if (existing) return existing;
+  const execution = executionTail.catch(() => undefined)
+    .then(() => keepWorkerAliveUntil(executeCommandOnce(command, browserId)))
+    .finally(() => {
+      executingCommands.delete(command.id);
+      activeCommandTabs.delete(command.id);
+      cancelledCommands.delete(command.id);
+    });
+  executingCommands.set(command.id, execution);
+  executionTail = execution;
+  return execution;
+}
+
+function assertCommandActive(commandId) {
+  if (cancelledCommands.has(commandId)) throw new Error("Local Codex automation stopped by user.");
+}
+
+async function cancelActiveCommand(commandId) {
+  if (typeof commandId !== "string" || !executingCommands.has(commandId)) return { ok: true, active: false };
+  cancelledCommands.add(commandId);
+  const tabId = activeCommandTabs.get(commandId);
+  if (Number.isInteger(tabId)) {
+    await extensionApi.tabs.sendMessage(tabId, { type: CANCEL_AUTOMATION_MESSAGE, commandId }).catch(() => undefined);
+  }
+  return { ok: true, active: true };
+}
+
+async function executeCommandOnce(command, browserId) {
+  assertCommandActive(command.id);
   let targetUrl;
   try {
     targetUrl = await commandTargetUrl(command);
+    assertCommandActive(command.id);
   } catch (error) {
     await postResult({
       commandId: command.id,
@@ -415,16 +465,52 @@ async function executeCommand(command, browserId) {
     return;
   }
 
-  const createsNewThread = command.kind === "send_message" && projectHomeId(targetUrl) !== null;
+  const createsNewThread = command.kind === "send_message" && conversationUrl(targetUrl) === null;
   let tabId;
   let created = false;
   let keepCreatedTab = false;
 
   try {
-    const acquired = await acquireAutomationTab(targetUrl, createsNewThread);
+    const settings = await getSettings();
+    const observing = !settings.automationExecutor;
+    if (observing && command.kind !== "inspect_thread" && command.kind !== "prepare_thread") {
+      throw new Error("This browser is only available for thread observation.");
+    }
+    const acquired = observing
+      ? await findConversationTab(targetUrl)
+      : await acquireAutomationTab(targetUrl, createsNewThread);
+    if (!acquired) throw new Error("The observed thread tab has closed or navigated away.");
     tabId = acquired.tab.id;
-    created = acquired.created;
+    activeCommandTabs.set(command.id, tabId);
+    created = acquired.created === true;
+    assertCommandActive(command.id);
+    const initialTab = await waitForTabComplete(tabId);
+    if (typeof initialTab.url !== "string" || !automationTargetMatches(initialTab.url, targetUrl)) {
+      throw new Error("ChatGPT automation was redirected away from the requested target.");
+    }
+    assertCommandActive(command.id);
+    if (created && conversationUrl(targetUrl)) {
+      await rememberOwnedThreadTab(targetUrl, tabId);
+      keepCreatedTab = true;
+    }
+    if (command.kind !== "stop_thread") await recoverPage(tabId);
+    assertCommandActive(command.id);
+    if (!observing && command.refreshRevision && conversationUrl(targetUrl) && command.kind !== "stop_thread") {
+      const revisionKey = `threadRevision:${tabId}`;
+      const saved = await extensionApi.storage.local.get(revisionKey);
+      if (!created && saved[revisionKey] !== command.refreshRevision) {
+        await waitForTabComplete(tabId);
+        const inspection = await sendAutomationMessageWithTimeout(tabId, { kind: "inspect_thread" });
+        if (!inspection?.ok || inspection.result?.status !== "idle") {
+          throw new Error("External conversation update is pending. Refresh deferred until the automation tab is idle.");
+        }
+        await extensionApi.tabs.reload(tabId);
+      }
+      await waitForTabComplete(tabId);
+      await extensionApi.storage.local.set({ [revisionKey]: command.refreshRevision });
+    }
     const loadedTab = await waitForTabComplete(tabId);
+    assertCommandActive(command.id);
     if (typeof loadedTab.url !== "string" || !automationTargetMatches(loadedTab.url, targetUrl)) {
       throw new Error("ChatGPT automation was redirected away from the requested target.");
     }
@@ -436,6 +522,7 @@ async function executeCommand(command, browserId) {
     }
 
     if (command.kind === "prepare_thread") {
+      assertCommandActive(command.id);
       await postResult({
         commandId: command.id,
         browserId,
@@ -446,7 +533,8 @@ async function executeCommand(command, browserId) {
       return;
     }
 
-    const response = await keepWorkerAliveUntil(sendAutomationMessageWithTimeout(tabId, command));
+    assertCommandActive(command.id);
+    const response = await sendAutomationMessageWithTimeout(tabId, command);
     if (!response?.ok) throw new Error(response?.error || "ChatGPT page automation failed.");
 
     if (command.kind === "send_message") {
@@ -474,6 +562,13 @@ async function executeCommand(command, browserId) {
       result: response.result,
     });
   } catch (error) {
+    if (Number.isInteger(tabId) && error instanceof Error && error.message.startsWith("CHATGPT_RATE_LIMITED:")) {
+      const key = `pageRecovery:${tabId}`;
+      const saved = await extensionApi.storage.local.get(key);
+      if (!saved[key]?.rateLimitedAt) {
+        await extensionApi.storage.local.set({ [key]: { ...saved[key], rateLimitedAt: Date.now() } });
+      }
+    }
     if (created && Number.isInteger(tabId) && createsNewThread) {
       try {
         const current = await extensionApi.tabs.get(tabId);
@@ -500,7 +595,55 @@ async function executeCommand(command, browserId) {
   }
 }
 
+const recoveringPages = new Map();
+function recoverPage(tabId) {
+  const existing = recoveringPages.get(tabId);
+  if (existing) return existing;
+  const recovery = recoverPageOnce(tabId).finally(() => recoveringPages.delete(tabId));
+  recoveringPages.set(tabId, recovery);
+  return recovery;
+}
+
+async function recoverPageOnce(tabId) {
+  const key = `pageRecovery:${tabId}`;
+  const stored = await extensionApi.storage.local.get(key);
+  const state = stored[key] ?? {};
+  const now = Date.now();
+  if (state.rateLimitedAt && now - state.rateLimitedAt < RATE_LIMIT_WAIT_MS) {
+    throw new Error("CHATGPT_RATE_LIMITED: Waiting ten minutes before dismissing the provider notice.");
+  }
+  const health = await sendAutomationMessageWithTimeout(tabId, { kind: "page_health" });
+  if (!health?.ok) throw new Error(health?.error || "Could not inspect ChatGPT page health.");
+  if (health.result?.status === "rate_limited") {
+    if (!state.rateLimitedAt) {
+      await extensionApi.storage.local.set({ [key]: { ...state, rateLimitedAt: now } });
+      throw new Error("CHATGPT_RATE_LIMITED: Waiting ten minutes before dismissing the provider notice.");
+    }
+    const dismissal = await sendAutomationMessageWithTimeout(tabId, { kind: "dismiss_rate_limit" });
+    await extensionApi.storage.local.set({ [key]: { ...state, rateLimitedAt: now } });
+    if (!dismissal?.ok || dismissal.result?.status !== "dismissed") {
+      throw new Error("CHATGPT_RATE_LIMITED: The provider notice could not be dismissed.");
+    }
+    // Give the page a chance to remove the dialog before checking it again.
+    await sleep(250);
+    const after = await sendAutomationMessageWithTimeout(tabId, { kind: "page_health" });
+    if (!after?.ok || after.result?.status !== "ok") {
+      throw new Error("CHATGPT_RATE_LIMITED: The provider notice is still blocking the page.");
+    }
+  } else if (health.result?.status === "recoverable_error") {
+    if (state.reloadedAt && now - state.reloadedAt < ERROR_RELOAD_INTERVAL_MS) {
+      throw new Error("ChatGPT recovery is waiting before another reload.");
+    }
+    await extensionApi.storage.local.set({ [key]: { reloadedAt: now } });
+    await extensionApi.tabs.reload(tabId);
+    await waitForTabComplete(tabId);
+    return;
+  }
+  if (state.rateLimitedAt) await extensionApi.storage.local.set({ [key]: { reloadedAt: state.reloadedAt } });
+}
+
 function enabledAutomationFeatures(settings) {
+  if (!settings.automationExecutor) return [];
   const features = [];
   if (settings.threadSync && settings.automationExecutor) features.push("threadPreparation");
   if (settings.ralph) features.push("ralph");
@@ -509,12 +652,33 @@ function enabledAutomationFeatures(settings) {
   return features;
 }
 
+async function syncPollingAlarm() {
+  if (!extensionApi.alarms) return;
+  const settings = await getSettings();
+  if (!settings.threadSync && enabledAutomationFeatures(settings).length === 0) {
+    await extensionApi.alarms.clear(SUPPORT_POLL_ALARM);
+    return;
+  }
+  if (await extensionApi.alarms.get(SUPPORT_POLL_ALARM)) return;
+  extensionApi.alarms.create(SUPPORT_POLL_ALARM, { periodInMinutes: SUPPORT_POLL_PERIOD_MINUTES });
+}
+
 async function pollCommands(generation) {
   const browserId = await getBrowserId();
   while (generation === pollGeneration) {
     const settings = await getSettings();
     const features = enabledAutomationFeatures(settings);
-    if (features.length === 0) return;
+    const tabs = settings.threadSync ? await extensionApi.tabs.query({ url: "https://chatgpt.com/*" }) : [];
+    const openThreads = [...new Set(tabs.map(tab => conversationUrl(tab.url)).filter(Boolean))];
+    for (const tab of tabs) {
+      if (!Number.isInteger(tab.id) || !conversationUrl(tab.url)) continue;
+      const key = `pageRecovery:${tab.id}`;
+      const saved = await extensionApi.storage.local.get(key);
+      if (saved[key]?.rateLimitedAt && Date.now() - saved[key].rateLimitedAt >= RATE_LIMIT_WAIT_MS) {
+        await recoverPage(tab.id).catch(() => undefined);
+      }
+    }
+    if (features.length === 0 && openThreads.length === 0) return;
 
     const controller = new AbortController();
     pollController = controller;
@@ -522,7 +686,7 @@ async function pollCommands(generation) {
       const response = await fetch(claimEndpoint.href, {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${config.extensionToken}` },
-        body: JSON.stringify({ browserId, features }),
+        body: JSON.stringify({ browserId, features, openThreads }),
         signal: controller.signal,
         redirect: "error",
       });
@@ -555,6 +719,10 @@ function sleep(ms) {
 }
 
 extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === CANCEL_AUTOMATION_MESSAGE) {
+    void cancelActiveCommand(message.commandId).then(sendResponse, () => sendResponse({ ok: false, active: false }));
+    return true;
+  }
   if (message?.type === SYNC_MESSAGE) {
     void bind(message, sender).then(sendResponse, () =>
       sendResponse({ status: "error", error: "The source tab is no longer available.", retryable: true }),
@@ -576,6 +744,7 @@ extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "local-codex-support/settings-changed") {
     reportedRalphConversations.clear();
     restartPolling();
+    void syncPollingAlarm();
     void scanExistingTabs();
     sendResponse({ ok: true });
   }
@@ -598,12 +767,17 @@ async function scanExistingTabs() {
 
 
 extensionApi.tabs.onUpdated?.addListener((_tabId, changeInfo, tab) => {
+  if (typeof changeInfo.url === "string") restartPolling();
   const observedUrl = typeof changeInfo.url === "string" ? changeInfo.url : tab?.url;
   if (typeof observedUrl !== "string" ||
       (typeof changeInfo.url !== "string" && typeof changeInfo.title !== "string")) return;
   const observedTitle = typeof changeInfo.title === "string" ? changeInfo.title : undefined;
   void observeConversation(observedUrl).catch(() => undefined);
   void registerRalphConversation(observedUrl, { title: observedTitle }).catch(() => undefined);
+});
+extensionApi.tabs.onRemoved?.addListener(tabId => {
+  void extensionApi.storage.local.remove([`pageRecovery:${tabId}`, `threadRevision:${tabId}`]);
+  restartPolling();
 });
 extensionApi.webNavigation?.onHistoryStateUpdated?.addListener((details) => {
   if (details.frameId === 0) {
@@ -618,13 +792,19 @@ extensionApi.webNavigation?.onCommitted?.addListener((details) => {
   }
 });
 
+extensionApi.alarms?.onAlarm?.addListener((alarm) => {
+  if (alarm.name === SUPPORT_POLL_ALARM) restartPolling();
+});
 extensionApi.runtime.onInstalled.addListener(() => {
+  void syncPollingAlarm();
   void scanExistingTabs();
   restartPolling();
 });
 extensionApi.runtime.onStartup.addListener(() => {
+  void syncPollingAlarm();
   void scanExistingTabs();
   restartPolling();
 });
+void syncPollingAlarm();
 void scanExistingTabs();
 restartPolling();

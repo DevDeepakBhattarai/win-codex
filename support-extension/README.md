@@ -5,13 +5,13 @@ The Local Codex Support extension is the ChatGPT-specific companion to the MCP s
 The support extension handles four jobs:
 
 - **Thread sync** binds the current ChatGPT conversation URL to the MCP caller's `openai/session` for `sync_current_thread` and `get_current_thread_url`.
-- **Thread preparation executor** opens or reuses persistent tabs for observed conversation threads. Enable it only in the Chrome automation profile.
+- **Automation browser executor** opens or reuses persistent tabs for active registered automation threads. Enable it only in the Chrome automation profile.
 - **RALPH automation** inspects registered ChatGPT threads and sends a continuation when a due thread still needs work.
-- **Agent thread messaging** executes the browser side of `start_subagent` and `send_thread_message`.
+- **Agent thread messaging** executes the browser side of `start_reviewer` and `send_thread_message`.
 
-The popup has two tabs. **RALPH threads** shows registered threads with readable titles, state, recent activity, next check, errors, and parent information for sub-agents. **Settings** contains the browser feature toggles, Sub-agent project, RALPH timing, and the RALPH project allowlist.
+The popup has two tabs. **RALPH threads** shows registered threads with readable titles, state, recent activity, next check, errors, and parent information for reviewers. **Settings** contains the browser feature toggles, Reviewer project, RALPH timing, and the RALPH project allowlist.
 
-Automation commands are claimed atomically by one enabled browser instance. Thread sync can be enabled in more than one compatible browser because binding is idempotent. Enable **Thread preparation executor** only in the Chrome automation profile. RALPH automation and Agent thread messaging should normally also be enabled in only one automation browser.
+Automation commands are claimed atomically by one enabled browser instance. Thread sync can be enabled in more than one compatible browser because binding is idempotent. Enable **Automation browser executor** only in the Chrome automation profile. RALPH automation, Agent thread messaging, and tab cleanup require this executor setting. Keep it off in Helium.
 
 ## Install
 
@@ -19,8 +19,8 @@ Automation commands are claimed atomically by one enabled browser instance. Thre
 2. Start or restart Local Codex. The support listener defaults to `http://127.0.0.1:6002`. Set `THREAD_SYNC_PORT` to use another port or `THREAD_SYNC_ENABLED=false` to disable the support listener.
 3. Remove the obsolete **Local Codex Thread Sync** extension if it is still installed.
 4. Load `.data/support-extension` as an unpacked extension. Load the generated directory, not the source `support-extension` directory.
-5. Choose which browser handles each feature. Thread sync can run in multiple browsers. Enable **Thread preparation executor** only in the Chrome profile that the backend launches. Keep RALPH automation and Agent thread messaging on the browser that should execute those commands.
-6. Set **Sub-agent project** if child conversations should be created inside a dedicated ChatGPT project. The value is stored on the Local Codex server and shared by executor browsers.
+5. Choose which browser handles each feature. Thread sync can run in multiple browsers. Enable **Automation browser executor** only in the Chrome profile that the backend launches. Keep RALPH automation and Agent thread messaging on the browser that should execute those commands.
+6. Set **Reviewer project** if reviewer conversations should be created inside a dedicated ChatGPT project. The value is stored on the Local Codex server and shared by executor browsers.
 7. Reload the unpacked extension after rerunning `pnpm support:prepare`.
 
 Keep `.data` private. It contains the support-extension credential, thread bindings, RALPH state, and RALPH audit logs.
@@ -29,31 +29,33 @@ Keep `.data` private. It contains the support-extension credential, thread bindi
 
 Thread Sync is a one-time binding for each ChatGPT conversation session.
 
-1. The agent calls `sync_current_thread` only when a later action needs the current conversation binding. `start_subagent` requires this binding before the child is started.
+1. The agent calls `sync_current_thread` only when a later action needs the current conversation binding. `start_reviewer` requires this binding before the reviewer is started.
 2. If the tool reports `syncing`, the Thread Sync MCP App performs the browser handshake and the agent follows with `get_current_thread_url` before the binding-dependent action.
 3. If the tool reports `synced`, it returns the saved URL immediately. No second handshake starts.
 
-The support extension observes every ChatGPT `/c/...` route and reports it to the local backend, regardless of RALPH registration or Thread Sync state. The backend ensures that the thread is present in the automation browser even when it was already bound earlier. Duplicate observations share the same in-flight preparation, and a successful preparation is remembered for the rest of that server run.
+The support extension reports observed ChatGPT routes to the backend. Observation and Thread Sync binding do not grant automation ownership. Only an active registered RALPH thread can be prepared from an observation. Ordinary projects stay in Helium. Explicit reviewer creation and authorized thread messages retain their own automation lifecycle.
 
-The Chrome profile with **Thread preparation executor** enabled reuses a matching open conversation tab or creates one background tab when none exists. Preparation concurrency is still capped at three, but the tab itself is not tied to the preparation slot or Thread Sync handshake. The same tab remains available for title observation, RALPH, and later messaging while the thread is active.
+The Chrome profile with **Automation browser executor** enabled reuses a matching open conversation tab or creates one background tab when none exists. Preparation concurrency is still capped at three, but the tab itself is not tied to the preparation slot or Thread Sync handshake. The same tab remains available for title observation, RALPH, and later messaging while the thread is active.
 
-## Sub-agents
+## Review handoff
 
-`start_subagent` accepts only the child task. The parent must already have completed its one-time Thread Sync binding.
+When `THREAD_SYNC_ENABLED` is not `false`, the server exposes:
 
-The server resolves the parent from `openai/session`, chooses the configured **Sub-agent project**, or falls back to `https://chatgpt.com/`. It creates a local job under `<DATA_DIR>/subagents/` and gives the child the job ID and result path. The child prompt does not contain the parent URL.
+- `sync_current_thread` binds the current MCP session to its conversation once. Repeated calls reuse the binding.
+- `get_current_thread_url` finishes a pending binding without opening another widget.
+- `start_reviewer` starts one independent review for a synced parent and returns the exact ChatGPT review-thread URL. The implementer ends its turn immediately after handoff.
+- `list_reviewers` returns a snapshot of reviews owned by the current synced parent, including known review-thread URLs. It is not a polling mechanism.
+- `review_done` stores the reviewer's complete report. The service waits for reviewer idle before waking the parent with the report path.
+- `start_thread` creates a separate conversation only on an explicit user request. It adds no review job or callback.
+- `send_thread_message` sends an explicitly requested message to an existing conversation.
 
-A child performs its bounded task without delegation. Before `submit_subagent_result`, it binds its own conversation with Thread Sync if needed. That tool stores the report in the assigned local `.md` file and releases the job's slot. Sub-agents are not created automatically for engineering or review work; `start_subagent` is reserved for explicit user-requested delegation.
+Generic delegation tools are not exposed to ChatGPT. Reviewers reuse the existing local job machinery internally, but model-facing tools and the MCP App use reviewer terminology only. A parent can have one unfinished review, including startup and report delivery. Different user-started parents remain independent. Nested reviewers are rejected.
 
-The backend reserves at most two pending children per parent, including startups, and rejects nested delegation. Different root parents have independent limits. Capacity refusals name that parent's active jobs. Wait for result notices or continue independent work instead of polling or retrying. Reservations survive restart. Unconfirmed startup keeps its slot until the parent resolves the job. For a known child URL, `cancel_subagent` opens or reuses the thread, stops an active ChatGPT run, confirms the stop, closes the tab only when it is automation-owned, and then releases the slot. If stopping fails, the job stays pending.
+The Reviewer project setting chooses where reviews start, with chatgpt.com as the default. New report state lives under `<DATA_DIR>/reviews/`. On first open, legacy `<DATA_DIR>/subagents/` jobs and report files are copied forward and rewritten to the reviewer directory. The historical `subagentProjectUrl` setting key remains readable for compatibility.
 
-Ready results for the same parent are collected for one second and delivered in one notice. RALPH defers parents with pending children or results awaiting notification, and skips further continuation for finished or cancelled children. Recognized visible English ChatGPT rate-limit alerts, dialogs, or toasts trigger a 15-minute cooldown shared by browser message commands. Rate-limited and already queued sends remain queued. A sub-agent start requested during cooldown reserves its parent slot and waits in the same message queue. After cooldown the deferred backlog drains at least five seconds apart; normal sends are no longer paced once that backlog is empty. Stop-thread cancellation remains available during cooldown. Restart clears the cooldown. The delay does not represent the account's actual quota.
+Repeated identical review briefs reuse their saved job across restarts. Include the current PR head SHA in each brief so a review of changed code is a new assignment. An uncertain startup keeps its reservation. Inspect it in the extension before cancelling. Known reviewers are stopped before cancellation releases the reservation. Unknown startups require confirmation that any untracked reviewer has stopped. Late reports from cancelled jobs are rejected.
 
-The backend watches unfinished jobs. `start_subagent` waits until the child conversation has been prepared in the automation browser before returning normal startup success. If preparation fails after the child already exists, the job records the error and the tool surfaces it without creating another child. After a service restart, the registry marks a startup without a known child as interrupted so that the parent can resolve it. When result files contain data, the backend groups ready jobs by parent and sends one notice with their paths. The reports never travel through browser messaging. Failed parent wake-ups use exponential backoff and stop after five attempts; the terminal errors remain visible in `list_subagents`. The parent reads every listed file before continuing.
-
-The child is registered for RALPH immediately and stores its parent thread ID.
-
-`list_subagents` returns children created by the current synced parent and mounts the Sub-agent MCP App. The view includes each child's title, RALPH state, mode, result path, result state, recent activity, and errors.
+The popup shows pending startup, review progress, delivery failure, cancellation, and the exact review-thread URL. Use the URL or review title to open the reviewer. Use **Cancel review** to stop an abandoned reviewer. Use **Retry parent wake-up** after fixing an abandoned delivery. Completed reviews remain available under **Completed**. Parents waiting for review are labelled explicitly and cannot be resumed by **Check now**.
 
 ## Thread message delivery
 
@@ -81,7 +83,7 @@ The extension does not wait for an assistant turn before typing. It no longer us
 
 RALPH registration is independent from Thread Sync. The server stores the registry in `.data/ralph.json`.
 
-Normal project threads are retained only when their project is in the RALPH project allowlist. Manually registered threads and agent-created sub-agents remain registered regardless of that allowlist.
+Normal project threads are retained only when their project is in the RALPH project allowlist. Manually registered threads and agent-created reviewers remain registered regardless of that allowlist.
 
 The extension reports the readable ChatGPT title during route updates, sends, and inspections. The registry stores the title so the popup can display a useful name instead of a thread UUID.
 
@@ -106,15 +108,19 @@ Classification requests and results are written to `<DATA_DIR>/ralph-openai.log`
 
 Continuous mode must be selected explicitly per thread. It uses the same repeated inspection interval. When a settled idle continuous thread is due, RALPH skips the OpenAI completion classifier and sends a fixed continuation instruction that tells the agent to reread the current state and execute the next useful improvement, experiment, verification, or cleanup toward the existing goal.
 
-**Stop continuous** restores normal completion checks. Marking the thread complete stops its scheduled checks. The running agent has no tool that disables continuous mode itself. Ending its turn leaves continuous mode enabled, so RALPH can wake it again when the thread is idle and due.
+**Stop continuous** restores normal completion checks. Marking the thread complete stops its scheduled checks. An ordinary idle turn leaves continuous mode enabled. Explicit COMPLETE or BLOCKED checkpoints stop scheduled continuation.
 
 ## Initial thread preparation
 
-Thread preparation is independent from RALPH. The support extension reports every observed ChatGPT conversation route to `/chatgpt-support/threads/observe`.
+The observation endpoint checks the RALPH registry before scheduling preparation. Unregistered and completed threads return `ignored` without launching Chrome or queuing a command. Project registration remains subject to the RALPH allowlist. Explicit manual registrations and agent-created threads are retained.
 
-`ThreadPreparationCoordinator` treats browser presence separately from Thread Sync binding. For every observed conversation it deduplicates repeated observations by thread ID, caps active preparations at three, starts Chrome only when no recent preparation executor is connected, and queues one `prepare_thread` command unless that thread was already prepared during the server run. Already-bound threads are still prepared so they are available to RALPH without waiting for a fresh page load.
+`ThreadPreparationCoordinator` deduplicates eligible preparations by thread ID, caps active preparations at three, and remembers successful preparation during the server run. Binding alone never opens Chrome.
 
-The Chrome automation profile reuses an existing matching conversation tab or creates one background tab and remembers that it owns it. Thread Sync no longer closes the tab. RALPH inspection and existing-thread messages reuse the same tab, preventing a fresh ChatGPT page load every few minutes. Automation-owned tabs remain open while the RALPH thread is active and are cleaned up ten minutes after completion; a tab that was already open in the user's browser is reused but never closed by lifecycle cleanup. Helium can keep Thread Sync enabled to observe and report routes while **Thread preparation executor** remains off, so it never claims `threadPreparation`.
+External composer activity in Helium records a persistent revision for registered conversations when a turn starts or finishes. Automation commands carry that revision. Chrome refreshes a matching idle tab once per changed revision before using it. A running or loading tab defers the refresh. Route changes, title updates, and unchanged RALPH cycles do not reload the page. Automation commands execute in order within the browser, and overlapping pollers share execution of the same command.
+
+The Chrome automation profile reuses an existing matching conversation tab or creates one background tab and remembers that it owns it. Thread Sync no longer closes the tab. RALPH inspection and existing-thread messages reuse the same tab, preventing a fresh ChatGPT page load every few minutes. Automation-owned tabs remain open while the RALPH thread is active and are cleaned up ten minutes after completion; a tab that was already open in the user's browser is reused but never closed by lifecycle cleanup. Helium keeps Thread Sync enabled and **Automation browser executor** off. It claims inspections only for conversations already open there. It never creates an automation tab or sends a message.
+
+The executor also keeps a one-minute extension alarm while automation is enabled. This wakes the Manifest V3 service worker after Chrome suspends it, so the backend continues to see the existing Chrome executor instead of launching another Chrome instance. When the backend does have to launch Chrome, it now waits for the support extension to reconnect before considering the launch successful; a missing or disabled executor fails with an explicit configuration error instead of leaving `prepare_thread` queued until its long timeout.
 
 ## Checks
 
@@ -124,4 +130,19 @@ Run:
 pnpm thread-sync-test
 ```
 
-The test covers one-time thread binding, backend preparation deduplication, generated-extension configuration, local sub-agent result files, parent wake-ups, request-level send deduplication, parent-child registration, title extraction, single-shot browser sends, fixed settle timing, persistent-tab reuse and delayed cleanup, continuous RALPH behavior, project-scoped registration, settled-idle classification gating, recurring check timing, command claiming, and MCP App routing. It does not start a real browser or network listener.
+The test covers one-time thread binding, backend preparation deduplication, generated-extension configuration, local reviewer result files, parent wake-ups, request-level send deduplication, parent-child registration, title extraction, single-shot browser sends, fixed settle timing, persistent-tab reuse and delayed cleanup, continuous RALPH behavior, project-scoped registration, settled-idle classification gating, recurring check timing, command claiming, and MCP App routing. It does not start a real browser or network listener.
+
+
+## Engineering checkpoints and browser load
+
+See the [sequential engineering workflow](../README.md#sequential-engineering-workflow) for the skill sequence and RALPH status lines. CONTINUE and WAIT_CI bypass the classifier, including for short turns. WAIT_CI delays the next wake-up for five minutes. Pending reviewers suppress parent inspection and continuation. Report submission alone does not wake a parent until the reviewer is idle.
+
+New reviewers already have an automation-owned tab, so startup records preparation without another browser command. Route observations are coalesced for one minute per conversation. Working-browser observations can serve inspections of existing tabs. Matching tabs are reused, and only an actual external conversation revision can cause an idle automation tab to reload. Ordinary observation, title updates, and timer ticks do not reload it.
+
+## Existing tabs and error recovery
+
+Keep Thread Sync enabled in both Helium and Chrome. Each browser reports its open conversation tabs when polling. The server prefers an existing Helium tab for inspection, then an existing Chrome tab. If neither has the thread, Chrome opens one background tab. Tab inventories expire after 90 seconds without a poll. Message delivery still uses the Chrome automation executor.
+
+Helium observations do not schedule Chrome preparation or refresh for external revisions. The extension checks visible error notices before refreshing. Rate-limit notices start a ten-minute wait stored across worker restarts. Polling clicks Got It after that wait, then checks whether the notice cleared. Recognized timeout and network errors reload the existing tab at most once per ten minutes. A lost message response does not trigger another send.
+
+After updating, run `pnpm support:prepare`, restart the server, and reload the generated extension in both browsers. Reload already-open ChatGPT pages once so the updated content script replaces the previous extension context.

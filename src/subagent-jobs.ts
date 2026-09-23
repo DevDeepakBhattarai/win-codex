@@ -1,19 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { z } from "zod";
 
 const MAX_JOBS = 2_000;
 const RETAINED_NOTIFIED_JOBS = 1_000;
-export const MAX_ACTIVE_SUBAGENTS_PER_PARENT = 2;
-const INTERRUPTED_STARTUP_ERROR = "Child startup was interrupted by a service restart. Inspect the browser, stop any running child, then cancel this job if it is abandoned.";
+export const MAX_ACTIVE_SUBAGENTS_PER_PARENT = 1;
+const INTERRUPTED_STARTUP_ERROR = "Reviewer startup was interrupted by a service restart. Inspect the browser, stop any running reviewer, then cancel this job if it is abandoned.";
 
 export class SubagentAdmissionError extends Error {
   constructor(readonly reason: "capacity" | "nested", readonly activeJobIds: string[] = []) {
     super(reason === "nested"
-      ? "Only root conversations can start sub-agents. Complete your assigned work and submit its result."
-      : `This parent already has two active sub-agents. Active jobs: ${activeJobIds.join(", ")}. Continue independent work or wait for a result notification. Do not retry or poll for capacity.`);
+      ? "A reviewer conversation cannot start another reviewer. Complete this review and call review_done."
+      : `This implementer already has an unfinished review. Reviews: ${activeJobIds.join(", ")}. End this turn and wait for the completion notice. Do not retry or poll.`);
   }
 }
 
@@ -25,7 +25,9 @@ const subagentJobSchema = z.object({
   childConversationUrl: z.string().url().optional(),
   title: z.string().optional(),
   resultPath: z.string(),
+  taskFingerprint: z.string().optional(),
   state: z.enum(["pending", "complete", "cancelled"]),
+  resolution: z.enum(["cancelled", "completed_manually"]).optional(),
   cancelledAt: z.string().optional(),
   createdAt: z.string(),
   completedAt: z.string().optional(),
@@ -54,49 +56,77 @@ export class SubagentJobRegistry {
   ) {}
 
   static async open(dataDirectory: string) {
-    const resultDirectory = path.resolve(dataDirectory, "subagents");
+    const resultDirectory = path.resolve(dataDirectory, "reviews");
+    const legacyResultDirectory = path.resolve(dataDirectory, "subagents");
     await mkdir(resultDirectory, { recursive: true });
     const filePath = path.join(resultDirectory, "jobs.json");
+    const legacyFilePath = path.join(legacyResultDirectory, "jobs.json");
     let state: SubagentStore = { version: 1, jobs: [] };
-    let recoveredInterruptedStartup = false;
+    let needsPersist = false;
     try {
       state = subagentStoreSchema.parse(JSON.parse(await readFile(filePath, "utf8")));
-      for (const job of state.jobs) {
-        if (job.state === "pending" && !job.childThreadId && !job.preparationError) {
-          job.preparationError = INTERRUPTED_STARTUP_ERROR;
-          recoveredInterruptedStartup = true;
-        }
-      }
-      const unfinished = state.jobs.filter((job) => !job.notifiedAt);
-      const notified = state.jobs
-        .filter((job) => job.notifiedAt)
-        .sort((left, right) => Date.parse(right.notifiedAt ?? right.createdAt) - Date.parse(left.notifiedAt ?? left.createdAt))
-        .slice(0, RETAINED_NOTIFIED_JOBS);
-      state.jobs = [...unfinished, ...notified];
-      if (recoveredInterruptedStartup) {
-        const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
-        await writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-        await rename(temporaryPath, filePath);
-      }
     } catch (error) {
       if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      try {
+        state = subagentStoreSchema.parse(JSON.parse(await readFile(legacyFilePath, "utf8")));
+        needsPersist = true;
+      } catch (legacyError) {
+        if (!(legacyError instanceof Error && "code" in legacyError && legacyError.code === "ENOENT")) throw legacyError;
+      }
+    }
+
+    for (const job of state.jobs) {
+      const nextResultPath = path.join(resultDirectory, `${job.jobId}.md`);
+      if (path.resolve(job.resultPath) !== path.resolve(nextResultPath)) {
+        try {
+          await copyFile(job.resultPath, nextResultPath);
+        } catch (error) {
+          if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+        }
+        job.resultPath = nextResultPath;
+        needsPersist = true;
+      }
+      if (job.state === "pending" && !job.childThreadId && !job.preparationError) {
+        job.preparationError = INTERRUPTED_STARTUP_ERROR;
+        needsPersist = true;
+      }
+    }
+
+    const unfinished = state.jobs.filter((job) => !job.notifiedAt);
+    const notified = state.jobs
+      .filter((job) => job.notifiedAt)
+      .sort((left, right) => Date.parse(right.notifiedAt ?? right.createdAt) - Date.parse(left.notifiedAt ?? left.createdAt))
+      .slice(0, RETAINED_NOTIFIED_JOBS);
+    const retained = [...unfinished, ...notified];
+    if (retained.length !== state.jobs.length) needsPersist = true;
+    state.jobs = retained;
+
+    if (needsPersist) {
+      const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
+      await writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+      await rename(temporaryPath, filePath);
     }
     return new SubagentJobRegistry(filePath, resultDirectory, state);
   }
 
-  async create(parent: { threadId: string; conversationUrl: string }) {
+  async create(parent: { threadId: string; conversationUrl: string }, taskFingerprint?: string) {
     return await this.update((state) => {
       if (state.jobs.some((job) => job.childThreadId === parent.threadId)) {
         throw new SubagentAdmissionError("nested");
       }
-      const active = state.jobs.filter((job) => job.state === "pending" && job.parentThreadId === parent.threadId);
+      const existing = taskFingerprint && state.jobs.find((job) =>
+        job.parentThreadId === parent.threadId && job.taskFingerprint === taskFingerprint);
+      if (existing) return { ...existing, reused: true };
+      const active = state.jobs.filter((job) => job.parentThreadId === parent.threadId &&
+        (job.state === "pending" || (job.state === "complete" && !job.notifiedAt)));
       if (active.length >= MAX_ACTIVE_SUBAGENTS_PER_PARENT) {
         throw new SubagentAdmissionError("capacity", active.map((job) => job.jobId));
       }
-      if (state.jobs.length >= MAX_JOBS) throw new Error("Sub-agent job limit reached.");
+      if (state.jobs.length >= MAX_JOBS) throw new Error("Reviewer job limit reached.");
       const jobId = randomUUID();
       const job: SubagentJob = {
         jobId,
+        taskFingerprint,
         parentThreadId: parent.threadId,
         parentConversationUrl: parent.conversationUrl,
         resultPath: path.join(this.resultDirectory, `${jobId}.md`),
@@ -105,14 +135,14 @@ export class SubagentJobRegistry {
         notificationAttempts: 0,
       };
       state.jobs.push(job);
-      return { ...job };
+      return { ...job, reused: false };
     });
   }
 
   async assignChild(jobId: string, child: { threadId: string; conversationUrl: string; title?: string }) {
     return await this.update((state) => {
       const job = state.jobs.find((entry) => entry.jobId === jobId);
-      if (!job) throw new Error("Sub-agent job not found.");
+      if (!job) throw new Error("Reviewer job not found.");
       job.childThreadId = child.threadId;
       job.childConversationUrl = child.conversationUrl;
       if (child.title) job.title = child.title;
@@ -120,40 +150,54 @@ export class SubagentJobRegistry {
     });
   }
 
-  async discard(jobId: string) {
+  async resolve(jobId: string, resolution: "cancelled" | "completed_manually") {
     return await this.update((state) => {
       const job = state.jobs.find((entry) => entry.jobId === jobId);
-      state.jobs = state.jobs.filter((entry) => entry.jobId !== jobId);
-      return job ? { ...job } : undefined;
-    });
-  }
-
-  async cancel(jobId: string) {
-    return await this.update((state) => {
-      const job = state.jobs.find((entry) => entry.jobId === jobId);
-      if (!job) throw new Error("Sub-agent job not found.");
+      if (!job) throw new Error("Reviewer job not found.");
+      const resolvedAt = new Date().toISOString();
       if (job.state === "pending") {
         job.state = "cancelled";
-        job.cancelledAt = new Date().toISOString();
-        job.notifiedAt = job.cancelledAt;
+        job.cancelledAt = resolvedAt;
       }
+      job.resolution = resolution;
+      job.notifiedAt = job.notifiedAt ?? resolvedAt;
+      job.notificationAbandonedAt = undefined;
+      job.notificationError = undefined;
       return { ...job };
     });
   }
 
+  async cancel(jobId: string) {
+    return await this.resolve(jobId, "cancelled");
+  }
+
+  async isReviewer(threadId: string) {
+    await this.queue;
+    return this.state.jobs.some((job) => job.childThreadId === threadId);
+  }
+
+  async all() {
+    await this.queue;
+    return this.state.jobs.map((job) => ({ ...job }));
+  }
+
   async blocksContinuation(threadId: string) {
     await this.queue;
+    return this.blocksContinuationNow(threadId);
+  }
+
+  blocksContinuationNow(threadId: string) {
     return this.state.jobs.some((job) =>
       (job.childThreadId === threadId && job.state !== "pending") ||
       (job.parentThreadId === threadId && (job.state === "pending" ||
-        (job.state === "complete" && !job.notifiedAt && !job.notificationAbandonedAt))));
+        (job.state === "complete" && !job.notifiedAt))));
   }
 
   complete(jobId: string, result: string) {
     const operation = this.queue.then(async () => {
       const current = this.state.jobs.find((entry) => entry.jobId === jobId);
-      if (!current) throw new Error("Sub-agent job not found.");
-      if (current.state === "cancelled") throw new Error("This sub-agent job was cancelled. End this child task.");
+      if (!current) throw new Error("Reviewer job not found.");
+      if (current.state === "cancelled") throw new Error("This reviewer job was cancelled. End this review.");
       if (current.state === "complete") return { job: { ...current }, newlyCompleted: false };
 
       const temporaryResultPath = `${current.resultPath}.${randomUUID()}.tmp`;
@@ -162,7 +206,7 @@ export class SubagentJobRegistry {
 
       const next = structuredClone(this.state);
       const target = next.jobs.find((entry) => entry.jobId === jobId);
-      if (!target) throw new Error("Sub-agent job not found.");
+      if (!target) throw new Error("Reviewer job not found.");
       target.state = "complete";
       target.completedAt = new Date().toISOString();
       target.preparationError = undefined;
@@ -189,7 +233,7 @@ export class SubagentJobRegistry {
   async recordNotificationFailure(jobId: string, error: string, maxAttempts: number) {
     return await this.update((state) => {
       const job = state.jobs.find((entry) => entry.jobId === jobId);
-      if (!job) throw new Error("Sub-agent job not found.");
+      if (!job) throw new Error("Reviewer job not found.");
       job.notificationAttempts += 1;
       job.notificationError = error.slice(0, 1_000);
       if (job.notificationAttempts >= maxAttempts) job.notificationAbandonedAt = new Date().toISOString();
@@ -197,10 +241,20 @@ export class SubagentJobRegistry {
     });
   }
 
+  async retryNotification(jobId: string) {
+    return this.update((state) => {
+      const job = state.jobs.find((entry) => entry.jobId === jobId);
+      if (!job || job.state !== "complete" || job.notifiedAt) throw new Error("No undelivered review report for this job.");
+      job.notificationAttempts = 0;
+      job.notificationAbandonedAt = undefined;
+      job.notificationError = undefined;
+    });
+  }
+
   async recordPreparationFailure(jobId: string, error: string) {
     return await this.update((state) => {
       const job = state.jobs.find((entry) => entry.jobId === jobId);
-      if (!job) throw new Error("Sub-agent job not found.");
+      if (!job) throw new Error("Reviewer job not found.");
       job.preparationError = error.slice(0, 1_000);
       return { ...job };
     });
@@ -215,20 +269,8 @@ export class SubagentJobRegistry {
   async jobsNeedingNotification() {
     await this.queue;
     return this.state.jobs
-      .filter((entry) => entry.state !== "cancelled" && !entry.notifiedAt && !entry.notificationAbandonedAt)
+      .filter((entry) => entry.state === "complete" && !entry.notifiedAt && !entry.notificationAbandonedAt)
       .map((entry) => ({ ...entry }));
-  }
-
-  async markFileComplete(jobId: string) {
-    return await this.update((state) => {
-      const job = state.jobs.find((entry) => entry.jobId === jobId);
-      if (!job) throw new Error("Sub-agent job not found.");
-      if (job.state === "pending") {
-        job.state = "complete";
-        job.completedAt = new Date().toISOString();
-      }
-      return { ...job };
-    });
   }
 
   async forParent(parentThreadId: string) {

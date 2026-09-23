@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.4.3";
+  const contentScriptVersion = "1.6.2";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -10,10 +10,12 @@
   const requestType = "local-codex-thread-sync/bind-v1";
   const responseType = "local-codex-thread-sync/result-v1";
   const automationType = "local-codex-support/automation-v1";
+  const cancelAutomationType = "local-codex-support/cancel-automation-v1";
   const reactivateRalphType = "local-codex-support/ralph-reactivate-v1";
   const titleObservedType = "local-codex-support/title-observed-v1";
   const sourceRoutes = new WeakMap();
   const pending = new Set();
+  const activeAutomations = new Map();
   let route = location.pathname;
   let generation = 0;
 
@@ -99,60 +101,141 @@
   installRalphComposerObserver();
 
   extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === cancelAutomationType && typeof message.commandId === "string") {
+      const cancellation = activeAutomations.get(message.commandId);
+      if (cancellation) cancelAutomation(cancellation);
+      sendResponse({ ok: true, active: Boolean(cancellation) });
+      return;
+    }
     if (message?.type !== automationType || !message.command) return;
-    void runAutomation(message.command).then(
+    const cancellation = createAutomationCancellation();
+    if (typeof message.command.id === "string") activeAutomations.set(message.command.id, cancellation);
+    const control = showAutomationControl(message.command, cancellation);
+    void runAutomation(message.command, cancellation).then(
       (result) => sendResponse({ ok: true, result }),
       (error) => sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) }),
-    );
+    ).finally(() => {
+      if (typeof message.command.id === "string" && activeAutomations.get(message.command.id) === cancellation) {
+        activeAutomations.delete(message.command.id);
+      }
+      control?.remove();
+    });
     return true;
   });
 
-  async function runAutomation(command) {
-    if (command.kind === "stop_thread") return await stopThread();
+  function createAutomationCancellation() {
+    return { cancelled: false, listeners: new Set() };
+  }
+
+  function cancelAutomation(cancellation) {
+    if (cancellation.cancelled) return;
+    cancellation.cancelled = true;
+    for (const listener of [...cancellation.listeners]) listener();
+    cancellation.listeners.clear();
+  }
+
+  function assertAutomationActive(cancellation) {
+    if (cancellation?.cancelled) throw new Error("Local Codex automation stopped by user.");
+  }
+
+  function automationLabel(command) {
+    if (typeof command.operationLabel === "string" && command.operationLabel.trim()) return command.operationLabel.trim();
+    if (command.kind === "send_message") return "Send ChatGPT message";
+    if (command.kind === "inspect_thread") return "Inspect ChatGPT thread";
+    if (command.kind === "stop_thread") return "Stop ChatGPT thread";
+    return "ChatGPT automation";
+  }
+
+  function showAutomationControl(command, cancellation) {
+    if (!["send_message", "inspect_thread", "stop_thread"].includes(command.kind) ||
+        !document?.createElement || !document.documentElement?.append) return null;
+    document.getElementById?.("__local-codex-support-automation")?.remove();
+    const host = document.createElement("div");
+    host.id = "__local-codex-support-automation";
+    host.dataset.commandId = command.id ?? "";
+    host.setAttribute("role", "status");
+    host.style.cssText = "all:initial;position:fixed;right:16px;bottom:16px;z-index:2147483647;display:flex;align-items:center;gap:10px;max-width:420px;padding:10px 12px;border:1px solid rgba(120,120,120,.45);border-radius:10px;background:#18181b;color:#f4f4f5;box-shadow:0 8px 28px rgba(0,0,0,.35);font:12px/1.35 system-ui,-apple-system,Segoe UI,sans-serif;pointer-events:auto";
+    const text = document.createElement("span");
+    text.textContent = `Local Codex: ${automationLabel(command)}`;
+    text.style.cssText = "all:initial;color:#f4f4f5;font:600 12px/1.35 system-ui,-apple-system,Segoe UI,sans-serif";
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.textContent = "Stop";
+    stop.style.cssText = "all:initial;cursor:pointer;padding:5px 9px;border-radius:6px;background:#ef4444;color:white;font:600 12px/1.2 system-ui,-apple-system,Segoe UI,sans-serif";
+    stop.addEventListener("click", () => {
+      stop.textContent = "Stopping...";
+      stop.disabled = true;
+      cancelAutomation(cancellation);
+    });
+    host.append(text, stop);
+    document.documentElement.append(host);
+    return host;
+  }
+
+  async function runAutomation(command, cancellation) {
+    if (command.kind === "page_health") return pageHealth();
+    if (command.kind === "dismiss_rate_limit") {
+      const notice = rateLimitNotice();
+      const button = notice && [...notice.querySelectorAll('button')].find(element =>
+        /^got it$/i.test((element.textContent ?? "").trim()) && isActionableButton(element));
+      if (button) button.click();
+      return { status: button ? "dismissed" : "not_found" };
+    }
+    assertAutomationActive(cancellation);
+    if (command.kind === "stop_thread") return await stopThread(cancellation);
     assertNotRateLimited();
-    if (command.kind === "inspect_thread") return await inspectThread();
-    if (command.kind === "send_message") return await sendMessage(command.message);
+    if (command.kind === "inspect_thread") {
+      const url = conversationUrl();
+      const result = await inspectThread(cancellation);
+      assertAutomationActive(cancellation);
+      if (url !== conversationUrl()) throw new Error("The observed thread navigated away during inspection.");
+      return result;
+    }
+    if (command.kind === "send_message") return await sendMessage(command.message, cancellation);
     throw new Error("Unsupported ChatGPT support command.");
   }
 
-  async function stopThread() {
-    const ready = await waitForCancellationState(30_000);
+  async function stopThread(cancellation) {
+    const ready = await waitForCancellationState(30_000, cancellation);
     if (!ready) throw new Error("ChatGPT child state did not become ready for cancellation.");
 
     const currentUrl = conversationUrl();
     if (!currentUrl) throw new Error("ChatGPT cancellation is not on a saved conversation.");
     if (!ready.stopButton) return { status: "idle", conversationUrl: currentUrl };
 
+    assertAutomationActive(cancellation);
     ready.stopButton.click();
-    const stopped = await waitForStableStop(30_000);
+    const stopped = await waitForStableStop(30_000, cancellation);
     if (!stopped) throw new Error("ChatGPT did not confirm that the child run stopped.");
     return { status: "stopped", conversationUrl: conversationUrl() ?? currentUrl };
   }
 
-  async function waitForCancellationState(timeoutMs) {
+  async function waitForCancellationState(timeoutMs, cancellation) {
     const deadline = Date.now() + timeoutMs;
     let idleSince = 0;
     while (Date.now() < deadline) {
+      assertAutomationActive(cancellation);
       const ready = getComposer();
       const hasUserTurn = Boolean(document.querySelector('section[data-turn="user"]'));
       if (!ready || document.readyState === "loading" || !hasUserTurn) {
         idleSince = 0;
-        await sleep(100);
+        await sleep(100, cancellation);
         continue;
       }
       const stopButton = ready.composer.querySelector('button[data-testid="stop-button"]');
       if (stopButton) return { ...ready, stopButton };
       if (!idleSince) idleSince = Date.now();
       if (Date.now() - idleSince >= 1_500) return { ...ready, stopButton: null };
-      await sleep(100);
+      await sleep(100, cancellation);
     }
     return null;
   }
 
-  async function waitForStableStop(timeoutMs) {
+  async function waitForStableStop(timeoutMs, cancellation) {
     const deadline = Date.now() + timeoutMs;
     let stoppedSince = 0;
     while (Date.now() < deadline) {
+      assertAutomationActive(cancellation);
       const ready = getComposer();
       const stopButton = ready?.composer.querySelector('button[data-testid="stop-button"]');
       if (!ready || stopButton) {
@@ -161,20 +244,20 @@
         if (!stoppedSince) stoppedSince = Date.now();
         if (Date.now() - stoppedSince >= 500) return true;
       }
-      await sleep(100);
+      await sleep(100, cancellation);
     }
     return false;
   }
 
-  async function inspectThread() {
+  async function inspectThread(cancellation) {
     const title = threadTitle();
-    const ready = await waitForConversationReady(5 * 60_000);
+    const ready = await waitForConversationReady(5 * 60_000, cancellation);
     if (!ready) return { status: "loading", ...(title ? { title } : {}) };
 
     const stopButton = ready.composer.querySelector('button[data-testid="stop-button"]');
     if (stopButton) return { status: "running", ...(title ? { title } : {}) };
 
-    const settled = await waitForStableTurns();
+    const settled = await waitForStableTurns(cancellation);
     if (!settled) return { status: "loading", ...(title ? { title } : {}) };
     if (isRunning()) return { status: "running", ...(title ? { title } : {}) };
     const workedSeconds = getWorkedDurationSeconds(await getRalphMinWorkedSeconds());
@@ -250,7 +333,7 @@
     };
   }
 
-  async function sendMessage(message) {
+  async function sendMessage(message, cancellation) {
     if (typeof message !== "string" || !message.trim()) throw new Error("A non-empty ChatGPT message is required.");
 
     const existingConversationUrl = conversationUrl();
@@ -258,18 +341,20 @@
       const loadedUserTurn = await waitFor(
         () => document.querySelector('section[data-turn="user"] [data-message-author-role="user"]'),
         SEND_READY_TIMEOUT_MS,
+        cancellation,
       );
       if (!loadedUserTurn) throw new Error("The existing ChatGPT thread did not load a user message.");
     }
 
-    await sleep(SEND_SETTLE_MS);
+    await sleep(SEND_SETTLE_MS, cancellation);
 
-    const ready = await waitForComposer(SEND_READY_TIMEOUT_MS);
+    const ready = await waitForComposer(SEND_READY_TIMEOUT_MS, cancellation);
     if (!ready) throw new Error("ChatGPT composer did not become available.");
     assertNotRateLimited();
+    assertAutomationActive(cancellation);
     insertMessage(ready.editor, message);
 
-    await sleep(SEND_SETTLE_MS);
+    await sleep(SEND_SETTLE_MS, cancellation);
 
     const current = await waitFor(() => {
       assertNotRateLimited();
@@ -277,28 +362,41 @@
       if (!composer) return null;
       const button = getSendButton(composer.composer);
       return isActionableButton(button) ? { ...composer, button } : null;
-    }, SEND_READY_TIMEOUT_MS);
+    }, SEND_READY_TIMEOUT_MS, cancellation);
     if (!current) throw new Error("ChatGPT send button did not become actionable.");
 
+    assertAutomationActive(cancellation);
     current.button.click();
-    await sleep(SEND_SETTLE_MS);
+    await sleep(SEND_SETTLE_MS, cancellation);
     assertNotRateLimited();
 
     const savedUrl = existingConversationUrl ?? await waitFor(() => {
       assertNotRateLimited();
       return conversationUrl();
-    }, SEND_NAVIGATION_TIMEOUT_MS);
+    }, SEND_NAVIGATION_TIMEOUT_MS, cancellation);
     if (!savedUrl) throw new Error("ChatGPT did not navigate to the newly created conversation after sending.");
 
     const title = threadTitle();
     return { status: "sent", conversationUrl: savedUrl, ...(title ? { title } : {}) };
   }
 
-  function assertNotRateLimited() {
+  function rateLimitNotice() {
     // Read visible provider notices, never conversation content that may quote an error.
     const notices = [...document.querySelectorAll('[role="alert"], [role="dialog"], [data-testid="toast"]')];
-    const notice = notices.find((element) => element.getClientRects?.().length &&
+    return notices.find((element) => element.getClientRects?.().length &&
       /too many (?:messages|requests)|rate limit|message limit|usage limit|you(?:'ve| have) reached.{0,60}limit/i.test(element.textContent ?? ""));
+  }
+
+  function pageHealth() {
+    if (rateLimitNotice()) return { status: "rate_limited" };
+    const notices = [...document.querySelectorAll('[role="alert"], [role="dialog"], [data-testid="toast"]')];
+    const failed = notices.some(element => element.getClientRects?.().length &&
+      /request timed out|connection timed out|something went wrong|unable to load conversation|network error/i.test(element.textContent ?? ""));
+    return { status: failed ? "recoverable_error" : "ok" };
+  }
+
+  function assertNotRateLimited() {
+    const notice = rateLimitNotice();
     if (notice) throw new Error(`CHATGPT_RATE_LIMITED: ${(notice.textContent ?? "").trim().slice(0, 500)}`);
   }
 
@@ -400,12 +498,13 @@
         : getSendButton(composer) ? "send" : null;
       if (!action) return;
 
-      if (action === "stop" && previousComposerAction === "send" &&
-          currentUrl?.startsWith("https://chatgpt.com/g/")) {
+      if (currentUrl && ((action === "stop" && previousComposerAction === "send") ||
+          (action === "send" && previousComposerAction === "stop"))) {
         try {
           const delivery = extensionApi.runtime.sendMessage({
             type: reactivateRalphType,
             conversationUrl: currentUrl,
+            ...(action === "send" ? { completed: true } : {}),
           });
           void Promise.resolve(delivery).catch(() => undefined);
         } catch {
@@ -458,27 +557,28 @@
   }
 
 
-  async function waitForComposer(timeoutMs) {
-    return await waitFor(() => getComposer(), timeoutMs);
+  async function waitForComposer(timeoutMs, cancellation) {
+    return await waitFor(() => getComposer(), timeoutMs, cancellation);
   }
 
-  async function waitForConversationReady(timeoutMs) {
+  async function waitForConversationReady(timeoutMs, cancellation) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const ready = await waitForComposer(Math.min(1_000, deadline - Date.now()));
+      assertAutomationActive(cancellation);
+      const ready = await waitForComposer(Math.min(1_000, deadline - Date.now()), cancellation);
       if (!ready) continue;
       if (document.readyState === "loading") {
-        await sleep(100);
+        await sleep(100, cancellation);
         continue;
       }
       if (ready.composer.querySelector('button[data-testid="stop-button"]')) return ready;
       if (document.querySelector('section[data-turn="user"]')) return ready;
-      await sleep(100);
+      await sleep(100, cancellation);
     }
     return null;
   }
 
-  async function waitForStableTurns() {
+  async function waitForStableTurns(cancellation) {
     const settled = await waitForAllSettled(() => {
       if (isRunning()) return { value: true, signature: "running", quietMs: 0 };
 
@@ -496,15 +596,16 @@
         signature,
         quietMs: hasAssistantAfterLastUser ? THREAD_ASSISTANT_SETTLE_MS : THREAD_UNCERTAIN_SETTLE_MS,
       };
-    }, THREAD_SETTLE_TIMEOUT_MS);
+    }, THREAD_SETTLE_TIMEOUT_MS, cancellation);
     return Boolean(settled);
   }
 
-  async function waitForAllSettled(sample, timeoutMs) {
+  async function waitForAllSettled(sample, timeoutMs, cancellation) {
     const deadline = timeoutMs === undefined ? Infinity : Date.now() + timeoutMs;
     let previousSignature = null;
     let stableSince = 0;
     while (Date.now() < deadline) {
+      assertAutomationActive(cancellation);
       assertNotRateLimited();
       const state = sample();
       if (!state) {
@@ -518,7 +619,7 @@
       } else if (Date.now() - stableSince >= state.quietMs) {
         return state.value;
       }
-      await sleep(100);
+      await sleep(100, cancellation);
     }
     return null;
   }
@@ -571,18 +672,32 @@
     return text;
   }
 
-  async function waitFor(getElement, timeoutMs) {
+  async function waitFor(getElement, timeoutMs, cancellation) {
     const deadline = timeoutMs === undefined ? Infinity : Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+      assertAutomationActive(cancellation);
       assertNotRateLimited();
       const value = getElement();
       if (value) return value;
-      await sleep(50);
+      await sleep(50, cancellation);
     }
     return null;
   }
 
-  function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  function sleep(ms, cancellation) {
+    assertAutomationActive(cancellation);
+    if (!cancellation) return new Promise((resolve) => setTimeout(resolve, ms));
+    return new Promise((resolve, reject) => {
+      const onCancel = () => {
+        clearTimeout(timer);
+        cancellation.listeners.delete(onCancel);
+        reject(new Error("Local Codex automation stopped by user."));
+      };
+      const timer = setTimeout(() => {
+        cancellation.listeners.delete(onCancel);
+        resolve();
+      }, ms);
+      cancellation.listeners.add(onCancel);
+    });
   }
 })();
