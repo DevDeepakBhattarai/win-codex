@@ -335,9 +335,8 @@ async function waitForTabComplete(tabId, timeoutMs = 5 * 60_000) {
 }
 
 async function sendAutomationMessage(tabId, command) {
-  // Establish the receiver before dispatching a side-effecting command. Never retry the
-  // command itself: tabs.sendMessage can reject after the page already handled it, for
-  // example when an extension reload or tab teardown closes the response channel.
+  // Establish the receiver before dispatching a side-effecting command. A lost response
+  // does not prove that the page failed to send the message.
   await extensionApi.scripting.executeScript({ target: { tabId }, files: ["content-script.js"] });
   return await extensionApi.tabs.sendMessage(tabId, { type: AUTOMATION_MESSAGE, command });
 }
@@ -419,12 +418,27 @@ async function executeCommand(command, browserId) {
   let tabId;
   let created = false;
   let keepCreatedTab = false;
+  let refreshed = false;
 
   try {
     const acquired = await acquireAutomationTab(targetUrl, createsNewThread);
     tabId = acquired.tab.id;
     created = acquired.created;
-    const loadedTab = await waitForTabComplete(tabId);
+    const refreshTab = async () => {
+      refreshed = true;
+      await extensionApi.tabs.reload(tabId);
+      const tab = await waitForTabComplete(tabId);
+      if (typeof tab.url !== "string" || !automationTargetMatches(tab.url, targetUrl)) {
+        throw new Error("ChatGPT automation was redirected away from the requested target after refresh.");
+      }
+      return tab;
+    };
+    let loadedTab;
+    try {
+      loadedTab = await waitForTabComplete(tabId);
+    } catch {
+      loadedTab = await refreshTab();
+    }
     if (typeof loadedTab.url !== "string" || !automationTargetMatches(loadedTab.url, targetUrl)) {
       throw new Error("ChatGPT automation was redirected away from the requested target.");
     }
@@ -446,8 +460,25 @@ async function executeCommand(command, browserId) {
       return;
     }
 
-    const response = await keepWorkerAliveUntil(sendAutomationMessageWithTimeout(tabId, command));
-    if (!response?.ok) throw new Error(response?.error || "ChatGPT page automation failed.");
+    const runPageCommand = async () => {
+      const response = await keepWorkerAliveUntil(sendAutomationMessageWithTimeout(tabId, command));
+      if (response?.ok) return response;
+      const error = new Error(response?.error || "ChatGPT page automation failed.");
+      error.retryable = response?.retryable === true;
+      throw error;
+    };
+    let response;
+    try {
+      response = await runPageCommand();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (refreshed || message.startsWith("CHATGPT_RATE_LIMITED:")) throw error;
+      await refreshTab();
+      if (command.kind !== "inspect_thread" && !(command.kind === "send_message" && error?.retryable === true)) {
+        throw error;
+      }
+      response = await runPageCommand();
+    }
 
     if (command.kind === "send_message") {
       const savedUrl = conversationUrl(response.result?.conversationUrl);

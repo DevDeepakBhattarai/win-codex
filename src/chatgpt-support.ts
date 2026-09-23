@@ -359,11 +359,13 @@ export class SupportCommandBus {
     if (pending.claimedBy !== result.browserId) throw new Error("Support command belongs to another browser instance.");
     if (pending.command.kind !== result.kind) throw new Error("Support command result kind does not match the request.");
 
-    if (!result.ok && result.kind === "send_message" && result.error.startsWith("CHATGPT_RATE_LIMITED:")) {
+    if (!result.ok && result.error.startsWith("CHATGPT_RATE_LIMITED:")) {
       this.cooldownUntil = Date.now() + this.messageCooldownMs;
       this.messagePacingActive = true;
       this.nextMessageClaimAt = Math.max(this.nextMessageClaimAt, this.cooldownUntil);
       console.warn(`[chatgpt-support] message_cooldown until=${new Date(this.cooldownUntil).toISOString()}`);
+    }
+    if (!result.ok && result.kind === "send_message" && result.error.startsWith("CHATGPT_RATE_LIMITED:")) {
       const browser = this.browsers.get(result.browserId);
       if (browser) browser.lastSeenAt = Date.now();
       pending.claimedBy = undefined;

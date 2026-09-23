@@ -59,7 +59,7 @@ This keeps transport retry handling below the tool contract instead of requiring
 
 ### Use one conservative browser send path
 
-The support extension uses one single-shot send procedure for new child prompts and messages to existing threads:
+The support extension uses one send procedure for new child prompts and messages to existing threads:
 
 1. Existing conversations wait for a loaded user turn.
 2. The page settles for five seconds.
@@ -68,7 +68,7 @@ The support extension uses one single-shot send procedure for new child prompts 
 5. The extension waits for an actionable send button and clicks it once.
 6. New conversations wait for their saved `/c/...` URL.
 
-The extension does not wait for an assistant turn before typing. It does not use DOM-stability signatures or post-send acknowledgement heuristics, and it does not automatically retry a click after an uncertain result.
+The extension does not wait for an assistant turn before typing. It does not use DOM-stability signatures or post-send acknowledgement heuristics. If a page error occurs before the send click, it refreshes the tab once and retries. An uncertain result after the click refreshes the tab but never repeats the click.
 
 ### Keep RALPH state separate from thread binding
 
@@ -85,7 +85,7 @@ Normal mode repeatedly inspects active threads. The default check interval is 18
 
 Continuous mode is operator-controlled. The agent has no MCP action that disables it. Ending a turn does not change the mode. The popup can switch the thread back to normal mode with **Stop continuous** or stop RALPH checks with **Mark complete**.
 
-Both modes defer parents while children are pending or results await notification. Finished and cancelled child jobs suppress further continuation. Ready files for a parent share a one-second collection window and one wake-up. Visible recognized ChatGPT rate-limit notices trigger a shared 15-minute message cooldown. The failed rate-limited send and other queued sends remain queued. A sub-agent start requested during cooldown also waits in that queue after reserving its parent slot. After cooldown the deferred backlog is claimed at least five seconds apart, and pacing turns off when the backlog is empty. Stop-thread commands bypass message cooldown. Cooldown state is not persisted across service restarts.
+Both modes defer parents while children are pending or results await notification. Finished and cancelled child jobs suppress further continuation. Ready files for a parent share a one-second collection window and one wake-up. Inspection timeouts and visible page errors refresh the tab once, then retry inspection. Visible recognized ChatGPT rate-limit notices during inspection or sending trigger a shared 15-minute message cooldown without refreshing the tab. The failed rate-limited send and other queued sends remain queued. A sub-agent start requested during cooldown also waits in that queue after reserving its parent slot. After cooldown the deferred backlog is claimed at least five seconds apart, and pacing turns off when the backlog is empty. Stop-thread commands bypass message cooldown. Cooldown state is not persisted across service restarts.
 
 ### Claim automation commands atomically
 
@@ -97,7 +97,7 @@ The parent does not sync merely because a conversation started. Before `start_su
 
 Sub-agents return reports through local files. The browser is used only to create child conversations and to wake parents after a result becomes available. Transport retries remain an implementation concern rather than part of the model-facing tool API.
 
-Browser delivery favors duplicate prevention over speculative recovery. A prompt is inserted once and the send button is clicked once after explicit settle periods.
+Browser delivery retries a prompt after one refresh only when the page confirms that the send button was not clicked. An uncertain send remains an error for inspection instead of risking a duplicate prompt.
 
 Automation-owned conversation tabs are persistent working state. Creation, preparation, Thread Sync, title capture, RALPH inspection, and existing-thread messaging reuse the same tab. Active threads are never closed by lifecycle cleanup. Ten minutes after a RALPH thread becomes complete, the backend requests cleanup; only tabs recorded as automation-owned are closed, while pre-existing user tabs are left alone. Chrome launches request a new tab so an already-running profile is reused instead of intentionally creating a new window.
 

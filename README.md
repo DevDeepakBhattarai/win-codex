@@ -218,6 +218,8 @@ Result notifications use a one-second collection window and combine ready files 
 
 Recognized visible ChatGPT rate-limit notices start a 15-minute message cooldown in the running service. The rate-limited send and other queued sends stay queued instead of being discarded. A `start_subagent` call made during cooldown also reserves its parent slot and waits for its child-start message to drain instead of failing only because of the cooldown. After cooldown, the deferred message backlog is claimed at least five seconds apart, then normal unpaced sending resumes. Stop-thread commands are not blocked by the message cooldown. The cooldown is a conservative retry delay, not a claim about the account's quota, and resets when the service restarts. Detection currently covers English rate-limit notices in visible alerts, dialogs, and toasts.
 
+For other visible page errors and automation timeouts, the extension refreshes the affected tab once. It retries an inspection after refresh. It retries a send only when the page confirms that the send button was not clicked; a lost response after the click remains an error to avoid posting the message twice.
+
 `start_subagent` and `send_thread_message` keep transport idempotency internal. The server deduplicates retries of the same MCP request by tool, request identity, session, and payload fingerprint. `send_thread_message` also fingerprints its normalized target. A new logical tool call remains a new send or a new child.
 
 ## RALPH
