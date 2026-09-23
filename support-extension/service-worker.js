@@ -33,7 +33,6 @@ const reportedRalphConversations = new Set();
 const observingConversations = new Map();
 const AUTOMATION_THREAD_TABS_KEY = "automationThreadTabsV1";
 const RATE_LIMIT_WAIT_MS = 10 * 60_000;
-const ERROR_RELOAD_INTERVAL_MS = 10 * 60_000;
 
 function validateLoopbackEndpoint(value, pathname) {
   const endpoint = new URL(value);
@@ -571,10 +570,7 @@ async function reloadPageAfterFailure(tabId, targetUrl) {
   if (state.rateLimitedAt && now - state.rateLimitedAt < RATE_LIMIT_WAIT_MS) {
     throw new Error("CHATGPT_RATE_LIMITED: Waiting ten minutes before dismissing the provider notice.");
   }
-  if (state.reloadedAt && now - state.reloadedAt < ERROR_RELOAD_INTERVAL_MS) {
-    throw new Error("ChatGPT recovery is waiting before another reload.");
-  }
-  await extensionApi.storage.local.set({ [key]: { ...state, reloadedAt: now } });
+  if (state.rateLimitedAt) await extensionApi.storage.local.set({ [key]: {} });
   await extensionApi.tabs.reload(tabId);
   const tab = await waitForTabComplete(tabId);
   if (targetUrl && (typeof tab.url !== "string" || !automationTargetMatches(tab.url, targetUrl))) {
@@ -620,7 +616,7 @@ async function recoverPageOnce(tabId) {
     await reloadPageAfterFailure(tabId);
     return true;
   }
-  if (state.rateLimitedAt) await extensionApi.storage.local.set({ [key]: { reloadedAt: state.reloadedAt } });
+  if (state.rateLimitedAt) await extensionApi.storage.local.set({ [key]: {} });
   return false;
 }
 
