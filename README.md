@@ -154,6 +154,10 @@ The hardening script restricts access to `.env` and `.data`. On Windows it appli
 
 ### Build and start
 
+On Windows, run `pnpm connector:install-startup` once to start the complete MCP server automatically when you sign in. The Startup shortcut runs the same `dist/server.js` as `pnpm start`. It owns the MCP listener on port 6000, the browser bridge on 6001, and the support bridge on 6002. Cloudflare Tunnel is a separate Windows service. Run `pnpm connector:status` to check the local listeners and public reachability. When the startup instance is running, there is no need to run `pnpm start` in a terminal; a second copy cannot bind the same ports. The shortcut is named `Local Computer Control MCP.lnk`, and the watchdog logs to `.data/connector-startup/`.
+
+For a manual foreground run when no startup instance is running:
+
 ```powershell
 pnpm build
 pnpm start
