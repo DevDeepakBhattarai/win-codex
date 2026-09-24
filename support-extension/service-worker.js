@@ -33,7 +33,6 @@ const reportedRalphConversations = new Set();
 const observingConversations = new Map();
 const AUTOMATION_THREAD_TABS_KEY = "automationThreadTabsV1";
 const RATE_LIMIT_WAIT_MS = 10 * 60_000;
-const ERROR_RELOAD_INTERVAL_MS = 10 * 60_000;
 
 function validateLoopbackEndpoint(value, pathname) {
   const endpoint = new URL(value);
@@ -337,9 +336,8 @@ async function waitForTabComplete(tabId, timeoutMs = 5 * 60_000) {
 }
 
 async function sendAutomationMessage(tabId, command) {
-  // Establish the receiver before dispatching a side-effecting command. Never retry the
-  // command itself: tabs.sendMessage can reject after the page already handled it, for
-  // example when an extension reload or tab teardown closes the response channel.
+  // Establish the receiver before dispatching a side-effecting command. A lost response
+  // does not prove that the page failed to send the message.
   await extensionApi.scripting.executeScript({ target: { tabId }, files: ["content-script.js"] });
   return await extensionApi.tabs.sendMessage(tabId, { type: AUTOMATION_MESSAGE, command });
 }
@@ -426,6 +424,7 @@ async function executeCommandOnce(command, browserId) {
   let created = false;
   let keepCreatedTab = false;
   let automationStarted = false;
+  let refreshed = false;
 
   try {
     const settings = await getSettings();
@@ -439,7 +438,13 @@ async function executeCommandOnce(command, browserId) {
     if (!acquired) throw new Error("The observed thread tab has closed or navigated away.");
     tabId = acquired.tab.id;
     created = acquired.created === true;
-    const loadedTab = await waitForTabComplete(tabId);
+    let loadedTab;
+    try {
+      loadedTab = await waitForTabComplete(tabId);
+    } catch {
+      loadedTab = await reloadPageAfterFailure(tabId, targetUrl);
+      refreshed = true;
+    }
     if (typeof loadedTab.url !== "string" || !automationTargetMatches(loadedTab.url, targetUrl)) {
       throw new Error("ChatGPT automation was redirected away from the requested target.");
     }
@@ -450,7 +455,16 @@ async function executeCommandOnce(command, browserId) {
       keepCreatedTab = true;
     }
 
-    if (command.kind !== "stop_thread") await recoverPage(tabId);
+    if (command.kind !== "stop_thread") {
+      try {
+        refreshed = await recoverPage(tabId) || refreshed;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (refreshed || /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(message)) throw error;
+        await reloadPageAfterFailure(tabId, targetUrl);
+        refreshed = true;
+      }
+    }
 
     if (command.kind === "prepare_thread") {
       await postResult({
@@ -463,9 +477,27 @@ async function executeCommandOnce(command, browserId) {
       return;
     }
 
+    const runPageCommand = async () => {
+      const response = await sendAutomationMessageWithTimeout(tabId, command);
+      if (response?.ok) return response;
+      const error = new Error(response?.error || "ChatGPT page automation failed.");
+      error.retryable = response?.retryable === true;
+      throw error;
+    };
     automationStarted = true;
-    const response = await sendAutomationMessageWithTimeout(tabId, command);
-    if (!response?.ok) throw new Error(response?.error || "ChatGPT page automation failed.");
+    let response;
+    try {
+      response = await runPageCommand();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (refreshed || /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(message)) throw error;
+      await reloadPageAfterFailure(tabId, targetUrl);
+      refreshed = true;
+      if (command.kind !== "inspect_thread" && !(command.kind === "send_message" && error?.retryable === true)) {
+        throw error;
+      }
+      response = await runPageCommand();
+    }
 
     if (command.kind === "send_message") {
       const savedUrl = conversationUrl(response.result?.conversationUrl);
@@ -530,6 +562,23 @@ async function executeCommandOnce(command, browserId) {
 }
 
 const recoveringPages = new Map();
+async function reloadPageAfterFailure(tabId, targetUrl) {
+  const key = `pageRecovery:${tabId}`;
+  const stored = await extensionApi.storage.local.get(key);
+  const state = stored[key] ?? {};
+  const now = Date.now();
+  if (state.rateLimitedAt && now - state.rateLimitedAt < RATE_LIMIT_WAIT_MS) {
+    throw new Error("CHATGPT_RATE_LIMITED: Waiting ten minutes before dismissing the provider notice.");
+  }
+  if (state.rateLimitedAt) await extensionApi.storage.local.set({ [key]: {} });
+  await extensionApi.tabs.reload(tabId);
+  const tab = await waitForTabComplete(tabId);
+  if (targetUrl && (typeof tab.url !== "string" || !automationTargetMatches(tab.url, targetUrl))) {
+    throw new Error("ChatGPT automation was redirected away from the requested target after refresh.");
+  }
+  return tab;
+}
+
 function recoverPage(tabId) {
   const existing = recoveringPages.get(tabId);
   if (existing) return existing;
@@ -564,15 +613,11 @@ async function recoverPageOnce(tabId) {
       throw new Error("CHATGPT_RATE_LIMITED: The provider notice is still blocking the page.");
     }
   } else if (health.result?.status === "recoverable_error") {
-    if (state.reloadedAt && now - state.reloadedAt < ERROR_RELOAD_INTERVAL_MS) {
-      throw new Error("ChatGPT recovery is waiting before another reload.");
-    }
-    await extensionApi.storage.local.set({ [key]: { reloadedAt: now } });
-    await extensionApi.tabs.reload(tabId);
-    await waitForTabComplete(tabId);
-    return;
+    await reloadPageAfterFailure(tabId);
+    return true;
   }
-  if (state.rateLimitedAt) await extensionApi.storage.local.set({ [key]: { reloadedAt: state.reloadedAt } });
+  if (state.rateLimitedAt) await extensionApi.storage.local.set({ [key]: {} });
+  return false;
 }
 
 function enabledAutomationFeatures(settings) {

@@ -145,6 +145,19 @@ try {
     await normalSend;
   } finally { cooldownBus.close(); }
 
+  const inspectCooldownBus = new SupportCommandBus(undefined, 30, 15);
+  try {
+    const inspection = inspectCooldownBus.execute({
+      feature: "ralph", kind: "inspect_thread", conversationUrl: parent.conversationUrl,
+    });
+    const claimed = await inspectCooldownBus.claim("browser", ["ralph"], 0);
+    inspectCooldownBus.complete({ commandId: claimed.id, browserId: "browser", kind: "inspect_thread", ok: false,
+      error: "CHATGPT_RATE_LIMITED: Usage limit reached" });
+    assert.equal((await inspection).ok, false);
+    assert.ok(inspectCooldownBus.messageCooldownUntil() > Date.now(),
+      "a rate limit found during inspection also pauses continuation");
+  } finally { inspectCooldownBus.close(); }
+
   const registry = await RalphRegistry.open(path.join(directory, "ralph"), 1);
   await registry.register(parent.conversationUrl, { agentCreated: true });
   await registry.setMode(parent.threadId, "continuous");

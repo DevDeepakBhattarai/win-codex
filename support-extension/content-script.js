@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.6.1";
+  const contentScriptVersion = "1.6.2";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -102,7 +102,11 @@
     if (message?.type !== automationType || !message.command) return;
     void runAutomation(message.command).then(
       (result) => sendResponse({ ok: true, result }),
-      (error) => sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) }),
+      (error) => sendResponse({
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+        retryable: error?.retryable === true,
+      }),
     );
     return true;
   });
@@ -118,7 +122,7 @@
     }
     if (command.kind === "stop_thread") return await stopThread();
     if (command.kind === "send_message") return await sendMessage(command.message);
-    assertNotRateLimited();
+    assertNoPageError();
     if (command.kind === "inspect_thread") {
       const url = conversationUrl();
       const result = await inspectThread();
@@ -182,13 +186,14 @@
   async function inspectThread() {
     const title = threadTitle();
     const ready = await waitForConversationReady(5 * 60_000);
-    if (!ready) return { status: "loading", ...(title ? { title } : {}) };
+    if (!ready) throw new Error("ChatGPT thread did not become ready for inspection.");
+    assertNoPageError();
 
     const stopButton = ready.composer.querySelector('button[data-testid="stop-button"]');
     if (stopButton) return { status: "running", ...(title ? { title } : {}) };
 
     const settled = await waitForStableTurns();
-    if (!settled) return { status: "loading", ...(title ? { title } : {}) };
+    if (!settled) throw new Error("ChatGPT thread did not settle for inspection.");
     if (isRunning()) return { status: "running", ...(title ? { title } : {}) };
     const workedSeconds = getWorkedDurationSeconds(await getRalphMinWorkedSeconds());
     const turns = [...document.querySelectorAll("section[data-turn]")];
@@ -235,6 +240,8 @@
     const finalMessage = assistantMessages.at(-1) ?? null;
     if (!finalMessage) {
       if (isRunning()) return { status: "running", ...(title ? { title } : {}) };
+      const failure = assistantTurn.textContent?.trim() ?? "";
+      if (isPageFailure(failure)) throw new Error(`CHATGPT_PAGE_ERROR: ${failure.slice(0, 500)}`);
       return {
         status: "idle",
         ...(title ? { title } : {}),
@@ -250,6 +257,7 @@
     if (isRunning()) return { status: "running", ...(title ? { title } : {}) };
     const text = extractText(finalMessage);
     if (!text) throw new Error("Could not extract the text of the final ChatGPT assistant message.");
+    if (isPageFailure(text)) throw new Error(`CHATGPT_PAGE_ERROR: ${text.slice(0, 500)}`);
     return {
       status: "idle",
       ...(title ? { title } : {}),
@@ -266,7 +274,7 @@
   async function sendMessage(message) {
     let sendClicked = false;
     try {
-      assertNotRateLimited();
+      assertNoPageError();
       if (typeof message !== "string" || !message.trim()) throw new Error("A non-empty ChatGPT message is required.");
 
       const existingConversationUrl = conversationUrl();
@@ -282,13 +290,13 @@
 
       const ready = await waitForComposer(SEND_READY_TIMEOUT_MS);
       if (!ready) throw new Error("ChatGPT composer did not become available.");
-      assertNotRateLimited();
+      assertNoPageError();
       insertMessage(ready.editor, message);
 
       await sleep(SEND_SETTLE_MS);
 
       const current = await waitFor(() => {
-        assertNotRateLimited();
+        assertNoPageError();
         const composer = getComposer();
         if (!composer) return null;
         const button = getSendButton(composer.composer);
@@ -296,13 +304,13 @@
       }, SEND_READY_TIMEOUT_MS);
       if (!current) throw new Error("ChatGPT send button did not become actionable.");
 
-      current.button.click();
       sendClicked = true;
+      current.button.click();
       await sleep(SEND_SETTLE_MS);
-      assertNotRateLimited();
+      assertNoPageError();
 
       const savedUrl = existingConversationUrl ?? await waitFor(() => {
-        assertNotRateLimited();
+        assertNoPageError();
         return conversationUrl();
       }, SEND_NAVIGATION_TIMEOUT_MS);
       if (!savedUrl) throw new Error("ChatGPT did not navigate to the newly created conversation after sending.");
@@ -315,6 +323,9 @@
         if (!sendClicked) throw new Error(`CHATGPT_RATE_LIMITED_RETRYABLE: ${detail}`);
         throw new Error(`CHATGPT_RATE_LIMITED: Delivery is uncertain after Send was clicked. ${detail}`);
       }
+      if (!sendClicked && typeof message === "string" && message.trim() && error instanceof Error) {
+        error.retryable = true;
+      }
       throw error;
     }
   }
@@ -323,20 +334,33 @@
     // Read visible provider notices, never conversation content that may quote an error.
     const notices = [...document.querySelectorAll('[role="alert"], [role="dialog"], [data-testid="toast"]')];
     return notices.find((element) => element.getClientRects?.().length &&
-      /too many (?:messages|requests)|rate limit|message limit|usage limit|you(?:'ve| have) reached.{0,60}limit/i.test(element.textContent ?? ""));
+      /too many (?:messages|requests)|rate limit|message limit|usage limit|usage cap|message cap|you(?:'ve| have) (?:reached|hit).{0,60}limit|limit reached|quota exceeded/i.test(element.textContent ?? ""));
   }
 
   function pageHealth() {
     if (rateLimitNotice()) return { status: "rate_limited" };
+    return { status: pageErrorNotice() ? "recoverable_error" : "ok" };
+  }
+
+  function pageErrorNotice() {
     const notices = [...document.querySelectorAll('[role="alert"], [role="dialog"], [data-testid="toast"]')];
-    const failed = notices.some(element => element.getClientRects?.().length &&
-      /request timed out|connection timed out|something went wrong|unable to load conversation|network error/i.test(element.textContent ?? ""));
-    return { status: failed ? "recoverable_error" : "ok" };
+    return notices.find(element => element.getClientRects?.().length &&
+      /\b(?:error|failed|failure|interrupted|disconnected)\b|something went wrong|connection lost|timed out/i.test(element.textContent ?? ""));
+  }
+
+  function isPageFailure(text) {
+    return /^(?:message delivery failed|something went wrong|there was an error (?:generating|processing) (?:a |the )?(?:response|message)|network error|stream (?:interrupted|disconnected|failed)|connection (?:lost|interrupted))(?:[.!]|\s+please try again\.?)*$/i.test(text.trim());
   }
 
   function assertNotRateLimited() {
     const notice = rateLimitNotice();
     if (notice) throw new Error(`CHATGPT_RATE_LIMITED: ${(notice.textContent ?? "").trim().slice(0, 500)}`);
+  }
+
+  function assertNoPageError() {
+    assertNotRateLimited();
+    const notice = pageErrorNotice();
+    if (notice) throw new Error(`CHATGPT_PAGE_ERROR: ${(notice.textContent ?? "").trim().slice(0, 500)}`);
   }
 
   function insertMessage(editor, message) {
@@ -542,7 +566,7 @@
     let previousSignature = null;
     let stableSince = 0;
     while (Date.now() < deadline) {
-      assertNotRateLimited();
+      assertNoPageError();
       const state = sample();
       if (!state) {
         previousSignature = null;
@@ -611,7 +635,7 @@
   async function waitFor(getElement, timeoutMs) {
     const deadline = timeoutMs === undefined ? Infinity : Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      assertNotRateLimited();
+      assertNoPageError();
       const value = getElement();
       if (value) return value;
       await sleep(50);

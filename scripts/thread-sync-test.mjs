@@ -56,7 +56,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.6.1");
+  assert.equal(manifest.version, "1.6.2");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -141,7 +141,7 @@ try {
     "thread sending does not use acknowledgement or DOM-stability heuristics");
   assert.match(preparedContentScript, /const SEND_SETTLE_MS = 5_000;/,
     "thread sending uses the fixed five-second settle requested for typing and sending");
-  assert.match(preparedContentScript, /contentScriptVersion = "1\.6\.1"/,
+  assert.match(preparedContentScript, /contentScriptVersion = "1\.6\.2"/,
     "extension reloads can replace a stale page script with the current content-script version");
   assert.equal(parseRalphProjectId(namedProjectHome), projectId);
   assert.equal(parseRalphProjectId(urlA), projectId);
@@ -1743,7 +1743,7 @@ try {
   await testContentScript(a.ticket.token, b.ticket.token);
   await testWorkerKeepsLongAutomationAlive(sync);
   await testWorkerNeverRedispatchesAfterLostResponse(sync);
-  await testWorkerTimesOutHungAutomation(sync);
+  await testWorkerRecoversHungAutomation(sync);
   await testRalphComposerObserver();
   await testSendWaitsForLoadedConversationAndClicksOnce();
   await testNewProjectComposerWithoutDataType();
@@ -2855,6 +2855,7 @@ async function testWorkerNeverRedispatchesAfterLostResponse(sync) {
   const generatedConfig = {};
   vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), generatedConfig);
   let automationDispatches = 0;
+  let reloads = 0;
   let injected = 0;
   const postedResults = [];
   const storage = {};
@@ -2882,6 +2883,7 @@ async function testWorkerNeverRedispatchesAfterLostResponse(sync) {
         query: async () => [],
         create: async () => ({ id: 11 }),
         get: async () => ({ id: 11, status: "complete", url: urlA }),
+        reload: async () => { reloads += 1; },
         sendMessage: async (_tabId, payload) => {
           assert.equal(payload.type, "local-codex-support/automation-v1");
           automationDispatches += 1;
@@ -2926,17 +2928,20 @@ async function testWorkerNeverRedispatchesAfterLostResponse(sync) {
   assert.equal(injected, 2, "the health check and command content script are established before the side-effecting dispatch");
   assert.equal(automationDispatches, 1,
     "a lost tabs.sendMessage response must never cause the same side-effecting command to be dispatched again");
+  assert.equal(reloads, 1, "the page is refreshed once after a lost response");
   assert.equal(postedResults.length, 1);
   assert.equal(postedResults[0].ok, false,
     "an ambiguous post-delivery failure is surfaced instead of being hidden behind an unsafe retry");
   assert.match(postedResults[0].error, /message port closed after delivery/);
 }
 
-async function testWorkerTimesOutHungAutomation(sync) {
+async function testWorkerRecoversHungAutomation(sync) {
   const generatedConfig = {};
   vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), generatedConfig);
   let automationTimeoutCallback;
   let removedTab = false;
+  let reloads = 0;
+  let dispatches = 0;
   const postedResults = [];
   const storage = {};
   const context = {
@@ -2972,7 +2977,10 @@ async function testWorkerTimesOutHungAutomation(sync) {
         query: async () => [],
         create: async () => ({ id: 11 }),
         get: async () => ({ id: 11, status: "complete", url: urlA }),
-        sendMessage: async () => await new Promise(() => {}),
+        reload: async () => { reloads += 1; },
+        sendMessage: async () => ++dispatches === 1
+          ? await new Promise(() => {})
+          : { ok: true, result: { status: "running" } },
         remove: async () => { removedTab = true; },
       },
       webNavigation: {
@@ -3010,8 +3018,10 @@ async function testWorkerTimesOutHungAutomation(sync) {
   await command;
 
   assert.equal(postedResults.length, 1);
-  assert.equal(postedResults[0].ok, false);
-  assert.match(postedResults[0].error, /Timed out waiting for ChatGPT page automation/);
+  assert.equal(postedResults[0].ok, true);
+  assert.equal(postedResults[0].result.status, "running");
+  assert.equal(reloads, 1, "a hung inspection refreshes once before retrying");
+  assert.equal(dispatches, 2);
   assert.equal(removedTab, false, "a timed-out RALPH inspection keeps the owned thread tab available for retry and inspection");
   assert.equal(JSON.stringify(storage.automationThreadTabsV1), JSON.stringify({ [urlA]: 11 }));
 }
