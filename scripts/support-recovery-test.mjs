@@ -29,7 +29,7 @@ async function runWorker(command, responses) {
         onMessage: { addListener() {} }, onInstalled: { addListener() {} }, onStartup: { addListener() {} },
       },
       tabs: {
-        onUpdated: { addListener() {} }, query: async () => [],
+        onUpdated: { addListener() {} }, query: async () => [{ id: 11, status: "complete", url }],
         create: async () => ({ id: 11 }),
         get: async () => ({ id: 11, status: "complete", url }),
         reload: async () => { reloads += 1; },
@@ -44,7 +44,7 @@ async function runWorker(command, responses) {
       webNavigation: { onHistoryStateUpdated: { addListener() {} }, onCommitted: { addListener() {} } },
       scripting: { executeScript: async () => {} },
       storage: { local: {
-        async get(query) { return typeof query === "string" ? { [query]: storage[query] } : { ...query, ...storage }; },
+        async get(query) { return typeof query === "string" ? { [query]: storage[query] } : { ...query, threadSync: false, ...storage }; },
         async set(values) { Object.assign(storage, values); },
       } },
     },
@@ -71,13 +71,23 @@ function sendCommand(id) {
 }
 
 {
+  const run = await runWorker(inspectCommand("inspection-timeout"), [
+    new Error("Timed out waiting for ChatGPT page automation."),
+  ]);
+  assert.equal(run.reloads, 0, "an inspection timeout must wait on the same page without reloading");
+  assert.equal(run.results[0].ok, true);
+  assert.equal(run.results[0].result.status, "loading");
+}
+
+{
   const run = await runWorker(inspectCommand("page-error"), [
     { ok: false, error: "Message delivery failed." },
     { ok: true, result: { status: "running" } },
   ]);
-  assert.equal(run.reloads, 1, "a page error refreshes the thread once");
-  assert.equal(run.dispatches, 2, "inspection resumes after refresh");
+  assert.equal(run.reloads, 0, "an inspection waits for page recovery without refreshing");
+  assert.equal(run.dispatches, 1, "inspection defers until the next check");
   assert.equal(run.results[0].ok, true);
+  assert.equal(run.results[0].result.status, "loading");
 }
 
 {
@@ -85,8 +95,8 @@ function sendCommand(id) {
     { ok: false, error: "Stream interrupted." },
     { ok: false, error: "Stream interrupted." },
   ]);
-  assert.equal(run.reloads, 1, "a second failure does not cause a refresh loop");
-  assert.equal(run.results[0].ok, false);
+  assert.equal(run.reloads, 0, "a persistent failure does not cause a refresh loop");
+  assert.equal(run.results[0].result.status, "loading");
 }
 
 {
@@ -176,9 +186,8 @@ function sendCommand(id) {
   const response = await new Promise(resolve => listener({
     type: "local-codex-support/automation-v1", command: { kind: "inspect_thread" },
   }, {}, resolve));
-  assert.equal(response.ok, false);
-  assert.match(response.error, /did not become ready for inspection/,
-    "a timed-out inspection must reach the worker's refresh path");
+  assert.equal(response.ok, true);
+  assert.equal(response.result.status, "loading", "an unready page is checked again later");
 }
 
 console.log("Support recovery tests passed.");

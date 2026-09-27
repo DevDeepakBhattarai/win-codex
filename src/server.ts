@@ -49,7 +49,7 @@ import {
   type BrowserActionInput,
   type BrowserDownloadInput,
 } from "./browser.js";
-import { launchChrome } from "./browser-launch.js";
+import { requireRunningChrome } from "./browser-launch.js";
 import {
   prepareThreadSync,
   registerThreadSync,
@@ -1621,7 +1621,7 @@ function createMcpServer(ownerId: string) {
       ralphRegistry,
       subagentJobs,
       threadPreparer,
-      () => launchChrome(),
+      requireRunningChrome,
       ownerId,
       threadSync.subagentWidgetHtml,
     );
@@ -2728,13 +2728,13 @@ await initializeAuthStore();
 const threadSync = THREAD_SYNC_ENABLED
   ? await prepareThreadSync(DATA_DIR, THREAD_SYNC_PORT)
   : undefined;
-const supportCommands = threadSync ? new SupportCommandBus(undefined, undefined, undefined, () => launchChrome()) : undefined;
+const supportCommands = threadSync ? new SupportCommandBus(undefined, undefined, undefined, requireRunningChrome) : undefined;
 const subagentJobs = threadSync ? await SubagentJobRegistry.open(DATA_DIR) : undefined;
 const threadPreparer = supportCommands && threadSync
-  ? new ThreadPreparationCoordinator(supportCommands, threadSync.registry, () => launchChrome())
+  ? new ThreadPreparationCoordinator(supportCommands, threadSync.registry, requireRunningChrome)
   : undefined;
 const subagentResultController = supportCommands && subagentJobs
-  ? new SubagentResultController(subagentJobs, supportCommands, () => launchChrome())
+  ? new SubagentResultController(subagentJobs, supportCommands, requireRunningChrome)
   : undefined;
 const ralphRegistry = threadSync ? await RalphRegistry.open(DATA_DIR) : undefined;
 const ralphController = supportCommands && ralphRegistry
@@ -2776,7 +2776,7 @@ const threadSyncHttpServer = threadSync
         ));
       if (ralphRegistry) {
         syncApp.post("/chatgpt-support/ralph/register", createRateLimiter("ralph-register", 60_000, 240),
-          ralphRegistrationHandler(ralphRegistry, threadSync.extensionToken));
+          ralphRegistrationHandler(ralphRegistry, threadSync.extensionToken, supportCommands));
         syncApp.get("/chatgpt-support/ralph/projects",
           ralphProjectsGetHandler(ralphRegistry, threadSync.extensionToken));
         syncApp.put("/chatgpt-support/ralph/projects",

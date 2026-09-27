@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.6.2";
+  const contentScriptVersion = "1.6.3";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -23,6 +23,8 @@
   const THREAD_ASSISTANT_SETTLE_MS = 5_000;
   const THREAD_UNCERTAIN_SETTLE_MS = 2 * 60_000;
   const THREAD_SETTLE_TIMEOUT_MS = 2.5 * 60_000;
+  let inspectionSignature;
+  let inspectionStableSince = 0;
   const RALPH_MIN_WORKED_SECONDS_KEY = "ralphMinWorkedSeconds";
   const LEGACY_RALPH_MIN_WORKED_SECONDS = 19 * 60;
   const DEFAULT_RALPH_MIN_WORKED_SECONDS = 20 * 60;
@@ -185,15 +187,15 @@
 
   async function inspectThread() {
     const title = threadTitle();
-    const ready = await waitForConversationReady(5 * 60_000);
-    if (!ready) throw new Error("ChatGPT thread did not become ready for inspection.");
+    const ready = await waitForConversationReady(5_000);
+    if (!ready) return { status: "loading", ...(title ? { title } : {}) };
     assertNoPageError();
 
     const stopButton = ready.composer.querySelector('button[data-testid="stop-button"]');
     if (stopButton) return { status: "running", ...(title ? { title } : {}) };
 
-    const settled = await waitForStableTurns();
-    if (!settled) throw new Error("ChatGPT thread did not settle for inspection.");
+    const settled = await waitForStableTurns(20_000);
+    if (!settled) return { status: "loading", ...(title ? { title } : {}) };
     if (isRunning()) return { status: "running", ...(title ? { title } : {}) };
     const workedSeconds = getWorkedDurationSeconds(await getRalphMinWorkedSeconds());
     const turns = [...document.querySelectorAll("section[data-turn]")];
@@ -539,7 +541,7 @@
     return null;
   }
 
-  async function waitForStableTurns() {
+  async function waitForStableTurns(timeoutMs = THREAD_SETTLE_TIMEOUT_MS) {
     const settled = await waitForAllSettled(() => {
       if (isRunning()) return { value: true, signature: "running", quietMs: 0 };
 
@@ -547,17 +549,22 @@
       const lastUserIndex = turns.findLastIndex((turn) => turn.dataset.turn === "user");
       if (lastUserIndex < 0) return null;
       const hasAssistantAfterLastUser = turns.slice(lastUserIndex + 1).some((turn) => turn.dataset.turn === "assistant");
-      const signature = turns.map((turn) => [
+      const signature = location.href + turns.map((turn) => [
         turn.dataset.turn,
         turn.dataset.turnId ?? "",
         turn.textContent ?? "",
       ].join(":")).join("|");
+      if (signature !== inspectionSignature) {
+        inspectionSignature = signature;
+        inspectionStableSince = Date.now();
+      }
+      const quietMs = hasAssistantAfterLastUser ? THREAD_ASSISTANT_SETTLE_MS : THREAD_UNCERTAIN_SETTLE_MS;
       return {
         value: true,
         signature,
-        quietMs: hasAssistantAfterLastUser ? THREAD_ASSISTANT_SETTLE_MS : THREAD_UNCERTAIN_SETTLE_MS,
+        quietMs: Date.now() - inspectionStableSince >= quietMs ? 0 : quietMs,
       };
-    }, THREAD_SETTLE_TIMEOUT_MS);
+    }, timeoutMs);
     return Boolean(settled);
   }
 

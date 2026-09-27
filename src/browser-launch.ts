@@ -3,6 +3,10 @@ import { access } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
+export async function requireRunningChrome(): Promise<void> {
+  throw new Error("Chrome must already be running with the required Local Codex extension enabled. Waiting for its connection.");
+}
+
 export async function launchChrome(input: {
   executablePath?: string;
   profileDirectory?: string;

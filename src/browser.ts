@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 
 import { getPlaywrightInstallExpression } from "./browser-playwright.js";
-import { launchChrome } from "./browser-launch.js";
+import { requireRunningChrome } from "./browser-launch.js";
 
 const BRIDGE_PROTOCOL_VERSION = 1;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
@@ -468,7 +468,7 @@ export class BrowserService {
       token,
     );
     const bridge = await BrowserBridge.listen(host, input.port, token);
-    return new BrowserService(bridge, extensionDirectory, input.launchBrowser ?? launchChrome);
+    return new BrowserService(bridge, extensionDirectory, input.launchBrowser ?? requireRunningChrome);
   }
 
   status() {

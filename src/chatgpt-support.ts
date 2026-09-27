@@ -20,7 +20,7 @@ const FAILURE_RETRY_MS = 2 * 60 * 1000;
 const COMMAND_TIMEOUT_MS = 20 * 60 * 1000;
 const INSPECT_CLAIM_LEASE_MS = 5 * 60 * 1000;
 const CLAIM_WAIT_MS = 20_000;
-const RALPH_BROWSER_INSPECTION_TIMEOUT_MS = 30_000;
+const RALPH_BROWSER_INSPECTION_TIMEOUT_MS = 60_000;
 const SUPPORT_BROWSER_HEARTBEAT_GRACE_MS = CLAIM_WAIT_MS + 5_000;
 const SUPPORT_BROWSER_LAUNCH_COOLDOWN_MS = 5_000;
 const SUBAGENT_RESULT_MISSING_RETRY_MS = 30_000;
@@ -248,6 +248,16 @@ export class SupportCommandBus {
 
   messageCooldownUntil() {
     return this.cooldownUntil > Date.now() ? this.cooldownUntil : 0;
+  }
+
+  cancelThreadChecks(threadId: string) {
+    for (const pending of this.pending.values()) {
+      const command = pending.command;
+      const url = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
+      if ((command.feature !== "ralph" && command.feature !== "threadPreparation") || parseConversationUrl(url).threadId !== threadId) continue;
+      this.removePending(command.id);
+      pending.reject(new Error("RALPH thread tab was closed."));
+    }
   }
 
   constructor(
@@ -681,6 +691,12 @@ export class RalphRegistry {
     return this.state.threads.map((entry) => ({ ...entry }));
   }
 
+  async remove(threadId: string) {
+    await this.update((state) => {
+      state.threads = state.threads.filter(thread => thread.threadId !== threadId);
+    });
+  }
+
   async settings() {
     await this.queue;
     return {
@@ -1036,9 +1052,6 @@ export class RalphController {
         await this.options.registry.recordRunning(thread.threadId);
         return;
       }
-      if (!this.options.commands.hasOpenThreadOwner(thread.threadId)) {
-        await this.options.commands.ensureBackgroundBrowserOnce("ralph");
-      }
       const commandResult = await this.options.commands.execute({
         feature: "ralph",
         kind: "inspect_thread",
@@ -1131,6 +1144,10 @@ export class RalphController {
       await this.options.registry.recordContinuation(thread.threadId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (/timed out|Chrome.*already running/i.test(message)) {
+        await this.options.registry.recordLoading(thread.threadId);
+        return;
+      }
       console.error(`[ralph] thread=${JSON.stringify(thread.conversationUrl)} failed: ${message}`);
       await this.options.registry.recordFailure(thread.threadId, message);
     }
@@ -1138,7 +1155,8 @@ export class RalphController {
 
   private async inspectExecutorBeforeContinuation(thread: z.infer<typeof ralphThreadSchema>) {
     if (!this.options.commands.hasBrowser("ralph")) {
-      await this.options.commands.ensureBackgroundBrowserOnce("ralph");
+      await this.options.registry.recordLoading(thread.threadId);
+      return undefined;
     }
     const result = await this.options.commands.execute({
       feature: "ralph",
@@ -1408,6 +1426,7 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
 export function ralphRegistrationHandler(
   registry: RalphRegistry,
   extensionToken: string,
+  commands?: SupportCommandBus,
 ): RequestHandler {
   const bodySchema = z.object({
     conversationUrl: z.string().max(2048),
@@ -1415,6 +1434,7 @@ export function ralphRegistrationHandler(
     reactivate: z.boolean().optional(),
     agentCreated: z.boolean().optional(),
     title: z.string().max(300).optional(),
+    removed: z.boolean().optional(),
   }).strict();
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
@@ -1424,6 +1444,13 @@ export function ralphRegistrationHandler(
       return;
     }
     try {
+      if (parsed.data.removed) {
+        const { threadId } = parseConversationUrl(parsed.data.conversationUrl);
+        await registry.remove(threadId);
+        commands?.cancelThreadChecks(threadId);
+        res.json({ status: "removed" });
+        return;
+      }
       const registration = await registry.register(parsed.data.conversationUrl, {
         manual: parsed.data.manual === true,
         reactivate: parsed.data.reactivate === true,

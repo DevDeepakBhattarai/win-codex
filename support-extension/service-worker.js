@@ -33,6 +33,47 @@ const reportedRalphConversations = new Set();
 const observingConversations = new Map();
 const AUTOMATION_THREAD_TABS_KEY = "automationThreadTabsV1";
 const RATE_LIMIT_WAIT_MS = 10 * 60_000;
+const trackedThreadTabs = new Map();
+const registeringConversations = new Set();
+
+function trackThreadTab(tabId, value) {
+  const url = conversationUrl(value);
+  if (!Number.isInteger(tabId)) return;
+  if (url) trackedThreadTabs.set(tabId, url);
+  else trackedThreadTabs.delete(tabId);
+  return extensionApi.storage.local.set({ [`ralphTab:${tabId}`]: url });
+}
+
+async function reportClosedThreadTabs() {
+  const stored = await extensionApi.storage.local.get(null);
+  for (const [key, url] of Object.entries(stored)) {
+    if (!key.startsWith("closedRalphTab:") || !url) continue;
+    const response = await fetch(ralphRegisterEndpoint.href, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${config.extensionToken}` },
+      body: JSON.stringify({ conversationUrl: url, removed: true }),
+      signal: AbortSignal.timeout(5000), redirect: "error",
+    });
+    if (!response.ok) throw new Error(`RALPH tab removal returned ${response.status}.`);
+    await extensionApi.storage.local.remove(key);
+  }
+}
+
+async function threadTabRemoved(tabId) {
+  const key = `ralphTab:${tabId}`;
+  const stored = await extensionApi.storage.local.get(key);
+  const url = trackedThreadTabs.get(tabId) ?? stored[key];
+  trackedThreadTabs.delete(tabId);
+  if (url) {
+    await extensionApi.storage.local.set({ [`closedRalphTab:${tabId}`]: url });
+    await forgetOwnedThreadTab(url, tabId);
+    await Promise.allSettled([...registeringConversations]
+      .filter(entry => automationTargetMatches(entry.url, url)).map(entry => entry.promise));
+    reportedRalphConversations.delete(url);
+  }
+  await extensionApi.storage.local.remove([key, `pageRecovery:${tabId}`]);
+  await reportClosedThreadTabs();
+}
 
 function validateLoopbackEndpoint(value, pathname) {
   const endpoint = new URL(value);
@@ -134,7 +175,13 @@ function observeConversation(value) {
   observingConversations.set(currentUrl, observation);
   return observation;
 }
-async function registerRalphConversation(value, { reactivate = false, agentCreated = false, title } = {}) {
+function registerRalphConversation(value, options = {}) {
+  const entry = { url: value, promise: registerRalphConversationOnce(value, options) };
+  registeringConversations.add(entry);
+  return entry.promise.finally(() => registeringConversations.delete(entry));
+}
+
+async function registerRalphConversationOnce(value, { reactivate = false, agentCreated = false, title } = {}) {
   const currentUrl = conversationUrl(value);
   const currentTitle = normalizeThreadTitle(title);
   if (!currentUrl || !currentUrl.startsWith("https://chatgpt.com/g/") ||
@@ -216,8 +263,12 @@ async function acquireAutomationTab(targetUrl, createsNewThread) {
     const existing = await findConversationTab(targetUrl);
     if (existing) return { ...existing, created: false };
   }
-  const tab = await extensionApi.tabs.create({ url: targetUrl, active: false });
+  const windows = await extensionApi.tabs.query({ windowType: "normal" });
+  const windowId = windows.find(tab => Number.isInteger(tab.windowId) && !tab.incognito)?.windowId;
+  if (!Number.isInteger(windowId)) throw new Error("Open a Chrome window before starting ChatGPT automation.");
+  const tab = await extensionApi.tabs.create({ windowId, url: targetUrl, active: false });
   if (!Number.isInteger(tab.id)) throw new Error("ChatGPT automation tab did not receive an id.");
+  await trackThreadTab(tab.id, targetUrl);
   return { tab, owned: true, created: true };
 }
 
@@ -349,7 +400,7 @@ async function sendAutomationMessageWithTimeout(tabId, command) {
       sendAutomationMessage(tabId, command),
       new Promise((_, reject) => {
         timeout = setTimeout(() => reject(new Error("Timed out waiting for ChatGPT page automation.")),
-          AUTOMATION_RESPONSE_TIMEOUT_MS);
+          command.kind === "inspect_thread" ? 30_000 : command.kind === "page_health" ? 15_000 : AUTOMATION_RESPONSE_TIMEOUT_MS);
       }),
     ]);
   } finally {
@@ -384,8 +435,14 @@ async function commandTargetUrl(command) {
   throw new Error("ChatGPT support command is missing its server-resolved target URL.");
 }
 
+const executingCommands = new Map();
 function executeCommand(command, browserId) {
-  return keepWorkerAliveUntil(executeCommandOnce(command, browserId));
+  const existing = executingCommands.get(command.id);
+  if (existing) return existing;
+  const operation = keepWorkerAliveUntil(executeCommandOnce(command, browserId))
+    .finally(() => executingCommands.delete(command.id));
+  executingCommands.set(command.id, operation);
+  return operation;
 }
 
 async function executeCommandOnce(command, browserId) {
@@ -432,27 +489,31 @@ async function executeCommandOnce(command, browserId) {
     if (observing && command.kind !== "inspect_thread") {
       throw new Error("This browser is only available for thread observation.");
     }
-    const acquired = observing
+    const acquired = observing || command.feature === "ralph" || command.kind === "prepare_thread"
       ? await findConversationTab(targetUrl)
       : await acquireAutomationTab(targetUrl, createsNewThread);
-    if (!acquired) throw new Error("The observed thread tab has closed or navigated away.");
+    if (!acquired) throw new Error("CHATGPT_TAB_UNAVAILABLE: The thread tab has closed or navigated away.");
     tabId = acquired.tab.id;
     created = acquired.created === true;
-    let loadedTab;
-    try {
-      loadedTab = await waitForTabComplete(tabId);
-    } catch {
-      loadedTab = await reloadPageAfterFailure(tabId, targetUrl);
-      refreshed = true;
-    }
-    if (typeof loadedTab.url !== "string" || !automationTargetMatches(loadedTab.url, targetUrl)) {
-      throw new Error("ChatGPT automation was redirected away from the requested target.");
-    }
-
     const existingConversation = conversationUrl(targetUrl);
     if (created && existingConversation) {
       await rememberOwnedThreadTab(existingConversation, tabId);
       keepCreatedTab = true;
+    }
+    let loadedTab;
+    try {
+      loadedTab = await waitForTabComplete(tabId, command.kind === "inspect_thread" ? 5_000 : undefined);
+    } catch (error) {
+      if (command.kind === "inspect_thread" || /timed out/i.test(String(error))) throw error;
+      loadedTab = await reloadPageAfterFailure(tabId, targetUrl);
+      refreshed = true;
+    }
+    if (typeof loadedTab.url !== "string" || !automationTargetMatches(loadedTab.url, targetUrl)) {
+      if (created && existingConversation) {
+        await forgetOwnedThreadTab(existingConversation, tabId);
+        keepCreatedTab = false;
+      }
+      throw new Error("ChatGPT automation was redirected away from the requested target.");
     }
 
     if (command.kind !== "stop_thread") {
@@ -460,7 +521,7 @@ async function executeCommandOnce(command, browserId) {
         refreshed = await recoverPage(tabId) || refreshed;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (refreshed || /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(message)) throw error;
+        if (command.kind === "inspect_thread" || /timed out/i.test(message) || refreshed || /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(message)) throw error;
         await reloadPageAfterFailure(tabId, targetUrl);
         refreshed = true;
       }
@@ -490,7 +551,7 @@ async function executeCommandOnce(command, browserId) {
       response = await runPageCommand();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (refreshed || /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(message)) throw error;
+      if (command.kind === "inspect_thread" || /timed out/i.test(message) || refreshed || /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(message)) throw error;
       await reloadPageAfterFailure(tabId, targetUrl);
       refreshed = true;
       if (command.kind !== "inspect_thread" && !(command.kind === "send_message" && error?.retryable === true)) {
@@ -502,6 +563,7 @@ async function executeCommandOnce(command, browserId) {
     if (command.kind === "send_message") {
       const savedUrl = conversationUrl(response.result?.conversationUrl);
       if (createsNewThread && savedUrl) {
+        await trackThreadTab(tabId, savedUrl);
         await rememberOwnedThreadTab(savedUrl, tabId);
         keepCreatedTab = true;
       } else if (!createsNewThread) {
@@ -525,6 +587,11 @@ async function executeCommandOnce(command, browserId) {
     });
   } catch (error) {
     let errorMessage = error instanceof Error ? error.message : String(error);
+    if (command.kind === "inspect_thread" && !/^CHATGPT_RATE_LIMITED/.test(errorMessage)) {
+      await postResult({ commandId: command.id, browserId, kind: command.kind, ok: true,
+        result: { status: "loading" } }).catch(() => undefined);
+      return;
+    }
     if (command.kind === "send_message" && !automationStarted && errorMessage.startsWith("CHATGPT_RATE_LIMITED:")) {
       errorMessage = errorMessage.replace("CHATGPT_RATE_LIMITED:", "CHATGPT_RATE_LIMITED_RETRYABLE:");
     }
@@ -540,6 +607,7 @@ async function executeCommandOnce(command, browserId) {
         const current = await extensionApi.tabs.get(tabId);
         const savedUrl = conversationUrl(current.url);
         if (savedUrl) {
+          await trackThreadTab(tabId, savedUrl);
           await rememberOwnedThreadTab(savedUrl, tabId);
           keepCreatedTab = true;
         }
@@ -613,8 +681,7 @@ async function recoverPageOnce(tabId) {
       throw new Error("CHATGPT_RATE_LIMITED: The provider notice is still blocking the page.");
     }
   } else if (health.result?.status === "recoverable_error") {
-    await reloadPageAfterFailure(tabId);
-    return true;
+    throw new Error("ChatGPT page is still recovering. Waiting before checking again.");
   }
   if (state.rateLimitedAt) await extensionApi.storage.local.set({ [key]: {} });
   return false;
@@ -633,6 +700,12 @@ function enabledAutomationFeatures(settings) {
 async function pollCommands(generation) {
   const browserId = await getBrowserId();
   while (generation === pollGeneration) {
+    try {
+      await reportClosedThreadTabs();
+    } catch {
+      await sleep(1000);
+      continue;
+    }
     const settings = await getSettings();
     const features = enabledAutomationFeatures(settings);
     const tabs = settings.threadSync ? await extensionApi.tabs.query({ url: "https://chatgpt.com/*" }) : [];
@@ -718,6 +791,7 @@ async function scanExistingTabs() {
   await Promise.allSettled(tabs.flatMap((tab) => {
     const tasks = [];
     if (Number.isInteger(tab.id)) {
+      tasks.push(trackThreadTab(tab.id, tab.url));
       tasks.push(extensionApi.scripting.executeScript({ target: { tabId: tab.id }, files: ["content-script.js"] }));
     }
     if (tab.active && typeof tab.url === "string") {
@@ -729,7 +803,10 @@ async function scanExistingTabs() {
 }
 
 
-extensionApi.tabs.onUpdated?.addListener((_tabId, changeInfo, tab) => {
+extensionApi.tabs.onUpdated?.addListener((tabId, changeInfo, tab) => {
+  if (typeof changeInfo.url === "string" || typeof tab?.url === "string") {
+    void trackThreadTab(tabId, changeInfo.url ?? tab.url);
+  }
   if (typeof changeInfo.url === "string") restartPolling();
   const observedUrl = typeof changeInfo.url === "string" ? changeInfo.url : tab?.url;
   if (typeof observedUrl !== "string" ||
@@ -739,17 +816,18 @@ extensionApi.tabs.onUpdated?.addListener((_tabId, changeInfo, tab) => {
   void registerRalphConversation(observedUrl, { title: observedTitle }).catch(() => undefined);
 });
 extensionApi.tabs.onRemoved?.addListener(tabId => {
-  void extensionApi.storage.local.remove?.([`pageRecovery:${tabId}`]);
-  restartPolling();
+  void threadTabRemoved(tabId).catch(() => undefined).finally(restartPolling);
 });
 extensionApi.webNavigation?.onHistoryStateUpdated?.addListener((details) => {
   if (details.frameId === 0) {
+    void trackThreadTab(details.tabId, details.url);
     void observeConversation(details.url).catch(() => undefined);
     void registerRalphConversation(details.url).catch(() => undefined);
   }
 });
 extensionApi.webNavigation?.onCommitted?.addListener((details) => {
   if (details.frameId === 0) {
+    void trackThreadTab(details.tabId, details.url);
     void observeConversation(details.url).catch(() => undefined);
     void registerRalphConversation(details.url).catch(() => undefined);
   }
