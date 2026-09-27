@@ -226,10 +226,10 @@ assert.equal(clicks, 1, 'persisted cooldown survives a worker restart and permit
 assert.equal(results.at(-1).ok, true);
 health = 'recoverable_error';
 await inspect();
-assert.equal(reloads, 1, 'recognized timeout errors reload the existing tab');
+assert.equal(reloads, 0, 'recognized timeout errors leave the existing tab alone');
 now += 120_000;
 await inspect();
-assert.equal(reloads, 2, 'a later inspection can refresh once again for a persistent non-rate-limit error');
+assert.equal(reloads, 0, 'a later inspection waits on the same page for a persistent error');
 assert.equal(creations, 0);
 
 let listener;

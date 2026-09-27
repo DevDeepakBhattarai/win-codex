@@ -56,7 +56,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.6.2");
+  assert.equal(manifest.version, "1.6.3");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -141,7 +141,7 @@ try {
     "thread sending does not use acknowledgement or DOM-stability heuristics");
   assert.match(preparedContentScript, /const SEND_SETTLE_MS = 5_000;/,
     "thread sending uses the fixed five-second settle requested for typing and sending");
-  assert.match(preparedContentScript, /contentScriptVersion = "1\.6\.2"/,
+  assert.match(preparedContentScript, /contentScriptVersion = "1\.6\.3"/,
     "extension reloads can replace a stale page script with the current content-script version");
   assert.equal(parseRalphProjectId(namedProjectHome), projectId);
   assert.equal(parseRalphProjectId(urlA), projectId);
@@ -2345,10 +2345,14 @@ async function testRunningHydrationDetection() {
     assert.equal(keepChannelOpen, true);
   });
   assert.equal(response.ok, true, response.error);
-  assert.equal(response.result.status, "running",
+  assert.equal(response.result.status, "loading",
     "a still-hydrating running thread must not be classified as stopped before the stop button appears");
-  assert.ok(now >= runningStateReadyAt,
-    "RALPH must keep waiting when a long conversation takes more than one minute to reveal its running state");
+  assert.ok(now < 30_000, "an inspection returns before the command deadline");
+  now = runningStateReadyAt;
+  const retry = await new Promise(resolve => automationListener({
+    type: "local-codex-support/automation-v1", command: { kind: "inspect_thread" },
+  }, {}, resolve));
+  assert.equal(retry.result.status, "running", "the next check observes the hydrated running state");
 }
 
 
@@ -2524,7 +2528,7 @@ async function testRalphAutoRegistration(sync) {
       },
       tabs: {
         onUpdated: { addListener: fn => { updatedListener = fn; } },
-        query: async () => [...tabs.values()],
+        query: async query => query.windowType ? [{ id: 1, windowId: 1 }, ...tabs.values()] : [...tabs.values()],
         create: async ({ url }) => {
           const tab = { id: nextTabId++, status: "complete", url };
           tabs.set(tab.id, tab);
@@ -2694,7 +2698,7 @@ async function testRalphWorkerReactivation(sync) {
       },
       tabs: {
         onUpdated: { addListener: listener => { updatedListener = listener; } },
-        query: async () => [],
+        query: async query => query.windowType ? [{ id: 1, windowId: 1 }] : [],
         get: async () => ({ id: 7, url: urlA }),
       },
       webNavigation: {
@@ -2811,7 +2815,7 @@ async function testWorkerKeepsLongAutomationAlive(sync) {
       },
       tabs: {
         onUpdated: { addListener() {} },
-        query: async () => [],
+        query: async query => query.windowType ? [{ id: 1, windowId: 1 }] : [],
         create: async () => ({ id: 11 }),
         get: async () => ({ id: 11, status: "complete", url: namedProjectHome }),
         sendMessage: async () => await automationResult,
@@ -2880,7 +2884,7 @@ async function testWorkerNeverRedispatchesAfterLostResponse(sync) {
       },
       tabs: {
         onUpdated: { addListener() {} },
-        query: async () => [],
+        query: async query => query.windowType ? [{ id: 1, windowId: 1 }] : [],
         create: async () => ({ id: 11 }),
         get: async () => ({ id: 11, status: "complete", url: urlA }),
         reload: async () => { reloads += 1; },
@@ -2943,7 +2947,7 @@ async function testWorkerRecoversHungAutomation(sync) {
   let reloads = 0;
   let dispatches = 0;
   const postedResults = [];
-  const storage = {};
+  const storage = { automationThreadTabsV1: { [urlA]: 11 } };
   const context = {
     URL,
     AbortSignal,
@@ -2953,7 +2957,7 @@ async function testWorkerRecoversHungAutomation(sync) {
     Response,
     importScripts() {},
     setTimeout(callback, ms) {
-      if (ms === 8 * 60_000) {
+      if (ms === 30_000) {
         automationTimeoutCallback = callback;
         return 98;
       }
@@ -2974,7 +2978,7 @@ async function testWorkerRecoversHungAutomation(sync) {
       },
       tabs: {
         onUpdated: { addListener() {} },
-        query: async () => [],
+        query: async query => query.windowType ? [{ id: 1, windowId: 1 }] : [],
         create: async () => ({ id: 11 }),
         get: async () => ({ id: 11, status: "complete", url: urlA }),
         reload: async () => { reloads += 1; },
@@ -3019,9 +3023,9 @@ async function testWorkerRecoversHungAutomation(sync) {
 
   assert.equal(postedResults.length, 1);
   assert.equal(postedResults[0].ok, true);
-  assert.equal(postedResults[0].result.status, "running");
-  assert.equal(reloads, 1, "a hung inspection refreshes once before retrying");
-  assert.equal(dispatches, 2);
+  assert.equal(postedResults[0].result.status, "loading");
+  assert.equal(reloads, 0, "a hung inspection waits without refreshing");
+  assert.equal(dispatches, 1);
   assert.equal(removedTab, false, "a timed-out RALPH inspection keeps the owned thread tab available for retry and inspection");
   assert.equal(JSON.stringify(storage.automationThreadTabsV1), JSON.stringify({ [urlA]: 11 }));
 }
@@ -3052,7 +3056,7 @@ async function testAutomationRedirectGuard(sync) {
         onStartup: { addListener() {} },
       },
       tabs: {
-        query: async () => [],
+        query: async query => query.windowType ? [{ id: 1, windowId: 1 }] : [],
         create: async () => ({ id: 11 }),
         get: async () => ({ id: 11, status: "complete", url: "https://chatgpt.com/" }),
         sendMessage: async () => {

@@ -394,8 +394,8 @@ try {
     method: "tools/call",
     params: { name: "browser_open", arguments: { url: "https://example.com" } },
   }, token.access_token, protocolHeaders);
-  if (browserOpen.status !== 200 || !browserOpen.responseText.includes("Could not start Chrome")) {
-    throw new Error(`Browser startup failure did not reach the MCP caller: ${browserOpen.responseText}`);
+  if (browserOpen.status !== 200 || !browserOpen.responseText.includes("Chrome must already be running")) {
+    throw new Error(`Disconnected browser error did not reach the MCP caller: ${browserOpen.responseText}`);
   }
 
   const terminalCall = await postMcp(
