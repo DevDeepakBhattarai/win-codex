@@ -49,7 +49,7 @@ import {
   type BrowserActionInput,
   type BrowserDownloadInput,
 } from "./browser.js";
-import { requireRunningChrome } from "./browser-launch.js";
+import { launchChrome } from "./browser-launch.js";
 import {
   prepareThreadSync,
   registerThreadSync,
@@ -1621,7 +1621,7 @@ function createMcpServer(ownerId: string) {
       ralphRegistry,
       subagentJobs,
       threadPreparer,
-      requireRunningChrome,
+      launchChrome,
       ownerId,
       threadSync.subagentWidgetHtml,
     );
@@ -2728,13 +2728,13 @@ await initializeAuthStore();
 const threadSync = THREAD_SYNC_ENABLED
   ? await prepareThreadSync(DATA_DIR, THREAD_SYNC_PORT)
   : undefined;
-const supportCommands = threadSync ? new SupportCommandBus(undefined, undefined, undefined, requireRunningChrome) : undefined;
+const supportCommands = threadSync ? new SupportCommandBus(undefined, undefined, undefined, launchChrome) : undefined;
 const subagentJobs = threadSync ? await SubagentJobRegistry.open(DATA_DIR) : undefined;
 const threadPreparer = supportCommands && threadSync
-  ? new ThreadPreparationCoordinator(supportCommands, threadSync.registry, requireRunningChrome)
+  ? new ThreadPreparationCoordinator(supportCommands, threadSync.registry, launchChrome)
   : undefined;
 const subagentResultController = supportCommands && subagentJobs
-  ? new SubagentResultController(subagentJobs, supportCommands, requireRunningChrome)
+  ? new SubagentResultController(subagentJobs, supportCommands, launchChrome)
   : undefined;
 const ralphRegistry = threadSync ? await RalphRegistry.open(DATA_DIR) : undefined;
 const ralphController = supportCommands && ralphRegistry

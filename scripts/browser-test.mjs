@@ -123,6 +123,11 @@ try {
   assert.equal(launchAttempts, 2, "a failed launch must be retryable and successful calls must share startup");
   const startupTabs = [startupA.snapshot.tabId, startupB.snapshot.tabId];
   assert.notEqual(...startupTabs);
+  const tabsBeforeReuse = (await service.listTabs()).map(tab => tab.id).sort();
+  await launchChrome({ executablePath, userDataDirectory: path.join(temporaryRoot, "profile") });
+  await new Promise(resolve => setTimeout(resolve, 500));
+  assert.deepEqual((await service.listTabs()).map(tab => tab.id).sort(), tabsBeforeReuse,
+    "the real launcher must reuse a running Chrome profile without creating another tab");
   const concurrentClicks = await Promise.all(startupTabs.map(tabId => service.action({ tabId, action: "dblclick", locator: "css=#double" })));
   for (const result of concurrentClicks) assert.match(result.snapshot.visibleText, /Double count: 1/);
   await Promise.all(startupTabs.map((tabId, index) => service.action({ tabId, action: "type", locator: "css=#text", text: `task ${index}` })));

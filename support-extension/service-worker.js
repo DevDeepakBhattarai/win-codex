@@ -36,9 +36,10 @@ const RATE_LIMIT_WAIT_MS = 10 * 60_000;
 const trackedThreadTabs = new Map();
 const registeringConversations = new Set();
 
-function trackThreadTab(tabId, value) {
+async function trackThreadTab(tabId, value) {
   const url = conversationUrl(value);
   if (!Number.isInteger(tabId)) return;
+  if (url) await extensionApi.storage.local.set({ [`closedThread:${url}`]: false });
   if (url) trackedThreadTabs.set(tabId, url);
   else trackedThreadTabs.delete(tabId);
   return extensionApi.storage.local.set({ [`ralphTab:${tabId}`]: url });
@@ -59,13 +60,13 @@ async function reportClosedThreadTabs() {
   }
 }
 
-async function threadTabRemoved(tabId) {
+async function threadTabRemoved(tabId, removeInfo) {
   const key = `ralphTab:${tabId}`;
   const stored = await extensionApi.storage.local.get(key);
   const url = trackedThreadTabs.get(tabId) ?? stored[key];
   trackedThreadTabs.delete(tabId);
-  if (url) {
-    await extensionApi.storage.local.set({ [`closedRalphTab:${tabId}`]: url });
+  if (url && !removeInfo?.isWindowClosing) {
+    await extensionApi.storage.local.set({ [`closedRalphTab:${tabId}`]: url, [`closedThread:${url}`]: true });
     await forgetOwnedThreadTab(url, tabId);
     await Promise.allSettled([...registeringConversations]
       .filter(entry => automationTargetMatches(entry.url, url)).map(entry => entry.promise));
@@ -389,7 +390,12 @@ async function waitForTabComplete(tabId, timeoutMs = 5 * 60_000) {
 async function sendAutomationMessage(tabId, command) {
   // Establish the receiver before dispatching a side-effecting command. A lost response
   // does not prove that the page failed to send the message.
-  await extensionApi.scripting.executeScript({ target: { tabId }, files: ["content-script.js"] });
+  try {
+    await extensionApi.scripting.executeScript({ target: { tabId }, files: ["content-script.js"] });
+  } catch (error) {
+    if (command.kind === "send_message" && error instanceof Error) error.retryable = true;
+    throw error;
+  }
   return await extensionApi.tabs.sendMessage(tabId, { type: AUTOMATION_MESSAGE, command });
 }
 
@@ -489,7 +495,9 @@ async function executeCommandOnce(command, browserId) {
     if (observing && command.kind !== "inspect_thread") {
       throw new Error("This browser is only available for thread observation.");
     }
-    const acquired = observing || command.feature === "ralph" || command.kind === "prepare_thread"
+    const closedKey = `closedThread:${conversationUrl(targetUrl)}`;
+    const closed = await extensionApi.storage.local.get(closedKey);
+    const acquired = observing || (closed[closedKey] && (command.kind === "inspect_thread" || command.kind === "prepare_thread"))
       ? await findConversationTab(targetUrl)
       : await acquireAutomationTab(targetUrl, createsNewThread);
     if (!acquired) throw new Error("CHATGPT_TAB_UNAVAILABLE: The thread tab has closed or navigated away.");
@@ -504,7 +512,6 @@ async function executeCommandOnce(command, browserId) {
     try {
       loadedTab = await waitForTabComplete(tabId, command.kind === "inspect_thread" ? 5_000 : undefined);
     } catch (error) {
-      if (command.kind === "inspect_thread" || /timed out/i.test(String(error))) throw error;
       loadedTab = await reloadPageAfterFailure(tabId, targetUrl);
       refreshed = true;
     }
@@ -521,9 +528,10 @@ async function executeCommandOnce(command, browserId) {
         refreshed = await recoverPage(tabId) || refreshed;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (command.kind === "inspect_thread" || /timed out/i.test(message) || refreshed || /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(message)) throw error;
+        if (refreshed || /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(message)) throw error;
         await reloadPageAfterFailure(tabId, targetUrl);
         refreshed = true;
+        await recoverPage(tabId);
       }
     }
 
@@ -551,12 +559,13 @@ async function executeCommandOnce(command, browserId) {
       response = await runPageCommand();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (command.kind === "inspect_thread" || /timed out/i.test(message) || refreshed || /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(message)) throw error;
+      if (refreshed || /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(message)) throw error;
       await reloadPageAfterFailure(tabId, targetUrl);
       refreshed = true;
-      if (command.kind !== "inspect_thread" && !(command.kind === "send_message" && error?.retryable === true)) {
+      if (command.kind === "send_message" && error?.retryable !== true) {
         throw error;
       }
+      if (command.kind !== "stop_thread") await recoverPage(tabId);
       response = await runPageCommand();
     }
 
@@ -639,8 +648,12 @@ async function reloadPageAfterFailure(tabId, targetUrl) {
     throw new Error("CHATGPT_RATE_LIMITED: Waiting ten minutes before dismissing the provider notice.");
   }
   if (state.rateLimitedAt) await extensionApi.storage.local.set({ [key]: {} });
+  const current = await extensionApi.tabs.get(tabId);
+  if (targetUrl && (typeof current.url !== "string" || !automationTargetMatches(current.url, targetUrl))) {
+    throw new Error("ChatGPT automation navigated away from the requested target before refresh.");
+  }
   await extensionApi.tabs.reload(tabId);
-  const tab = await waitForTabComplete(tabId);
+  const tab = await waitForTabComplete(tabId, 30_000);
   if (targetUrl && (typeof tab.url !== "string" || !automationTargetMatches(tab.url, targetUrl))) {
     throw new Error("ChatGPT automation was redirected away from the requested target after refresh.");
   }
@@ -815,8 +828,8 @@ extensionApi.tabs.onUpdated?.addListener((tabId, changeInfo, tab) => {
   void observeConversation(observedUrl).catch(() => undefined);
   void registerRalphConversation(observedUrl, { title: observedTitle }).catch(() => undefined);
 });
-extensionApi.tabs.onRemoved?.addListener(tabId => {
-  void threadTabRemoved(tabId).catch(() => undefined).finally(restartPolling);
+extensionApi.tabs.onRemoved?.addListener((tabId, removeInfo) => {
+  void threadTabRemoved(tabId, removeInfo).catch(() => undefined).finally(restartPolling);
 });
 extensionApi.webNavigation?.onHistoryStateUpdated?.addListener((details) => {
   if (details.frameId === 0) {

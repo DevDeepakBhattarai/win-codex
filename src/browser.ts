@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 
 import { getPlaywrightInstallExpression } from "./browser-playwright.js";
-import { requireRunningChrome } from "./browser-launch.js";
+import { launchChrome } from "./browser-launch.js";
 
 const BRIDGE_PROTOCOL_VERSION = 1;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
@@ -468,7 +468,7 @@ export class BrowserService {
       token,
     );
     const bridge = await BrowserBridge.listen(host, input.port, token);
-    return new BrowserService(bridge, extensionDirectory, input.launchBrowser ?? requireRunningChrome);
+    return new BrowserService(bridge, extensionDirectory, input.launchBrowser ?? launchChrome);
   }
 
   status() {
@@ -492,7 +492,7 @@ export class BrowserService {
     await this.launchBrowser();
     if (await this.waitForConnection(BROWSER_CONNECT_TIMEOUT_MS)) return;
     throw new Error(
-      `Chrome was started, but its extension did not connect within 15 seconds. ` +
+      `The Chrome extension did not connect within 15 seconds. ` +
       `Load or enable the unpacked extension at ${this.extensionDirectory} in chrome://extensions. ` +
       `If it is installed in another profile, set BROWSER_PROFILE_DIRECTORY to that profile's directory name.`,
     );

@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.6.3";
+  const contentScriptVersion = "1.6.4";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -152,6 +152,7 @@
     const deadline = Date.now() + timeoutMs;
     let idleSince = 0;
     while (Date.now() < deadline) {
+      assertNoPageError(true);
       const ready = getComposer();
       const hasUserTurn = Boolean(document.querySelector('section[data-turn="user"]'));
       if (!ready || document.readyState === "loading" || !hasUserTurn) {
@@ -172,6 +173,7 @@
     const deadline = Date.now() + timeoutMs;
     let stoppedSince = 0;
     while (Date.now() < deadline) {
+      assertNoPageError(true);
       const ready = getComposer();
       const stopButton = ready?.composer.querySelector('button[data-testid="stop-button"]');
       if (!ready || stopButton) {
@@ -359,7 +361,8 @@
     if (notice) throw new Error(`CHATGPT_RATE_LIMITED: ${(notice.textContent ?? "").trim().slice(0, 500)}`);
   }
 
-  function assertNoPageError() {
+  function assertNoPageError(allowRateLimit = false) {
+    if (allowRateLimit && rateLimitNotice()) return;
     assertNotRateLimited();
     const notice = pageErrorNotice();
     if (notice) throw new Error(`CHATGPT_PAGE_ERROR: ${(notice.textContent ?? "").trim().slice(0, 500)}`);

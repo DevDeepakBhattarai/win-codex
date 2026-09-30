@@ -20,7 +20,7 @@ const FAILURE_RETRY_MS = 2 * 60 * 1000;
 const COMMAND_TIMEOUT_MS = 20 * 60 * 1000;
 const INSPECT_CLAIM_LEASE_MS = 5 * 60 * 1000;
 const CLAIM_WAIT_MS = 20_000;
-const RALPH_BROWSER_INSPECTION_TIMEOUT_MS = 60_000;
+const RALPH_BROWSER_INSPECTION_TIMEOUT_MS = 3 * 60_000;
 const SUPPORT_BROWSER_HEARTBEAT_GRACE_MS = CLAIM_WAIT_MS + 5_000;
 const SUPPORT_BROWSER_LAUNCH_COOLDOWN_MS = 5_000;
 const SUBAGENT_RESULT_MISSING_RETRY_MS = 30_000;
@@ -274,7 +274,7 @@ export class SupportCommandBus {
   ) {
     const allowBrowserLaunch = options.allowBrowserLaunch !== false;
     const targetUrl = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
-    if (allowBrowserLaunch && command.kind === "send_message" && this.launchBrowser) {
+    if (allowBrowserLaunch && (command.kind === "send_message" || command.kind === "stop_thread" || command.kind === "prepare_thread") && this.launchBrowser) {
       await this.ensureBrowser(command.feature, this.launchBrowser);
     }
     if (allowBrowserLaunch && command.kind === "inspect_thread" && this.launchBrowser) {
@@ -1056,7 +1056,7 @@ export class RalphController {
         feature: "ralph",
         kind: "inspect_thread",
         conversationUrl: thread.conversationUrl,
-      }, RALPH_BROWSER_INSPECTION_TIMEOUT_MS, { allowBrowserLaunch: false });
+      }, RALPH_BROWSER_INSPECTION_TIMEOUT_MS);
       if (!commandResult.ok) throw new Error(commandResult.error);
       if (commandResult.kind !== "inspect_thread") throw new Error("RALPH received the wrong support command result.");
       if (!await this.options.registry.isActive(thread.threadId)) return;
@@ -1144,7 +1144,7 @@ export class RalphController {
       await this.options.registry.recordContinuation(thread.threadId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (/timed out|Chrome.*already running/i.test(message)) {
+      if (/timed out/i.test(message)) {
         await this.options.registry.recordLoading(thread.threadId);
         return;
       }
@@ -1154,16 +1154,12 @@ export class RalphController {
   }
 
   private async inspectExecutorBeforeContinuation(thread: z.infer<typeof ralphThreadSchema>) {
-    if (!this.options.commands.hasBrowser("ralph")) {
-      await this.options.registry.recordLoading(thread.threadId);
-      return undefined;
-    }
     const result = await this.options.commands.execute({
       feature: "ralph",
       kind: "inspect_thread",
       conversationUrl: thread.conversationUrl,
       executorOnly: true,
-    }, RALPH_BROWSER_INSPECTION_TIMEOUT_MS, { allowBrowserLaunch: false });
+    }, RALPH_BROWSER_INSPECTION_TIMEOUT_MS);
     if (!result.ok) throw new Error(result.error);
     if (result.kind !== "inspect_thread") throw new Error("RALPH received the wrong pre-send inspection result.");
     if (!await this.options.registry.isActive(thread.threadId)) return undefined;
