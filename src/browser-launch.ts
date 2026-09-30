@@ -59,16 +59,22 @@ async function isChromeRunning(executablePath: string, userDataDirectory?: strin
     commandLines = processes.filter(entry => entry.ExecutablePath?.toLowerCase() === path.resolve(executablePath).toLowerCase())
       .flatMap(entry => entry.CommandLine ? [entry.CommandLine] : []);
   } else {
-    const { stdout } = await execFileAsync("ps", ["-ax", "-o", "args="], { timeout: 10_000 });
+    const { stdout } = await execFileAsync("ps", ["-ax", "-ww", "-o", "args="], { timeout: 10_000 });
     commandLines = stdout.split("\n").filter(line => line.trimStart().startsWith(`${executablePath} `) ||
       line.trimStart().startsWith(`"${executablePath}" `) || line.trim() === executablePath);
   }
   return commandLines.some(commandLine => {
     if (/(?:^|\s)--type(?:=|\s)/.test(commandLine)) return false;
-    const match = commandLine.match(/(?:^|\s)--user-data-dir(?:=|\s+)(?:"([^"]+)"|(\S+))/);
-    const runningDirectory = match?.[1] ?? match?.[2];
-    if (!userDataDirectory) return !runningDirectory;
-    if (!runningDirectory) return false;
+    const argument = commandLine.match(/(?:^|\s)--user-data-dir(?:=|\s+)(.*)/)?.[1];
+    if (!userDataDirectory) return !argument;
+    if (!argument) return false;
+    const runningDirectory = argument.match(/^"([^"]+)"/)?.[1]
+      ?? (process.platform === "win32" ? argument.split(/\s/)[0] : undefined);
+    if (!runningDirectory) {
+      // ps joins arguments without quoting. Match the configured directory in full.
+      const directory = path.resolve(userDataDirectory);
+      return argument.startsWith(directory) && /^(?:\s+(?:--|https?:\/\/|about:)|\s*$)/.test(argument.slice(directory.length));
+    }
     const normalize = (directory: string) => process.platform === "win32"
       ? path.resolve(directory).toLowerCase() : path.resolve(directory);
     return normalize(runningDirectory) === normalize(userDataDirectory);

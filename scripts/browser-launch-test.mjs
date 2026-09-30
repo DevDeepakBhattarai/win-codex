@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 // The launch decision, profile matching, and concurrent startup remain production code.
 const originalExecFile = childProcess.execFile;
 const originalSpawn = childProcess.spawn;
+const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 let processes = [];
 let inventoryError;
 let spawnError;
@@ -64,7 +65,19 @@ try {
   inventoryError = new Error("Process inventory unavailable");
   await assert.rejects(launchChrome(input), /Process inventory unavailable/);
   assert.equal(starts.length, 5, "an unknown process state must not spawn duplicate browsers");
+  inventoryError = undefined;
+  Object.defineProperty(process, "platform", { value: "darwin" });
+  processes = [{ ExecutablePath: executablePath, CommandLine: `${executablePath} --user-data-dir=${userDataDirectory} --new-tab` }];
+  await launchChrome(input);
+  assert.equal(starts.length, 5, "Unix process output preserves a matching profile path containing spaces");
+  processes = [{ ExecutablePath: executablePath, CommandLine: `${executablePath} --user-data-dir=${userDataDirectory} about:blank` }];
+  await launchChrome(input);
+  assert.equal(starts.length, 5, "a URL following the profile argument does not cause another launch");
+  processes = [{ ExecutablePath: executablePath, CommandLine: `${executablePath} --user-data-dir=${userDataDirectory} extra --new-tab` }];
+  await launchChrome(input);
+  assert.equal(starts.length, 6, "a different Unix profile sharing a path prefix must not be reused");
 } finally {
+  Object.defineProperty(process, "platform", originalPlatform);
   childProcess.execFile = originalExecFile;
   childProcess.spawn = originalSpawn;
   syncBuiltinESMExports();

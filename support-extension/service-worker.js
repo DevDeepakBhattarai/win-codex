@@ -34,15 +34,25 @@ const observingConversations = new Map();
 const AUTOMATION_THREAD_TABS_KEY = "automationThreadTabsV1";
 const RATE_LIMIT_WAIT_MS = 10 * 60_000;
 const trackedThreadTabs = new Map();
+const trackingThreadTabs = new Map();
 const registeringConversations = new Set();
 
-async function trackThreadTab(tabId, value) {
+function trackThreadTab(tabId, value) {
   const url = conversationUrl(value);
   if (!Number.isInteger(tabId)) return;
-  if (url) await extensionApi.storage.local.set({ [`closedThread:${url}`]: false });
   if (url) trackedThreadTabs.set(tabId, url);
   else trackedThreadTabs.delete(tabId);
-  return extensionApi.storage.local.set({ [`ralphTab:${tabId}`]: url });
+  const tracking = (trackingThreadTabs.get(tabId) ?? Promise.resolve())
+    .catch(() => undefined)
+    .then(() => extensionApi.storage.local.set({
+      [`ralphTab:${tabId}`]: url,
+      ...(url ? { [`closedThread:${url}`]: false } : {}),
+    }))
+    .finally(() => {
+      if (trackingThreadTabs.get(tabId) === tracking) trackingThreadTabs.delete(tabId);
+    });
+  trackingThreadTabs.set(tabId, tracking);
+  return tracking;
 }
 
 async function reportClosedThreadTabs() {
@@ -62,9 +72,11 @@ async function reportClosedThreadTabs() {
 
 async function threadTabRemoved(tabId, removeInfo) {
   const key = `ralphTab:${tabId}`;
-  const stored = await extensionApi.storage.local.get(key);
-  const url = trackedThreadTabs.get(tabId) ?? stored[key];
+  const trackedUrl = trackedThreadTabs.get(tabId);
   trackedThreadTabs.delete(tabId);
+  await trackingThreadTabs.get(tabId)?.catch(() => undefined);
+  const stored = await extensionApi.storage.local.get(key);
+  const url = trackedUrl ?? stored[key];
   if (url && !removeInfo?.isWindowClosing) {
     await extensionApi.storage.local.set({ [`closedRalphTab:${tabId}`]: url, [`closedThread:${url}`]: true });
     await forgetOwnedThreadTab(url, tabId);

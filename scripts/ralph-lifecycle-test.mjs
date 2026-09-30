@@ -71,6 +71,8 @@ let pageFailure = false;
 let dispatches = 0;
 let reloads = 0;
 let releaseInspection;
+let holdTracking = false;
+let releaseTracking;
 const context = {
   URL, AbortSignal, AbortController, crypto: globalThis.crypto, Response, console, setTimeout, clearTimeout,
   importScripts() {}, LOCAL_CODEX_THREAD_SYNC: config,
@@ -78,7 +80,12 @@ const context = {
     runtime: { id: "a".repeat(32), onMessage: { addListener() {} }, onInstalled: { addListener() {} }, onStartup: { addListener() {} } },
     storage: { local: {
       async get(query) { return typeof query === "string" ? { [query]: storage[query] } : { ...query, threadSync: false, ...storage }; },
-      async set(values) { Object.assign(storage, values); },
+      async set(values) {
+        if (holdTracking && Object.entries(values).some(([key, value]) => key.startsWith("closedThread:") && value === false)) {
+          await new Promise(resolve => { releaseTracking = resolve; });
+        }
+        Object.assign(storage, values);
+      },
       async remove(keys) { for (const key of [keys].flat()) delete storage[key]; },
     } },
     scripting: { async executeScript() {} },
@@ -151,4 +158,20 @@ await inspect("after-browser-close");
 assert.equal(creations.length, 2, "an executor reopens the thread after Chrome restarts");
 await inspect("reuse-reopened-thread");
 assert.equal(creations.length, 2, "subsequent inspections reuse the reopened tab");
+const raceUrl = "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222";
+tabs.set(10, { id: 10, windowId: 3, url: raceUrl, status: "complete" });
+holdTracking = true;
+const tracking = context.trackThreadTab(10, raceUrl);
+await new Promise(resolve => setImmediate(resolve));
+tabs.delete(10);
+const removal = context.threadTabRemoved(10, { isWindowClosing: false });
+await new Promise(resolve => setImmediate(resolve));
+holdTracking = false;
+releaseTracking();
+await Promise.all([tracking, removal]);
+assert.equal(removals.at(-1).conversationUrl, raceUrl, "closure during tracking still removes the registered thread");
+assert.equal(storage["closedThread:" + raceUrl], true, "a late tracking write must not erase deliberate closure");
+assert.equal(storage["ralphTab:10"], undefined, "late tracking must not restore a removed tab");
+await context.executeCommand({ id: "closed-during-tracking", feature: "ralph", kind: "inspect_thread", conversationUrl: raceUrl }, "existing");
+assert.equal(creations.length, 2, "a stale inspection cannot recreate the tab closed during tracking");
 console.log("RALPH lifecycle tests passed.");
