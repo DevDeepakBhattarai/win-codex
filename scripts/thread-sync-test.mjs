@@ -56,7 +56,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.6.3");
+  assert.equal(manifest.version, "1.6.4");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -141,7 +141,7 @@ try {
     "thread sending does not use acknowledgement or DOM-stability heuristics");
   assert.match(preparedContentScript, /const SEND_SETTLE_MS = 5_000;/,
     "thread sending uses the fixed five-second settle requested for typing and sending");
-  assert.match(preparedContentScript, /contentScriptVersion = "1\.6\.3"/,
+  assert.match(preparedContentScript, /contentScriptVersion = "1\.6\.4"/,
     "extension reloads can replace a stale page script with the current content-script version");
   assert.equal(parseRalphProjectId(namedProjectHome), projectId);
   assert.equal(parseRalphProjectId(urlA), projectId);
@@ -3023,9 +3023,9 @@ async function testWorkerRecoversHungAutomation(sync) {
 
   assert.equal(postedResults.length, 1);
   assert.equal(postedResults[0].ok, true);
-  assert.equal(postedResults[0].result.status, "loading");
-  assert.equal(reloads, 0, "a hung inspection waits without refreshing");
-  assert.equal(dispatches, 1);
+  assert.equal(postedResults[0].result.status, "running");
+  assert.equal(reloads, 1, "a hung inspection refreshes the same tab once");
+  assert.equal(dispatches, 2);
   assert.equal(removedTab, false, "a timed-out RALPH inspection keeps the owned thread tab available for retry and inspection");
   assert.equal(JSON.stringify(storage.automationThreadTabsV1), JSON.stringify({ [urlA]: 11 }));
 }

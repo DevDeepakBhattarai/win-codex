@@ -14,13 +14,14 @@ const config = {
   extensionToken: "x".repeat(32),
 };
 
-async function runWorker(command, responses) {
+async function runWorker(command, responses, healthResponses = [], injectionFailures = []) {
   const results = [];
   let dispatches = 0;
   let reloads = 0;
+  let activeInjectionFailures = [];
   const storage = {};
   const context = {
-    URL, AbortSignal, AbortController, crypto: globalThis.crypto, Response,
+    URL, AbortSignal, AbortController, crypto: globalThis.crypto, Response, Error,
     setTimeout, clearTimeout, console, importScripts() {},
     LOCAL_CODEX_THREAD_SYNC: config,
     browser: {
@@ -34,7 +35,11 @@ async function runWorker(command, responses) {
         get: async () => ({ id: 11, status: "complete", url }),
         reload: async () => { reloads += 1; },
         sendMessage: async (_tabId, payload) => {
-          if (payload.command.kind === "page_health") return { ok: true, result: { status: "ok" } };
+          if (payload.command.kind === "page_health") {
+            const response = healthResponses.shift();
+            if (response instanceof Error) throw response;
+            return response ?? { ok: true, result: { status: "ok" } };
+          }
           const response = responses[dispatches++];
           if (response instanceof Error) throw response;
           return response;
@@ -42,7 +47,7 @@ async function runWorker(command, responses) {
         remove: async () => {},
       },
       webNavigation: { onHistoryStateUpdated: { addListener() {} }, onCommitted: { addListener() {} } },
-      scripting: { executeScript: async () => {} },
+      scripting: { executeScript: async () => { const failure = activeInjectionFailures.shift(); if (failure) throw failure; } },
       storage: { local: {
         async get(query) { return typeof query === "string" ? { [query]: storage[query] } : { ...query, threadSync: false, ...storage }; },
         async set(values) { Object.assign(storage, values); },
@@ -56,6 +61,7 @@ async function runWorker(command, responses) {
   };
   vm.runInNewContext(workerScript, context);
   await new Promise(resolve => setImmediate(resolve));
+  activeInjectionFailures = injectionFailures;
   context.restartPolling = () => {};
   context.getSettings = async () => ({ threadSync: true, automationExecutor: true });
   await context.executeCommand(command, "browser-a");
@@ -70,13 +76,35 @@ function sendCommand(id) {
   return { id, feature: "threadMessaging", kind: "send_message", targetUrl: url, message: "Continue" };
 }
 
+for (const kind of ["inspect_thread", "prepare_thread"]) {
+  const run = await runWorker({ id: `health-${kind}`, feature: kind === "inspect_thread" ? "ralph" : "threadPreparation",
+    kind, conversationUrl: url }, [{ ok: true, result: { status: "running" } }], [
+    new Error("Timed out waiting for ChatGPT page automation."),
+    { ok: true, result: { status: "ok" } },
+  ]);
+  assert.equal(run.reloads, 1, "page-health failures refresh the existing tab");
+  assert.equal(run.results[0].ok, true);
+  assert.equal(run.results[0].result.status, kind === "inspect_thread" ? "running" : "prepared");
+}
+
+{
+  const run = await runWorker(inspectCommand("persistently-blocked"), [], [
+    { ok: true, result: { status: "recoverable_error" } },
+    { ok: true, result: { status: "recoverable_error" } },
+  ]);
+  assert.equal(run.reloads, 1);
+  assert.equal(run.dispatches, 0, "a refresh must recheck page health before inspecting a still-blocked page");
+  assert.equal(run.results[0].result.status, "loading");
+}
+
 {
   const run = await runWorker(inspectCommand("inspection-timeout"), [
     new Error("Timed out waiting for ChatGPT page automation."),
+    { ok: true, result: { status: "running" } },
   ]);
-  assert.equal(run.reloads, 0, "an inspection timeout must wait on the same page without reloading");
+  assert.equal(run.reloads, 1, "an inspection timeout refreshes the same tab once");
   assert.equal(run.results[0].ok, true);
-  assert.equal(run.results[0].result.status, "loading");
+  assert.equal(run.results[0].result.status, "running");
 }
 
 {
@@ -84,10 +112,10 @@ function sendCommand(id) {
     { ok: false, error: "Message delivery failed." },
     { ok: true, result: { status: "running" } },
   ]);
-  assert.equal(run.reloads, 0, "an inspection waits for page recovery without refreshing");
-  assert.equal(run.dispatches, 1, "inspection defers until the next check");
+  assert.equal(run.reloads, 1, "an inspection refreshes a failed page");
+  assert.equal(run.dispatches, 2, "inspection repeats on the refreshed tab");
   assert.equal(run.results[0].ok, true);
-  assert.equal(run.results[0].result.status, "loading");
+  assert.equal(run.results[0].result.status, "running");
 }
 
 {
@@ -95,8 +123,20 @@ function sendCommand(id) {
     { ok: false, error: "Stream interrupted." },
     { ok: false, error: "Stream interrupted." },
   ]);
-  assert.equal(run.reloads, 0, "a persistent failure does not cause a refresh loop");
+  assert.equal(run.reloads, 1, "a persistent failure does not cause a refresh loop");
+  assert.equal(run.dispatches, 2);
   assert.equal(run.results[0].result.status, "loading");
+}
+
+for (const failure of [new Error("Timed out waiting for ChatGPT page automation."),
+  { ok: false, error: "ChatGPT did not confirm that the child run stopped." }]) {
+  const run = await runWorker({ id: "stop-recovery", feature: "threadMessaging", kind: "stop_thread", targetUrl: url }, [
+    failure, { ok: true, result: { status: "stopped", conversationUrl: url } },
+  ]);
+  assert.equal(run.reloads, 1, "a failed stop refreshes the same tab");
+  assert.equal(run.dispatches, 2, "stop state is checked again after refresh");
+  assert.equal(run.results[0].ok, true);
+  assert.equal(run.results[0].result.status, "stopped");
 }
 
 {
@@ -133,6 +173,15 @@ function sendCommand(id) {
 }
 
 {
+  const run = await runWorker(sendCommand("receiver-setup-failure"), [
+    { ok: true, result: { status: "sent", conversationUrl: url } },
+  ], [], [undefined, new Error("Could not establish the page receiver.")]);
+  assert.equal(run.reloads, 1);
+  assert.equal(run.dispatches, 1, "failure before dispatch can retry without sending twice");
+  assert.equal(run.results[0].ok, true);
+}
+
+{
   let listener;
   const alert = { textContent: "Message delivery failed.", getClientRects: () => [{}] };
   const document = {
@@ -144,11 +193,13 @@ function sendCommand(id) {
     document, location: new URL(url), window: { addEventListener() {} },
     browser: { runtime: { async sendMessage() {}, onMessage: { addListener(value) { listener = value; } } } },
   });
-  const response = await new Promise(resolve => listener({
-    type: "local-codex-support/automation-v1", command: { kind: "inspect_thread" },
-  }, {}, resolve));
-  assert.equal(response.ok, false);
-  assert.match(response.error, /Message delivery failed/);
+  for (const kind of ["inspect_thread", "stop_thread"]) {
+    const response = await new Promise(resolve => listener({
+      type: "local-codex-support/automation-v1", command: { kind },
+    }, {}, resolve));
+    assert.equal(response.ok, false);
+    assert.match(response.error, /Message delivery failed/);
+  }
 }
 
 {
