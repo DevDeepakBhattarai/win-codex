@@ -41,7 +41,8 @@ try {
   assert.ok(send.message.includes(payload.prompt));
   assert.ok(send.message.includes(jobId));
   assert.match(send.message, /browser_recording/);
-  assert.match(send.message, /submit_subagent_result/);
+  assert.match(send.message, /review_done/);
+  assert.doesNotMatch(send.message, /independent reviewer/);
   assert.equal(await commands.claim("other", ["threadMessaging"], 0), undefined);
   const childUrl = `https://chatgpt.com/c/${randomUUID()}`;
   completeCommand(send, { status: "sent", conversationUrl: childUrl });

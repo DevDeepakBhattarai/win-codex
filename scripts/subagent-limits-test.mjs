@@ -79,7 +79,9 @@ try {
     damagedBus.complete({ commandId: notice.id, browserId: "browser", kind: "send_message", ok: true,
       result: { status: "sent", conversationUrl: parent.conversationUrl } });
     await new Promise(resolve => setTimeout(resolve, 30));
-    assert.match((await damagedJobs.job(damaged.jobId)).notificationError, /EISDIR/);
+    assert.equal((await damagedJobs.job(damaged.jobId)).notificationError, undefined,
+      "an unfinished result artifact is ignored until the child explicitly submits completion");
+    assert.equal((await damagedJobs.job(damaged.jobId)).state, "pending");
     assert.ok((await damagedJobs.job(healthy.jobId)).notifiedAt);
   } finally { damagedController.close(); damagedBus.close(); }
 
@@ -176,77 +178,16 @@ try {
   const toolBus = new SupportCommandBus(undefined, 30, 15);
   registerChatGptAgents({ registerResource() {}, registerTool(name, definition, handler) { handlers.set(name, handler); } },
     toolBus, { async binding({ sessionId }) { return sessionId === "owner" ? parent : { threadId: "other" }; } },
-    registry, batchJobs, { async ensurePrepared() {} }, async () => {}, "grant", "");
+    registry, batchJobs, { async ensurePrepared() {}, markPrepared() {} }, async () => {}, "grant", "");
   try {
-    const cancel = handlers.get("cancel_subagent");
-    assert.equal((await cancel({ jobId: waiting.jobId }, { _meta: { "openai/session": "stranger" } })).isError, true);
-    assert.equal((await batchJobs.job(waiting.jobId)).state, "pending");
-    assert.equal((await cancel({ jobId: waiting.jobId }, { _meta: { "openai/session": "owner" } })).isError, true,
-      "an unresolved in-flight startup cannot release its reservation");
-    await batchJobs.recordPreparationFailure(waiting.jobId, "startup could not be confirmed");
-    await cancel({ jobId: waiting.jobId }, { _meta: { "openai/session": "owner" } });
-    assert.equal((await batchJobs.job(waiting.jobId)).state, "cancelled");
-
-    const childThreadId = "22222222-2222-4222-8222-222222222222";
-    const childUrl = `https://chatgpt.com/c/${childThreadId}`;
-    const cancellable = await batchJobs.create(parent);
-    await batchJobs.assignChild(cancellable.jobId, { threadId: childThreadId, conversationUrl: childUrl });
-    await registry.register(childUrl, { agentCreated: true, parentThreadId: parent.threadId });
-    const cancellation = cancel({ jobId: cancellable.jobId }, { _meta: { "openai/session": "owner" } });
-    const stopCommand = await toolBus.claim("browser", ["threadMessaging"], 1000);
-    assert.equal(stopCommand.kind, "stop_thread");
-    assert.equal(stopCommand.targetUrl, childUrl);
-    assert.equal((await batchJobs.job(cancellable.jobId)).state, "pending",
-      "the slot remains reserved until browser cancellation succeeds");
-    toolBus.complete({ commandId: stopCommand.id, browserId: "browser", kind: "stop_thread", ok: true,
-      result: { status: "stopped", conversationUrl: childUrl } });
-    assert.equal((await cancellation).isError, undefined);
-    assert.equal((await batchJobs.job(cancellable.jobId)).state, "cancelled");
-    assert.equal((await registry.threads()).find(thread => thread.threadId === childThreadId).state, "complete");
-
-    const limiter = toolBus.execute(
-      { feature: "threadMessaging", kind: "send_message", targetUrl: parent.conversationUrl, message: "trigger cooldown" },
-      200,
-    );
-    const limiterCommand = await toolBus.claim("browser", ["threadMessaging"], 0);
-    toolBus.complete({ commandId: limiterCommand.id, browserId: "browser", kind: "send_message", ok: false,
-      error: "CHATGPT_RATE_LIMITED_RETRYABLE: Too many messages" });
-    const queuedStart = handlers.get("start_subagent")({ message: "queued child start" },
-      { requestId: "cooldown-child", _meta: { "openai/session": "owner" } });
-    await new Promise(resolve => setTimeout(resolve, 10));
-    const queuedJob = (await batchJobs.forParent(parent.threadId)).find(job =>
-      job.state === "pending" && !job.childThreadId && job.jobId !== waiting.jobId);
-    assert.ok(queuedJob, "a child start during cooldown reserves its parent slot instead of being discarded");
-    assert.equal(await toolBus.claim("browser", ["threadMessaging"], 0), undefined,
-      "the child-start browser message waits during cooldown");
-
-    await new Promise(resolve => setTimeout(resolve, 35));
-    const limiterRetry = await toolBus.claim("browser", ["threadMessaging"], 0);
-    assert.equal(limiterRetry.id, limiterCommand.id);
-    toolBus.complete({ commandId: limiterRetry.id, browserId: "browser", kind: "send_message", ok: true,
-      result: { status: "sent", conversationUrl: parent.conversationUrl } });
-    await limiter;
-    await new Promise(resolve => setTimeout(resolve, 20));
-    const queuedChildCommand = await toolBus.claim("browser", ["threadMessaging"], 0);
-    assert.match(queuedChildCommand.message, /queued child start/);
-    const queuedChildThreadId = "33333333-3333-4333-8333-333333333333";
-    const queuedChildUrl = `https://chatgpt.com/c/${queuedChildThreadId}`;
-    toolBus.complete({ commandId: queuedChildCommand.id, browserId: "browser", kind: "send_message", ok: true,
-      result: { status: "sent", conversationUrl: queuedChildUrl, title: "Queued child" } });
-    const queuedStartResult = await queuedStart;
-    assert.equal(queuedStartResult.isError, undefined);
-    assert.equal((await batchJobs.job(queuedJob.jobId)).childConversationUrl, queuedChildUrl);
-    await registry.recordComplete(queuedChildThreadId);
-    await batchJobs.cancel(queuedJob.jobId);
-
-    const pending = [await batchJobs.create(parent), await batchJobs.create(parent)];
-    const refused = await handlers.get("start_subagent")({ message: "third child" }, { requestId: "capacity", _meta: { "openai/session": "owner" } });
-    assert.equal(refused.isError, true);
-    for (const job of pending) assert.ok(refused.content[0].text.includes(job.jobId));
-    assert.equal(await toolBus.claim("browser", ["threadMessaging"], 0), undefined,
-      "capacity refusal reaches no browser send");
-    const listing = await handlers.get("list_subagents")({}, { _meta: { "openai/session": "owner" } });
-    for (const job of pending) assert.ok(listing.structuredContent.subagents.some(view => view.jobId === job.jobId));
+    assert.deepEqual([...handlers.keys()].sort(),
+      ["list_reviewers", "review_done", "send_thread_message", "start_reviewer", "start_thread"],
+      "the ChatGPT-facing API exposes sequential reviews and explicit threads, not generic delegation tools");
+    for (const removed of ["start_subagent", "cancel_subagent", "list_subagents", "submit_subagent_result"]) {
+      assert.equal(handlers.has(removed), false, `${removed} stays off the ChatGPT-facing tool surface`);
+    }
+    await batchJobs.recordPreparationFailure(waiting.jobId, "test cleanup");
+    await batchJobs.cancel(waiting.jobId);
   } finally { toolBus.close(); }
 
   const contentScript = await readFile("support-extension/content-script.js", "utf8");

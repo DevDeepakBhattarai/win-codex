@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Sub-agents</title>
+  <title>Reviews</title>
   <style>
     :root {
       color-scheme: light dark;
@@ -91,6 +91,15 @@
       font-weight: 620;
       line-height: 1.3;
     }
+    .url {
+      margin-top: 3px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 10.5px;
+      line-height: 1.25;
+      opacity: .7;
+    }
     .meta {
       display: flex;
       gap: 8px;
@@ -149,8 +158,8 @@
     <div class="header">
       <span class="mark" aria-hidden="true"></span>
       <div class="heading">
-        <div class="title">Sub-agents</div>
-        <div id="summary" class="summary">Loading agents...</div>
+        <div class="title">Reviews</div>
+        <div id="summary" class="summary">Review handoff</div>
       </div>
     </div>
     <div id="root" class="list"></div>
@@ -190,9 +199,9 @@
       visual.append(Object.assign(document.createElement("span"), { className: "empty-link" }));
       copy.append(
         visual,
-        Object.assign(document.createElement("strong"), { textContent: "No sub-agents yet" }),
+        Object.assign(document.createElement("strong"), { textContent: "No review started" }),
         Object.assign(document.createElement("p"), {
-          textContent: "Agents started from this conversation will appear here with their live RALPH state.",
+          textContent: "Start a review after implementation and verification. The implementer pauses until the review is done.",
         }),
       );
       empty.append(copy);
@@ -201,11 +210,11 @@
 
     function render(result) {
       const data = result?.structuredContent ?? result?.mcp_tool_result?.structuredContent ?? result?.call_tool_result?.structuredContent;
-      const agents = Array.isArray(data?.subagents) ? data.subagents : [];
+      const agents = Array.isArray(data?.reviews) ? data.reviews : [];
       root.replaceChildren();
       summary.textContent = agents.length === 0
         ? "Nothing running from this conversation"
-        : `${agents.length} ${agents.length === 1 ? "agent" : "agents"}`;
+        : `${agents.length} review${agents.length === 1 ? "" : "s"}`;
 
       if (agents.length === 0) {
         root.append(emptyState());
@@ -228,8 +237,15 @@
         copy.className = "copy";
         copy.append(Object.assign(document.createElement("div"), {
           className: "name",
-          textContent: agent.title || `Sub-agent ${String(agent.threadId ?? agent.jobId).slice(0, 8)}`,
+          textContent: agent.title || `Reviewer ${String(agent.threadId ?? agent.jobId).slice(0, 8)}`,
         }));
+        if (agent.conversationUrl) {
+          copy.append(Object.assign(document.createElement("div"), {
+            className: "url",
+            textContent: agent.conversationUrl,
+            title: agent.conversationUrl,
+          }));
+        }
 
         const meta = document.createElement("div");
         meta.className = "meta";
@@ -248,12 +264,6 @@
         if (agent.resultState) {
           meta.append(Object.assign(document.createElement("span"), {
             textContent: agent.resultState === "cancelled" ? "Cancelled" : agent.resultState === "complete" ? "Result ready" : "Result pending",
-          }));
-        }
-        if (agent.resultPath) {
-          meta.append(Object.assign(document.createElement("span"), {
-            textContent: agent.resultPath,
-            title: agent.resultPath,
           }));
         }
         copy.append(meta);
@@ -279,7 +289,7 @@
     window.addEventListener("message", (event) => {
       const message = event.data;
       if (event.source !== window.parent || message?.jsonrpc !== "2.0") return;
-      if (message.id === "subagent-ui-init" && message.result) {
+      if (message.id === "reviewer-ui-init" && message.result) {
         window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} }, "*");
       }
       if (message.method === "ui/notifications/tool-result") render(message.params);
@@ -291,11 +301,11 @@
     readOpenAiResult();
     window.parent.postMessage({
       jsonrpc: "2.0",
-      id: "subagent-ui-init",
+      id: "reviewer-ui-init",
       method: "ui/initialize",
       params: {
         protocolVersion: "2026-01-26",
-        appInfo: { name: "local-codex-subagents", version: "1.3.0" },
+        appInfo: { name: "local-codex-reviewers", version: "1.4.0" },
         appCapabilities: {},
       },
     }, "*");

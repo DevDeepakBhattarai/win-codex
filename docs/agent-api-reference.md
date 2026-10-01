@@ -21,7 +21,7 @@ Each session has at most two pending jobs. Capacity returns 429. Reusing a reque
 
 A job has `jobId`, `state`, `resultPath`, `createdAt`, and `parentThreadId`. API parents use `api:SESSION` and have no ChatGPT parent URL. A confirmed startup adds `childThreadId` and `childConversationUrl`. `preparationError` records failed or uncertain startup. An interrupted startup stays pending across restarts and is never resent automatically. Unknown child URLs require manual inspection before cancellation.
 
-`state` is `pending`, `complete`, or `cancelled`. Only `GET /agents/JOB_ID` adds `result`, `videos`, and `screenshots`. `result` is null until completion. Results use the existing `submit_subagent_result` tool. API jobs never send a ChatGPT parent notification.
+`state` is `pending`, `complete`, or `cancelled`. Only `GET /agents/JOB_ID` adds `result`, `videos`, and `screenshots`. `result` is null until completion. The spawned testing thread stores its result with `review_done`; API jobs do not use the reviewer handoff or parent wake-up behavior. API jobs never send a ChatGPT parent notification.
 
 ## Browser tools added for testing
 

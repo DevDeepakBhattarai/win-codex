@@ -33,6 +33,7 @@ let pollGeneration = 0;
 let pollController = null;
 const reportedRalphConversations = new Set();
 const observingConversations = new Map();
+const observedAt = new Map();
 const AUTOMATION_THREAD_TABS_KEY = "automationThreadTabsV1";
 const RATE_LIMIT_WAIT_MS = 10 * 60_000;
 const trackedThreadTabs = new Map();
@@ -175,6 +176,8 @@ function observeConversation(value) {
   const observation = (async () => {
     const settings = await getSettings();
     if (!settings.threadSync) return;
+    const now = Date.now();
+    if (now - (observedAt.get(currentUrl) ?? 0) < 60_000) return;
     const response = await fetch(threadObserveEndpoint.href, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${config.extensionToken}` },
@@ -186,6 +189,10 @@ function observeConversation(value) {
       redirect: "error",
     });
     if (!response.ok) throw new Error(`Thread observation returned ${response.status}.`);
+    observedAt.set(currentUrl, now);
+    for (const [url, timestamp] of observedAt) {
+      if (now - timestamp >= 60_000) observedAt.delete(url);
+    }
   })().finally(() => observingConversations.delete(currentUrl));
   observingConversations.set(currentUrl, observation);
   return observation;
@@ -196,17 +203,18 @@ function registerRalphConversation(value, options = {}) {
   return entry.promise.finally(() => registeringConversations.delete(entry));
 }
 
-async function registerRalphConversationOnce(value, { reactivate = false, agentCreated = false, title } = {}) {
+async function registerRalphConversationOnce(value, { reactivate = false, externalUpdate = false, agentCreated = false, title } = {}) {
   const currentUrl = conversationUrl(value);
   const currentTitle = normalizeThreadTitle(title);
-  if (!currentUrl || !currentUrl.startsWith("https://chatgpt.com/g/") ||
-      (!reactivate && !agentCreated && !currentTitle && reportedRalphConversations.has(currentUrl))) return;
+  if (!currentUrl || (!reactivate && !externalUpdate && !currentUrl.startsWith("https://chatgpt.com/g/")) ||
+      (!reactivate && !externalUpdate && !agentCreated && !currentTitle && reportedRalphConversations.has(currentUrl))) return;
   const response = await fetch(ralphRegisterEndpoint.href, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${config.extensionToken}` },
     body: JSON.stringify({
       conversationUrl: currentUrl,
       ...(reactivate ? { reactivate: true } : {}),
+      ...(externalUpdate ? { externalUpdate: true } : {}),
       ...(agentCreated ? { agentCreated: true } : {}),
       ...(currentTitle ? { title: currentTitle } : {}),
     }),
@@ -355,10 +363,11 @@ async function reactivateRalphConversation(message, sender) {
   }
   const requestedUrl = conversationUrl(message.conversationUrl);
   const currentUrl = conversationUrl((await extensionApi.tabs.get(sender.tab.id)).url);
-  if (!requestedUrl || requestedUrl !== currentUrl || !requestedUrl.startsWith("https://chatgpt.com/g/")) {
+  if (!requestedUrl || requestedUrl !== currentUrl) {
     return { ok: false, error: "RALPH no longer matches the current conversation." };
   }
-  await registerRalphConversation(currentUrl, { reactivate: true });
+  const settings = await getSettings();
+  await registerRalphConversation(currentUrl, { reactivate: message.completed !== true, externalUpdate: !settings.automationExecutor });
   return { ok: true };
 }
 
@@ -456,12 +465,16 @@ async function commandTargetUrl(command) {
 }
 
 const executingCommands = new Map();
+let executionTail = Promise.resolve();
+
 function executeCommand(command, browserId) {
   const existing = executingCommands.get(command.id);
   if (existing) return existing;
-  const operation = keepWorkerAliveUntil(executeCommandOnce(command, browserId))
+  const operation = executionTail.catch(() => undefined)
+    .then(() => keepWorkerAliveUntil(executeCommandOnce(command, browserId)))
     .finally(() => executingCommands.delete(command.id));
   executingCommands.set(command.id, operation);
+  executionTail = operation;
   return operation;
 }
 
@@ -496,7 +509,7 @@ async function executeCommandOnce(command, browserId) {
     return;
   }
 
-  const createsNewThread = command.kind === "send_message" && projectHomeId(targetUrl) !== null;
+  const createsNewThread = command.kind === "send_message" && conversationUrl(targetUrl) === null;
   let tabId;
   let created = false;
   let keepCreatedTab = false;
@@ -535,6 +548,21 @@ async function executeCommandOnce(command, browserId) {
         keepCreatedTab = false;
       }
       throw new Error("ChatGPT automation was redirected away from the requested target.");
+    }
+
+    if (!observing && command.refreshRevision && existingConversation && command.kind !== "stop_thread") {
+      const revisionKey = `threadRevision:${tabId}`;
+      const saved = await extensionApi.storage.local.get(revisionKey);
+      if (!created && saved[revisionKey] !== command.refreshRevision) {
+        const inspection = await sendAutomationMessageWithTimeout(tabId, { kind: "inspect_thread" });
+        if (!inspection?.ok || inspection.result?.status !== "idle") {
+          throw new Error("External conversation update is pending. Refresh deferred until the automation tab is idle.");
+        }
+        await extensionApi.tabs.reload(tabId);
+        loadedTab = await waitForTabComplete(tabId);
+        refreshed = true;
+      }
+      await extensionApi.storage.local.set({ [revisionKey]: command.refreshRevision });
     }
 
     if (command.kind !== "stop_thread") {
