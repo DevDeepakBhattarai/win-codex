@@ -6,7 +6,10 @@ import vm from 'node:vm';
 const url = 'https://chatgpt.com/c/11111111-1111-4111-8111-111111111111';
 
 let launches = 0;
-const launchAwareBus = new SupportCommandBus(undefined, undefined, undefined, async () => { launches += 1; });
+const launchAwareBus = new SupportCommandBus(undefined, undefined, undefined, async () => {
+  launches += 1;
+  await launchAwareBus.claim('chrome-launch', ['ralph'], 0);
+});
 try {
   await launchAwareBus.claim('helium', [], 0, undefined, [url]);
   const observed = launchAwareBus.execute({ feature: 'ralph', kind: 'inspect_thread', conversationUrl: url });
@@ -28,7 +31,10 @@ try {
   launchAwareBus.close();
 }
 
-const fallbackLaunchBus = new SupportCommandBus(undefined, undefined, undefined, async () => { launches += 1; });
+const fallbackLaunchBus = new SupportCommandBus(undefined, undefined, undefined, async () => {
+  launches += 1;
+  await fallbackLaunchBus.claim('chrome-fallback-launch', ['ralph'], 0);
+});
 try {
   await fallbackLaunchBus.claim('helium-fallback', [], 0, undefined, []);
   const fallback = fallbackLaunchBus.execute({ feature: 'ralph', kind: 'inspect_thread', conversationUrl: url });

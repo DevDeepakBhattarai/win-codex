@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.6.4";
+  const contentScriptVersion = "1.6.5";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 

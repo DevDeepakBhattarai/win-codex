@@ -9,7 +9,10 @@ const url = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
 const threadId = url.split("/c/")[1];
 const directory = await mkdtemp(path.join(os.tmpdir(), "ralph-lifecycle-"));
 let launches = 0;
-const commands = new SupportCommandBus(undefined, undefined, undefined, async () => { launches++; });
+const commands = new SupportCommandBus(undefined, undefined, undefined, async () => {
+  launches++;
+  await commands.claim("chrome-launch", ["ralph"], 0);
+});
 try {
   const registry = await RalphRegistry.open(directory);
   await registry.register(url, { manual: true });
@@ -30,7 +33,10 @@ try {
   assert.deepEqual(await (await RalphRegistry.open(directory)).threads(), [], "removal survives a server restart");
   assert.equal(await commands.claim("existing", ["ralph"], 0, undefined, [url]), undefined);
 
-  const startupCommands = new SupportCommandBus(undefined, undefined, undefined, async () => { launches++; });
+  const startupCommands = new SupportCommandBus(undefined, undefined, undefined, async () => {
+    launches++;
+    await startupCommands.claim("startup-chrome-launch", ["ralph"], 0);
+  });
   const startupRegistry = await RalphRegistry.open(directory, 1);
   await startupRegistry.register(url, { manual: true });
   const controller = new RalphController({ registry: startupRegistry, commands: startupCommands,

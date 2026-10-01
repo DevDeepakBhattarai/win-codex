@@ -116,6 +116,8 @@ Thread preparation is independent from RALPH. The support extension reports ever
 
 The Chrome automation profile reuses existing conversation tabs and opens missing tabs in its existing window. Explicit message commands can create a background tab in an existing normal window and record ownership. Thread Sync no longer closes the tab. RALPH inspection and existing-thread messages reuse the same tab, preventing a fresh ChatGPT page load every few minutes. Automation-owned tabs remain open while the RALPH thread is active and are cleaned up ten minutes after completion; a tab that was already open in the user's browser is reused but never closed by lifecycle cleanup. Helium keeps Thread Sync enabled with **Thread preparation executor** off. It can claim read-only inspections only for conversations already open in that browser. It never creates an automation tab or sends a message. The command bus prefers an already-open observer tab before falling back to the Chrome automation executor.
 
+The executor also keeps a one-minute extension alarm while automation is enabled. This wakes the Manifest V3 service worker after Chrome suspends it, so the backend continues to see the existing executor instead of launching another Chrome instance. When the backend does have to launch Chrome, it waits for the support extension to reconnect before considering the launch successful; a missing or disabled executor fails with an explicit configuration error instead of leaving `prepare_thread` queued until its long timeout.
+
 ## Checks
 
 Run:
