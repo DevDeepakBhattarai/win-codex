@@ -324,6 +324,10 @@ async function dispatchRequest(method, params) {
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (!Number.isInteger(source.tabId)) return;
+  // Acknowledge in the extension so a slow or disconnected bridge cannot stall capture.
+  if (method === "Page.screencastFrame") {
+    void chrome.debugger.sendCommand(source, "Page.screencastFrameAck", { sessionId: params.sessionId }).catch(() => {});
+  }
   send({
     type: "event",
     event: "debugger",

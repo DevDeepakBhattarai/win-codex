@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -58,6 +60,10 @@ const testServer = http.createServer((request, response) => {
     <button id="popup">Open popup</button>
     <input id="upload" type="file" hidden>
     <input id="text" aria-label="Text">
+    <input id="checked" type="checkbox">
+    <select id="choice"><option value="a">Alpha</option><option value="b">Beta</option></select>
+    <button id="hover" onmouseenter="this.textContent='Hovered'">Hover me</button>
+    <div id="drag" style="width:200px;height:60px;background:#eee" onmousedown="this.textContent='Dragging'" onmouseup="this.textContent='Dropped'">Drag here</div>
     <p id="upload-result">Upload: empty</p>
     <a id="download" href="/download" download>Download</a>
     <a id="next" href="/second">Next</a>
@@ -174,10 +180,67 @@ try {
   );
   await assertControlFavicon(context, agentTabId);
 
+  // These assertions exercise extension CDP delivery against real rendered controls.
+  const originalEncoder = process.env.FFMPEG_PATH;
+  process.env.FFMPEG_PATH = path.join(temporaryRoot, "missing-ffmpeg");
+  await assert.rejects(service.recording({ action: "start", tabId: agentTabId }), /requires FFmpeg/);
+  if (originalEncoder === undefined) delete process.env.FFMPEG_PATH;
+  else process.env.FFMPEG_PATH = originalEncoder;
+  const recording = await service.recording({ action: "start", tabId: agentTabId });
+  assert.equal(recording.status, "recording");
+  await service.action({ tabId: agentTabId, action: "hover", locator: "css=#hover" });
+  assert.equal((await service.evaluate(agentTabId, 'document.querySelector("#hover").textContent')).value, "Hovered");
+  await service.action({ tabId: agentTabId, action: "select", locator: "css=#choice", values: ["b"] });
+  assert.equal((await service.evaluate(agentTabId, 'document.querySelector("#choice").value')).value, "b");
+  await assert.rejects(service.action({ tabId: agentTabId, action: "select", locator: "css=#choice", values: ["absent"] }), /missing or disabled/);
+  for (const checked of [true, true, false]) {
+    await service.action({ tabId: agentTabId, action: "check", locator: "css=#checked", checked });
+    assert.equal((await service.evaluate(agentTabId, 'document.querySelector("#checked").checked')).value, checked);
+  }
+  const dragRect = (await service.evaluate(agentTabId, 'JSON.stringify(document.querySelector("#drag").getBoundingClientRect().toJSON())')).value;
+  const rect = JSON.parse(dragRect);
+  await service.action({ tabId: agentTabId, action: "drag", path: [{ x: rect.x + 5, y: rect.y + 5 }, { x: rect.x + 100, y: rect.y + 10 }] });
+  assert.equal((await service.evaluate(agentTabId, 'document.querySelector("#drag").textContent')).value, "Dropped");
+  const viewport = await service.viewport({ tabId: agentTabId, width: 390, height: 844 });
+  assert.ok(viewport.screenshotData, "responsive results include a real image");
+  assert.deepEqual((await service.evaluate(agentTabId, '[innerWidth, innerHeight]')).value, [390, 844]);
+  const cropped = await service.screenshot({ tabId: agentTabId, clip: { x: 0, y: 0, width: 200, height: 100 } });
+  const png = await readFile(cropped.path);
+  assert.equal(png.readUInt32BE(16), 200);
+  assert.equal(png.readUInt32BE(20), 100);
+  await service.viewport({ tabId: agentTabId });
+  await service.evaluate(agentTabId, 'document.body.style.background = "rgb(30, 170, 90)"');
+  await new Promise(resolve => setTimeout(resolve, 500));
+  const saved = await service.recording({ action: "stop", tabId: agentTabId });
+  assert.equal(saved.status, "saved", saved.error);
+  const runFile = promisify(execFile);
+  const probe = JSON.parse((await runFile("ffprobe", ["-v", "error", "-show_streams", "-show_format", "-of", "json", saved.path])).stdout);
+  assert.equal(probe.streams[0].codec_name, "vp8");
+  assert.ok(Number(probe.format.duration) >= 1, "recording preserves elapsed time");
+  const decoded = (await runFile(process.env.FFMPEG_PATH ?? "ffmpeg", ["-v", "error", "-i", saved.path, "-f", "framemd5", "-"])).stdout;
+  const hashes = decoded.split("\n").filter(line => line && !line.startsWith("#")).map(line => line.split(",").at(-1).trim());
+  assert.ok(new Set(hashes).size > 1, "video contains changing rendered frames, not one repeated screenshot");
+  await mkdir(path.resolve(".audit-backup", "agent-api"), { recursive: true });
+  await copyFile(saved.path, path.resolve(".audit-backup", "agent-api", "browser-test.webm"));
+  await copyFile(cropped.path, path.resolve(".audit-backup", "agent-api", "screenshot.png"));
+  await service.evaluate(agentTabId, 'document.body.style.minHeight = "1800px"');
+  const full = await service.screenshot({ tabId: agentTabId, fullPage: true });
+  assert.ok((await readFile(full.path)).readUInt32BE(20) >= 1800, "full-page screenshots include content below the viewport");
+  await service.evaluate(agentTabId, 'document.body.style.minHeight = ""');
+  const keepDialogOpen = () => {};
+  agentPage.on("dialog", keepDialogOpen);
+  await service.evaluate(agentTabId, 'setTimeout(() => { document.querySelector("#text").value = prompt("Test prompt", "initial"); }, 100); "scheduled"');
+  await waitUntil(async () => (await service.dialog({ tabId: agentTabId, action: "get" })).dialog, 5000, "JavaScript prompt");
+  assert.equal((await service.dialog({ tabId: agentTabId, action: "get" })).dialog.type, "prompt");
+  await service.dialog({ tabId: agentTabId, action: "accept", text: "Confirmed" });
+  assert.equal((await service.evaluate(agentTabId, 'document.querySelector("#text").value')).value, "Confirmed");
+  agentPage.off("dialog", keepDialogOpen);
+
+  const clicksBeforeDouble = Number((await readOverlay(agentPage))?.clickCount ?? 0);
   result = await service.action({ tabId: agentTabId, action: "dblclick", locator: "css=#double" });
   assert.match(result.snapshot.visibleText, /Double count: 1/);
   const clickedOverlay = await readOverlay(agentPage);
-  assert.equal(clickedOverlay?.clickCount, "2");
+  assert.equal(Number(clickedOverlay?.clickCount), clicksBeforeDouble + 2);
   assert.ok(Number.isFinite(Number(clickedOverlay?.pointerX)));
   assert.ok(Number.isFinite(Number(clickedOverlay?.pointerY)));
   const screenshotDirectory = path.resolve(".audit-backup", "browser-indicators");
@@ -274,7 +337,10 @@ try {
   await waitUntil(async () => isControlFavicon((await readFavicons(userPage))[0].href), 5_000, "control favicon after site update");
 
   const releasedAgentTab = await service.open({ url: `${baseUrl}/second`, active: false });
+  const closingVideo = await service.recording({ action: "start", tabId: releasedAgentTab.snapshot.tabId });
   await service.releaseTab(releasedAgentTab.snapshot.tabId);
+  await access(closingVideo.path);
+  assert.equal(JSON.parse(await readFile(`${closingVideo.path}.json`, "utf8")).status, "saved", "release finalizes the video before closing the tab");
   assert.equal(
     (await service.listTabs()).some((tab) => tab.id === releasedAgentTab.snapshot.tabId),
     false,

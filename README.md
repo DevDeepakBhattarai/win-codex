@@ -22,6 +22,8 @@ graph TD
 
 ## What the server provides
 
+For Claude or another local caller, send a prompt to `POST http://127.0.0.1:6002/agents` to start a ChatGPT browser-testing conversation. Fetch `GET /agents/JOB_ID` for its report, screenshots, and recorded video paths. See [Call a ChatGPT browser agent from Claude](docs/agent-api.md) and the [API reference](docs/agent-api-reference.md).
+
 ### Local computer tools
 
 The core MCP server always exposes these tools:
