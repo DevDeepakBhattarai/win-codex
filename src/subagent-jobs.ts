@@ -6,21 +6,32 @@ import { z } from "zod";
 
 const MAX_JOBS = 2_000;
 const RETAINED_NOTIFIED_JOBS = 1_000;
-export const MAX_ACTIVE_SUBAGENTS_PER_PARENT = 1;
+export const MAX_ACTIVE_SUBAGENTS_PER_PARENT = 2;
+const MAX_ACTIVE_REVIEWS_PER_PARENT = 1;
 const INTERRUPTED_STARTUP_ERROR = "Reviewer startup was interrupted by a service restart. Inspect the browser, stop any running reviewer, then cancel this job if it is abandoned.";
 
 export class SubagentAdmissionError extends Error {
-  constructor(readonly reason: "capacity" | "nested", readonly activeJobIds: string[] = []) {
+  constructor(
+    readonly reason: "capacity" | "nested",
+    readonly activeJobIds: string[] = [],
+    readonly kind: "agent" | "reviewer" = "agent",
+  ) {
     super(reason === "nested"
-      ? "A reviewer conversation cannot start another reviewer. Complete this review and call review_done."
-      : `This implementer already has an unfinished review. Reviews: ${activeJobIds.join(", ")}. End this turn and wait for the completion notice. Do not retry or poll.`);
+      ? kind === "reviewer"
+        ? "A reviewer conversation cannot start another reviewer. Complete this review and call review_done."
+        : "Only root conversations can start sub-agents. Complete your assigned work and submit its result."
+      : kind === "reviewer"
+        ? `This implementer already has an unfinished review. Reviews: ${activeJobIds.join(", ")}. End this turn and wait for the completion notice. Do not retry or poll.`
+        : `This parent already has two active sub-agents. Active jobs: ${activeJobIds.join(", ")}. Continue independent work or wait for a result notification. Do not retry or poll for capacity.`);
   }
 }
 
 const subagentJobSchema = z.object({
   jobId: z.string().uuid(),
   parentThreadId: z.string(),
-  parentConversationUrl: z.string().url(),
+  parentConversationUrl: z.string().url().optional(),
+  requestId: z.string().optional(),
+  promptHash: z.string().optional(),
   childThreadId: z.string().optional(),
   childConversationUrl: z.string().url().optional(),
   title: z.string().optional(),
@@ -108,26 +119,47 @@ export class SubagentJobRegistry {
     return new SubagentJobRegistry(filePath, resultDirectory, state);
   }
 
-  async create(parent: { threadId: string; conversationUrl: string }, taskFingerprint?: string) {
+  async create(parent: { threadId: string; conversationUrl?: string; requestId?: string; promptHash?: string }) {
+    return await this.createWithPolicy(parent, undefined, MAX_ACTIVE_SUBAGENTS_PER_PARENT, "agent");
+  }
+
+  async createReview(parent: { threadId: string; conversationUrl: string }, taskFingerprint?: string) {
+    return await this.createWithPolicy(parent, taskFingerprint, MAX_ACTIVE_REVIEWS_PER_PARENT, "reviewer");
+  }
+
+  private async createWithPolicy(
+    parent: { threadId: string; conversationUrl?: string; requestId?: string; promptHash?: string },
+    taskFingerprint: string | undefined,
+    maxActive: number,
+    kind: "agent" | "reviewer",
+  ) {
     return await this.update((state) => {
+      const previous = parent.requestId && state.jobs.find((job) =>
+        job.parentThreadId === parent.threadId && job.requestId === parent.requestId);
+      if (previous) {
+        if (previous.promptHash !== parent.promptHash) throw new Error("requestId already belongs to a different prompt.");
+        return { ...previous, reused: true };
+      }
       if (state.jobs.some((job) => job.childThreadId === parent.threadId)) {
-        throw new SubagentAdmissionError("nested");
+        throw new SubagentAdmissionError("nested", [], kind);
       }
       const existing = taskFingerprint && state.jobs.find((job) =>
         job.parentThreadId === parent.threadId && job.taskFingerprint === taskFingerprint);
       if (existing) return { ...existing, reused: true };
       const active = state.jobs.filter((job) => job.parentThreadId === parent.threadId &&
         (job.state === "pending" || (job.state === "complete" && !job.notifiedAt)));
-      if (active.length >= MAX_ACTIVE_SUBAGENTS_PER_PARENT) {
-        throw new SubagentAdmissionError("capacity", active.map((job) => job.jobId));
+      if (active.length >= maxActive) {
+        throw new SubagentAdmissionError("capacity", active.map((job) => job.jobId), kind);
       }
-      if (state.jobs.length >= MAX_JOBS) throw new Error("Reviewer job limit reached.");
+      if (state.jobs.length >= MAX_JOBS) throw new Error(`${kind === "reviewer" ? "Reviewer" : "Agent"} job limit reached.`);
       const jobId = randomUUID();
       const job: SubagentJob = {
         jobId,
         taskFingerprint,
         parentThreadId: parent.threadId,
         parentConversationUrl: parent.conversationUrl,
+        requestId: parent.requestId,
+        promptHash: parent.promptHash,
         resultPath: path.join(this.resultDirectory, `${jobId}.md`),
         state: "pending",
         createdAt: new Date().toISOString(),

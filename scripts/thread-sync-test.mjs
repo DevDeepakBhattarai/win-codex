@@ -56,7 +56,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.5.1");
+  assert.equal(manifest.version, "1.6.6");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["alarms", "scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -147,7 +147,7 @@ try {
     "thread sending does not use acknowledgement or DOM-stability heuristics");
   assert.match(preparedContentScript, /const SEND_SETTLE_MS = 5_000;/,
     "thread sending uses the fixed five-second settle requested for typing and sending");
-  assert.match(preparedContentScript, /contentScriptVersion = "1\.5\.0"/,
+  assert.match(preparedContentScript, /contentScriptVersion = "1\.6\.6"/,
     "extension reloads can replace a stale page script with the current content-script version");
   assert.equal(parseRalphProjectId(namedProjectHome), projectId);
   assert.equal(parseRalphProjectId(urlA), projectId);
@@ -326,7 +326,7 @@ try {
   assert.equal(await observationRegistry.externalRevision(urlC), firstRevision, "title and route observations do not invalidate a tab");
   const restoredRegistry = await RalphRegistry.open(path.join(preparationRoot, "ralph"));
   assert.equal(await restoredRegistry.externalRevision(urlC), firstRevision, "stale state survives a backend restart");
-  const revisionBus = new SupportCommandBus(undefined, undefined, undefined, restoredRegistry);
+  const revisionBus = new SupportCommandBus(undefined, undefined, undefined, undefined, restoredRegistry);
   const revisionRequest = revisionBus.execute({ feature: "ralph", kind: "inspect_thread", conversationUrl: urlC });
   const revisionCommand = await revisionBus.claim("chrome", ["ralph"], 1000);
   assert.equal(revisionCommand.refreshRevision, firstRevision);
@@ -347,13 +347,17 @@ try {
     }, response);
   });
   assert.equal((await requestPreparation({ conversationUrl: urlC }, "Bearer wrong")).code, 401);
+  assert.deepEqual(await requestPreparation({ conversationUrl: urlC, canPrepare: false }), {
+    code: 200,
+    body: { status: "observed" },
+  }, "a Helium observation records presence without scheduling Chrome preparation");
   assert.deepEqual(await requestPreparation({ conversationUrl: urlB }), {
     code: 200, body: { status: "ignored" },
   }, "ordinary unregistered observations must not launch Chrome");
   assert.deepEqual(await requestPreparation({ conversationUrl: urlC }), {
     code: 200, body: { status: "ignored" },
   }, "completed observations must not launch Chrome");
-  assert.equal(preparationLaunches, 0);
+  assert.equal(preparationLaunches, 0, "observer-only and unmanaged routes must not launch Chrome");
   for (const url of [urlC, urlD, urlE]) await observationRegistry.register(url, { manual: true });
   assert.deepEqual(await requestPreparation({ conversationUrl: urlC }), {
     code: 200,
@@ -821,7 +825,7 @@ try {
     sleepingWorkerBus.close();
   }
 
-  const missingExecutorBus = new SupportCommandBus(undefined, undefined, undefined, undefined, undefined, 25);
+  const missingExecutorBus = new SupportCommandBus(undefined, undefined, undefined, undefined, undefined, undefined, 25);
   let missingExecutorLaunches = 0;
   const launchWithoutExecutor = async () => { missingExecutorLaunches += 1; };
   await assert.rejects(
@@ -1439,6 +1443,47 @@ try {
     assert.equal(await ralphControllerRegistry.isActive(parseConversationUrl(shortRalphUrl).threadId), false,
       "a short settled turn is marked complete without classification");
 
+    const staleObserverRalphUrl = `https://chatgpt.com/g/${projectId}/c/30303030-3030-4030-8030-303030303030`;
+    await ralphControllerRegistry.register(staleObserverRalphUrl);
+    const apiRequestsBeforeStaleObserver = apiRequestCount;
+    await ralphCommands.claim("helium-stale", [], 0, undefined, [staleObserverRalphUrl]);
+    await ralphCommands.claim("chrome-live", ["ralph"], 0, undefined, [staleObserverRalphUrl]);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    await ralphController.tick();
+    const staleObserverInspect = await ralphCommands.claim("helium-stale", [], 1000, undefined, [staleObserverRalphUrl]);
+    assert.equal(staleObserverInspect.kind, "inspect_thread");
+    ralphCommands.complete({
+      commandId: staleObserverInspect.id,
+      browserId: "helium-stale",
+      kind: "inspect_thread",
+      ok: true,
+      result: {
+        status: "idle",
+        title: "Stale Helium copy - ChatGPT",
+        workedSeconds: 20 * 60 + 1,
+        users: [{ id: "u-stale", text: "Finish the task without duplicate wake-ups." }],
+        assistant: { synthetic: false, id: "a-stale", text: "Stale Helium says work remains." },
+      },
+    });
+    const preSendSafetyInspect = await ralphCommands.claim("chrome-live", ["ralph"], 1000, undefined, [staleObserverRalphUrl]);
+    assert.equal(preSendSafetyInspect.kind, "inspect_thread",
+      "before any RALPH send, Chrome must be freshly inspected even when Helium reported the thread idle");
+    assert.equal(preSendSafetyInspect.executorOnly, true,
+      "the pre-send safety inspection must bypass observer precedence and run in the automation executor");
+    ralphCommands.complete({
+      commandId: preSendSafetyInspect.id,
+      browserId: "chrome-live",
+      kind: "inspect_thread",
+      ok: true,
+      result: { status: "running", title: "Live Chrome copy - ChatGPT" },
+    });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(apiRequestCount, apiRequestsBeforeStaleObserver,
+      "RALPH must not call the classifier when the fresh Chrome inspection says the thread is running");
+    assert.equal(await ralphCommands.claim("chrome-live", ["ralph"], 0, undefined, [staleObserverRalphUrl]), undefined,
+      "RALPH must not send when the fresh Chrome inspection says the thread is running");
+    await ralphControllerRegistry.recordComplete(parseConversationUrl(staleObserverRalphUrl).threadId);
+
     const continuousRalphUrl = `https://chatgpt.com/g/${projectId}/c/66666666-6666-4666-8666-666666666666`;
     await ralphControllerRegistry.register(continuousRalphUrl);
     await ralphControllerRegistry.setMode(parseConversationUrl(continuousRalphUrl).threadId, "continuous");
@@ -1716,7 +1761,7 @@ try {
   await testContentScript(a.ticket.token, b.ticket.token);
   await testWorkerKeepsLongAutomationAlive(sync);
   await testWorkerNeverRedispatchesAfterLostResponse(sync);
-  await testWorkerTimesOutHungAutomation(sync);
+  await testWorkerRecoversHungAutomation(sync);
   await testRalphComposerObserver();
   await testSendWaitsForLoadedConversationAndClicksOnce();
   await testNewProjectComposerWithoutDataType();
@@ -2318,10 +2363,14 @@ async function testRunningHydrationDetection() {
     assert.equal(keepChannelOpen, true);
   });
   assert.equal(response.ok, true, response.error);
-  assert.equal(response.result.status, "running",
+  assert.equal(response.result.status, "loading",
     "a still-hydrating running thread must not be classified as stopped before the stop button appears");
-  assert.ok(now >= runningStateReadyAt,
-    "RALPH must keep waiting when a long conversation takes more than one minute to reveal its running state");
+  assert.ok(now < 30_000, "an inspection returns before the command deadline");
+  now = runningStateReadyAt;
+  const retry = await new Promise(resolve => automationListener({
+    type: "local-codex-support/automation-v1", command: { kind: "inspect_thread" },
+  }, {}, resolve));
+  assert.equal(retry.result.status, "running", "the next check observes the hydrated running state");
 }
 
 
@@ -2499,7 +2548,7 @@ async function testRalphAutoRegistration(sync) {
       },
       tabs: {
         onUpdated: { addListener: fn => { updatedListener = fn; } },
-        query: async () => [...tabs.values()],
+        query: async query => query.windowType ? [{ id: 1, windowId: 1 }, ...tabs.values()] : [...tabs.values()],
         create: async ({ url }) => {
           const tab = { id: nextTabId++, status: "complete", url };
           tabs.set(tab.id, tab);
@@ -2557,6 +2606,7 @@ async function testRalphAutoRegistration(sync) {
 
   vm.runInNewContext(await readFile("support-extension/service-worker.js", "utf8"), context);
   await new Promise(resolve => setImmediate(resolve));
+  configureAutomationContext(context);
   assert.equal(typeof historyListener, "function");
   assert.equal(typeof updatedListener, "function");
 
@@ -2622,7 +2672,8 @@ async function testRalphAutoRegistration(sync) {
   assert.equal(commandResults.length, concurrentResults + 1, "overlapping pollers execute the same command once");
   const changedInspection = { id: "external-change", feature: "ralph", kind: "inspect_thread", conversationUrl: urlB, refreshRevision: "revision-one" };
   await context.executeCommand(changedInspection, "browser-a");
-  assert.equal(commandResults.at(-1).ok, false, "a running tab defers refresh");
+  assert.equal(commandResults.at(-1).ok, true, "a running tab defers refresh without failing the RALPH check");
+  assert.equal(commandResults.at(-1).result.status, "loading");
   assert.equal(reloadedTabs.length, 0);
   inspectionStatus = "idle";
   await context.executeCommand(changedInspection, "browser-a");
@@ -2697,7 +2748,7 @@ async function testRalphWorkerReactivation(sync) {
       },
       tabs: {
         onUpdated: { addListener: listener => { updatedListener = listener; } },
-        query: async () => [],
+        query: async query => query.windowType ? [{ id: 1, windowId: 1 }] : [],
         get: async () => ({ id: 7, url: urlA }),
       },
       webNavigation: {
@@ -2815,7 +2866,7 @@ async function testWorkerKeepsLongAutomationAlive(sync) {
       },
       tabs: {
         onUpdated: { addListener() {} },
-        query: async () => [],
+        query: async query => query.windowType ? [{ id: 1, windowId: 1 }] : [],
         create: async () => ({ id: 11 }),
         get: async () => ({ id: 11, status: "complete", url: namedProjectHome }),
         sendMessage: async () => await automationResult,
@@ -2838,6 +2889,7 @@ async function testWorkerKeepsLongAutomationAlive(sync) {
   };
   vm.runInNewContext(await readFile("support-extension/service-worker.js", "utf8"), context);
   await new Promise(resolve => setImmediate(resolve));
+  configureAutomationContext(context);
 
   const command = context.executeCommand({
     id: "long-send",
@@ -2858,6 +2910,7 @@ async function testWorkerNeverRedispatchesAfterLostResponse(sync) {
   const generatedConfig = {};
   vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), generatedConfig);
   let automationDispatches = 0;
+  let reloads = 0;
   let injected = 0;
   const postedResults = [];
   const storage = {};
@@ -2882,9 +2935,10 @@ async function testWorkerNeverRedispatchesAfterLostResponse(sync) {
       },
       tabs: {
         onUpdated: { addListener() {} },
-        query: async () => [],
+        query: async query => query.windowType ? [{ id: 1, windowId: 1 }] : [],
         create: async () => ({ id: 11 }),
         get: async () => ({ id: 11, status: "complete", url: urlA }),
+        reload: async () => { reloads += 1; },
         sendMessage: async (_tabId, payload) => {
           assert.equal(payload.type, "local-codex-support/automation-v1");
           automationDispatches += 1;
@@ -2916,6 +2970,7 @@ async function testWorkerNeverRedispatchesAfterLostResponse(sync) {
   };
   vm.runInNewContext(await readFile("support-extension/service-worker.js", "utf8"), context);
   await new Promise(resolve => setImmediate(resolve));
+  configureAutomationContext(context);
 
   await context.executeCommand({
     id: "lost-send-response",
@@ -2925,22 +2980,25 @@ async function testWorkerNeverRedispatchesAfterLostResponse(sync) {
     message: "must be dispatched once",
   }, "browser-a");
 
-  assert.equal(injected, 1, "the content script is established before the side-effecting dispatch");
+  assert.equal(injected, 2, "the health check and command content script are established before the side-effecting dispatch");
   assert.equal(automationDispatches, 1,
     "a lost tabs.sendMessage response must never cause the same side-effecting command to be dispatched again");
+  assert.equal(reloads, 1, "the page is refreshed once after a lost response");
   assert.equal(postedResults.length, 1);
   assert.equal(postedResults[0].ok, false,
     "an ambiguous post-delivery failure is surfaced instead of being hidden behind an unsafe retry");
   assert.match(postedResults[0].error, /message port closed after delivery/);
 }
 
-async function testWorkerTimesOutHungAutomation(sync) {
+async function testWorkerRecoversHungAutomation(sync) {
   const generatedConfig = {};
   vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), generatedConfig);
   let automationTimeoutCallback;
   let removedTab = false;
+  let reloads = 0;
+  let dispatches = 0;
   const postedResults = [];
-  const storage = {};
+  const storage = { automationThreadTabsV1: { [urlA]: 11 } };
   const context = {
     URL,
     AbortSignal,
@@ -2950,7 +3008,7 @@ async function testWorkerTimesOutHungAutomation(sync) {
     Response,
     importScripts() {},
     setTimeout(callback, ms) {
-      if (ms === 8 * 60_000) {
+      if (ms === 30_000) {
         automationTimeoutCallback = callback;
         return 98;
       }
@@ -2971,10 +3029,13 @@ async function testWorkerTimesOutHungAutomation(sync) {
       },
       tabs: {
         onUpdated: { addListener() {} },
-        query: async () => [],
+        query: async query => query.windowType ? [{ id: 1, windowId: 1 }] : [],
         create: async () => ({ id: 11 }),
         get: async () => ({ id: 11, status: "complete", url: urlA }),
-        sendMessage: async () => await new Promise(() => {}),
+        reload: async () => { reloads += 1; },
+        sendMessage: async () => ++dispatches === 1
+          ? await new Promise(() => {})
+          : { ok: true, result: { status: "running" } },
         remove: async () => { removedTab = true; },
       },
       webNavigation: {
@@ -2998,6 +3059,7 @@ async function testWorkerTimesOutHungAutomation(sync) {
   };
   vm.runInNewContext(await readFile("support-extension/service-worker.js", "utf8"), context);
   await new Promise(resolve => setImmediate(resolve));
+  configureAutomationContext(context);
 
   const command = context.executeCommand({
     id: "hung-inspection",
@@ -3011,8 +3073,10 @@ async function testWorkerTimesOutHungAutomation(sync) {
   await command;
 
   assert.equal(postedResults.length, 1);
-  assert.equal(postedResults[0].ok, false);
-  assert.match(postedResults[0].error, /Timed out waiting for ChatGPT page automation/);
+  assert.equal(postedResults[0].ok, true);
+  assert.equal(postedResults[0].result.status, "running");
+  assert.equal(reloads, 1, "a hung inspection refreshes the same tab once");
+  assert.equal(dispatches, 2);
   assert.equal(removedTab, false, "a timed-out RALPH inspection keeps the owned thread tab available for retry and inspection");
   assert.equal(JSON.stringify(storage.automationThreadTabsV1), JSON.stringify({ [urlA]: 11 }));
 }
@@ -3043,7 +3107,7 @@ async function testAutomationRedirectGuard(sync) {
         onStartup: { addListener() {} },
       },
       tabs: {
-        query: async () => [],
+        query: async query => query.windowType ? [{ id: 1, windowId: 1 }] : [],
         create: async () => ({ id: 11 }),
         get: async () => ({ id: 11, status: "complete", url: "https://chatgpt.com/" }),
         sendMessage: async () => {
@@ -3069,6 +3133,7 @@ async function testAutomationRedirectGuard(sync) {
   };
   vm.runInNewContext(await readFile("support-extension/service-worker.js", "utf8"), context);
   await new Promise(resolve => setImmediate(resolve));
+  configureAutomationContext(context);
   assert.equal(typeof context.executeCommand, "function");
   assert.equal(context.automationTargetMatches(namedProjectHome, `https://chatgpt.com/g/${projectId}/project`), true,
     "project display-name suffixes do not change the automation target identity");
@@ -3193,4 +3258,13 @@ async function testWidget(html, ticket) {
   assert.equal(sent.at(-1).type, "local-codex-thread-sync/bind-v1");
   listeners.get("message")({ source: top, origin: "https://chatgpt.com", data: { type: "local-codex-thread-sync/result-v1", token: ticket.token, status: "bound", conversationUrl: urlA } });
   assert.equal(cleared, true, "the URL bridge stops retrying after the extension confirms binding");
+}
+
+function configureAutomationContext(context) {
+  context.restartPolling = () => {};
+  context.getSettings = async () => ({ threadSync: true, automationExecutor: true });
+  const sendMessage = context.browser.tabs.sendMessage;
+  context.browser.tabs.sendMessage = async (tabId, payload) => payload.command.kind === "page_health"
+    ? { ok: true, result: { status: "ok" } }
+    : sendMessage(tabId, payload);
 }

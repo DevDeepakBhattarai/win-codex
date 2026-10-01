@@ -20,6 +20,7 @@ const FAILURE_RETRY_MS = 2 * 60 * 1000;
 const COMMAND_TIMEOUT_MS = 20 * 60 * 1000;
 const INSPECT_CLAIM_LEASE_MS = 5 * 60 * 1000;
 const CLAIM_WAIT_MS = 20_000;
+const RALPH_BROWSER_INSPECTION_TIMEOUT_MS = 3 * 60_000;
 const SUPPORT_BROWSER_HEARTBEAT_GRACE_MS = 90_000;
 const SUPPORT_BROWSER_LAUNCH_COOLDOWN_MS = 60_000;
 const SUPPORT_BROWSER_CONNECT_TIMEOUT_MS = 10_000;
@@ -34,7 +35,7 @@ const THREAD_TAB_CLEANUP_TICK_MS = 60 * 1000;
 const MAX_CONTINUATION_CHARS = 500;
 const TOOL_REQUEST_REPLAY_TTL_MS = 30 * 60 * 1000;
 const MAX_TOOL_REQUEST_REPLAYS = 1_000;
-const MESSAGE_COOLDOWN_MS = 15 * 60_000;
+const MESSAGE_COOLDOWN_MS = 10 * 60_000;
 const MESSAGE_SEND_SPACING_MS = 5_000;
 
 type ToolRequestReplay = {
@@ -118,6 +119,7 @@ const supportCommandSchema = z.union([
     feature: z.enum(["ralph", "threadMessaging"]),
     kind: z.literal("inspect_thread"),
     conversationUrl: z.string().url(),
+    executorOnly: z.boolean().optional(),
   }),
   z.object({
     id: z.string(),
@@ -225,6 +227,8 @@ interface PendingCommand {
   timeoutMs: number;
   claimedBy?: string;
   claimedAt?: number;
+  inspectionFallback?: NodeJS.Timeout;
+  allowBrowserLaunch: boolean;
 }
 
 interface ClaimWaiter {
@@ -240,9 +244,10 @@ export class SupportCommandBus {
   private readonly queued: PendingCommand[] = [];
   private readonly pending = new Map<string, PendingCommand>();
   private readonly waiters = new Set<ClaimWaiter>();
-  private readonly browsers = new Map<string, { features: Set<SupportFeature>; lastSeenAt: number }>();
+  private readonly browsers = new Map<string, { features: Set<SupportFeature>; lastSeenAt: number; openThreads: Set<string> }>();
   private launchInFlight?: Promise<void>;
   private lastLaunchAt = 0;
+  private readonly backgroundLaunchPending = new Set<SupportFeature>();
   private cooldownUntil = 0;
   private nextMessageClaimAt = 0;
   private messagePacingActive = false;
@@ -251,10 +256,21 @@ export class SupportCommandBus {
     return this.cooldownUntil > Date.now() ? this.cooldownUntil : 0;
   }
 
+  cancelThreadChecks(threadId: string) {
+    for (const pending of this.pending.values()) {
+      const command = pending.command;
+      const url = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
+      if ((command.feature !== "ralph" && command.feature !== "threadPreparation") || parseConversationUrl(url).threadId !== threadId) continue;
+      this.removePending(command.id);
+      pending.reject(new Error("RALPH thread tab was closed."));
+    }
+  }
+
   constructor(
     private readonly inspectClaimLeaseMs = INSPECT_CLAIM_LEASE_MS,
     private readonly messageCooldownMs = MESSAGE_COOLDOWN_MS,
     private readonly messageSendSpacingMs = MESSAGE_SEND_SPACING_MS,
+    private readonly launchBrowser?: () => Promise<void>,
     private readonly registry?: RalphRegistry,
     private readonly jobs?: SubagentJobRegistry,
     private readonly browserConnectWaitMs = SUPPORT_BROWSER_CONNECT_TIMEOUT_MS,
@@ -263,12 +279,25 @@ export class SupportCommandBus {
   async execute(
     command: SupportCommandInput,
     timeoutMs = COMMAND_TIMEOUT_MS,
+    options: { allowBrowserLaunch?: boolean } = {},
   ) {
+    const allowBrowserLaunch = options.allowBrowserLaunch !== false;
     const targetUrl = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
-    const refreshRevision = this.registry ? await this.registry.externalRevision(targetUrl) : undefined;
-    if (command.feature === "ralph" && this.jobs?.blocksContinuationNow(parseConversationUrl(targetUrl).threadId)) {
+    let targetThreadId: string | undefined;
+    try { targetThreadId = parseConversationUrl(targetUrl).threadId; } catch { targetThreadId = undefined; }
+    if (command.feature === "ralph" && targetThreadId && this.jobs?.blocksContinuationNow(targetThreadId)) {
       throw new Error("RALPH is paused for this review handoff.");
     }
+    if (allowBrowserLaunch && (command.kind === "send_message" || command.kind === "stop_thread" || command.kind === "prepare_thread") && this.launchBrowser) {
+      await this.ensureBrowser(command.feature, this.launchBrowser);
+    }
+    if (allowBrowserLaunch && command.kind === "inspect_thread" && this.launchBrowser) {
+      const threadId = parseConversationUrl(targetUrl).threadId;
+      if (command.executorOnly || !this.hasOpenThreadOwner(threadId)) {
+        await this.ensureBrowser(command.feature, this.launchBrowser);
+      }
+    }
+    const refreshRevision = this.registry ? await this.registry.externalRevision(targetUrl) : undefined;
     const fullCommand = supportCommandSchema.parse({ ...command, ...(refreshRevision ? { refreshRevision } : {}), id: randomUUID() });
     return new Promise<SupportCommandResult>((resolve, reject) => {
       const pending: PendingCommand = {
@@ -280,12 +309,13 @@ export class SupportCommandBus {
           reject(new Error(`ChatGPT support command timed out: ${fullCommand.kind}`));
         }, timeoutMs),
         timeoutMs,
+        allowBrowserLaunch,
       };
       pending.timeout.unref();
       this.pending.set(fullCommand.id, pending);
 
       const waiter = [...this.waiters].find((candidate) =>
-        candidate.features.has(fullCommand.feature) && this.canClaim(fullCommand));
+        this.browserCanClaim(candidate.browserId, fullCommand) && this.canClaim(fullCommand));
       if (waiter) {
         this.markClaimed(pending, waiter.browserId);
         this.resolveWaiter(waiter, fullCommand);
@@ -293,6 +323,7 @@ export class SupportCommandBus {
       }
 
       this.queued.push(pending);
+      this.scheduleInspectionFallback(pending);
     });
   }
 
@@ -349,11 +380,42 @@ export class SupportCommandBus {
   private executorUnavailableError(feature: SupportFeature) {
     return new Error(
       `Chrome is running, but Local Codex Support did not connect as a ${feature} executor. ` +
-      "In the Chrome automation profile, reload the generated .data/support-extension and enable Automation browser executor plus the required support feature.",
+      'In the Chrome automation profile, reload the generated .data/support-extension and enable the designated preparation/automation executor plus the required support feature.',
     );
   }
 
-  claim(browserId: string, features: SupportFeature[], waitMs = CLAIM_WAIT_MS, signal?: AbortSignal) {
+  async ensureBackgroundBrowserOnce(feature: SupportFeature) {
+    if (this.hasBrowser(feature)) {
+      this.backgroundLaunchPending.delete(feature);
+      return;
+    }
+    if (!this.launchBrowser || this.backgroundLaunchPending.has(feature)) return;
+    this.backgroundLaunchPending.add(feature);
+    try {
+      if (this.launchInFlight) {
+        await this.launchInFlight;
+        return;
+      }
+      const launch = this.launchBrowser();
+      this.launchInFlight = launch;
+      try {
+        await launch;
+        this.lastLaunchAt = Date.now();
+      } finally {
+        if (this.launchInFlight === launch) this.launchInFlight = undefined;
+      }
+    } catch (error) {
+      this.backgroundLaunchPending.delete(feature);
+      throw error;
+    }
+  }
+
+  browserHasFeature(browserId: string, feature: SupportFeature) {
+    const browser = this.browsers.get(browserId);
+    return Boolean(browser && Date.now() - browser.lastSeenAt <= SUPPORT_BROWSER_HEARTBEAT_GRACE_MS && browser.features.has(feature));
+  }
+
+  claim(browserId: string, features: SupportFeature[], waitMs = CLAIM_WAIT_MS, signal?: AbortSignal, openThreads: string[] = []) {
     for (const pending of [...this.queued]) {
       const command = pending.command;
       const target = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
@@ -363,27 +425,33 @@ export class SupportCommandBus {
       }
     }
     const featureSet = new Set(features);
-    this.browsers.set(browserId, { features: featureSet, lastSeenAt: Date.now() });
+    for (const feature of featureSet) this.backgroundLaunchPending.delete(feature);
+    this.browsers.set(browserId, {
+      features: featureSet,
+      lastSeenAt: Date.now(),
+      openThreads: new Set(openThreads.map(url => parseConversationUrl(url).threadId)),
+    });
+    this.dispatchQueuedCommandsToWaiters();
+    for (const pending of this.pending.values()) this.scheduleInspectionFallback(pending);
     const resumable = [...this.pending.values()].find((pending) =>
       (pending.command.kind === "inspect_thread" || pending.command.kind === "prepare_thread") &&
-      featureSet.has(pending.command.feature) &&
+      this.browserCanClaim(browserId, pending.command) &&
       (pending.claimedBy === browserId ||
         (pending.claimedAt !== undefined && Date.now() - pending.claimedAt >= this.inspectClaimLeaseMs)));
     if (resumable) {
-      resumable.claimedBy = browserId;
-      resumable.claimedAt = Date.now();
+      this.markClaimed(resumable, browserId);
       return Promise.resolve(resumable.command);
     }
 
     const queuedIndex = this.queued.findIndex((pending) =>
-      featureSet.has(pending.command.feature) && this.canClaim(pending.command));
+      this.browserCanClaim(browserId, pending.command) && this.canClaim(pending.command));
     if (queuedIndex >= 0) {
       const [pending] = this.queued.splice(queuedIndex, 1);
       this.markClaimed(pending, browserId);
       return Promise.resolve(pending.command);
     }
 
-    if (featureSet.size === 0 || waitMs <= 0 || signal?.aborted) return Promise.resolve(undefined);
+    if ((featureSet.size === 0 && openThreads.length === 0) || waitMs <= 0 || signal?.aborted) return Promise.resolve(undefined);
 
     return new Promise<SupportCommand | undefined>((resolve) => {
       let waiter: ClaimWaiter;
@@ -405,13 +473,19 @@ export class SupportCommandBus {
     if (pending.claimedBy !== result.browserId) throw new Error("Support command belongs to another browser instance.");
     if (pending.command.kind !== result.kind) throw new Error("Support command result kind does not match the request.");
 
-    if (!result.ok && result.kind === "send_message" && result.error.startsWith("CHATGPT_RATE_LIMITED:")) {
-      this.cooldownUntil = Date.now() + this.messageCooldownMs;
+    if (!result.ok && /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(result.error)) {
+      if (!this.messageCooldownUntil()) this.cooldownUntil = Date.now() + this.messageCooldownMs;
       this.messagePacingActive = true;
       this.nextMessageClaimAt = Math.max(this.nextMessageClaimAt, this.cooldownUntil);
       console.warn(`[chatgpt-support] message_cooldown until=${new Date(this.cooldownUntil).toISOString()}`);
       const browser = this.browsers.get(result.browserId);
       if (browser) browser.lastSeenAt = Date.now();
+      const retryableSend = result.kind === "send_message" && result.error.startsWith("CHATGPT_RATE_LIMITED_RETRYABLE:");
+      if (!retryableSend) {
+        this.removePending(result.commandId);
+        pending.resolve(result);
+        return;
+      }
       pending.claimedBy = undefined;
       pending.claimedAt = undefined;
       clearTimeout(pending.timeout);
@@ -438,11 +512,91 @@ export class SupportCommandBus {
     for (const waiter of [...this.waiters]) this.resolveWaiter(waiter, undefined);
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timeout);
+      if (pending.inspectionFallback) clearTimeout(pending.inspectionFallback);
       pending.reject(new Error("ChatGPT support service is shutting down."));
     }
     this.pending.clear();
     this.queued.length = 0;
     this.browsers.clear();
+  }
+
+  private browserCanClaim(browserId: string, command: SupportCommand) {
+    const browser = this.browsers.get(browserId);
+    if (!browser) return false;
+    if (command.kind === "inspect_thread") {
+      if (command.executorOnly) return browser.features.has(command.feature);
+      const threadId = parseConversationUrl(command.conversationUrl).threadId;
+      const owners = [...this.browsers.entries()].filter(([, candidate]) =>
+        Date.now() - candidate.lastSeenAt <= SUPPORT_BROWSER_HEARTBEAT_GRACE_MS && candidate.openThreads.has(threadId));
+      const owner = owners.find(([, candidate]) => candidate.features.size === 0) ?? owners[0];
+      if (owner) return owner[0] === browserId;
+    }
+    return browser.features.has(command.feature);
+  }
+
+  hasOpenThreadOwner(threadId: string) {
+    return [...this.browsers.values()].some((browser) =>
+      Date.now() - browser.lastSeenAt <= SUPPORT_BROWSER_HEARTBEAT_GRACE_MS && browser.openThreads.has(threadId));
+  }
+
+  private dispatchQueuedCommandsToWaiters() {
+    for (let index = 0; index < this.queued.length;) {
+      const pending = this.queued[index];
+      if (!this.canClaim(pending.command)) {
+        index += 1;
+        continue;
+      }
+      const waiter = [...this.waiters].find((candidate) => this.browserCanClaim(candidate.browserId, pending.command));
+      if (!waiter) {
+        index += 1;
+        continue;
+      }
+      this.queued.splice(index, 1);
+      this.markClaimed(pending, waiter.browserId);
+      this.resolveWaiter(waiter, pending.command);
+    }
+  }
+
+  private scheduleInspectionFallback(pending: PendingCommand) {
+    if (pending.inspectionFallback) {
+      clearTimeout(pending.inspectionFallback);
+      pending.inspectionFallback = undefined;
+    }
+    if (!this.launchBrowser || pending.command.kind !== "inspect_thread" || !pending.allowBrowserLaunch) return;
+    if (pending.command.executorOnly) {
+      if (pending.claimedBy) return;
+      this.dispatchQueuedCommandsToWaiters();
+      if (!pending.claimedBy) void this.ensureBrowser(pending.command.feature, this.launchBrowser).catch(() => undefined);
+      return;
+    }
+
+    const threadId = parseConversationUrl(pending.command.conversationUrl).threadId;
+    const claimant = pending.claimedBy ? this.browsers.get(pending.claimedBy) : undefined;
+    const observerClaim = Boolean(pending.claimedBy && !claimant?.features.has(pending.command.feature));
+    if (pending.claimedBy && !observerClaim) return;
+
+    const owners = [...this.browsers.entries()].filter(([, browser]) =>
+      Date.now() - browser.lastSeenAt <= SUPPORT_BROWSER_HEARTBEAT_GRACE_MS && browser.openThreads.has(threadId));
+    const claimantStillOwnsThread = Boolean(pending.claimedBy && owners.some(([browserId]) => browserId === pending.claimedBy));
+    if (observerClaim && !claimantStillOwnsThread) {
+      pending.claimedBy = undefined;
+      pending.claimedAt = undefined;
+      if (!this.queued.includes(pending)) this.queued.unshift(pending);
+      this.dispatchQueuedCommandsToWaiters();
+      if (pending.claimedBy) return;
+    }
+    if (owners.length === 0) {
+      this.dispatchQueuedCommandsToWaiters();
+      if (!pending.claimedBy) void this.ensureBrowser(pending.command.feature, this.launchBrowser).catch(() => undefined);
+      return;
+    }
+
+    const nextExpiry = Math.max(...owners.map(([, browser]) => browser.lastSeenAt + SUPPORT_BROWSER_HEARTBEAT_GRACE_MS));
+    pending.inspectionFallback = setTimeout(() => {
+      pending.inspectionFallback = undefined;
+      if (this.pending.has(pending.command.id)) this.scheduleInspectionFallback(pending);
+    }, Math.max(1, nextExpiry - Date.now() + 1));
+    pending.inspectionFallback.unref();
   }
 
   private canClaim(command: SupportCommand) {
@@ -457,6 +611,7 @@ export class SupportCommandBus {
     if (pending.command.kind === "send_message" && this.messagePacingActive) {
       this.nextMessageClaimAt = Date.now() + this.messageSendSpacingMs;
     }
+    this.scheduleInspectionFallback(pending);
   }
 
   private resolveWaiter(waiter: ClaimWaiter, command: SupportCommand | undefined) {
@@ -470,6 +625,7 @@ export class SupportCommandBus {
     const pending = this.pending.get(commandId);
     if (!pending) return;
     clearTimeout(pending.timeout);
+    if (pending.inspectionFallback) clearTimeout(pending.inspectionFallback);
     this.pending.delete(commandId);
     const queuedIndex = this.queued.indexOf(pending);
     if (queuedIndex >= 0) this.queued.splice(queuedIndex, 1);
@@ -592,6 +748,12 @@ export class RalphRegistry {
     catch { return undefined; }
     await this.queue;
     return this.state.threads.find((thread) => thread.threadId === threadId)?.externalRevision;
+  }
+
+  async remove(threadId: string) {
+    await this.update((state) => {
+      state.threads = state.threads.filter(thread => thread.threadId !== threadId);
+    });
   }
 
   async settings() {
@@ -973,27 +1135,21 @@ export class RalphController {
         feature: "ralph",
         kind: "inspect_thread",
         conversationUrl: thread.conversationUrl,
-      });
+      }, RALPH_BROWSER_INSPECTION_TIMEOUT_MS);
       if (!commandResult.ok) throw new Error(commandResult.error);
       if (commandResult.kind !== "inspect_thread") throw new Error("RALPH received the wrong support command result.");
       if (!await this.options.registry.isActive(thread.threadId)) return;
 
-      const inspection = commandResult.result;
-      if (inspection.title) await this.options.registry.recordTitle(thread.threadId, inspection.title);
-      if (inspection.status === "loading") {
+      const observedInspection = commandResult.result;
+      const observedByExecutor = this.options.commands.browserHasFeature(commandResult.browserId, "ralph");
+      if (observedInspection.title) await this.options.registry.recordTitle(thread.threadId, observedInspection.title);
+      if (observedInspection.status === "loading") {
         await this.options.registry.recordLoading(thread.threadId);
         return;
       }
-      if (inspection.status === "running") {
+      if (observedInspection.status === "running") {
         await this.options.registry.recordRunning(thread.threadId);
         return;
-      }
-
-      if (inspection.users.length === 0 || inspection.users.some((message) => !message.text.trim())) {
-        throw new Error("RALPH could not extract every ChatGPT user message.");
-      }
-      if (!inspection.assistant.text.trim()) {
-        throw new Error("RALPH could not extract the final ChatGPT assistant message.");
       }
 
       const currentMode = await this.options.registry.activeMode(thread.threadId);
@@ -1002,6 +1158,12 @@ export class RalphController {
         await this.options.registry.recordRunning(thread.threadId);
         return;
       }
+      const inspection = observedByExecutor
+        ? observedInspection
+        : await this.inspectExecutorBeforeContinuation(thread);
+      if (!inspection) return;
+      if (await this.options.registry.activeMode(thread.threadId) !== currentMode) return;
+
       const checkpoint = inspection.assistant.text.trim().match(/(?:^|\n)RALPH_STATUS: (CONTINUE|WAIT_CI|BLOCKED|COMPLETE)$/)?.[1];
       if (checkpoint === "COMPLETE" || checkpoint === "BLOCKED") {
         await this.options.registry.recordComplete(thread.threadId);
@@ -1026,7 +1188,6 @@ export class RalphController {
         return;
       }
       if (currentMode === "continuous") {
-        if (await this.options.registry.activeMode(thread.threadId) !== "continuous") return;
         const sendResult = await this.options.commands.execute({
           feature: "ralph",
           kind: "send_message",
@@ -1039,6 +1200,12 @@ export class RalphController {
         return;
       }
 
+      if (inspection.users.length === 0 || inspection.users.some((message) => !message.text.trim())) {
+        throw new Error("RALPH could not extract every ChatGPT user message.");
+      }
+      if (!inspection.assistant.text.trim()) {
+        throw new Error("RALPH could not extract the final ChatGPT assistant message.");
+      }
       if (inspection.workedSeconds === null) {
         await this.options.registry.recordComplete(thread.threadId);
         return;
@@ -1065,6 +1232,7 @@ export class RalphController {
         await this.options.registry.recordRunning(thread.threadId);
         return;
       }
+      if (await this.options.registry.activeMode(thread.threadId) !== modeBeforeSend) return;
 
       const sendResult = await this.options.commands.execute({
         feature: "ralph",
@@ -1077,9 +1245,35 @@ export class RalphController {
       await this.options.registry.recordContinuation(thread.threadId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (/timed out/i.test(message)) {
+        await this.options.registry.recordLoading(thread.threadId);
+        return;
+      }
       console.error(`[ralph] thread=${JSON.stringify(thread.conversationUrl)} failed: ${message}`);
       await this.options.registry.recordFailure(thread.threadId, message);
     }
+  }
+
+  private async inspectExecutorBeforeContinuation(thread: z.infer<typeof ralphThreadSchema>) {
+    const result = await this.options.commands.execute({
+      feature: "ralph",
+      kind: "inspect_thread",
+      conversationUrl: thread.conversationUrl,
+      executorOnly: true,
+    }, RALPH_BROWSER_INSPECTION_TIMEOUT_MS);
+    if (!result.ok) throw new Error(result.error);
+    if (result.kind !== "inspect_thread") throw new Error("RALPH received the wrong pre-send inspection result.");
+    if (!await this.options.registry.isActive(thread.threadId)) return undefined;
+    if (result.result.title) await this.options.registry.recordTitle(thread.threadId, result.result.title);
+    if (result.result.status === "loading") {
+      await this.options.registry.recordLoading(thread.threadId);
+      return undefined;
+    }
+    if (result.result.status === "running") {
+      await this.options.registry.recordRunning(thread.threadId);
+      return undefined;
+    }
+    return result.result;
   }
 }
 
@@ -1272,7 +1466,7 @@ function compactContinuation(value: string) {
   if (!normalized) throw new Error("OpenAI RALPH decision returned an empty continuation instruction.");
   return normalized.length <= MAX_CONTINUATION_CHARS
     ? normalized
-    : `${normalized.slice(0, MAX_CONTINUATION_CHARS - 1).trimEnd()}…`;
+    : `${normalized.slice(0, MAX_CONTINUATION_CHARS - 1).trimEnd()}â€¦`;
 }
 
 function authenticateSupportExtension(req: Request, res: Response, extensionToken: string) {
@@ -1295,6 +1489,9 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
   const bodySchema = z.object({
     browserId: z.string().min(1).max(200),
     features: z.array(supportFeatureSchema).max(4),
+    openThreads: z.array(z.string().max(2048).refine(value => {
+      try { parseConversationUrl(value); return true; } catch { return false; }
+    })).max(2000).optional(),
   }).strict();
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
@@ -1308,7 +1505,7 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
     req.once("aborted", onDisconnect);
     res.once("close", onDisconnect);
     try {
-      const command = await commands.claim(parsed.data.browserId, parsed.data.features, CLAIM_WAIT_MS, abortController.signal);
+      const command = await commands.claim(parsed.data.browserId, parsed.data.features, CLAIM_WAIT_MS, abortController.signal, parsed.data.openThreads);
       if (abortController.signal.aborted) return;
       res.setHeader("Cache-Control", "no-store");
       if (!command) {
@@ -1326,6 +1523,7 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
 export function ralphRegistrationHandler(
   registry: RalphRegistry,
   extensionToken: string,
+  commands?: SupportCommandBus,
 ): RequestHandler {
   const bodySchema = z.object({
     conversationUrl: z.string().max(2048),
@@ -1334,6 +1532,7 @@ export function ralphRegistrationHandler(
     externalUpdate: z.boolean().optional(),
     agentCreated: z.boolean().optional(),
     title: z.string().max(300).optional(),
+    removed: z.boolean().optional(),
   }).strict();
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
@@ -1343,6 +1542,13 @@ export function ralphRegistrationHandler(
       return;
     }
     try {
+      if (parsed.data.removed) {
+        const { threadId } = parseConversationUrl(parsed.data.conversationUrl);
+        await registry.remove(threadId);
+        commands?.cancelThreadChecks(threadId);
+        res.json({ status: "removed" });
+        return;
+      }
       const registration = await registry.register(parsed.data.conversationUrl, {
         manual: parsed.data.manual === true,
         reactivate: parsed.data.reactivate === true,
@@ -1704,6 +1910,11 @@ export function threadObservationHandler(
       return;
     }
     try {
+      if (parsed.data.canPrepare === false) {
+        res.setHeader("Cache-Control", "no-store");
+        res.json({ status: "observed" });
+        return;
+      }
       const conversation = parseConversationUrl(parsed.data.conversationUrl);
       const managed = (await registry.threads()).some((thread) =>
         thread.threadId === conversation.threadId && thread.state === "active");
@@ -1724,7 +1935,21 @@ export function threadObservationHandler(
   };
 }
 
-function subagentPrompt(message: string, jobId: string, resultPath: string) {
+function agentPrompt(message: string, jobId: string, resultPath: string) {
+  return [
+    message.trim(),
+    "",
+    "You are a local testing agent working in a separate ChatGPT conversation.",
+    "Complete only the bounded task above. Nested delegation is disabled. Perform the work yourself and report concrete observed results and evidence.",
+    "Before review_done, bind this conversation with sync_current_thread. If it reports syncing, follow with get_current_thread_url; if it reports synced, reuse that binding.",
+    "The local API caller does not expect a browser message from you. Do not call send_thread_message to report back.",
+    `When your work is complete, call review_done exactly once with jobId ${JSON.stringify(jobId)} and put your complete final report in its result argument.`,
+    `The application stores that report locally at ${JSON.stringify(resultPath)} for the API caller.`,
+    "After review_done succeeds, end this turn with only a brief acknowledgement.",
+  ].join("\n");
+}
+
+function reviewerPrompt(message: string, jobId: string, resultPath: string) {
   return [
     message.trim(),
     "",
@@ -1831,6 +2056,52 @@ const subagentToolMeta = {
   "openai/outputTemplate": SUBAGENT_WIDGET_URI,
 };
 
+type SubagentJob = NonNullable<Awaited<ReturnType<SubagentJobRegistry["job"]>>>;
+type AgentServices = {
+  commands: SupportCommandBus;
+  registry: RalphRegistry;
+  jobs: SubagentJobRegistry;
+  launchBrowser: () => Promise<void>;
+};
+
+export async function startSubagentJob(job: SubagentJob, message: string,
+  { commands, registry, jobs, preparer, launchBrowser }: AgentServices & { preparer: ThreadPreparationCoordinator }) {
+  const { subagentProjectUrl } = await registry.settings();
+  await commands.ensureBrowser("threadMessaging", launchBrowser);
+  const result = await commands.execute({
+    feature: "threadMessaging", kind: "send_message", targetUrl: subagentProjectUrl ?? "https://chatgpt.com/",
+    message: agentPrompt(message, job.jobId, job.resultPath),
+  });
+  if (!result.ok) throw new Error(result.error);
+  if (result.kind !== "send_message") throw new Error("Sub-agent creation received the wrong support command result.");
+  const child = parseConversationUrl(result.result.conversationUrl);
+  await jobs.assignChild(job.jobId, { ...child, title: result.result.title });
+  await registry.register(child.conversationUrl, { agentCreated: true, parentThreadId: job.parentThreadId, title: result.result.title });
+  try {
+    await preparer.ensurePrepared(child.conversationUrl);
+  } catch (error) {
+    await jobs.recordPreparationFailure(job.jobId, error instanceof Error ? error.message : String(error));
+  }
+}
+
+export async function cancelSubagentJob(job: SubagentJob, { commands, registry, jobs, launchBrowser }: AgentServices) {
+  if (job.state !== "pending") return job;
+  if (!job.childThreadId && !job.preparationError) throw new Error("Child startup is still in progress. Wait for its startup result before cancelling this job.");
+  if (job.childThreadId && !job.childConversationUrl) throw new Error("This child has no stored conversation URL. The job remains pending.");
+  if (job.childConversationUrl) {
+    try {
+      await commands.ensureBrowser("threadMessaging", launchBrowser);
+      const stopped = await commands.execute({ feature: "threadMessaging", kind: "stop_thread", targetUrl: job.childConversationUrl });
+      if (!stopped.ok) throw new Error(stopped.error);
+      if (stopped.kind !== "stop_thread") throw new Error("Unexpected stop result.");
+    } catch (error) {
+      throw new Error(`Could not confirm that the child stopped. Job ${job.jobId} remains pending. ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (job.childThreadId) await registry.recordComplete(job.childThreadId);
+  return await jobs.cancel(job.jobId);
+}
+
 export function registerChatGptAgents(
   server: McpServer,
   commands: SupportCommandBus,
@@ -1881,7 +2152,7 @@ export function registerChatGptAgents(
         if ((await registry.threads()).some((thread) => thread.threadId === parent.threadId && thread.parentThreadId)) {
           throw new SubagentAdmissionError("nested");
         }
-        job = await jobs.create(parent, fingerprint);
+        job = await jobs.createReview(parent, fingerprint);
       } catch (error) {
         return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] };
       }
@@ -1899,7 +2170,7 @@ export function registerChatGptAgents(
           feature: "threadMessaging",
           kind: "send_message",
           targetUrl: subagentProjectUrl ?? "https://chatgpt.com/",
-          message: subagentPrompt(message, job.jobId, job.resultPath),
+          message: reviewerPrompt(message, job.jobId, job.resultPath),
         });
         if (!result.ok) throw new Error(result.error);
         if (result.kind !== "send_message") throw new Error("Reviewer creation received the wrong support command result.");
@@ -1966,7 +2237,7 @@ export function registerChatGptAgents(
 
   server.registerTool("review_done", {
     title: "Review done",
-    description: "Finish this review by storing its complete report in the local result file. The service waits for this reviewer to become idle, then wakes the implementer. End your turn immediately after success. Submit once. A cancelled review rejects late results.",
+    description: "Store the complete report for the current reviewer or externally started local agent. For reviewer jobs, the service waits for this reviewer to become idle, then wakes the implementer. External API jobs remain local. End the turn immediately after success. Submit once; cancelled jobs reject late results.",
     inputSchema: {
       jobId: z.string().uuid(),
       result: z.string().trim().min(1).max(200_000),
@@ -2041,7 +2312,7 @@ export function registerChatGptAgents(
 
   server.registerTool("send_thread_message", {
     title: "Send Thread Message",
-    description: "Send one message to an existing ChatGPT conversation only when the user explicitly requests that post. Transport retries of the same MCP request are deduplicated internally. This tool never creates a new thread. If ChatGPT rate-limits delivery, the command stays queued and resumes after cooldown with global send pacing. For other uncertain delivery errors, inspect the target before making a new send request.",
+    description: "Send one message to an existing ChatGPT conversation only when the user explicitly requests that post. Transport retries of the same MCP request are deduplicated internally. This tool never creates a new thread. A rate limit known to occur before Send is clicked stays queued and may resume after cooldown with global send pacing. If a provider notice appears after Send is clicked, delivery is uncertain and the command is never replayed automatically; inspect the target before making a new send request.",
     inputSchema: {
       targetUrl: z.string().url().describe("Exact existing ChatGPT /c/... conversation URL."),
       message: z.string().min(1).max(200_000).describe("Message to send to that conversation."),
@@ -2137,6 +2408,10 @@ export class SubagentResultController {
       if (job.state === "complete" && !job.notifiedAt && !job.notificationAbandonedAt) ready.push(job);
     }
     if (!ready.length) return;
+    if (!ready[0].parentConversationUrl) {
+      await this.jobs.markNotified(ready.map((job) => job.jobId));
+      return;
+    }
     const batchAfter = this.batchAfter.get(parentId) ?? Date.now() + this.batchWindowMs;
     this.batchAfter.set(parentId, batchAfter);
     if (Date.now() < batchAfter || this.commands.messageCooldownUntil()) return;

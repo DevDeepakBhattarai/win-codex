@@ -11,15 +11,15 @@ try {
   const parent = { threadId: "11111111-1111-4111-8111-111111111111", conversationUrl: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111" };
   const child = { threadId: "22222222-2222-4222-8222-222222222222", conversationUrl: "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222" };
   const jobs = await SubagentJobRegistry.open(directory);
-  const attempts = await Promise.allSettled(Array.from({ length: 8 }, () => jobs.create(parent)));
+  const attempts = await Promise.allSettled(Array.from({ length: 8 }, () => jobs.createReview(parent)));
   assert.equal(attempts.filter(result => result.status === "fulfilled").length, 1, "concurrent starts reserve only one reviewer per parent");
   const job = attempts.find(result => result.status === "fulfilled").value;
   await jobs.assignChild(job.jobId, child);
-  await assert.rejects(jobs.create(child), /cannot start another reviewer/);
+  await assert.rejects(jobs.createReview(child), /cannot start another reviewer/);
   await writeFile(job.resultPath, "An unfinished report file");
   assert.deepEqual(await jobs.jobsNeedingNotification(), [], "writing a file cannot complete a review");
   await jobs.complete(job.jobId, "Review report");
-  await assert.rejects(jobs.create(parent), /unfinished review/, "submission alone does not release the parent's handoff");
+  await assert.rejects(jobs.createReview(parent), /unfinished review/, "submission alone does not release the parent's handoff");
   await jobs.recordNotificationFailure(job.jobId, "delivery failed", 1);
   assert.equal(await jobs.blocksContinuation(parent.threadId), true, "failed wake-up must not silently resume the parent");
   await jobs.retryNotification(job.jobId);
@@ -55,10 +55,10 @@ try {
     assert.equal(await jobs.blocksContinuation(child.threadId), true);
   } finally { wakeController.close(); wakeBus.close(); }
 
-  const duplicates = await Promise.all(Array.from({ length: 8 }, () => jobs.create(parent, "same-review-sha")));
+  const duplicates = await Promise.all(Array.from({ length: 8 }, () => jobs.createReview(parent, "same-review-sha")));
   assert.equal(new Set(duplicates.map(job => job.jobId)).size, 1);
   const reopened = await SubagentJobRegistry.open(directory);
-  assert.equal((await reopened.create(parent, "same-review-sha")).jobId, duplicates[0].jobId);
+  assert.equal((await reopened.createReview(parent, "same-review-sha")).jobId, duplicates[0].jobId);
   assert.match((await reopened.job(duplicates[0].jobId)).preparationError, /interrupted/);
   await reopened.cancel(duplicates[0].jobId);
   await assert.rejects(reopened.complete(duplicates[0].jobId, "late"), /cancelled/);
@@ -103,7 +103,9 @@ try {
   let preparations = 0;
   registerChatGptAgents({ registerResource() {}, registerTool(name, definition, handler) { handlers.set(name, handler); } },
     toolBus, { async binding({ sessionId }) { return sessionId === "owner" ? parent : sessionId === "child" ? child : undefined; } },
-    registry, toolJobs, { markPrepared() { preparations += 1; } }, async () => {}, "grant", "");
+    registry, toolJobs, { markPrepared() { preparations += 1; } }, async () => {
+      await toolBus.claim("browser-launch", ["threadMessaging"], 0);
+    }, "grant", "");
   const owner = { requestId: "review", _meta: { "openai/session": "owner" } };
   try {
     assert.deepEqual([...handlers.keys()].sort(), ["list_reviewers", "review_done", "send_thread_message", "start_reviewer", "start_thread"]);
@@ -186,8 +188,10 @@ try {
   } finally { ralph.close(); checkpointBus.close(); }
 
   const recoveryJobs = await SubagentJobRegistry.open(path.join(directory, "recovery"));
-  const recoveryBus = new SupportCommandBus(undefined, undefined, undefined, registry, recoveryJobs);
-  const recovery = reviewActionHandler(recoveryJobs, registry, recoveryBus, async () => {}, "test-token");
+  const recoveryBus = new SupportCommandBus(undefined, undefined, undefined, undefined, registry, recoveryJobs);
+  const recovery = reviewActionHandler(recoveryJobs, registry, recoveryBus, async () => {
+    await recoveryBus.claim("browser-launch", ["threadMessaging"], 0);
+  }, "test-token");
   const requestAction = async (jobId, body, authorized = true) => {
     let status = 200;
     let result;
@@ -198,7 +202,7 @@ try {
   try {
     const staleSend = recoveryBus.execute({ feature: "ralph", kind: "send_message", targetUrl: parent.conversationUrl, message: "stale continuation" });
     const staleRejection = assert.rejects(staleSend, /paused for review/);
-    const pending = await recoveryJobs.create(parent);
+    const pending = await recoveryJobs.createReview(parent);
     assert.equal(await recoveryBus.claim("browser", ["ralph"], 0), undefined, "a queued continuation is discarded when review starts before delivery");
     await staleRejection;
     assert.equal((await requestAction(pending.jobId, { action: "cancel" }, false)).status, 401);
@@ -206,7 +210,7 @@ try {
     await recoveryJobs.recordPreparationFailure(pending.jobId, "unconfirmed startup");
     assert.equal((await requestAction(pending.jobId, { action: "cancel" })).status, 409);
     assert.equal((await requestAction(pending.jobId, { action: "cancel", confirmedStopped: true })).status, 200);
-    const known = await recoveryJobs.create(parent);
+    const known = await recoveryJobs.createReview(parent);
     await recoveryJobs.assignChild(known.jobId, child);
     const cancel = requestAction(known.jobId, { action: "cancel" });
     const stop = await recoveryBus.claim("browser", ["threadMessaging"], 1000);
@@ -219,7 +223,7 @@ try {
     const confirmed = await recoveryBus.claim("browser", ["threadMessaging"], 1000);
     recoveryBus.complete({ commandId: confirmed.id, browserId: "browser", kind: "stop_thread", ok: true, result: { status: "stopped", conversationUrl: child.conversationUrl } });
     assert.equal((await retryCancel).status, 200);
-    const undelivered = await recoveryJobs.create(parent);
+    const undelivered = await recoveryJobs.createReview(parent);
     await recoveryJobs.complete(undelivered.jobId, "report");
     await recoveryJobs.recordNotificationFailure(undelivered.jobId, "failed", 1);
     assert.equal((await requestAction(undelivered.jobId, { action: "retry" })).status, 200);
@@ -235,7 +239,7 @@ try {
     const claimed = await cooldownBus.claim("browser", ["threadMessaging"], 0);
     const secondSend = cooldownBus.execute({ feature: "ralph", kind: "send_message", targetUrl: parent.conversationUrl, message: "second" });
     cooldownBus.complete({ commandId: claimed.id, browserId: "browser", kind: "send_message", ok: false,
-      error: "CHATGPT_RATE_LIMITED: Too many messages" });
+      error: "CHATGPT_RATE_LIMITED_RETRYABLE: Too many messages" });
     const thirdSend = cooldownBus.execute({ feature: "threadMessaging", kind: "send_message", targetUrl: parent.conversationUrl, message: "third" });
     assert.ok(cooldownBus.messageCooldownUntil() > Date.now());
     assert.equal(await cooldownBus.claim("browser", ["ralph", "threadMessaging"], 0), undefined,
@@ -250,7 +254,7 @@ try {
 
     await new Promise(resolve => setTimeout(resolve, 35));
     const retryFirst = await cooldownBus.claim("browser", ["ralph", "threadMessaging"], 0);
-    assert.equal(retryFirst.id, claimed.id, "the rate-limited command is retried before later queued sends");
+    assert.equal(retryFirst.id, claimed.id, "a pre-click rate-limited send retries before later queued sends");
     cooldownBus.complete({ commandId: retryFirst.id, browserId: "browser", kind: "send_message", ok: true,
       result: { status: "sent", conversationUrl: parent.conversationUrl } });
     await firstSend;
@@ -270,6 +274,15 @@ try {
     cooldownBus.complete({ commandId: third.id, browserId: "browser", kind: "send_message", ok: true,
       result: { status: "sent", conversationUrl: parent.conversationUrl } });
     await thirdSend;
+
+    const uncertainSend = cooldownBus.execute({ feature: "threadMessaging", kind: "send_message", targetUrl: parent.conversationUrl, message: "uncertain" });
+    const uncertain = await cooldownBus.claim("browser", ["threadMessaging"], 0);
+    cooldownBus.complete({ commandId: uncertain.id, browserId: "browser", kind: "send_message", ok: false,
+      error: "CHATGPT_RATE_LIMITED: Provider notice appeared after click" });
+    assert.equal((await uncertainSend).ok, false, "post-click rate limits surface as uncertain instead of replaying the send");
+    await new Promise(resolve => setTimeout(resolve, 35));
+    assert.equal((await cooldownBus.claim("browser", ["threadMessaging"], 0))?.id, undefined,
+      "an uncertain send is never requeued after cooldown");
 
     const normalSend = cooldownBus.execute({ feature: "threadMessaging", kind: "send_message", targetUrl: parent.conversationUrl, message: "normal" });
     const normal = await cooldownBus.claim("browser", ["threadMessaging"], 0);
@@ -295,7 +308,7 @@ try {
     const response = await new Promise(resolve => listener({ type: "local-codex-support/automation-v1",
       command: { kind: "send_message", message: "" } }, {}, resolve));
     assert.equal(response.ok, false);
-    if (visible) assert.match(response.error, /^CHATGPT_RATE_LIMITED:/);
+    if (visible) assert.match(response.error, /^CHATGPT_RATE_LIMITED_RETRYABLE:/);
     else assert.match(response.error, /non-empty ChatGPT message/,
       "hidden notices must not trigger account cooldowns");
   }

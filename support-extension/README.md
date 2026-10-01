@@ -55,6 +55,8 @@ The Reviewer project setting chooses where reviews start, with chatgpt.com as th
 
 Repeated identical review briefs reuse their saved job across restarts. Include the current PR head SHA in each brief so a review of changed code is a new assignment. An uncertain startup keeps its reservation. Inspect it in the extension before cancelling. Known reviewers are stopped before cancellation releases the reservation. Unknown startups require confirmation that any untracked reviewer has stopped. Late reports from cancelled jobs are rejected.
 
+Ready reviewer results for the same implementer are collected for one second and delivered in one notice. RALPH defers implementers with pending reviews or results awaiting notification. Recognized visible English ChatGPT rate-limit alerts, dialogs, or toasts trigger a 10-minute cooldown. The extension persists the first-seen time across service-worker restarts and waits the full interval before dismissing the notice. Sends blocked before the Send click may resume after cooldown. A send with uncertain post-click delivery is never replayed automatically. Stop-thread cancellation remains available during cooldown.
+
 The popup shows pending startup, review progress, delivery failure, cancellation, and the exact review-thread URL. Use the URL or review title to open the reviewer. Use **Cancel review** to stop an abandoned reviewer. Use **Retry parent wake-up** after fixing an abandoned delivery. Completed reviews remain available under **Completed**. Parents waiting for review are labelled explicitly and cannot be resumed by **Check now**.
 
 ## Thread message delivery
@@ -77,7 +79,7 @@ The browser-side send path is deliberately single-shot:
 5. Wait for an actionable send button and click it once.
 6. For a new conversation, wait for ChatGPT to navigate to its saved `/c/...` URL.
 
-The extension does not wait for an assistant turn before typing. It no longer uses DOM-stability signatures or post-send acknowledgement heuristics. It also does not perform an automatic second click or message retry.
+The extension does not wait for an assistant turn before typing. It no longer uses DOM-stability signatures or post-send acknowledgement heuristics. After a page error, it refreshes once and retries only when the page confirms that Send was not clicked. An uncertain send refreshes the page but remains an error without another click.
 
 ## RALPH behavior
 
@@ -114,7 +116,9 @@ Continuous mode must be selected explicitly per thread. It uses the same repeate
 
 The observation endpoint checks the RALPH registry before scheduling preparation. Unregistered and completed threads return `ignored` without launching Chrome or queuing a command. Project registration remains subject to the RALPH allowlist. Explicit manual registrations and agent-created threads are retained.
 
-`ThreadPreparationCoordinator` deduplicates eligible preparations by thread ID, caps active preparations at three, and remembers successful preparation during the server run. Binding alone never opens Chrome.
+`ThreadPreparationCoordinator` deduplicates eligible preparations by thread ID, caps active preparations at three, and remembers successful preparation during the server run. Binding alone never opens Chrome. Observation does not grant automation ownership. Only active registered RALPH threads are eligible for preparation.
+
+The Chrome automation profile reuses matching conversation tabs and opens missing tabs in its existing window. Explicit reviewer and thread-message commands can create a background tab and record ownership. Thread Sync leaves the tab in place for title observation, RALPH inspection, and later messaging. Helium keeps Thread Sync enabled with **Automation browser executor** off, so it can report routes and provide read-only inspection for conversations already open there without claiming automation commands.
 
 External composer activity in Helium records a persistent revision for registered conversations when a turn starts or finishes. Automation commands carry that revision. Chrome refreshes a matching idle tab once per changed revision before using it. A running or loading tab defers the refresh. Route changes, title updates, and unchanged RALPH cycles do not reload the page. Automation commands execute in order within the browser, and overlapping pollers share execution of the same command.
 
@@ -130,11 +134,14 @@ Run:
 pnpm thread-sync-test
 ```
 
-The test covers one-time thread binding, backend preparation deduplication, generated-extension configuration, local reviewer result files, parent wake-ups, request-level send deduplication, parent-child registration, title extraction, single-shot browser sends, fixed settle timing, persistent-tab reuse and delayed cleanup, continuous RALPH behavior, project-scoped registration, settled-idle classification gating, recurring check timing, command claiming, and MCP App routing. It does not start a real browser or network listener.
-
+The test suite covers one-time thread binding, managed-thread preparation, generated-extension configuration, reviewer result delivery, request-level send deduplication, reviewer registration, browser ownership, persistent-tab reuse, continuous RALPH behavior, project-scoped registration, checkpoint continuation, rate-limit recovery, and MCP App routing. The dedicated popup test uses local fixtures and a headless browser.
 
 ## Engineering checkpoints and browser load
 
-See the [sequential engineering workflow](../README.md#sequential-engineering-workflow) for the skill sequence and RALPH status lines. CONTINUE and WAIT_CI bypass the classifier, including for short turns. WAIT_CI delays the next wake-up for five minutes. Pending reviewers suppress parent inspection and continuation. Report submission alone does not wake a parent until the reviewer is idle.
+See the [sequential engineering workflow](../README.md#sequential-engineering-workflow) for the skill sequence and RALPH status lines. `CONTINUE` and `WAIT_CI` bypass the classifier. `WAIT_CI` delays the next wake-up for five minutes. Pending reviewers suppress parent inspection and continuation. Report submission alone does not wake a parent until the reviewer is idle.
 
-New reviewers already have an automation-owned tab, so startup records preparation without another browser command. Route observations are coalesced for one minute per conversation. Working-browser observations never claim execution. Matching tabs are reused, and only an actual external conversation revision can cause an idle automation tab to reload. Ordinary observation, title updates, and timer ticks do not reload it.
+New reviewers already have an automation-owned tab, so startup records preparation without another browser command. Route observations are coalesced per conversation. Matching tabs are reused, and only an external conversation revision can cause an idle automation tab to reload. Ordinary observation, title updates, and timer ticks do not reload it.
+
+Each browser with Thread Sync enabled reports the conversations it already has open while polling the local support service. Read-only inspection is routed to an existing observer tab first, then an executor tab. If no browser reports the thread, RALPH uses the Chrome executor and opens a matching tab if needed. Message delivery remains executor-only.
+
+Closing an individual tracked conversation tab removes its RALPH entry and cancels queued checks. The extension persists removal reports while the server is offline and retries them after reconnecting. Closing a browser window preserves registered threads so RALPH can restore their tabs after Chrome restarts.
