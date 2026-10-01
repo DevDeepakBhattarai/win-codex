@@ -92,7 +92,7 @@ try {
     const claimed = await cooldownBus.claim("browser", ["threadMessaging"], 0);
     const secondSend = cooldownBus.execute({ feature: "ralph", kind: "send_message", targetUrl: parent.conversationUrl, message: "second" });
     cooldownBus.complete({ commandId: claimed.id, browserId: "browser", kind: "send_message", ok: false,
-      error: "CHATGPT_RATE_LIMITED: Too many messages" });
+      error: "CHATGPT_RATE_LIMITED_RETRYABLE: Too many messages" });
     const thirdSend = cooldownBus.execute({ feature: "threadMessaging", kind: "send_message", targetUrl: parent.conversationUrl, message: "third" });
     assert.ok(cooldownBus.messageCooldownUntil() > Date.now());
     assert.equal(await cooldownBus.claim("browser", ["ralph", "threadMessaging"], 0), undefined,
@@ -128,6 +128,15 @@ try {
       result: { status: "sent", conversationUrl: parent.conversationUrl } });
     await thirdSend;
 
+    const uncertainSend = cooldownBus.execute({ feature: "threadMessaging", kind: "send_message", targetUrl: parent.conversationUrl, message: "uncertain" });
+    const uncertain = await cooldownBus.claim("browser", ["threadMessaging"], 0);
+    cooldownBus.complete({ commandId: uncertain.id, browserId: "browser", kind: "send_message", ok: false,
+      error: "CHATGPT_RATE_LIMITED: Provider notice appeared after click" });
+    assert.equal((await uncertainSend).ok, false, "post-click rate limits surface as uncertain instead of replaying the send");
+    await new Promise(resolve => setTimeout(resolve, 35));
+    assert.equal((await cooldownBus.claim("browser", ["threadMessaging"], 0))?.id, undefined,
+      "an uncertain send is never requeued after cooldown");
+
     const normalSend = cooldownBus.execute({ feature: "threadMessaging", kind: "send_message", targetUrl: parent.conversationUrl, message: "normal" });
     const normal = await cooldownBus.claim("browser", ["threadMessaging"], 0);
     assert.equal(normal.message, "normal", "pacing turns off after the deferred backlog is drained");
@@ -135,6 +144,19 @@ try {
       result: { status: "sent", conversationUrl: parent.conversationUrl } });
     await normalSend;
   } finally { cooldownBus.close(); }
+
+  const inspectCooldownBus = new SupportCommandBus(undefined, 30, 15);
+  try {
+    const inspection = inspectCooldownBus.execute({
+      feature: "ralph", kind: "inspect_thread", conversationUrl: parent.conversationUrl,
+    });
+    const claimed = await inspectCooldownBus.claim("browser", ["ralph"], 0);
+    inspectCooldownBus.complete({ commandId: claimed.id, browserId: "browser", kind: "inspect_thread", ok: false,
+      error: "CHATGPT_RATE_LIMITED: Usage limit reached" });
+    assert.equal((await inspection).ok, false);
+    assert.ok(inspectCooldownBus.messageCooldownUntil() > Date.now(),
+      "a rate limit found during inspection also pauses continuation");
+  } finally { inspectCooldownBus.close(); }
 
   const registry = await RalphRegistry.open(path.join(directory, "ralph"), 1);
   await registry.register(parent.conversationUrl, { agentCreated: true });
@@ -188,7 +210,7 @@ try {
     );
     const limiterCommand = await toolBus.claim("browser", ["threadMessaging"], 0);
     toolBus.complete({ commandId: limiterCommand.id, browserId: "browser", kind: "send_message", ok: false,
-      error: "CHATGPT_RATE_LIMITED: Too many messages" });
+      error: "CHATGPT_RATE_LIMITED_RETRYABLE: Too many messages" });
     const queuedStart = handlers.get("start_subagent")({ message: "queued child start" },
       { requestId: "cooldown-child", _meta: { "openai/session": "owner" } });
     await new Promise(resolve => setTimeout(resolve, 10));
@@ -243,7 +265,7 @@ try {
     const response = await new Promise(resolve => listener({ type: "local-codex-support/automation-v1",
       command: { kind: "send_message", message: "" } }, {}, resolve));
     assert.equal(response.ok, false);
-    if (visible) assert.match(response.error, /^CHATGPT_RATE_LIMITED:/);
+    if (visible) assert.match(response.error, /^CHATGPT_RATE_LIMITED_RETRYABLE:/);
     else assert.match(response.error, /non-empty ChatGPT message/,
       "hidden notices must not trigger account cooldowns");
   }

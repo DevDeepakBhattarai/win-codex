@@ -1,0 +1,244 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import vm from "node:vm";
+
+const workerScript = await readFile("support-extension/service-worker.js", "utf8");
+const contentScript = await readFile("support-extension/content-script.js", "utf8");
+const url = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
+const config = {
+  bindUrl: "http://127.0.0.1:3000/thread-sync/bind",
+  commandClaimUrl: "http://127.0.0.1:3000/chatgpt-support/commands/claim",
+  commandResultUrl: "http://127.0.0.1:3000/chatgpt-support/commands/result",
+  threadObserveUrl: "http://127.0.0.1:3000/chatgpt-support/threads/observe",
+  ralphRegisterUrl: "http://127.0.0.1:3000/chatgpt-support/ralph/register",
+  extensionToken: "x".repeat(32),
+};
+
+async function runWorker(command, responses, healthResponses = [], injectionFailures = []) {
+  const results = [];
+  let dispatches = 0;
+  let reloads = 0;
+  let activeInjectionFailures = [];
+  const storage = {};
+  const context = {
+    URL, AbortSignal, AbortController, crypto: globalThis.crypto, Response, Error,
+    setTimeout, clearTimeout, console, importScripts() {},
+    LOCAL_CODEX_THREAD_SYNC: config,
+    browser: {
+      runtime: {
+        id: "a".repeat(32), getPlatformInfo: async () => {},
+        onMessage: { addListener() {} }, onInstalled: { addListener() {} }, onStartup: { addListener() {} },
+      },
+      tabs: {
+        onUpdated: { addListener() {} }, query: async () => [{ id: 11, status: "complete", url }],
+        create: async () => ({ id: 11 }),
+        get: async () => ({ id: 11, status: "complete", url }),
+        reload: async () => { reloads += 1; },
+        sendMessage: async (_tabId, payload) => {
+          if (payload.command.kind === "page_health") {
+            const response = healthResponses.shift();
+            if (response instanceof Error) throw response;
+            return response ?? { ok: true, result: { status: "ok" } };
+          }
+          const response = responses[dispatches++];
+          if (response instanceof Error) throw response;
+          return response;
+        },
+        remove: async () => {},
+      },
+      webNavigation: { onHistoryStateUpdated: { addListener() {} }, onCommitted: { addListener() {} } },
+      scripting: { executeScript: async () => { const failure = activeInjectionFailures.shift(); if (failure) throw failure; } },
+      storage: { local: {
+        async get(query) { return typeof query === "string" ? { [query]: storage[query] } : { ...query, threadSync: false, ...storage }; },
+        async set(values) { Object.assign(storage, values); },
+      } },
+    },
+    fetch: async (endpoint, options) => {
+      if (endpoint !== config.commandResultUrl) return new Response(null, { status: 204 });
+      results.push(JSON.parse(options.body));
+      return new Response("", { status: 200 });
+    },
+  };
+  vm.runInNewContext(workerScript, context);
+  await new Promise(resolve => setImmediate(resolve));
+  activeInjectionFailures = injectionFailures;
+  context.restartPolling = () => {};
+  context.getSettings = async () => ({ threadSync: true, automationExecutor: true });
+  await context.executeCommand(command, "browser-a");
+  return { results, dispatches, reloads };
+}
+
+function inspectCommand(id) {
+  return { id, feature: "ralph", kind: "inspect_thread", conversationUrl: url };
+}
+
+function sendCommand(id) {
+  return { id, feature: "threadMessaging", kind: "send_message", targetUrl: url, message: "Continue" };
+}
+
+for (const kind of ["inspect_thread", "prepare_thread"]) {
+  const run = await runWorker({ id: `health-${kind}`, feature: kind === "inspect_thread" ? "ralph" : "threadPreparation",
+    kind, conversationUrl: url }, [{ ok: true, result: { status: "running" } }], [
+    new Error("Timed out waiting for ChatGPT page automation."),
+    { ok: true, result: { status: "ok" } },
+  ]);
+  assert.equal(run.reloads, 1, "page-health failures refresh the existing tab");
+  assert.equal(run.results[0].ok, true);
+  assert.equal(run.results[0].result.status, kind === "inspect_thread" ? "running" : "prepared");
+}
+
+{
+  const run = await runWorker(inspectCommand("persistently-blocked"), [], [
+    { ok: true, result: { status: "recoverable_error" } },
+    { ok: true, result: { status: "recoverable_error" } },
+  ]);
+  assert.equal(run.reloads, 1);
+  assert.equal(run.dispatches, 0, "a refresh must recheck page health before inspecting a still-blocked page");
+  assert.equal(run.results[0].result.status, "loading");
+}
+
+{
+  const run = await runWorker(inspectCommand("inspection-timeout"), [
+    new Error("Timed out waiting for ChatGPT page automation."),
+    { ok: true, result: { status: "running" } },
+  ]);
+  assert.equal(run.reloads, 1, "an inspection timeout refreshes the same tab once");
+  assert.equal(run.results[0].ok, true);
+  assert.equal(run.results[0].result.status, "running");
+}
+
+{
+  const run = await runWorker(inspectCommand("page-error"), [
+    { ok: false, error: "Message delivery failed." },
+    { ok: true, result: { status: "running" } },
+  ]);
+  assert.equal(run.reloads, 1, "an inspection refreshes a failed page");
+  assert.equal(run.dispatches, 2, "inspection repeats on the refreshed tab");
+  assert.equal(run.results[0].ok, true);
+  assert.equal(run.results[0].result.status, "running");
+}
+
+{
+  const run = await runWorker(inspectCommand("repeated-error"), [
+    { ok: false, error: "Stream interrupted." },
+    { ok: false, error: "Stream interrupted." },
+  ]);
+  assert.equal(run.reloads, 1, "a persistent failure does not cause a refresh loop");
+  assert.equal(run.dispatches, 2);
+  assert.equal(run.results[0].result.status, "loading");
+}
+
+for (const failure of [new Error("Timed out waiting for ChatGPT page automation."),
+  { ok: false, error: "ChatGPT did not confirm that the child run stopped." }]) {
+  const run = await runWorker({ id: "stop-recovery", feature: "threadMessaging", kind: "stop_thread", targetUrl: url }, [
+    failure, { ok: true, result: { status: "stopped", conversationUrl: url } },
+  ]);
+  assert.equal(run.reloads, 1, "a failed stop refreshes the same tab");
+  assert.equal(run.dispatches, 2, "stop state is checked again after refresh");
+  assert.equal(run.results[0].ok, true);
+  assert.equal(run.results[0].result.status, "stopped");
+}
+
+{
+  const run = await runWorker(inspectCommand("rate-limit"), [
+    { ok: false, error: "CHATGPT_RATE_LIMITED: Too many messages." },
+  ]);
+  assert.equal(run.reloads, 0, "rate limits must back off without refreshing");
+  assert.equal(run.dispatches, 1);
+}
+
+{
+  const run = await runWorker(sendCommand("send-rate-limit"), [
+    { ok: false, error: "CHATGPT_RATE_LIMITED: Too many messages.", retryable: true },
+  ]);
+  assert.equal(run.reloads, 0, "a rate-limited send must not refresh or retry");
+  assert.equal(run.dispatches, 1);
+}
+
+{
+  const run = await runWorker(sendCommand("uncertain-send"), [new Error("The message port closed after delivery.")]);
+  assert.equal(run.reloads, 1, "an uncertain send still refreshes the broken page");
+  assert.equal(run.dispatches, 1, "an uncertain send must not duplicate the message");
+  assert.equal(run.results[0].ok, false);
+}
+
+{
+  const run = await runWorker(sendCommand("unsent-message"), [
+    { ok: false, error: "Composer did not load.", retryable: true },
+    { ok: true, result: { status: "sent", conversationUrl: url } },
+  ]);
+  assert.equal(run.reloads, 1);
+  assert.equal(run.dispatches, 2, "a known unsent message is retried after refresh");
+  assert.equal(run.results[0].ok, true);
+}
+
+{
+  const run = await runWorker(sendCommand("receiver-setup-failure"), [
+    { ok: true, result: { status: "sent", conversationUrl: url } },
+  ], [], [undefined, new Error("Could not establish the page receiver.")]);
+  assert.equal(run.reloads, 1);
+  assert.equal(run.dispatches, 1, "failure before dispatch can retry without sending twice");
+  assert.equal(run.results[0].ok, true);
+}
+
+{
+  let listener;
+  const alert = { textContent: "Message delivery failed.", getClientRects: () => [{}] };
+  const document = {
+    title: "ChatGPT", readyState: "complete",
+    querySelector: () => null,
+    querySelectorAll: selector => selector.includes('[role="alert"]') ? [alert] : [],
+  };
+  vm.runInNewContext(contentScript, {
+    document, location: new URL(url), window: { addEventListener() {} },
+    browser: { runtime: { async sendMessage() {}, onMessage: { addListener(value) { listener = value; } } } },
+  });
+  for (const kind of ["inspect_thread", "stop_thread"]) {
+    const response = await new Promise(resolve => listener({
+      type: "local-codex-support/automation-v1", command: { kind },
+    }, {}, resolve));
+    assert.equal(response.ok, false);
+    assert.match(response.error, /Message delivery failed/);
+  }
+}
+
+{
+  let listener;
+  const alert = { textContent: "Message delivery failed.", getClientRects: () => [{}] };
+  const document = {
+    title: "ChatGPT", readyState: "complete",
+    querySelector: () => null,
+    querySelectorAll: selector => selector.includes('[role="alert"]') ? [alert] : [],
+  };
+  vm.runInNewContext(contentScript, {
+    document, location: new URL(url), window: { addEventListener() {} },
+    browser: { runtime: { async sendMessage() {}, onMessage: { addListener(value) { listener = value; } } } },
+  });
+  const response = await new Promise(resolve => listener({
+    type: "local-codex-support/automation-v1", command: { kind: "send_message", message: "Continue" },
+  }, {}, resolve));
+  assert.equal(response.ok, false);
+  assert.equal(response.retryable, true, "a page error before Send is safe to retry");
+}
+
+{
+  let listener;
+  let now = 0;
+  const document = {
+    title: "ChatGPT", readyState: "complete",
+    querySelector: () => null, querySelectorAll: () => [],
+  };
+  vm.runInNewContext(contentScript, {
+    document, location: new URL(url), window: { addEventListener() {} },
+    Date: { now: () => { now += 60_000; return now; } },
+    setTimeout: callback => { callback(); return 1; },
+    browser: { runtime: { async sendMessage() {}, onMessage: { addListener(value) { listener = value; } } } },
+  });
+  const response = await new Promise(resolve => listener({
+    type: "local-codex-support/automation-v1", command: { kind: "inspect_thread" },
+  }, {}, resolve));
+  assert.equal(response.ok, true);
+  assert.equal(response.result.status, "loading", "an unready page is checked again later");
+}
+
+console.log("Support recovery tests passed.");

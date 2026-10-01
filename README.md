@@ -22,6 +22,8 @@ graph TD
 
 ## What the server provides
 
+For Claude or another local caller, send a prompt to `POST http://127.0.0.1:6002/agents` to start a ChatGPT browser-testing conversation. Fetch `GET /agents/JOB_ID` for its report, screenshots, and recorded video paths. See [Call a ChatGPT browser agent from Claude](docs/agent-api.md) and the [API reference](docs/agent-api-reference.md).
+
 ### Local computer tools
 
 The core MCP server always exposes these tools:
@@ -38,7 +40,7 @@ When `BROWSER_BRIDGE_ENABLED` is not `false`, the server also exposes:
 - `browser_tabs` lists tabs in the user's real Chrome profile.
 - `browser_claim` takes control of one existing user tab after checking its tab ID, title, and URL.
 - `browser_release` ends control. It closes an agent-created tab and leaves a claimed user tab open.
-- `browser_open` opens and controls a new tab or window and can start Chrome when the bridge is disconnected.
+- `browser_open` opens and controls a new tab or an explicitly requested window in Chrome. It starts Chrome when needed and reuses a running browser.
 - `browser_snapshot` returns visible text, fresh element references, accessibility information, diagnostics, and an optional screenshot.
 - `browser_action` navigates, clicks, types, presses keys, scrolls, waits, activates, reloads, or closes a controlled tab.
 - `browser_upload` uploads local files through a file input or intercepted file chooser.
@@ -177,7 +179,7 @@ The server generates a private unpacked extension under `.data/browser-extension
 
 The browser bridge listens only on loopback. It is separate from the public MCP listener.
 
-`browser_open` can start Chrome when the bridge is disconnected. The extension must already be installed in the profile that Chrome opens. Use `BROWSER_EXECUTABLE_PATH`, `BROWSER_PROFILE_DIRECTORY`, and `BROWSER_USER_DATA_DIRECTORY` when the default installation or profile is not the one you want.
+Install the browser-control extension in the configured Chrome profile. Browser tools reuse connected Chrome and start it when closed. If Chrome is running but its extension is disconnected, the server waits for that connection and reports a setup error without launching another instance.
 
 Controlled pages show visible control indicators. Element references returned by `browser_snapshot` are valid only for the latest page state. Navigation or document changes invalidate stale references.
 
@@ -198,7 +200,7 @@ Load `.data/support-extension` as an unpacked extension. Do not load the source 
 The popup lets you configure four browser responsibilities:
 
 - Thread sync. This can be enabled in more than one compatible browser because binding is idempotent.
-- Thread preparation executor. Enable this only in the Chrome automation profile. It opens or reuses persistent thread tabs for unsynced conversations.
+- Thread preparation executor. Enable this only in the Chrome automation profile. It prepares existing thread tabs for unsynced conversations.
 - RALPH automation. Normally enable this in only one browser.
 - Agent thread messaging. Normally enable this in only one browser.
 
@@ -216,7 +218,7 @@ The browser path is still used to create the child and to wake the parent. It us
 
 Result notifications use a one-second collection window and combine ready files for the same parent into one message. RALPH defers inspection and continuation while that parent has pending children or completed results awaiting notification. Finished and cancelled children receive no further RALPH continuation through their job. Notification failures remain bounded to five attempts; when delivery is abandoned, the parent can inspect `list_subagents` and read the result files.
 
-Recognized visible ChatGPT rate-limit notices start a 15-minute message cooldown in the running service. The rate-limited send and other queued sends stay queued instead of being discarded. A `start_subagent` call made during cooldown also reserves its parent slot and waits for its child-start message to drain instead of failing only because of the cooldown. After cooldown, the deferred message backlog is claimed at least five seconds apart, then normal unpaced sending resumes. Stop-thread commands are not blocked by the message cooldown. The cooldown is a conservative retry delay, not a claim about the account's quota, and resets when the service restarts. Detection currently covers English rate-limit notices in visible alerts, dialogs, and toasts.
+Recognized visible ChatGPT rate-limit notices start a 10-minute message cooldown. The extension also persists when the provider notice was first seen, so a service-worker restart does not shorten the wait. During those 10 minutes it neither reloads the blocked tab nor clicks the notice. After the wait it clicks **Got It** and verifies that the notice cleared. Sends known not to have reached the Send click remain queued and may resume after cooldown; a rate-limit notice detected after Send was clicked is treated as uncertain delivery and is never replayed automatically. Unready pages report loading. Page errors and timeouts refresh the same tab once, recheck page health, and retry inspection. A second failure reports loading for a later check. Failed Stop commands also refresh once and retry the stop check. A send resumes only when the page confirms that Send was not clicked; uncertain delivery remains an error to avoid posting the message twice. Stop-thread commands remain available during message cooldown. Detection currently covers English provider notices in visible alerts, dialogs, and toasts.
 
 `start_subagent` and `send_thread_message` keep transport idempotency internal. The server deduplicates retries of the same MCP request by tool, request identity, session, and payload fingerprint. `send_thread_message` also fingerprints its normalized target. A new logical tool call remains a new send or a new child.
 
@@ -226,7 +228,9 @@ RALPH is the support-extension continuation runtime. It tracks registered ChatGP
 
 Normal project threads are registered only when their project is in the RALPH project allowlist. Manually registered threads and agent-created sub-agents remain registered independently of that allowlist.
 
-Thread preparation is independent from RALPH registration. Every observed ChatGPT `/c/...` route is sent to the local backend, regardless of whether Thread Sync is already bound. The backend starts Chrome only when no recent preparation executor is connected and queues one `prepare_thread`. The automation profile reuses an already-open matching conversation when possible; otherwise it creates one background tab and records ownership. That same tab is then reused for Thread Sync, title observation, RALPH inspection, and thread messaging instead of reloading the conversation on every command. Running threads stay open. Automation-owned tabs are eligible for cleanup ten minutes after the registry marks the thread complete; tabs that were already open and owned by the user are never closed by this cleanup.
+Thread preparation is independent from RALPH registration. Every observed ChatGPT `/c/...` route is sent to the local backend, regardless of whether Thread Sync is already bound. The backend queues `prepare_thread` for the Chrome executor and starts Chrome when needed. Preparation reuses a matching conversation tab or opens it in an existing Chrome window. That same tab is then reused for Thread Sync, title observation, RALPH inspection, and thread messaging instead of reloading the conversation on every command. Running threads stay open. Automation-owned tabs are eligible for cleanup ten minutes after the registry marks the thread complete; tabs that were already open and owned by the user are never closed by this cleanup.
+
+Closing an individual tracked conversation tab removes its RALPH entry and cancels queued checks. The extension persists removal reports while the server is offline and retries them after reconnecting. Stale checks cannot recreate a deliberately closed tab. Closing a browser window preserves registered threads so RALPH can restore their tabs after Chrome restarts.
 
 RALPH has two modes:
 

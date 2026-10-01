@@ -80,6 +80,7 @@ import {
   supportCommandResultHandler,
 } from "./chatgpt-support.js";
 import { SubagentJobRegistry } from "./subagent-jobs.js";
+import { createAgentApi } from "./agent-api.js";
 
 const PORT = Number(process.env.PORT ?? 6000);
 const HOST = process.env.HOST ?? "localhost";
@@ -1621,7 +1622,7 @@ function createMcpServer(ownerId: string) {
       ralphRegistry,
       subagentJobs,
       threadPreparer,
-      () => launchChrome(),
+      launchChrome,
       ownerId,
       threadSync.subagentWidgetHtml,
     );
@@ -1854,6 +1855,36 @@ function createMcpServer(ownerId: string) {
   );
 
   if (browserService) {
+    server.registerTool("browser_screenshot", {
+      title: "Save Browser Screenshot", description: "Capture and save a PNG image. Returns the actual image and a local path. Supports full-page or cropped screenshots. Pass jobId to include it in the API job's screenshots.",
+      inputSchema: { tabId: z.number().int().nonnegative(), fullPage: z.boolean().default(false), jobId: z.string().uuid().optional(),
+        clip: z.object({ x: z.number().nonnegative(), y: z.number().nonnegative(), width: z.number().positive(), height: z.number().positive() }).optional() },
+    }, async (input) => {
+      if (input.jobId && !(await subagentJobs?.job(input.jobId))) throw new Error("Sub-agent job not found.");
+      const result = await browserService.screenshot(input);
+      return { content: [{ type: "text", text: result.path }, { type: "image", mimeType: "image/png", data: result.data }], structuredContent: { path: result.path } };
+    });
+    server.registerTool("browser_viewport", {
+      title: "Set Browser Viewport", description: "Set width and height in CSS pixels for responsive testing. Omit both to reset the viewport.",
+      inputSchema: { tabId: z.number().int().nonnegative(), width: z.number().int().min(100).max(3840).optional(), height: z.number().int().min(100).max(3840).optional() },
+    }, async (input) => browserSnapshotToolResponse(await browserService.viewport(input)));
+    server.registerTool("browser_dialog", {
+      title: "Handle Browser Dialog", description: "Inspect, accept, or dismiss a JavaScript alert, confirm, prompt, or beforeunload dialog. For prompts, pass text when accepting.",
+      inputSchema: { tabId: z.number().int().nonnegative(), action: z.enum(["get", "accept", "dismiss"]), text: z.string().optional() },
+    }, async (input) => {
+      const structuredContent = await browserService.dialog(input);
+      return { content: textContentFromStructuredContent(structuredContent), structuredContent };
+    });
+    server.registerTool("browser_recording", {
+      title: "Record Browser Video",
+      description: "Start, stop, or inspect a video recording of a controlled test tab. Start before testing and stop before submitting a report. Returns a local WebM path. Requires FFmpeg. Recordings have no audio and stop after 30 minutes. Pass the sub-agent jobId to attach the video to its API result.",
+      inputSchema: { action: z.enum(["start", "stop", "status"]), tabId: z.number().int().nonnegative(), jobId: z.string().uuid().optional() },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async (input) => {
+      if (input.jobId && !(await subagentJobs?.job(input.jobId))) throw new Error("Sub-agent job not found.");
+      const structuredContent = await browserService.recording(input);
+      return { content: textContentFromStructuredContent(structuredContent), structuredContent };
+    });
     server.registerTool(
       "browser_tabs",
       {
@@ -1974,9 +2005,12 @@ function createMcpServer(ownerId: string) {
           "Perform one action in a controlled Chrome tab and return a fresh snapshot. Pass the tabId returned by browser_open or browser_claim. Existing user tabs must be claimed first. Prefer fresh element refs from browser_snapshot over selectors or coordinates. Use close only when you intentionally need to close a tab immediately; browser_release is the normal final operation.",
         inputSchema: {
           tabId: z.number().int().nonnegative().optional().describe("Chrome tab ID. Omit to use the active tab in the last-focused window."),
-          action: z.enum(["navigate", "back", "forward", "reload", "click", "dblclick", "type", "press", "scroll", "wait", "activate", "close"])
+          action: z.enum(["navigate", "back", "forward", "reload", "click", "dblclick", "type", "press", "scroll", "wait", "activate", "close", "hover", "drag", "select", "check"])
             .describe("Action to perform. Prefer browser_release over close when finishing normal browser work."),
           url: z.string().optional().describe("Destination for navigate."),
+          path: z.array(z.object({ x: z.number().finite().nonnegative(), y: z.number().finite().nonnegative() })).min(2).max(200).optional().describe("Viewport points for drag."),
+          values: z.array(z.string()).min(1).max(100).optional().describe("Native select option values for select."),
+          checked: z.boolean().optional().describe("Desired state for check, including false to uncheck."),
           ref: z.string().optional().describe("Fresh element ref from the latest browser snapshot, such as e3."),
           locator: z.string().optional().describe("Playwright-style locator, for example css=#save or text=Continue."),
           x: z.number().finite().optional().describe("Viewport x coordinate for coordinate click fallback."),
@@ -2728,13 +2762,13 @@ await initializeAuthStore();
 const threadSync = THREAD_SYNC_ENABLED
   ? await prepareThreadSync(DATA_DIR, THREAD_SYNC_PORT)
   : undefined;
-const supportCommands = threadSync ? new SupportCommandBus() : undefined;
+const supportCommands = threadSync ? new SupportCommandBus(undefined, undefined, undefined, launchChrome) : undefined;
 const subagentJobs = threadSync ? await SubagentJobRegistry.open(DATA_DIR) : undefined;
 const threadPreparer = supportCommands && threadSync
-  ? new ThreadPreparationCoordinator(supportCommands, threadSync.registry, () => launchChrome())
+  ? new ThreadPreparationCoordinator(supportCommands, threadSync.registry, launchChrome)
   : undefined;
 const subagentResultController = supportCommands && subagentJobs
-  ? new SubagentResultController(subagentJobs, supportCommands, () => launchChrome())
+  ? new SubagentResultController(subagentJobs, supportCommands, launchChrome)
   : undefined;
 const ralphRegistry = threadSync ? await RalphRegistry.open(DATA_DIR) : undefined;
 const ralphController = supportCommands && ralphRegistry
@@ -2768,6 +2802,11 @@ const threadSyncHttpServer = threadSync
       const syncApp = express();
       syncApp.disable("x-powered-by");
       syncApp.use(express.json({ limit: "5mb" }));
+      if (subagentJobs && supportCommands && ralphRegistry && threadPreparer) {
+        syncApp.use("/agents", createAgentApi({ token: threadSync.extensionToken, jobs: subagentJobs,
+          commands: supportCommands, registry: ralphRegistry, preparer: threadPreparer,
+          launchBrowser: launchChrome, dataDirectory: DATA_DIR }));
+      }
       syncApp.post("/thread-sync/bind", createRateLimiter("thread-sync", 60_000, 120),
         threadSyncBindHandler(
           threadSync.registry,
@@ -2776,7 +2815,7 @@ const threadSyncHttpServer = threadSync
         ));
       if (ralphRegistry) {
         syncApp.post("/chatgpt-support/ralph/register", createRateLimiter("ralph-register", 60_000, 240),
-          ralphRegistrationHandler(ralphRegistry, threadSync.extensionToken));
+          ralphRegistrationHandler(ralphRegistry, threadSync.extensionToken, supportCommands));
         syncApp.get("/chatgpt-support/ralph/projects",
           ralphProjectsGetHandler(ralphRegistry, threadSync.extensionToken));
         syncApp.put("/chatgpt-support/ralph/projects",
@@ -2857,18 +2896,16 @@ async function shutdown(signal: string) {
   const forcedExit = setTimeout(() => process.exit(1), 10_000);
   forcedExit.unref();
 
-  void browserService?.close().catch((error) =>
-    console.error("Browser bridge shutdown failed:", error),
-  );
+  const browserClosed = browserService?.close();
   ralphController?.close();
   threadTabCleanupController?.close();
   subagentResultController?.close();
   supportCommands?.close();
 
   try {
-    await Promise.all([httpServer, threadSyncHttpServer].filter(server => server !== undefined).map(server =>
+    await Promise.all([browserClosed, ...[httpServer, threadSyncHttpServer].filter(server => server !== undefined).map(server =>
       new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())),
-    ));
+    )]);
     clearTimeout(forcedExit);
     process.exit(0);
   } catch (error) {

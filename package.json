@@ -3,10 +3,13 @@
     "version":  "1.3.13",
     "description":  "Hardened local Streamable HTTP MCP server with terminal, file, and process tools protected by OAuth on Windows and macOS.",
     "main":  "dist/server.js",
+    "bin": { "win-codex-agent": "dist/cli.js" },
     "type":  "module",
     "packageManager":  "pnpm@11.8.0",
     "scripts":  {
                     "dev":  "tsx src/server.ts",
+                    "agent": "node dist/cli.js",
+                    "agent-api-test": "pnpm build && node scripts/agent-api-test.mjs",
                     "build":  "tsc -p tsconfig.build.json",
                     "start":  "node dist/server.js",
                     "type":  "tsc --noEmit",
@@ -16,7 +19,7 @@
                     "harden":  "node scripts/run-powershell.mjs scripts/harden-acl.ps1",
                     "security-test":  "pnpm build && node scripts/security-test.mjs",
                     "browser-test":  "pnpm build && node scripts/browser-test.mjs",
-                    "thread-sync-test":  "pnpm build && node scripts/thread-sync-test.mjs && node scripts/subagent-limits-test.mjs",
+                    "thread-sync-test":  "pnpm build && node scripts/browser-launch-test.mjs && node scripts/thread-sync-test.mjs && node scripts/subagent-limits-test.mjs && node scripts/browser-presence-test.mjs && node scripts/support-recovery-test.mjs && node scripts/ralph-lifecycle-test.mjs",
                     "support:prepare":  "pnpm build && node scripts/prepare-support-extension.mjs",
                     "thread-sync:prepare":  "pnpm support:prepare"
                 },
