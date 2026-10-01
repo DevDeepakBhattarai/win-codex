@@ -147,7 +147,7 @@ export class SubagentJobRegistry {
         job.parentThreadId === parent.threadId && job.taskFingerprint === taskFingerprint);
       if (existing) return { ...existing, reused: true };
       const active = state.jobs.filter((job) => job.parentThreadId === parent.threadId &&
-        (job.state === "pending" || (job.state === "complete" && !job.notifiedAt)));
+        (job.state === "pending" || (kind === "reviewer" && job.state === "complete" && !job.notifiedAt)));
       if (active.length >= maxActive) {
         throw new SubagentAdmissionError("capacity", active.map((job) => job.jobId), kind);
       }

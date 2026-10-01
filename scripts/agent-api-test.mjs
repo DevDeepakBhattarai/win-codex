@@ -81,6 +81,19 @@ try {
   assert.equal(await commands.claim("extension", ["threadMessaging"], 0), undefined, "API results never send a parent message");
   assert.equal((await request()).body.jobs.length, 2);
 
+  // Local callers can submit again immediately after reading completed reports.
+  // Their jobs do not need to reserve slots for ChatGPT parent notifications.
+  for (let index = 0; index < 2; index++) {
+    const finished = await jobs.create({ threadId: "api:completed-capacity" });
+    await jobs.complete(finished.jobId, `Finished test ${index}`);
+  }
+  const replacement = await request("", { session: "completed-capacity", prompt: "Next browser test" });
+  assert.equal(replacement.status, 202, "completed API jobs release capacity before notification cleanup");
+  const replacementSend = await claim();
+  commands.complete({ commandId: replacementSend.id, browserId: "extension", kind: "send_message", ok: false, error: "Test executor unavailable" });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal((await request(`/${replacement.body.jobId}/cancel`, {})).body.state, "cancelled");
+
   const interrupted = await jobs.create({ threadId: "api:restart", requestId: "restart", promptHash: "hash" });
   const reopened = await SubagentJobRegistry.open(directory);
   assert.match((await reopened.job(interrupted.jobId)).preparationError, /interrupted/);
