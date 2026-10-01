@@ -1788,7 +1788,7 @@ function subagentPrompt(message: string, jobId: string, resultPath: string) {
     "Before submit_subagent_result, bind this child conversation with sync_current_thread. If it reports syncing, follow with get_current_thread_url; if it reports synced, reuse that binding.",
     "Your parent does not expect a browser message from you. Do not call send_thread_message to report back.",
     `When your work is complete, call submit_subagent_result exactly once with jobId ${JSON.stringify(jobId)} and put your complete final report in its result argument.`,
-    `The application stores that report locally at ${JSON.stringify(resultPath)} and wakes the parent automatically.`,
+    `The application stores that report locally at ${JSON.stringify(resultPath)} for the caller.`,
     "After submit_subagent_result succeeds, end this child turn with only a brief acknowledgement.",
   ].join("\n");
 }
@@ -1872,6 +1872,52 @@ const subagentToolMeta = {
   "openai/outputTemplate": SUBAGENT_WIDGET_URI,
 };
 
+type SubagentJob = NonNullable<Awaited<ReturnType<SubagentJobRegistry["job"]>>>;
+type AgentServices = {
+  commands: SupportCommandBus;
+  registry: RalphRegistry;
+  jobs: SubagentJobRegistry;
+  launchBrowser: () => Promise<void>;
+};
+
+export async function startSubagentJob(job: SubagentJob, message: string,
+  { commands, registry, jobs, preparer, launchBrowser }: AgentServices & { preparer: ThreadPreparationCoordinator }) {
+  const { subagentProjectUrl } = await registry.settings();
+  await commands.ensureBrowser("threadMessaging", launchBrowser);
+  const result = await commands.execute({
+    feature: "threadMessaging", kind: "send_message", targetUrl: subagentProjectUrl ?? "https://chatgpt.com/",
+    message: subagentPrompt(message, job.jobId, job.resultPath),
+  });
+  if (!result.ok) throw new Error(result.error);
+  if (result.kind !== "send_message") throw new Error("Sub-agent creation received the wrong support command result.");
+  const child = parseConversationUrl(result.result.conversationUrl);
+  await jobs.assignChild(job.jobId, { ...child, title: result.result.title });
+  await registry.register(child.conversationUrl, { agentCreated: true, parentThreadId: job.parentThreadId, title: result.result.title });
+  try {
+    await preparer.ensurePrepared(child.conversationUrl);
+  } catch (error) {
+    await jobs.recordPreparationFailure(job.jobId, error instanceof Error ? error.message : String(error));
+  }
+}
+
+export async function cancelSubagentJob(job: SubagentJob, { commands, registry, jobs, launchBrowser }: AgentServices) {
+  if (job.state !== "pending") return job;
+  if (!job.childThreadId && !job.preparationError) throw new Error("Child startup is still in progress. Wait for its startup result before cancelling this job.");
+  if (job.childThreadId && !job.childConversationUrl) throw new Error("This child has no stored conversation URL. The job remains pending.");
+  if (job.childConversationUrl) {
+    try {
+      await commands.ensureBrowser("threadMessaging", launchBrowser);
+      const stopped = await commands.execute({ feature: "threadMessaging", kind: "stop_thread", targetUrl: job.childConversationUrl });
+      if (!stopped.ok) throw new Error(stopped.error);
+      if (stopped.kind !== "stop_thread") throw new Error("Unexpected stop result.");
+    } catch (error) {
+      throw new Error(`Could not confirm that the child stopped. Job ${job.jobId} remains pending. ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (job.childThreadId) await registry.recordComplete(job.childThreadId);
+  return await jobs.cancel(job.jobId);
+}
+
 export function registerChatGptAgents(
   server: McpServer,
   commands: SupportCommandBus,
@@ -1926,53 +1972,23 @@ export function registerChatGptAgents(
       } catch (error) {
         return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] };
       }
-      let result: SupportCommandResult;
-      try {
-        const { subagentProjectUrl } = await registry.settings();
-        await commands.ensureBrowser("threadMessaging", launchBrowser);
-        result = await commands.execute({
-          feature: "threadMessaging",
-          kind: "send_message",
-          targetUrl: subagentProjectUrl ?? "https://chatgpt.com/",
-          message: subagentPrompt(message, job.jobId, job.resultPath),
-        });
-        if (!result.ok) throw new Error(result.error);
-        if (result.kind !== "send_message") throw new Error("Sub-agent creation received the wrong support command result.");
-      } catch (error) {
-        // Delivery can fail after Send was clicked. Keep the reservation until the parent resolves it.
-        await jobs.recordPreparationFailure(job.jobId, error instanceof Error ? error.message : String(error));
-        return {
-          isError: true,
-          content: [{ type: "text", text: `Child startup could not be confirmed. Job ${job.jobId} still reserves a slot. ${error instanceof Error ? error.message : "Sub-agent creation failed."} Inspect the browser before using cancel_subagent to release it. Do not repeat the start request.` }],
-        };
-      }
-
-      const child = parseConversationUrl(result.result.conversationUrl);
-      await jobs.assignChild(job.jobId, {
-        threadId: child.threadId,
-        conversationUrl: child.conversationUrl,
-        title: result.result.title,
-      });
-      await registry.register(child.conversationUrl, {
-        agentCreated: true,
-        parentThreadId: parent.threadId,
-        title: result.result.title,
-      });
       let preparationError: string | undefined;
       try {
-        await preparer.ensurePrepared(child.conversationUrl);
+        await startSubagentJob(job, message, { commands, registry, jobs, preparer, launchBrowser });
+        preparationError = (await jobs.job(job.jobId))?.preparationError;
       } catch (error) {
-        preparationError = error instanceof Error ? error.message : String(error);
-        await jobs.recordPreparationFailure(job.jobId, preparationError);
+        await jobs.recordPreparationFailure(job.jobId, error instanceof Error ? error.message : String(error));
+        return { isError: true, content: [{ type: "text", text: `Child startup could not be confirmed. Job ${job.jobId} still reserves a slot. ${error instanceof Error ? error.message : String(error)} Inspect the browser before using cancel_subagent. Do not repeat the start request.` }] };
       }
+      const child = (await jobs.job(job.jobId))!;
       const structuredContent = {
         parentConversationUrl: parent.conversationUrl,
         subagents: await subagentViews(parent.threadId, registry, jobs),
       };
       return {
         content: [{ type: "text", text: preparationError
-          ? `${child.conversationUrl}\nResult file: ${job.resultPath}\nAutomatic thread preparation failed: ${preparationError}`
-          : `${child.conversationUrl}\nResult file: ${job.resultPath}` }],
+          ? `${child.childConversationUrl}\nResult file: ${job.resultPath}\nAutomatic thread preparation failed: ${preparationError}`
+          : `${child.childConversationUrl}\nResult file: ${job.resultPath}` }],
         structuredContent,
       };
     });
@@ -2033,32 +2049,12 @@ export function registerChatGptAgents(
     if (!parent || !job || job.parentThreadId !== parent.threadId) {
       return { isError: true, content: [{ type: "text", text: "This job does not belong to the current synced parent." }] };
     }
-    if (job.state === "pending" && !job.childThreadId && !job.preparationError) {
-      return { isError: true, content: [{ type: "text", text: "Child startup is still in progress. Wait for its startup result before cancelling this job." }] };
+    try {
+      const cancelled = await cancelSubagentJob(job, { commands, registry, jobs, launchBrowser });
+      return { content: [{ type: "text", text: `Job ${jobId}: ${cancelled.state}.` }] };
+    } catch (error) {
+      return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] };
     }
-    if (job.state === "pending" && job.childThreadId && !job.childConversationUrl) {
-      return { isError: true, content: [{ type: "text", text: "This child has a thread ID but no stored conversation URL, so cancellation cannot open and stop it safely. The job remains pending." }] };
-    }
-    if (job.state === "pending" && job.childConversationUrl) {
-      try {
-        await commands.ensureBrowser("threadMessaging", launchBrowser);
-        const stopped = await commands.execute({
-          feature: "threadMessaging",
-          kind: "stop_thread",
-          targetUrl: job.childConversationUrl,
-        });
-        if (!stopped.ok) throw new Error(stopped.error);
-        if (stopped.kind !== "stop_thread") throw new Error("Sub-agent cancellation received the wrong support command result.");
-      } catch (error) {
-        return {
-          isError: true,
-          content: [{ type: "text", text: `Could not confirm that the child stopped. Job ${jobId} remains pending. ${error instanceof Error ? error.message : String(error)}` }],
-        };
-      }
-    }
-    if (job.childThreadId) await registry.recordComplete(job.childThreadId);
-    const cancelled = await jobs.cancel(jobId);
-    return { content: [{ type: "text", text: `Job ${jobId}: ${cancelled.state}.` }] };
   });
 
   server.registerTool("send_thread_message", {
@@ -2204,6 +2200,10 @@ export class SubagentResultController {
       }
     }
     if (!ready.length) return;
+    if (!ready[0].parentConversationUrl) {
+      await this.jobs.markNotified(ready.map((job) => job.jobId));
+      return;
+    }
     const batchAfter = this.batchAfter.get(parentId) ?? Date.now() + this.batchWindowMs;
     this.batchAfter.set(parentId, batchAfter);
     if (Date.now() < batchAfter || this.commands.messageCooldownUntil()) return;

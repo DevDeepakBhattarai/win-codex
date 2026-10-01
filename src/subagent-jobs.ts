@@ -20,7 +20,9 @@ export class SubagentAdmissionError extends Error {
 const subagentJobSchema = z.object({
   jobId: z.string().uuid(),
   parentThreadId: z.string(),
-  parentConversationUrl: z.string().url(),
+  parentConversationUrl: z.string().url().optional(),
+  requestId: z.string().optional(),
+  promptHash: z.string().optional(),
   childThreadId: z.string().optional(),
   childConversationUrl: z.string().url().optional(),
   title: z.string().optional(),
@@ -84,8 +86,14 @@ export class SubagentJobRegistry {
     return new SubagentJobRegistry(filePath, resultDirectory, state);
   }
 
-  async create(parent: { threadId: string; conversationUrl: string }) {
+  async create(parent: { threadId: string; conversationUrl?: string; requestId?: string; promptHash?: string }) {
     return await this.update((state) => {
+      const previous = parent.requestId && state.jobs.find((job) =>
+        job.parentThreadId === parent.threadId && job.requestId === parent.requestId);
+      if (previous) {
+        if (previous.promptHash !== parent.promptHash) throw new Error("requestId already belongs to a different prompt.");
+        return { ...previous };
+      }
       if (state.jobs.some((job) => job.childThreadId === parent.threadId)) {
         throw new SubagentAdmissionError("nested");
       }
@@ -99,6 +107,8 @@ export class SubagentJobRegistry {
         jobId,
         parentThreadId: parent.threadId,
         parentConversationUrl: parent.conversationUrl,
+        requestId: parent.requestId,
+        promptHash: parent.promptHash,
         resultPath: path.join(this.resultDirectory, `${jobId}.md`),
         state: "pending",
         createdAt: new Date().toISOString(),

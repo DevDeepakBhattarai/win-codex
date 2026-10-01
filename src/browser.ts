@@ -1,4 +1,4 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { copyFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,6 +6,7 @@ import { WebSocket, WebSocketServer } from "ws";
 
 import { getPlaywrightInstallExpression } from "./browser-playwright.js";
 import { launchChrome } from "./browser-launch.js";
+import { startVideo } from "./browser-recording.js";
 
 const BRIDGE_PROTOCOL_VERSION = 1;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
@@ -112,7 +113,10 @@ export type BrowserSnapshotResult = {
 
 export type BrowserActionInput = {
   tabId?: number;
-  action: "navigate" | "back" | "forward" | "reload" | "click" | "dblclick" | "type" | "press" | "scroll" | "wait" | "activate" | "close";
+  action: "navigate" | "back" | "forward" | "reload" | "click" | "dblclick" | "type" | "press" | "scroll" | "wait" | "activate" | "close" | "hover" | "drag" | "select" | "check";
+  path?: Array<{ x: number; y: number }>;
+  values?: string[];
+  checked?: boolean;
   url?: string;
   ref?: string;
   locator?: string;
@@ -369,6 +373,7 @@ class BrowserBridge {
       this.socket = undefined;
       this.hello = undefined;
       this.failPending(new Error("Chrome browser bridge disconnected."));
+      for (const listener of this.eventListeners) listener({ type: "event", event: "disconnected" });
     });
     socket.on("error", () => undefined);
   }
@@ -445,11 +450,14 @@ export class BrowserService {
   private readonly fileChooserWaiters = new Map<number, PendingFileChooser>();
   private readonly downloads = new Map<number, BrowserDownload>();
   private readonly downloadWaiters = new Set<PendingDownload>();
+  private readonly recordings = new Map<number, Awaited<ReturnType<typeof startVideo>>>();
+  private readonly dialogs = new Map<number, { type: string; message: string; defaultPrompt?: string }>();
 
   private constructor(
     private readonly bridge: BrowserBridge,
     private readonly extensionDirectory: string,
     private readonly launchBrowser: () => Promise<void>,
+    private readonly dataDirectory: string,
   ) {
     this.bridge.onEvent((event) => this.handleBridgeEvent(event));
   }
@@ -468,7 +476,7 @@ export class BrowserService {
       token,
     );
     const bridge = await BrowserBridge.listen(host, input.port, token);
-    return new BrowserService(bridge, extensionDirectory, input.launchBrowser ?? launchChrome);
+    return new BrowserService(bridge, extensionDirectory, input.launchBrowser ?? launchChrome, input.dataDirectory);
   }
 
   status() {
@@ -511,6 +519,7 @@ export class BrowserService {
 
   async close() {
     this.closed = true;
+    await Promise.all([...this.recordings.keys()].map((tabId) => this.stopRecording(tabId)));
     for (const pending of this.fileChooserWaiters.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error("Browser service is shutting down."));
@@ -563,6 +572,85 @@ export class BrowserService {
     });
   }
 
+  async recording(input: { action: "start" | "stop" | "status"; tabId: number; jobId?: string }) {
+    if (input.action === "stop") return await this.stopRecording(input.tabId);
+    if (input.action === "status") return this.recordings.get(input.tabId)?.status() ?? { status: "inactive" };
+    this.requireControlled(input.tabId);
+    return await this.withTabLock(input.tabId, async () => {
+      if (this.recordings.has(input.tabId)) throw new Error("This tab already has a recording. Stop it before starting another.");
+      if (input.jobId && !/^[0-9a-f-]{36}$/i.test(input.jobId)) throw new Error("Invalid recording job ID.");
+      await this.ensureAttached(input.tabId);
+      const directory = path.resolve(this.dataDirectory, "recordings", input.jobId ?? "manual");
+      await mkdir(directory, { recursive: true });
+      const first = await this.sendCdp<{ data: string }>(input.tabId, "Page.captureScreenshot", { format: "jpeg", quality: 75 });
+      const video = await startVideo(path.join(directory, `${randomUUID()}.webm`), first.data, () => {
+        void this.sendCdp(input.tabId, "Page.stopScreencast").catch(() => undefined);
+      });
+      this.recordings.set(input.tabId, video);
+      try {
+        await this.sendCdp(input.tabId, "Page.startScreencast", { format: "jpeg", quality: 75, maxWidth: 1280, maxHeight: 720 });
+      } catch (error) {
+        await this.stopRecording(input.tabId);
+        throw error;
+      }
+      return video.status();
+    });
+  }
+
+  private async stopRecording(tabId: number) {
+    const video = this.recordings.get(tabId);
+    if (!video) return { status: "inactive" };
+    await this.sendCdp(tabId, "Page.stopScreencast").catch(() => undefined);
+    const result = await video.stop();
+    this.recordings.delete(tabId);
+    return result;
+  }
+
+  async screenshot(input: { tabId: number; fullPage?: boolean; clip?: { x: number; y: number; width: number; height: number }; jobId?: string }) {
+    this.requireControlled(input.tabId);
+    return await this.withTabLock(input.tabId, async () => {
+      await this.ensureAttached(input.tabId);
+      if (input.fullPage && input.clip) throw new Error("Use fullPage or clip, not both.");
+      let clip = input.clip;
+      if (input.fullPage) {
+        const metrics = await this.sendCdp<{ cssContentSize: { x: number; y: number; width: number; height: number } }>(input.tabId, "Page.getLayoutMetrics");
+        clip = metrics.cssContentSize;
+      }
+      const result = await this.sendCdp<{ data: string }>(input.tabId, "Page.captureScreenshot", {
+        format: "png", captureBeyondViewport: !!clip, ...(clip ? { clip: { ...clip, scale: 1 } } : {}),
+      });
+      if (input.jobId && !/^[0-9a-f-]{36}$/i.test(input.jobId)) throw new Error("Invalid screenshot job ID.");
+      const directory = path.resolve(this.dataDirectory, "recordings", input.jobId ?? "manual");
+      await mkdir(directory, { recursive: true });
+      const filePath = path.join(directory, `${randomUUID()}.png`);
+      await writeFile(filePath, Buffer.from(result.data, "base64"), { mode: 0o600 });
+      return { path: filePath, data: result.data };
+    });
+  }
+
+  async viewport(input: { tabId: number; width?: number; height?: number }) {
+    this.requireControlled(input.tabId);
+    return await this.withTabLock(input.tabId, async () => {
+      await this.ensureAttached(input.tabId);
+      if (input.width === undefined && input.height === undefined) await this.sendCdp(input.tabId, "Emulation.clearDeviceMetricsOverride");
+      else {
+        if (!input.width || !input.height) throw new Error("Provide both width and height, or omit both to reset.");
+        await this.sendCdp(input.tabId, "Emulation.setDeviceMetricsOverride", { width: input.width, height: input.height, deviceScaleFactor: 1, mobile: false });
+      }
+      return await this.captureSnapshot(input.tabId, true);
+    });
+  }
+
+  async dialog(input: { tabId: number; action: "get" | "accept" | "dismiss"; text?: string }) {
+    this.requireControlled(input.tabId);
+    const dialog = this.dialogs.get(input.tabId);
+    if (input.action === "get") return { dialog: dialog ?? null };
+    if (!dialog) throw new Error("This tab has no open JavaScript dialog.");
+    // Dialogs can block an action holding the tab lock. Handle them outside it.
+    await this.sendCdp(input.tabId, "Page.handleJavaScriptDialog", { accept: input.action === "accept", promptText: input.text ?? "" });
+    return { handled: true };
+  }
+
   async evaluate(tabId: number | undefined, expression: string, awaitPromise = true) {
     const resolvedTabId = await this.resolveTabId(tabId);
     this.requireControlled(resolvedTabId);
@@ -584,6 +672,7 @@ export class BrowserService {
     this.requireControlled(tabId);
 
     if (input.action === "close") {
+      await this.stopRecording(tabId);
       await this.bridge.request("tabs.close", { tabId });
       this.states.delete(tabId);
       return {
@@ -632,6 +721,34 @@ export class BrowserService {
           break;
         case "dblclick":
           await this.click(tabId, input, timeoutMs, 2);
+          break;
+        case "hover": {
+          const point = typeof input.x === "number" && typeof input.y === "number" ? { x: input.x, y: input.y }
+            : await this.waitForClickPoint(tabId, this.resolveLocator(tabId, input)!, timeoutMs);
+          await this.sendCdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...point, modifiers: keyboardModifiers(input.modifiers ?? []) });
+          this.recordAction(tabId, "hover");
+          break;
+        }
+        case "drag": {
+          const points = input.path;
+          if (!points || points.length < 2) throw new Error("drag requires a path with at least two points.");
+          const modifiers = keyboardModifiers(input.modifiers ?? []);
+          await this.sendCdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...points[0], modifiers });
+          await this.sendCdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...points[0], button: "left", buttons: 1, clickCount: 1, modifiers });
+          try {
+            for (const point of points.slice(1)) {
+              await this.sendCdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...point, button: "left", buttons: 1, modifiers });
+              await sleep(30);
+            }
+          } finally {
+            await this.sendCdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...points[points.length - 1], button: "left", buttons: 0, clickCount: 1, modifiers });
+          }
+          this.recordAction(tabId, "drag");
+          break;
+        }
+        case "select":
+        case "check":
+          await this.setFormControl(tabId, input, timeoutMs);
           break;
         case "type":
           await this.typeText(tabId, input, timeoutMs);
@@ -820,6 +937,7 @@ export class BrowserService {
   }
 
   private async finishTab(tabId: number) {
+    await this.stopRecording(tabId);
     const state = this.state(tabId);
     if (state.ownership === "agent") {
       await state.attaching?.catch(() => undefined);
@@ -834,6 +952,7 @@ export class BrowserService {
   }
 
   private async detachTab(tabId: number) {
+    await this.stopRecording(tabId);
     const state = this.state(tabId);
     await state.attaching?.catch(() => undefined);
     await this.bridge.request("overlay.hide", { tabId }).catch(() => undefined);
@@ -1075,6 +1194,35 @@ export class BrowserService {
       await this.bridge.request("overlay.click", { tabId }).catch(() => undefined);
     }
     this.recordAction(tabId, clickCount === 2 ? "dblclick" : "click", locator ?? `${point.x},${point.y}`);
+  }
+
+  private async setFormControl(tabId: number, input: BrowserActionInput, timeoutMs: number) {
+    const locator = this.resolveLocator(tabId, input)!;
+    await this.waitForLocator(tabId, locator, timeoutMs, "visible");
+    const target = `const injected = globalThis.__localCodexPlaywrightInjected;
+      const element = injected.querySelector(injected.parseSelector(${JSON.stringify(locator)}), document, true);
+      if (!element || element.disabled) throw new Error("Control is missing or disabled.");`;
+    if (input.action === "check") {
+      if (typeof input.checked !== "boolean") throw new Error("check requires checked=true or checked=false.");
+      const readChecked = `(() => { ${target}
+        if (element instanceof HTMLInputElement && ["checkbox", "radio"].includes(element.type)) return element.checked;
+        if (["checkbox", "radio", "switch"].includes(element.getAttribute("role"))) return element.getAttribute("aria-checked") === "true";
+        throw new Error("Target is not a checkbox, radio, or switch."); })()`;
+      if (await this.evaluateExpression(tabId, readChecked) !== input.checked) await this.click(tabId, input, timeoutMs, 1);
+      if (await this.evaluateExpression(tabId, readChecked) !== input.checked) throw new Error("Control did not reach the requested checked state.");
+    } else {
+      if (!input.values?.length) throw new Error("select requires at least one option value.");
+      await this.evaluateExpression(tabId, `(() => { ${target}
+        if (!(element instanceof HTMLSelectElement)) throw new Error("Target is not a native select.");
+        const values = ${JSON.stringify(input.values)};
+        if (!element.multiple && values.length !== 1) throw new Error("This select accepts only one value.");
+        if (values.some(value => !Array.from(element.options).some(option => option.value === value && !option.disabled && !option.parentElement?.disabled))) throw new Error("Option is missing or disabled.");
+        for (const option of element.options) option.selected = values.includes(option.value);
+        element.dispatchEvent(new Event("input", { bubbles: true }));
+        element.dispatchEvent(new Event("change", { bubbles: true }));
+      })()`);
+    }
+    this.recordAction(tabId, input.action, locator);
   }
 
   private async waitForClickPoint(tabId: number, locator: string, timeoutMs: number, force = false) {
@@ -1354,7 +1502,7 @@ export class BrowserService {
               format: "png",
               fromSurface: true,
               captureBeyondViewport: false,
-            }).catch(() => ({ data: undefined }))
+            })
           : Promise.resolve({ data: undefined as string | undefined }),
       ]);
 
@@ -1452,6 +1600,10 @@ export class BrowserService {
   }
 
   private handleBridgeEvent(event: BridgeEvent) {
+    if (event.event === "disconnected") {
+      for (const tabId of this.recordings.keys()) void this.stopRecording(tabId).catch(console.error);
+      return;
+    }
     if (event.event === "downloadCreated" || event.event === "downloadChanged") {
       if (event.download) this.updateDownload(event.download);
       return;
@@ -1462,6 +1614,10 @@ export class BrowserService {
     }
     if (!Number.isInteger(event.tabId)) return;
     const tabId = event.tabId!;
+    if (event.event === "debugger" && event.method === "Page.screencastFrame") {
+      if (typeof event.params?.data === "string") this.recordings.get(tabId)?.update(event.params.data);
+      return;
+    }
 
     if (event.event === "tabCreated") {
       const parentTabId = event.tab?.openerTabId;
@@ -1475,6 +1631,7 @@ export class BrowserService {
     }
 
     if (event.event === "tabRemoved") {
+      void this.stopRecording(tabId).catch(console.error);
       const removed = this.states.get(tabId);
       if (removed?.parentTabId !== undefined) this.states.get(removed.parentTabId)?.popupTabIds.delete(tabId);
       for (const state of this.states.values()) state.popupTabIds.delete(tabId);
@@ -1488,6 +1645,7 @@ export class BrowserService {
     if (!state) return;
 
     if (event.event === "debuggerDetached") {
+      void this.stopRecording(tabId).catch(console.error);
       state.attached = false;
       state.attaching = undefined;
       this.invalidateRefs(tabId);
@@ -1498,6 +1656,15 @@ export class BrowserService {
       return;
     }
     if (event.event !== "debugger" || !event.method) return;
+    if (event.method === "Page.javascriptDialogOpening") {
+      this.dialogs.set(tabId, { type: String(event.params?.type ?? "alert"), message: String(event.params?.message ?? ""),
+        ...(typeof event.params?.defaultPrompt === "string" ? { defaultPrompt: event.params.defaultPrompt } : {}) });
+      return;
+    }
+    if (event.method === "Page.javascriptDialogClosed") {
+      this.dialogs.delete(tabId);
+      return;
+    }
 
     if (event.method === "Page.fileChooserOpened") {
       const pending = this.fileChooserWaiters.get(tabId);
