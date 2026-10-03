@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Reviews</title>
+  <title>Tasks</title>
   <style>
     :root {
       color-scheme: light dark;
@@ -158,8 +158,8 @@
     <div class="header">
       <span class="mark" aria-hidden="true"></span>
       <div class="heading">
-        <div class="title">Reviews</div>
-        <div id="summary" class="summary">Review handoff</div>
+        <div class="title">Tasks</div>
+        <div id="summary" class="summary">Task handoff</div>
       </div>
     </div>
     <div id="root" class="list"></div>
@@ -199,9 +199,9 @@
       visual.append(Object.assign(document.createElement("span"), { className: "empty-link" }));
       copy.append(
         visual,
-        Object.assign(document.createElement("strong"), { textContent: "No review started" }),
+        Object.assign(document.createElement("strong"), { textContent: "No task started" }),
         Object.assign(document.createElement("p"), {
-          textContent: "Start a review after implementation and verification. The implementer pauses until the review is done.",
+          textContent: "Start a task after implementation and verification. The implementer pauses until the task is done.",
         }),
       );
       empty.append(copy);
@@ -210,11 +210,11 @@
 
     function render(result) {
       const data = result?.structuredContent ?? result?.mcp_tool_result?.structuredContent ?? result?.call_tool_result?.structuredContent;
-      const agents = Array.isArray(data?.reviews) ? data.reviews : [];
+      const agents = Array.isArray(data?.tasks) ? data.tasks : [];
       root.replaceChildren();
       summary.textContent = agents.length === 0
         ? "Nothing running from this conversation"
-        : `${agents.length} review${agents.length === 1 ? "" : "s"}`;
+        : `${agents.length} task${agents.length === 1 ? "" : "s"}`;
 
       if (agents.length === 0) {
         root.append(emptyState());
@@ -237,7 +237,7 @@
         copy.className = "copy";
         copy.append(Object.assign(document.createElement("div"), {
           className: "name",
-          textContent: agent.title || `Reviewer ${String(agent.threadId ?? agent.jobId).slice(0, 8)}`,
+          textContent: agent.title || `Worker ${String(agent.threadId ?? agent.jobId).slice(0, 8)}`,
         }));
         if (agent.conversationUrl) {
           copy.append(Object.assign(document.createElement("div"), {
@@ -256,10 +256,6 @@
           meta.append(Object.assign(document.createElement("span"), { className: "error-text", textContent: error }));
         } else if (activity) {
           meta.append(Object.assign(document.createElement("span"), { textContent: `Activity ${activity}` }));
-        }
-        if (!error && agent.state === "active") {
-          const next = relative(agent.nextCheckAt);
-          if (next) meta.append(Object.assign(document.createElement("span"), { textContent: `RALPH ${next}` }));
         }
         if (agent.resultState) {
           meta.append(Object.assign(document.createElement("span"), {
@@ -289,7 +285,7 @@
     window.addEventListener("message", (event) => {
       const message = event.data;
       if (event.source !== window.parent || message?.jsonrpc !== "2.0") return;
-      if (message.id === "reviewer-ui-init" && message.result) {
+      if (message.id === "worker-ui-init" && message.result) {
         window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} }, "*");
       }
       if (message.method === "ui/notifications/tool-result") render(message.params);
@@ -301,11 +297,11 @@
     readOpenAiResult();
     window.parent.postMessage({
       jsonrpc: "2.0",
-      id: "reviewer-ui-init",
+      id: "worker-ui-init",
       method: "ui/initialize",
       params: {
         protocolVersion: "2026-01-26",
-        appInfo: { name: "local-codex-reviewers", version: "1.4.0" },
+        appInfo: { name: "local-codex-workers", version: "1.4.0" },
         appCapabilities: {},
       },
     }, "*");

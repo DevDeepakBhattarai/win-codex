@@ -55,18 +55,18 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.6.6");
+  assert.equal(manifest.version, "1.7.1");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["alarms", "scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
   assert.equal(manifest.content_security_policy.extension_pages,
     "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:*");
   const preparedPopup = await readFile(path.join(sync.extensionDirectory, "popup.html"), "utf8");
-  assert.match(preparedPopup, /Reviewer project URL/);
+  assert.match(preparedPopup, /ChatGPT worker project URL/);
   assert.match(preparedPopup, /id="panel-threads"/, "the popup exposes the RALPH threads tab");
   assert.match(preparedPopup, /id="panel-settings"/, "the popup exposes the settings tab");
   assert.match(preparedPopup, /id="subagentThreadsSection"/, "the popup gives auto-RALPH sub-agents their own section");
-  assert.match(preparedPopup, /Reviews/);
+  assert.match(preparedPopup, /Tasks/);
   assert.match(preparedPopup, /RALPH projects/);
   assert.match(preparedPopup, /RALPH check interval \(seconds\)/);
   assert.match(preparedPopup, /RALPH classifier worked-time threshold \(seconds\)/);
@@ -103,7 +103,7 @@ try {
   assert.match(preparedPopupScript, /textContent: thread\.conversationUrl/,
     "thread cards show their full ChatGPT URL");
   assert.match(preparedPopupScript, /textContent: job\.childConversationUrl/,
-    "RALPH review cards show the exact ChatGPT review URL");
+    "RALPH task cards show the exact ChatGPT task URL");
   assert.match(preparedPopupScript,
     /sort\(\(left, right\) => Date\.parse\(right\.registeredAt\) - Date\.parse\(left\.registeredAt\)\)/,
     "thread cards sort from most recently registered to oldest");
@@ -146,7 +146,7 @@ try {
     "thread sending does not use acknowledgement or DOM-stability heuristics");
   assert.match(preparedContentScript, /const SEND_SETTLE_MS = 5_000;/,
     "thread sending uses the fixed five-second settle requested for typing and sending");
-  assert.match(preparedContentScript, /contentScriptVersion = "1\.6\.6"/,
+  assert.match(preparedContentScript, /contentScriptVersion = "1\.7\.1"/,
     "extension reloads can replace a stale page script with the current content-script version");
   assert.equal(parseRalphProjectId(namedProjectHome), projectId);
   assert.equal(parseRalphProjectId(urlA), projectId);
@@ -524,7 +524,7 @@ try {
   await projectScopedRegistry.setProjects([]);
   assert.equal((await projectScopedRegistry.threads()).length, 1,
     "project allowlist changes retain manually registered threads");
-  assert.deepEqual(await registerThread({ conversationUrl: urlB, agentCreated: true, title: "Review auth refresh - ChatGPT" }), {
+  assert.deepEqual(await registerThread({ conversationUrl: urlB, agentCreated: true, title: "Task auth refresh - ChatGPT" }), {
     code: 200,
     body: { status: "registered" },
   });
@@ -534,7 +534,7 @@ try {
     agentCreated: agentCreatedThread.agentCreated,
     state: agentCreatedThread.state,
     title: agentCreatedThread.title,
-  }, { conversationUrl: urlB, agentCreated: true, state: "active", title: "Review auth refresh" },
+  }, { conversationUrl: urlB, agentCreated: true, state: "active", title: "Task auth refresh" },
   "AI-created sub-agents register even when their project is not allowlisted");
   await projectScopedRegistry.setProjects([]);
   assert.equal((await projectScopedRegistry.threads()).length, 2,
@@ -718,12 +718,12 @@ try {
   const tools = (await client.listTools()).tools;
   const syncDefinition = tools.find(tool => tool.name === "sync_current_thread");
   const getDefinition = tools.find(tool => tool.name === "get_current_thread_url");
-  const startSubagentDefinition = tools.find(tool => tool.name === "start_reviewer");
-  const listReviewersDefinition = tools.find(tool => tool.name === "list_reviewers");
-  const submitSubagentDefinition = tools.find(tool => tool.name === "review_done");
+  const startSubagentDefinition = tools.find(tool => tool.name === "start_task");
+  const listReviewersDefinition = tools.find(tool => tool.name === "list_tasks");
+  const submitSubagentDefinition = tools.find(tool => tool.name === "task_done");
   const sendThreadDefinition = tools.find(tool => tool.name === "send_thread_message");
   assert.equal(tools.some(tool => ["list_subagents", "cancel_subagent", "start_subagent", "submit_subagent_result"].includes(tool.name)), false);
-  assert.ok(listReviewersDefinition, "reviewers expose a reviewer-named list tool backed by the existing job registry");
+  assert.ok(listReviewersDefinition, "workers expose a worker-named list tool backed by the existing job registry");
   assert.ok(tools.some(tool => tool.name === "start_thread"));
   assert.equal(syncDefinition._meta.ui.resourceUri, THREAD_SYNC_WIDGET_URI);
   assert.match(syncDefinition.description, /not a required startup call/);
@@ -734,12 +734,12 @@ try {
   assert.equal(listReviewersDefinition._meta.ui.resourceUri, SUBAGENT_WIDGET_URI);
   assert.doesNotMatch([startSubagentDefinition, listReviewersDefinition, submitSubagentDefinition]
     .map(tool => `${tool.name} ${tool.title ?? ""} ${tool.description ?? ""}`).join("\n"), /sub[- ]?agent/i,
-    "model-facing reviewer tools never advertise the underlying sub-agent implementation");
-  assert.match(submitSubagentDefinition.description, /waits for this reviewer to become idle/);
+    "model-facing worker tools never advertise the underlying sub-agent implementation");
+  assert.match(submitSubagentDefinition.description, /waits for this worker to become idle/);
   assert.match(sendThreadDefinition.description, /deduplicated internally/);
   assert.deepEqual([...sendThreadDefinition.inputSchema.required].sort(), ["message", "targetUrl"],
     "send_thread_message keeps the public API to targetUrl and message only");
-  assert.match(startSubagentDefinition.description, /end this turn immediately/);
+  assert.match(startSubagentDefinition.description, /End your turn immediately/);
   assert.equal(tools.some(tool => tool.name === "chatgpt_message"), false, "the ambiguous chatgpt_message tool is removed");
   const syncCall = sessionId => client.callTool({ name: "sync_current_thread", arguments: {}, _meta: { "openai/session": sessionId } });
   const getCall = sessionId => client.callTool({ name: "get_current_thread_url", arguments: {}, _meta: { "openai/session": sessionId } });
@@ -858,33 +858,33 @@ try {
   launchDedupBus.close();
 
   const unsyncedReviewList = await client.callTool({
-    name: "list_reviewers",
+    name: "list_tasks",
     arguments: {},
     _meta: { "openai/session": "mcp-unsynced" },
   });
-  assert.equal(unsyncedReviewList.isError, true, "review listing requires the current parent binding");
+  assert.equal(unsyncedReviewList.isError, true, "task listing requires the current parent binding");
 
   const unsyncedSubagent = await client.callTool({
-    name: "start_reviewer",
-    arguments: { message: "should fail without parent sync" },
+    name: "start_task",
+    arguments: { prompt: "should fail without parent sync" },
     _meta: { "openai/session": "mcp-unsynced" },
   });
   assert.equal(unsyncedSubagent.isError, true, "sub-agents require a bound parent conversation");
 
   const startSubagentCall = client.callTool({
-    name: "start_reviewer",
-    arguments: { message: "Review the implementation independently." },
+    name: "start_task",
+    arguments: { prompt: "Task the implementation independently." },
     _meta: { "openai/session": "mcp-A" },
   });
   const startSubagentCommand = await supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
   assert.equal(startSubagentCommand.targetUrl, "https://chatgpt.com/",
     "an unset Sub-agent project falls back to the normal ChatGPT new-chat page");
-  assert.match(startSubagentCommand.message, /Review the implementation independently/);
-  assert.match(startSubagentCommand.message, /Before review_done, bind this reviewer conversation with sync_current_thread/);
+  assert.match(startSubagentCommand.message, /Task the implementation independently/);
+  assert.match(startSubagentCommand.message, /Before task_done, bind this conversation with sync_current_thread/);
   assert.doesNotMatch(startSubagentCommand.message, /first MCP action/);
-  assert.match(startSubagentCommand.message, /Do not implement fixes, start another thread, or delegate/);
-  assert.match(startSubagentCommand.message, /review_done exactly once/);
-  assert.match(startSubagentCommand.message, /Do not call send_thread_message to report back/);
+  assert.match(startSubagentCommand.message, /Change files only when the specification authorizes it/);
+  assert.match(startSubagentCommand.message, /task_done exactly once/);
+  assert.match(startSubagentCommand.message, /Use task_done to report back, not send_thread_message/);
   assert.doesNotMatch(startSubagentCommand.message, new RegExp(urlA.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
     "the child prompt does not receive the parent URL or callback transport details");
   supportCommands.complete({
@@ -892,28 +892,28 @@ try {
     browserId: "chrome-browser",
     kind: "send_message",
     ok: true,
-    result: { status: "sent", conversationUrl: urlC, title: "Independent implementation review" },
+    result: { status: "sent", conversationUrl: urlC, title: "Independent implementation task" },
   });
   const startSubagentResult = await startSubagentCall;
   assert.equal(startSubagentResult.structuredContent.parentConversationUrl, urlA);
-  assert.equal(startSubagentResult.structuredContent.reviews.length, 1);
-  const firstSubagent = startSubagentResult.structuredContent.reviews[0];
+  assert.equal(startSubagentResult.structuredContent.tasks.length, 1);
+  const firstSubagent = startSubagentResult.structuredContent.tasks[0];
   assert.equal(firstSubagent.conversationUrl, urlC);
-  assert.match(startSubagentResult.content[0].text, new RegExp(`Review thread: ${urlC.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
-    "start_reviewer exposes the exact review URL in its visible result");
+  assert.match(startSubagentResult.content[0].text, new RegExp(`Task thread: ${urlC.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
+    "start_task exposes the exact task URL in its visible result");
   const listedReviews = await client.callTool({
-    name: "list_reviewers",
+    name: "list_tasks",
     arguments: {},
     _meta: { "openai/session": "mcp-A" },
   });
-  assert.equal(listedReviews.structuredContent.reviews.some(review => review.conversationUrl === urlC), true,
-    "list_reviewers returns the review thread URL for the current parent");
+  assert.equal(listedReviews.structuredContent.tasks.some(task => task.conversationUrl === urlC), true,
+    "list_tasks returns the task thread URL for the current parent");
   assert.match(listedReviews.content[0].text, new RegExp(urlC.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
-    "list_reviewers exposes the review URL in its visible text result");
-  assert.equal(firstSubagent.title, "Independent implementation review");
+    "list_tasks exposes the task URL in its visible text result");
+  assert.equal(firstSubagent.title, "Independent implementation task");
   assert.match(firstSubagent.jobId, /^[0-9a-f-]{36}$/i);
   assert.equal(firstSubagent.resultState, "pending");
-  assert.equal(path.dirname(firstSubagent.resultPath), path.resolve(path.join(temporaryRoot, "subagent-jobs", "reviews")));
+  assert.equal(path.dirname(firstSubagent.resultPath), path.resolve(path.join(temporaryRoot, "subagent-jobs", "tasks")));
   assert.match(startSubagentCommand.message, new RegExp(firstSubagent.jobId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.ok(startSubagentCommand.message.includes(JSON.stringify(firstSubagent.resultPath)),
     "the child prompt receives the exact local result path");
@@ -927,20 +927,20 @@ try {
 
   const resultController = new SubagentResultController(subagentJobs, supportCommands, launchSupportBrowser, 60_000, 0);
   const whitespaceSubmit = await client.callTool({
-    name: "review_done",
+    name: "task_done",
     arguments: { jobId: firstSubagent.jobId, result: "   " },
     _meta: { "openai/session": "mcp-child-C" },
   });
   assert.equal(whitespaceSubmit.isError, true, "a whitespace-only sub-agent report is rejected");
-  const childReport = "Independent review complete. No blocking defects found.";
+  const childReport = "Independent task complete. No blocking defects found.";
   const [submitResult, duplicateSubmit] = await Promise.all([
     client.callTool({
-      name: "review_done",
+      name: "task_done",
       arguments: { jobId: firstSubagent.jobId, result: childReport },
       _meta: { "openai/session": "mcp-child-C" },
     }),
     client.callTool({
-      name: "review_done",
+      name: "task_done",
       arguments: { jobId: firstSubagent.jobId, result: "Transport retry must not replace the first report." },
       _meta: { "openai/session": "mcp-child-C" },
     }),
@@ -954,12 +954,12 @@ try {
   const reviewerIdle = await supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
   assert.equal(reviewerIdle.kind, "inspect_thread");
   supportCommands.complete({ commandId: reviewerIdle.id, browserId: "chrome-browser", kind: "inspect_thread", ok: true,
-    result: { status: "idle", workedSeconds: null, users: [], assistant: { synthetic: false, text: "Review done." } } });
+    result: { status: "idle", workedSeconds: null, users: [], assistant: { synthetic: false, text: "Task done." } } });
   const wakeCommand = await supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
   assert.equal(wakeCommand.targetUrl, urlA);
   assert.ok(wakeCommand.message.includes(JSON.stringify(firstSubagent.resultPath)),
     "the wake-up points the parent at the exact local result file");
-  assert.doesNotMatch(wakeCommand.message, /Independent review complete/,
+  assert.doesNotMatch(wakeCommand.message, /Independent task complete/,
     "the application wake-up carries only the result location, not the sub-agent report");
   supportCommands.complete({
     commandId: wakeCommand.id,
@@ -992,8 +992,8 @@ try {
 
   await ralphRegistry.setSubagentProjectUrl(namedProjectHome);
   const configuredSubagentCall = client.callTool({
-    name: "start_reviewer",
-    arguments: { message: "Use the server-configured project." },
+    name: "start_task",
+    arguments: { prompt: "Use the server-configured project." },
     _meta: { "openai/session": "mcp-A" },
   });
   const configuredSubagentCommand = await supportCommands.claim("helium-browser", ["threadMessaging"], 1000);
@@ -1085,7 +1085,7 @@ try {
   const firstSubagentReplayServer = {
     registerResource() {},
     registerTool(name, _definition, handler) {
-      if (name === "start_reviewer") firstSubagentReplayHandler = handler;
+      if (name === "start_task") firstSubagentReplayHandler = handler;
     },
   };
   registerChatGptAgents(firstSubagentReplayServer, supportCommands, registry, ralphRegistry, subagentJobs, threadPreparer, launchSupportBrowser, "mcp-grant", sync.subagentWidgetHtml);
@@ -1093,21 +1093,21 @@ try {
   const secondSubagentReplayServer = {
     registerResource() {},
     registerTool(name, _definition, handler) {
-      if (name === "start_reviewer") secondSubagentReplayHandler = handler;
+      if (name === "start_task") secondSubagentReplayHandler = handler;
     },
   };
   registerChatGptAgents(secondSubagentReplayServer, supportCommands, registry, ralphRegistry, subagentJobs, threadPreparer, launchSupportBrowser, "mcp-grant", sync.subagentWidgetHtml);
   assert.equal(typeof firstSubagentReplayHandler, "function");
   assert.equal(typeof secondSubagentReplayHandler, "function");
-  const subagentRetryArguments = { message: "Start exactly one child for this transport request." };
+  const subagentRetryArguments = { prompt: "Start exactly one child for this transport request." };
   const subagentRetryExtra = { mcpReq: { id: "same-start-subagent-request", _meta: { "openai/session": "mcp-A" } } };
   const firstSubagentRetryCall = firstSubagentReplayHandler(subagentRetryArguments, subagentRetryExtra);
   const secondSubagentRetryCall = secondSubagentReplayHandler(subagentRetryArguments, { mcpReq: { ...subagentRetryExtra.mcpReq, id: "different-request-same-task" } });
   await new Promise(resolve => setImmediate(resolve));
   const subagentRetryCommand = await supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
-  assert.equal(subagentRetryCommand.message.includes(subagentRetryArguments.message), true);
+  assert.equal(subagentRetryCommand.message.includes(subagentRetryArguments.prompt), true);
   assert.equal(await supportCommands.claim("helium-browser", ["threadMessaging"], 0), undefined,
-    "a transport retry of the same start_reviewer request must not create a second child command");
+    "a transport retry of the same start_task request must not create a second child command");
   supportCommands.complete({
     commandId: subagentRetryCommand.id,
     browserId: "chrome-browser",
@@ -1119,9 +1119,9 @@ try {
     firstSubagentRetryCall,
     secondSubagentRetryCall,
   ]);
-  assert.equal(firstSubagentRetryResult.structuredContent.reviews.at(-1).conversationUrl, urlE);
-  const startedJobId = firstSubagentRetryResult.structuredContent.reviews.at(-1).jobId;
-  assert.ok(secondSubagentRetryResult.structuredContent.reviews.some(job => job.jobId === startedJobId),
+  assert.equal(firstSubagentRetryResult.structuredContent.tasks.at(-1).conversationUrl, urlE);
+  const startedJobId = firstSubagentRetryResult.structuredContent.tasks.at(-1).jobId;
+  assert.ok(secondSubagentRetryResult.structuredContent.tasks.some(job => job.jobId === startedJobId),
     "a different request ID reuses the saved child job");
 
   const abandonedController = new AbortController();
@@ -1751,19 +1751,23 @@ try {
     "the Sub-agent app never scrolls at the outer document level");
   assert.match(subagentHtml, /\.list[\s\S]*overflow-y:\s*auto/,
     "only the Sub-agent list is scrollable");
-  assert.match(subagentHtml, /No review started/,
+  assert.match(subagentHtml, /No task started/,
     "the Sub-agent app renders a designed empty state");
-  assert.match(subagentHtml, /agent\.resultState/, "the reviewer app renders local result state");
-  assert.match(subagentHtml, /textContent: agent\.conversationUrl/, "the reviewer app visibly renders the exact review-thread URL");
-  assert.doesNotMatch(subagentHtml, /textContent: agent\.resultPath/, "the reviewer app does not substitute a local result file for the thread link");
-  assert.match(subagentHtml, /local-codex-reviewers/, "the reviewer app does not expose sub-agent naming to ChatGPT");
+  assert.match(subagentHtml, /agent\.resultState/, "the worker app renders local result state");
+  assert.match(subagentHtml, /textContent: agent\.conversationUrl/, "the worker app visibly renders the exact task-thread URL");
+  assert.doesNotMatch(subagentHtml, /textContent: agent\.resultPath/, "the worker app does not substitute a local result file for the thread link");
+  assert.match(subagentHtml, /local-codex-workers/, "the worker app does not expose sub-agent naming to ChatGPT");
   await testContentScript(a.ticket.token, b.ticket.token);
   await testWorkerKeepsLongAutomationAlive(sync);
   await testWorkerNeverRedispatchesAfterLostResponse(sync);
   await testWorkerRecoversHungAutomation(sync);
   await testRalphComposerObserver();
   await testSendWaitsForLoadedConversationAndClicksOnce();
+  await testSendWaitsForLoadedConversationAndClicksOnce(false);
   await testNewProjectComposerWithoutDataType();
+  await testNewProjectComposerWithoutDataType(true);
+  await testNewProjectComposerWithoutDataType(true, "Codex");
+  await testNewProjectComposerWithoutDataType(true, "Codex", false);
   await testReactTrackedTextareaEnablesSendButton();
   await testRunningHydrationDetection();
   await testWorkedDurationDetection();
@@ -1840,7 +1844,7 @@ async function testContentScript(tokenA, tokenB) {
   assert.equal(replies.length, previousReplies, "delayed acknowledgement is not applied after navigation");
 }
 
-async function testSendWaitsForLoadedConversationAndClicksOnce() {
+async function testSendWaitsForLoadedConversationAndClicksOnce(acceptSend = true) {
   let automationListener;
   let now = 0;
   const userReadyAt = 65_000;
@@ -1867,7 +1871,7 @@ async function testSendWaitsForLoadedConversationAndClicksOnce() {
     getAttribute() { return null; },
     click() {
       clickTimes.push(now);
-      if (now >= assistantReadyAt) {
+      if (acceptSend) {
         editor.textContent = "";
         userCount = 2;
         generationStarted = true;
@@ -1901,7 +1905,7 @@ async function testSendWaitsForLoadedConversationAndClicksOnce() {
       return null;
     },
     querySelectorAll(selector) {
-      if (selector === 'section[data-turn="user"]') return Array.from({ length: userCount }, () => ({}));
+      if (selector === 'section[data-turn="user"]') return Array.from({ length: userCount }, (_, index) => ({ dataset: { turnId: "u" + index }, textContent: index === 0 ? "original request" : "hello", querySelector() { return null; } }));
       if (selector === "section[data-turn]") {
         const turns = [];
         if (now >= userReadyAt) turns.push({
@@ -1968,9 +1972,15 @@ async function testSendWaitsForLoadedConversationAndClicksOnce() {
     assert.equal(keepChannelOpen, true);
   });
 
-  assert.equal(response.ok, true, response.error);
-  assert.equal(response.result.status, "sent");
-  assert.equal(response.result.conversationUrl, urlA);
+  if (acceptSend) {
+    assert.equal(response.ok, true, response.error);
+    assert.equal(response.result.status, "sent");
+    assert.equal(response.result.conversationUrl, urlA);
+  } else {
+    assert.equal(response.ok, false);
+    assert.match(response.error, /Delivery uncertain after Send/);
+    assert.notEqual(response.retryable, true, "an uncertain send must never be replayed automatically");
+  }
   assert.equal(insertionCalls, 1, "the prompt is inserted exactly once");
   assert.deepEqual(editorEvents, [], "contenteditable insertion does not perform a second fallback write");
   assert.equal(clickTimes.length, 1, "RALPH must click send exactly once");
@@ -1982,7 +1992,7 @@ async function testSendWaitsForLoadedConversationAndClicksOnce() {
     "the message is typed once, left to settle for five seconds, then sent once");
 }
 
-async function testNewProjectComposerWithoutDataType() {
+async function testNewProjectComposerWithoutDataType(modernComposer = false, connectorName, connectorAvailable = true) {
   let automationListener;
   let now = 0;
   let generationStarted = false;
@@ -1991,12 +2001,15 @@ async function testNewProjectComposerWithoutDataType() {
   let insertionCalls = 0;
   let clickedAt;
   let clickCount = 0;
+  let menuOpened = false;
+  let connectorAttached = false;
+  let submittedText = "start the new project thread";
   const location = new URL(namedProjectHome);
   const stopButton = {};
   const editor = {
     textContent: "",
     focus() {},
-    closest(selector) { return selector === "form" ? composer : null; },
+    closest(selector) { return selector === (modernComposer ? "[data-composer-body]" : "form") ? composer : null; },
     dispatchEvent(event) {
       if (event.type === "input") {
         insertedAt = now;
@@ -2004,13 +2017,16 @@ async function testNewProjectComposerWithoutDataType() {
       }
     },
     getAttribute(key) { return key === "contenteditable" ? "true" : null; },
+    querySelectorAll() { return connectorAttached ? [{ getAttribute: () => "Codex" }] : []; },
   };
   const sendButton = {
     disabled: false,
     getAttribute(key) { return key === "aria-disabled" ? "false" : null; },
     click() {
+      assert.equal(connectorAttached, Boolean(connectorName), "the connector must be attached before Send");
       clickCount += 1;
       clickedAt = now;
+      submittedText = editor.textContent;
       editor.textContent = "";
       userCount = 1;
       generationStarted = true;
@@ -2025,6 +2041,10 @@ async function testNewProjectComposerWithoutDataType() {
   const composer = {
     getAttribute() { return null; },
     querySelector(selector) {
+      if (selector === 'button[aria-label="Add files and more"]') return {
+        disabled: false, getAttribute() { return null; }, click() { menuOpened = true; },
+      };
+      if (modernComposer) return selector === 'button[aria-label="Send"]' ? sendButton : null;
       if (selector === '#composer-submit-button' ||
           selector === 'button[data-testid="send-button"]' ||
           selector === 'button[aria-label="Send prompt"]') return sendButton;
@@ -2032,10 +2052,17 @@ async function testNewProjectComposerWithoutDataType() {
       return null;
     },
   };
+  const connectorButton = {
+    disabled: false, getAttribute() { return null; }, getClientRects() { return [{}]; },
+    querySelectorAll() { return [{ textContent: "Codex" }, { textContent: "Helps you control my computer" }]; },
+    click() { connectorAttached = true; editor.textContent += " Codex"; },
+  };
   const document = {
     readyState: "complete",
     querySelector(selector) {
       if (selector === 'form[data-type="unified-composer"]') return null;
+      if (modernComposer && selector === '[data-composer-markdown][contenteditable="true"]') return editor;
+      if (modernComposer) return null;
       if (selector === '#prompt-textarea[contenteditable="true"]' ||
           selector === 'textarea[name="prompt-textarea"]') return editor;
       if (selector === '#composer-submit-button') return staleSendButton;
@@ -2045,7 +2072,8 @@ async function testNewProjectComposerWithoutDataType() {
       return null;
     },
     querySelectorAll(selector) {
-      if (selector === 'section[data-turn="user"]') return Array.from({ length: userCount }, () => ({}));
+      if (selector === 'section[data-turn="user"]') return Array.from({ length: userCount }, (_, index) => ({ dataset: { turnId: "u" + index }, textContent: submittedText, querySelector() { return null; } }));
+      if (selector === 'button[data-list-navigation-item="true"]') return menuOpened && connectorAvailable ? [connectorButton] : [];
       return [];
     },
     createRange() { return { selectNodeContents() {} }; },
@@ -2083,9 +2111,15 @@ async function testNewProjectComposerWithoutDataType() {
   const response = await new Promise(resolve => {
     automationListener({
       type: "local-codex-support/automation-v1",
-      command: { kind: "send_message", message: "start the new project thread" },
+      command: { kind: "send_message", message: "start the new project thread", ...(connectorName ? { connectorName } : {}) },
     }, {}, resolve);
   });
+  if (connectorName && !connectorAvailable) {
+    assert.equal(response.ok, false);
+    assert.match(response.error, /connector "Codex" was not found/);
+    assert.equal(clickCount, 0, "a missing connector cannot send a worker without tools");
+    return;
+  }
   assert.equal(response.ok, true, response.error);
   assert.equal(response.result.conversationUrl, urlA);
   assert.equal(insertionCalls, 1, "a new sub-agent prompt is inserted exactly once");
@@ -2105,7 +2139,7 @@ async function testReactTrackedTextareaEnablesSendButton() {
   let nativeValueWritten = false;
   let reactValue = "";
   const location = new URL(urlA);
-  const message = "send the completed review to the parent";
+  const message = "send the completed task to the parent";
   const stopButton = {};
   const textareaPrototype = {};
   Object.defineProperty(textareaPrototype, "value", {
@@ -2178,7 +2212,7 @@ async function testReactTrackedTextareaEnablesSendButton() {
       return null;
     },
     querySelectorAll(selector) {
-      if (selector === 'section[data-turn="user"]') return Array.from({ length: userCount }, () => ({}));
+      if (selector === 'section[data-turn="user"]') return Array.from({ length: userCount }, (_, index) => ({ dataset: { turnId: "u" + index }, textContent: index === 0 ? "original request" : message, querySelector() { return null; } }));
       if (selector === "section[data-turn]") return [userTurn, assistantTurn];
       return [];
     },

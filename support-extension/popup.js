@@ -100,8 +100,9 @@ const relativeTime = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" })
 const TIME_UNITS = [["day", 86_400], ["hour", 3_600], ["minute", 60], ["second", 1]];
 let threadFilter = "active";
 let loadedThreads = [];
-let loadedReviews = [];
+let loadedTasks = [];
 let currentConversationUrl;
+let continuationEnabled = false;
 
 function canonicalProjectId(value) {
   const known = value.match(/^(g-p-[0-9a-f]{32})(?:-[A-Za-z0-9_-]+)?$/i);
@@ -178,7 +179,7 @@ async function openConversation(conversation) {
   globalThis.close();
 }
 function threadState(thread) {
-  if (thread.waitingForReview) return "waiting for review";
+  if (thread.waitingForTask) return "waiting for task";
   if (thread.state === "complete") return "complete";
   return thread.lastError ? "retrying" : "active";
 }
@@ -218,7 +219,7 @@ function renderThread(thread) {
   const pill = document.createElement("span");
   pill.className = "pill";
   pill.dataset.state = state;
-  const pillLabel = state === "retrying" || thread.waitingForReview
+  const pillLabel = state === "retrying" || thread.waitingForTask
     ? state
     : thread.mode === "continuous" && thread.state === "active" ? "continuous" : state;
   pill.append(document.createElement("i"), pillLabel);
@@ -233,7 +234,7 @@ function renderThread(thread) {
     meta.append(metaEntry("Checked", formatRelative(Date.parse(thread.lastCheckedAt))));
   }
   if (thread.parentThreadId) meta.append(metaEntry("Parent", thread.parentThreadId.slice(0, 8)));
-  if (thread.state === "active" && !thread.waitingForReview) meta.append(metaEntry("Next check", formatRelative(thread.nextCheckAt)));
+  if (thread.state === "active" && !thread.waitingForTask) meta.append(metaEntry("Next check", formatRelative(thread.nextCheckAt)));
 
   link.append(head, Object.assign(document.createElement("p"), {
     className: "thread-url",
@@ -248,13 +249,13 @@ function renderThread(thread) {
   }
 
   card.append(link);
-  if (thread.waitingForReview) {
+  if (thread.waitingForTask || !continuationEnabled) {
     item.append(card);
     return item;
   }
   const actions = document.createElement("div");
   actions.className = "thread-actions";
-  if (thread.state === "active" && !thread.waitingForReview) {
+  if (thread.state === "active" && !thread.waitingForTask) {
     const checkButton = document.createElement("button");
     checkButton.className = "button";
     checkButton.type = "button";
@@ -346,10 +347,10 @@ function renderEmptyState(kind) {
   empty.className = "empty";
   if (kind === "subagent") {
     empty.append(
-      Object.assign(document.createElement("strong"), { textContent: threadFilter === "active" ? "No active reviewers" : "No completed reviewers" }),
+      Object.assign(document.createElement("strong"), { textContent: threadFilter === "active" ? "No active workers" : "No completed workers" }),
       threadFilter === "active"
-        ? "Automatically registered reviewer threads appear here while they are running."
-        : "Completed reviewer threads remain separated from your normal RALPH list.",
+        ? "Automatically registered worker threads appear here while they are running."
+        : "Completed worker threads remain separated from your normal RALPH list.",
     );
   } else if (threadFilter === "active") {
     empty.append(
@@ -380,23 +381,23 @@ function renderThreads() {
   const regular = loadedThreads.filter((thread) => !thread.parentThreadId && thread.state === threadFilter);
   renderThreadList(element("threadList"), regular, "regular");
   const section = element("subagentThreadsSection");
-  section.hidden = loadedReviews.length === 0;
-  const reviews = loadedReviews.filter((job) => (job.state === "pending" || (job.state === "complete" && !job.notifiedAt)) === (threadFilter === "active"));
-  element("subagentCount").textContent = String(reviews.length);
+  section.hidden = loadedTasks.length === 0;
+  const tasks = loadedTasks.filter((job) => (job.state === "pending" || (job.state === "complete" && !job.notifiedAt)) === (threadFilter === "active"));
+  element("subagentCount").textContent = String(tasks.length);
   const list = element("subagentThreadList");
-  list.replaceChildren(...reviews.map(renderReview));
-  if (!reviews.length) list.append(renderEmptyState("subagent"));
+  list.replaceChildren(...tasks.map(renderTask));
+  if (!tasks.length) list.append(renderEmptyState("subagent"));
 }
 
-function renderReview(job) {
+function renderTask(job) {
   const item = document.createElement("li");
   const card = Object.assign(document.createElement("div"), { className: "thread" });
   const label = job.preparationError || job.notificationError ? "Needs attention"
     : job.notifiedAt ? (job.state === "cancelled" ? "Cancelled" : "Delivered")
-    : job.state === "complete" ? "Waiting to resume parent" : "Review in progress";
+    : job.state === "complete" ? "Waiting to resume parent" : "Task in progress";
   const title = document.createElement(job.childConversationUrl ? "a" : "strong");
   title.className = "thread-id";
-  title.textContent = job.title || "Reviewer startup";
+  title.textContent = job.title || "Worker startup";
   if (job.childConversationUrl) {
     title.href = job.childConversationUrl;
     title.addEventListener("click", (event) => { event.preventDefault(); void openConversation(job.childConversationUrl); });
@@ -421,7 +422,7 @@ function renderReview(job) {
   if (error) card.append(Object.assign(document.createElement("p"), { className: "thread-error", textContent: error }));
   if (job.state === "pending" || (job.state === "complete" && !job.notifiedAt && job.notificationAbandonedAt)) {
     const action = job.state === "pending" ? "cancel" : "retry";
-    const button = Object.assign(document.createElement("button"), { className: "button", type: "button", textContent: action === "cancel" ? "Cancel review" : "Retry parent wake-up" });
+    const button = Object.assign(document.createElement("button"), { className: "button", type: "button", textContent: action === "cancel" ? "Cancel task" : "Retry parent wake-up" });
     button.addEventListener("click", () => void changeReview(job, action, button));
     card.append(button);
   }
@@ -431,16 +432,16 @@ function renderReview(job) {
 
 async function changeReview(job, action, button) {
   if (action === "cancel" && !globalThis.confirm(job.childConversationUrl
-    ? "Stop this reviewer and cancel its review?"
-    : "Inspect the automation browser first. Confirm that any reviewer created by this startup has stopped, then cancel the saved job?")) return;
+    ? "Stop this worker and cancel its task?"
+    : "Inspect the automation browser first. Confirm that any worker created by this startup has stopped, then cancel the saved job?")) return;
   button.disabled = true;
   try {
     const endpoint = new URL(ralphThreadsEndpoint.href);
-    endpoint.pathname = `/chatgpt-support/reviews/${encodeURIComponent(job.jobId)}`;
+    endpoint.pathname = `/chatgpt-support/tasks/${encodeURIComponent(job.jobId)}`;
     await callServer(endpoint, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, confirmedStopped: action === "cancel" }) }, 9 * 60_000);
     await loadThreads();
   } catch (error) {
-    setNote(element("threadsStatus"), errorMessage(error, "Review action failed."), "error");
+    setNote(element("threadsStatus"), errorMessage(error, "Task action failed."), "error");
   } finally { button.disabled = false; }
 }
 
@@ -457,9 +458,11 @@ async function loadThreads() {
   const status = element("threadsStatus");
   button.disabled = true;
   try {
-    const { threads, reviews = [] } = await callServer(ralphThreadsEndpoint);
+    const { threads, tasks = [], continuationEnabled: enabled } = await callServer(ralphThreadsEndpoint);
+    continuationEnabled = enabled === true;
+    for (const node of document.querySelectorAll("[data-legacy-continuation]")) node.hidden = !continuationEnabled;
     loadedThreads = threads;
-    loadedReviews = reviews;
+    loadedTasks = tasks;
     const active = threads.filter((thread) => !thread.agentCreated && thread.state === "active").length;
     element("activeCount").textContent = String(active);
     renderThreads();
@@ -530,10 +533,10 @@ async function saveSubagentProject() {
     input.value = settings.subagentProjectUrl ?? "";
     await extensionApi.storage.local.remove?.(SUBAGENT_PROJECT_KEY);
     setNote(status, settings.subagentProjectUrl
-      ? "Saved on the Local Codex server. New reviewers will spawn in this project."
-      : "No dedicated project configured. New reviewers will start at chatgpt.com.");
+      ? "Saved on the Local Codex server. New workers will spawn in this project."
+      : "No dedicated project configured. New workers will start at chatgpt.com.");
   } catch (error) {
-    setNote(status, errorMessage(error, "Could not save the reviewer project."), "error");
+    setNote(status, errorMessage(error, "Could not save the worker project."), "error");
   } finally {
     button.disabled = false;
   }
@@ -571,11 +574,11 @@ async function loadRalphSettings(legacySubagentProjectUrl = "") {
         body: JSON.stringify({ subagentProjectUrl: projectUrl }),
       });
       await extensionApi.storage.local.remove?.(SUBAGENT_PROJECT_KEY);
-      setNote(projectStatus, "Migrated the saved Reviewer project to the Local Codex server.");
+      setNote(projectStatus, "Migrated the saved Worker project to the Local Codex server.");
     } else {
       setNote(projectStatus, settings.subagentProjectUrl
-        ? "Stored on the Local Codex server. New reviewers spawn inside this project."
-        : "No dedicated project configured. New reviewers start at chatgpt.com.");
+        ? "Stored on the Local Codex server. New workers spawn inside this project."
+        : "No dedicated project configured. New workers start at chatgpt.com.");
     }
     element(SUBAGENT_PROJECT_KEY).value = settings.subagentProjectUrl ?? "";
     element("ralphLoopIntervalSeconds").value = String(settings.loopIntervalSeconds);
@@ -618,7 +621,7 @@ async function loadRalphProjects() {
   try {
     const { projects } = await callServer(ralphProjectsEndpoint);
     element("ralphProjects").value = projects.join("\n");
-    setNote(status, "These projects are registered automatically. Manual registrations and reviewers are also retained.");
+    setNote(status, "These projects are registered automatically. Manual registrations and workers are also retained.");
   } catch (error) {
     setNote(status, errorMessage(error, "Could not load RALPH projects."), "error");
   }

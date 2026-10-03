@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.6.6";
+  const contentScriptVersion = "1.7.1";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -123,7 +123,7 @@
       return { status: button ? "dismissed" : "not_found" };
     }
     if (command.kind === "stop_thread") return await stopThread();
-    if (command.kind === "send_message") return await sendMessage(command.message);
+    if (command.kind === "send_message") return await sendMessage(command.message, command.connectorName);
     assertNoPageError();
     if (command.kind === "inspect_thread") {
       const url = conversationUrl();
@@ -275,7 +275,7 @@
     };
   }
 
-  async function sendMessage(message) {
+  async function sendMessage(message, connectorName) {
     let sendClicked = false;
     try {
       assertNoPageError();
@@ -297,6 +297,9 @@
       assertNoPageError();
       insertMessage(ready.editor, message);
 
+      if (connectorName) await attachConnector(ready, connectorName);
+      const submittedMessage = (ready.editor.textContent ?? ready.editor.value ?? message).replace(/\s+/g, " ").trim();
+
       await sleep(SEND_SETTLE_MS);
 
       const current = await waitFor(() => {
@@ -308,6 +311,8 @@
       }, SEND_READY_TIMEOUT_MS);
       if (!current) throw new Error("ChatGPT send button did not become actionable.");
 
+      const previousTurns = new Set([...document.querySelectorAll('section[data-turn="user"]')]
+        .map(turn => turn.dataset?.turnId ?? turn));
       sendClicked = true;
       current.button.click();
       await sleep(SEND_SETTLE_MS);
@@ -318,6 +323,19 @@
         return conversationUrl();
       }, SEND_NAVIGATION_TIMEOUT_MS);
       if (!savedUrl) throw new Error("ChatGPT did not navigate to the newly created conversation after sending.");
+
+      const normalizedMessage = message.replace(/\s+/g, " ").trim();
+      const accepted = await waitFor(() => {
+        assertNoPageError();
+        return [...document.querySelectorAll('section[data-turn="user"]')].some(turn => {
+          if (previousTurns.has(turn.dataset?.turnId ?? turn)) return false;
+          const user = turn.querySelector('[data-message-author-role="user"]') ?? turn;
+          const content = user.querySelector('[data-testid="collapsible-user-message-content"]') ?? user;
+          const text = content.textContent?.replace(/\s+/g, " ").trim();
+          return text === normalizedMessage || (connectorName && text === submittedMessage);
+        });
+      }, SEND_NAVIGATION_TIMEOUT_MS);
+      if (!accepted) throw new Error("Delivery uncertain after Send: the submitted message was not confirmed as a new user turn. Inspect the conversation before retrying.");
 
       const title = threadTitle();
       return { status: "sent", conversationUrl: savedUrl, ...(title ? { title } : {}) };
@@ -330,8 +348,30 @@
       if (!sendClicked && typeof message === "string" && message.trim() && error instanceof Error) {
         error.retryable = true;
       }
+      if (sendClicked && error instanceof Error && !error.message.startsWith("Delivery uncertain after Send:")) {
+        throw new Error(`Delivery uncertain after Send: ${error.message}. Inspect the conversation before retrying.`);
+      }
       throw error;
     }
+  }
+
+  async function attachConnector({ composer, editor }, name) {
+    const add = await waitFor(() => {
+      const button = composer.querySelector('button[aria-label="Add files and more"]');
+      return isActionableButton(button) ? button : null;
+    }, 30_000);
+    if (!add) throw new Error("ChatGPT connector menu did not become available.");
+    add.click();
+    const button = await waitFor(() => {
+      const matches = [...document.querySelectorAll('button[data-list-navigation-item="true"]')].filter(button =>
+        button.getClientRects().length && [...button.querySelectorAll("span")].some(span => span.textContent?.trim() === name));
+      return matches.length === 1 && isActionableButton(matches[0]) ? matches[0] : null;
+    }, 30_000);
+    if (!button) throw new Error(`ChatGPT connector ${JSON.stringify(name)} was not found in the composer menu.`);
+    button.click();
+    const mention = await waitFor(() => [...editor.querySelectorAll("[app-mention-display-name]")]
+      .find(mention => mention.getAttribute("app-mention-display-name") === name), 10_000);
+    if (!mention) throw new Error(`ChatGPT did not attach connector ${JSON.stringify(name)}. The task was not sent.`);
   }
 
   function rateLimitNotice() {
@@ -507,9 +547,10 @@
     const typedComposer = document.querySelector('form[data-type="unified-composer"]');
     const editor = typedComposer?.querySelector('#prompt-textarea[contenteditable="true"]') ??
       typedComposer?.querySelector('textarea[name="prompt-textarea"]') ??
+      document.querySelector('[data-composer-markdown][contenteditable="true"]') ??
       document.querySelector('#prompt-textarea[contenteditable="true"]') ??
       document.querySelector('textarea[name="prompt-textarea"]');
-    const composer = typedComposer ?? editor?.closest?.("form");
+    const composer = typedComposer ?? editor?.closest?.("[data-composer-body]") ?? editor?.closest?.("form");
     return composer && editor ? { composer, editor } : null;
   }
 
@@ -517,7 +558,8 @@
     const root = composer ?? document;
     return root.querySelector("#composer-submit-button") ??
       root.querySelector('button[data-testid="send-button"]') ??
-      root.querySelector('button[aria-label="Send prompt"]');
+      root.querySelector('button[aria-label="Send prompt"]') ??
+      root.querySelector('button[aria-label="Send"]');
   }
 
   function isActionableButton(button) {
@@ -596,7 +638,8 @@
   }
 
   function isRunning() {
-    return Boolean(document.querySelector('form[data-type="unified-composer"] button[data-testid="stop-button"]'));
+    return Boolean(document.querySelector('form[data-type="unified-composer"] button[data-testid="stop-button"]') ??
+      document.querySelector('[data-composer-body] button[data-testid="stop-button"]'));
   }
 
   async function getRalphMinWorkedSeconds() {

@@ -41,22 +41,11 @@ export function createAgentApi(input: {
     try {
       const job = await input.jobs.create({
         threadId: `api:${session}`, requestId,
-        promptHash: createHash("sha256").update(prompt).digest("hex"),
+        promptHash: createHash("sha256").update(prompt).digest("hex"), prompt,
       });
       if (job.state === "pending" && !job.childThreadId && !job.preparationError && !starting.has(job.jobId)) {
         starting.add(job.jobId);
-        const task = [
-          prompt,
-          "",
-          "For browser testing, use this server's browser_* tools through the installed Local Codex browser extension.",
-          "Open the requested site, inspect a fresh snapshot, and verify the actual result after each meaningful action.",
-          `Before interacting with each test tab, start browser_recording with its tabId and jobId ${JSON.stringify(job.jobId)}.`,
-          "Use browser_snapshot with includeScreenshot=true to inspect the actual rendered image, especially for visual checks.",
-          `Save important evidence with browser_screenshot and jobId ${JSON.stringify(job.jobId)}. Use fullPage or clip when helpful.`,
-          "Keep recording through the test. Stop each recording before releasing its tab and include the returned video paths in your report.",
-          "Report the steps performed, expected and observed outcomes, failures, and artifact paths. If a tool, login, or recording is unavailable, report the exact blocker. Never claim unperformed checks passed.",
-        ].join("\n");
-        void startSubagentJob(job, task, input).catch(async (error: unknown) => {
+        void startSubagentJob(job, prompt, input).catch(async (error: unknown) => {
           await input.jobs.recordPreparationFailure(job.jobId, error instanceof Error ? error.message : String(error));
         }).catch((error: unknown) => console.error("[agents] Could not persist startup failure:", error))
           .finally(() => starting.delete(job.jobId));
@@ -73,17 +62,39 @@ export function createAgentApi(input: {
     res.json({ jobs: await input.jobs.forParent(`api:${session.data}`) });
   });
 
-  router.get("/:jobId", async (req, res) => {
-    const job = await input.jobs.job(req.params.jobId);
-    if (!job || job.parentConversationUrl) { res.status(404).json({ error: "API job not found." }); return; }
+  const readJob = async (job: NonNullable<Awaited<ReturnType<SubagentJobRegistry["job"]>>>) => {
     const directory = path.resolve(input.dataDirectory, "recordings", job.jobId);
     const files = await readdir(directory).catch((error: unknown) => {
       if (error instanceof Error && "code" in error && error.code === "ENOENT") return [];
       throw error;
     });
-    res.json({ ...job, result: job.state === "complete" ? await readFile(job.resultPath, "utf8") : null,
+    return { ...job, result: job.state === "complete" ? await readFile(job.resultPath, "utf8") : null,
       videos: files.filter((file) => file.endsWith(".webm") && !file.endsWith(".partial.webm")).map((file) => path.join(directory, file)),
-      screenshots: files.filter((file) => file.endsWith(".png")).map((file) => path.join(directory, file)) });
+      screenshots: files.filter((file) => file.endsWith(".png")).map((file) => path.join(directory, file)) };
+  };
+
+  router.get("/:jobId/wait", async (req, res) => {
+    const timeout = z.coerce.number().int().min(1).max(50_000).default(25_000).safeParse(req.query.timeoutMs);
+    if (!timeout.success) { res.status(400).json({ error: "timeoutMs must be between 1 and 50000." }); return; }
+    const existing = await input.jobs.job(req.params.jobId);
+    if (!existing || existing.parentConversationUrl) { res.status(404).json({ error: "API job not found." }); return; }
+    const controller = new AbortController();
+    const disconnected = () => controller.abort(new Error("Caller disconnected."));
+    res.once("close", disconnected);
+    try {
+      const job = await input.jobs.waitForResult(existing.jobId, timeout.data, controller.signal);
+      if (job && !controller.signal.aborted) res.json(await readJob(job));
+    } catch (error) {
+      if (!controller.signal.aborted) throw error;
+    } finally {
+      res.off("close", disconnected);
+    }
+  });
+
+  router.get("/:jobId", async (req, res) => {
+    const job = await input.jobs.job(req.params.jobId);
+    if (!job || job.parentConversationUrl) { res.status(404).json({ error: "API job not found." }); return; }
+    res.json(await readJob(job));
   });
 
   router.post("/:jobId/cancel", async (req, res) => {

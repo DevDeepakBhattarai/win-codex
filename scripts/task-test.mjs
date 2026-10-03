@@ -4,22 +4,22 @@ import vm from "node:vm";
 import os from "node:os";
 import path from "node:path";
 import { SubagentJobRegistry } from "../dist/subagent-jobs.js";
-import { RalphController, RalphRegistry, SubagentResultController, SupportCommandBus, registerChatGptAgents, reviewActionHandler } from "../dist/chatgpt-support.js";
+import { RalphController, RalphRegistry, SubagentResultController, SupportCommandBus, registerChatGptAgents, taskActionHandler } from "../dist/chatgpt-support.js";
 
 const directory = await mkdtemp(path.join(os.tmpdir(), "subagent-limits-"));
 try {
   const parent = { threadId: "11111111-1111-4111-8111-111111111111", conversationUrl: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111" };
   const child = { threadId: "22222222-2222-4222-8222-222222222222", conversationUrl: "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222" };
   const jobs = await SubagentJobRegistry.open(directory);
-  const attempts = await Promise.allSettled(Array.from({ length: 8 }, () => jobs.createReview(parent)));
-  assert.equal(attempts.filter(result => result.status === "fulfilled").length, 1, "concurrent starts reserve only one reviewer per parent");
+  const attempts = await Promise.allSettled(Array.from({ length: 8 }, () => jobs.createTask(parent)));
+  assert.equal(attempts.filter(result => result.status === "fulfilled").length, 1, "concurrent starts reserve only one worker per parent");
   const job = attempts.find(result => result.status === "fulfilled").value;
   await jobs.assignChild(job.jobId, child);
-  await assert.rejects(jobs.createReview(child), /cannot start another reviewer/);
+  await assert.rejects(jobs.createTask(child), /cannot start another task/);
   await writeFile(job.resultPath, "An unfinished report file");
-  assert.deepEqual(await jobs.jobsNeedingNotification(), [], "writing a file cannot complete a review");
-  await jobs.complete(job.jobId, "Review report");
-  await assert.rejects(jobs.createReview(parent), /unfinished review/, "submission alone does not release the parent's handoff");
+  assert.deepEqual(await jobs.jobsNeedingNotification(), [], "writing a file cannot complete a task");
+  await jobs.complete(job.jobId, "Task report");
+  await assert.rejects(jobs.createTask(parent), /unfinished task/, "submission alone does not release the parent's handoff");
   await jobs.recordNotificationFailure(job.jobId, "delivery failed", 1);
   assert.equal(await jobs.blocksContinuation(parent.threadId), true, "failed wake-up must not silently resume the parent");
   await jobs.retryNotification(job.jobId);
@@ -33,9 +33,9 @@ try {
     assert.equal(inspection.kind, "inspect_thread");
     finish(inspection, { status: "running" });
     await new Promise(resolve => setTimeout(resolve, 10));
-    assert.equal(await bus.claim("browser", ["threadMessaging"], 0), undefined, "review_done cannot wake the parent while the reviewer is still running");
+    assert.equal(await bus.claim("browser", ["threadMessaging"], 0), undefined, "task_done cannot wake the parent while the worker is still running");
     await controller.tick();
-    assert.equal(await bus.claim("browser", ["threadMessaging"], 0), undefined, "running reviewer checks back off");
+    assert.equal(await bus.claim("browser", ["threadMessaging"], 0), undefined, "running worker checks back off");
   } finally { controller.close(); bus.close(); }
 
   const wakeBus = new SupportCommandBus();
@@ -44,7 +44,7 @@ try {
     await Promise.all([wakeController.tick(), wakeController.tick()]);
     const inspection = await wakeBus.claim("browser", ["threadMessaging"], 1000);
     wakeBus.complete({ commandId: inspection.id, browserId: "browser", kind: "inspect_thread", ok: true,
-      result: { status: "idle", users: [], workedSeconds: null, assistant: { synthetic: false, text: "Review done" } } });
+      result: { status: "idle", users: [], workedSeconds: null, assistant: { synthetic: false, text: "Task done" } } });
     const notice = await wakeBus.claim("browser", ["threadMessaging"], 1000);
     assert.equal(notice.targetUrl, parent.conversationUrl);
     assert.ok(notice.message.includes(JSON.stringify(job.resultPath)));
@@ -55,20 +55,59 @@ try {
     assert.equal(await jobs.blocksContinuation(child.threadId), true);
   } finally { wakeController.close(); wakeBus.close(); }
 
-  const duplicates = await Promise.all(Array.from({ length: 8 }, () => jobs.createReview(parent, "same-review-sha")));
+  const unreported = await jobs.create({ threadId: "api:unreported" });
+  await jobs.assignChild(unreported.jobId, child);
+  const monitoringBus = new SupportCommandBus(undefined, undefined, 0);
+  const monitor = new SubagentResultController(jobs, monitoringBus, async () => {}, 60_000, 0, 0);
+  try {
+    await monitor.tick();
+    const first = await monitoringBus.claim("browser", ["threadMessaging"], 1000);
+    monitoringBus.complete({ commandId: first.id, browserId: "browser", kind: "inspect_thread", ok: true,
+      result: { status: "idle", users: [], workedSeconds: null, assistant: { synthetic: false, text: "Stopped before reporting" } } });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal((await jobs.job(unreported.jobId)).state, "pending", "a single idle observation cannot declare a stopped worker");
+    const originalNow = Date.now;
+    try {
+      Date.now = () => originalNow() + 31_000;
+      await monitor.tick();
+      const second = await monitoringBus.claim("browser", ["threadMessaging"], 1000);
+      monitoringBus.complete({ commandId: second.id, browserId: "browser", kind: "inspect_thread", ok: true,
+        result: { status: "idle", users: [], workedSeconds: null, assistant: { synthetic: false, text: "Stopped before reporting" } } });
+      await new Promise(resolve => setTimeout(resolve, 10));
+    } finally { Date.now = originalNow; }
+    assert.equal((await jobs.job(unreported.jobId)).state, "complete");
+    assert.match(await readFile(unreported.resultPath, "utf8"), /BLOCKED: worker stopped without calling task_done/);
+    assert.equal(await monitoringBus.claim("browser", ["threadMessaging"], 0), undefined, "the monitor never starts a continuation");
+  } finally { monitor.close(); monitoringBus.close(); }
+
+  const uncertain = await jobs.createTask(parent, "uncertain-wakeup");
+  await jobs.complete(uncertain.jobId, "Stored report");
+  const uncertainBus = new SupportCommandBus(undefined, undefined, 0);
+  const uncertainController = new SubagentResultController(jobs, uncertainBus, async () => {}, 60_000, 0);
+  try {
+    await uncertainController.tick();
+    const notice = await uncertainBus.claim("browser", ["threadMessaging"], 1000);
+    uncertainBus.complete({ commandId: notice.id, browserId: "browser", kind: "send_message", ok: false,
+      error: "Delivery uncertain after Send: message not confirmed" });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok((await jobs.job(uncertain.jobId)).notificationAbandonedAt, "uncertain wake-up requires operator inspection instead of a duplicate send");
+    await jobs.markNotified(uncertain.jobId);
+  } finally { uncertainController.close(); uncertainBus.close(); }
+
+  const duplicates = await Promise.all(Array.from({ length: 8 }, () => jobs.createTask(parent, "same-task-sha")));
   assert.equal(new Set(duplicates.map(job => job.jobId)).size, 1);
   const reopened = await SubagentJobRegistry.open(directory);
-  assert.equal((await reopened.createReview(parent, "same-review-sha")).jobId, duplicates[0].jobId);
+  assert.equal((await reopened.createTask(parent, "same-task-sha")).jobId, duplicates[0].jobId);
   assert.match((await reopened.job(duplicates[0].jobId)).preparationError, /interrupted/);
   await reopened.cancel(duplicates[0].jobId);
   await assert.rejects(reopened.complete(duplicates[0].jobId, "late"), /cancelled/);
 
-  const legacyRoot = path.join(directory, "legacy-review-storage");
+  const legacyRoot = path.join(directory, "legacy-task-storage");
   const legacyDirectory = path.join(legacyRoot, "subagents");
   await mkdir(legacyDirectory, { recursive: true });
   const legacyJobId = "44444444-4444-4444-8444-444444444444";
   const legacyResultPath = path.join(legacyDirectory, `${legacyJobId}.md`);
-  await writeFile(legacyResultPath, "Legacy review report\n");
+  await writeFile(legacyResultPath, "Legacy task report\n");
   await writeFile(path.join(legacyDirectory, "jobs.json"), JSON.stringify({
     version: 1,
     jobs: [{
@@ -87,12 +126,12 @@ try {
   }));
   const migratedJobs = await SubagentJobRegistry.open(legacyRoot);
   const migratedJob = await migratedJobs.job(legacyJobId);
-  assert.equal(path.dirname(migratedJob.resultPath), path.join(legacyRoot, "reviews"),
-    "legacy sub-agent storage migrates to reviewer-named storage without changing the internal job registry");
-  assert.equal((await readFile(migratedJob.resultPath, "utf8")).trim(), "Legacy review report");
-  const migratedStore = JSON.parse(await readFile(path.join(legacyRoot, "reviews", "jobs.json"), "utf8"));
+  assert.equal(path.dirname(migratedJob.resultPath), path.join(legacyRoot, "tasks"),
+    "legacy sub-agent storage migrates to worker-named storage without changing the internal job registry");
+  assert.equal((await readFile(migratedJob.resultPath, "utf8")).trim(), "Legacy task report");
+  const migratedStore = JSON.parse(await readFile(path.join(legacyRoot, "tasks", "jobs.json"), "utf8"));
   assert.equal(migratedStore.jobs[0].resultPath, migratedJob.resultPath,
-    "the canonical reviewer store persists the migrated report path");
+    "the canonical worker store persists the migrated report path");
 
   const registry = await RalphRegistry.open(path.join(directory, "ralph"), 1);
   await registry.register(parent.conversationUrl, { agentCreated: true });
@@ -106,27 +145,30 @@ try {
     registry, toolJobs, { markPrepared() { preparations += 1; } }, async () => {
       await toolBus.claim("browser-launch", ["threadMessaging"], 0);
     }, "grant", "");
-  const owner = { mcpReq: { id: "review", _meta: { "openai/session": "owner" } } };
+  const owner = { mcpReq: { id: "task", _meta: { "openai/session": "owner" } } };
   try {
-    assert.deepEqual([...handlers.keys()].sort(), ["list_reviewers", "review_done", "send_thread_message", "start_reviewer", "start_thread"]);
-    assert.equal((await handlers.get("start_reviewer")({ message: "review" }, { mcpReq: { id: "unsynced" } })).isError, true);
-    const start = handlers.get("start_reviewer")({ message: "Review this PR at exact SHA" }, owner);
+    assert.equal((await handlers.get("start_task")({ prompt: "task" }, { mcpReq: { id: "unsynced" } })).isError, true);
+    const specification = "Reproduce the checkout failure at http://localhost:3000 in D:/workspace at SHA abc123. Report the observed validation and screenshots.";
+    const start = handlers.get("start_task")({ prompt: specification }, owner);
     const command = await toolBus.claim("browser", ["threadMessaging"], 1000);
-    assert.match(command.message, /read-only/);
-    assert.match(command.message, /GitHub COMMENT review/);
+    assert.ok(command.message.includes(specification));
+    assert.equal(command.connectorName, "Codex", "a default worker chat attaches the local connector");
+    assert.match(command.message, /ROLE: ChatGPT worker/);
+    assert.match(command.message, /task_done/);
+    assert.doesNotMatch(command.message, /GitHub COMMENT|RALPH_STATUS/);
     toolBus.complete({ commandId: command.id, browserId: "browser", kind: "send_message", ok: true, result: { status: "sent", conversationUrl: child.conversationUrl } });
     const started = await start;
     assert.match(started.content[0].text, /End this turn now/);
     assert.equal(preparations, 1);
-    assert.equal(await toolBus.claim("browser", ["threadPreparation"], 0), undefined, "new reviewer tabs need no redundant preparation command");
-    const reviewJob = started.structuredContent.reviews[0];
+    assert.equal(await toolBus.claim("browser", ["threadPreparation"], 0), undefined, "new worker tabs need no redundant preparation command");
+    const reviewJob = started.structuredContent.tasks[0];
     assert.equal(reviewJob.conversationUrl, child.conversationUrl);
-    const listed = await handlers.get("list_reviewers")({}, owner);
-    assert.equal(listed.structuredContent.reviews.some(review => review.conversationUrl === child.conversationUrl), true);
+    const listed = await handlers.get("list_tasks")({}, owner);
+    assert.equal(listed.structuredContent.tasks.some(task => task.conversationUrl === child.conversationUrl), true);
     assert.match(listed.content[0].text, new RegExp(child.conversationUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-    assert.equal((await handlers.get("start_reviewer")({ message: "another" }, { mcpReq: { ...owner.mcpReq, id: "another" } })).isError, true);
+    assert.equal((await handlers.get("start_task")({ prompt: "another" }, { mcpReq: { ...owner.mcpReq, id: "another" } })).isError, true);
     assert.equal((await handlers.get("start_thread")({ message: "nested" }, { mcpReq: { _meta: { "openai/session": "child" } } })).isError, true);
-    assert.equal((await handlers.get("review_done")({ jobId: reviewJob.jobId, result: "report" }, owner)).isError, true, "the parent cannot submit the reviewer's report");
+    assert.equal((await handlers.get("task_done")({ jobId: reviewJob.jobId, result: "report" }, owner)).isError, true, "the parent cannot submit the worker's report");
     const ralph = new RalphController({ registry, commands: toolBus, jobs: toolJobs, model: "unused", auditLogPath: path.join(directory, "audit.log"), checkEveryMs: 60_000 });
     try {
       await registry.setMode(parent.threadId, "continuous");
@@ -142,10 +184,10 @@ try {
     } finally { ralph.close(); }
     const explicit = handlers.get("start_thread")({ message: "Explicit user-requested task" }, { mcpReq: { ...owner.mcpReq, id: "new-thread" } });
     const newThread = await toolBus.claim("browser", ["threadMessaging"], 1000);
-    assert.equal(newThread.message, "Explicit user-requested task", "explicit threads receive no child transport or review instructions");
+    assert.equal(newThread.message, "Explicit user-requested task", "explicit threads receive no child transport or task instructions");
     toolBus.complete({ commandId: newThread.id, browserId: "browser", kind: "send_message", ok: true, result: { status: "sent", conversationUrl: "https://chatgpt.com/c/33333333-3333-4333-8333-333333333333" } });
     assert.equal((await explicit).isError, undefined);
-    assert.equal((await toolJobs.all()).length, 1, "explicit thread creation creates no review job");
+    assert.equal((await toolJobs.all()).length, 1, "explicit thread creation creates no task job");
   } finally { toolBus.close(); }
 
   const checkpointRegistry = await RalphRegistry.open(path.join(directory, "checkpoint"), 1);
@@ -189,7 +231,7 @@ try {
 
   const recoveryJobs = await SubagentJobRegistry.open(path.join(directory, "recovery"));
   const recoveryBus = new SupportCommandBus(undefined, undefined, undefined, undefined, registry, recoveryJobs);
-  const recovery = reviewActionHandler(recoveryJobs, registry, recoveryBus, async () => {
+  const recovery = taskActionHandler(recoveryJobs, registry, recoveryBus, async () => {
     await recoveryBus.claim("browser-launch", ["threadMessaging"], 0);
   }, "test-token");
   const requestAction = async (jobId, body, authorized = true) => {
@@ -201,16 +243,16 @@ try {
   };
   try {
     const staleSend = recoveryBus.execute({ feature: "ralph", kind: "send_message", targetUrl: parent.conversationUrl, message: "stale continuation" });
-    const staleRejection = assert.rejects(staleSend, /paused for review/);
-    const pending = await recoveryJobs.createReview(parent);
-    assert.equal(await recoveryBus.claim("browser", ["ralph"], 0), undefined, "a queued continuation is discarded when review starts before delivery");
+    const staleRejection = assert.rejects(staleSend, /paused for task/);
+    const pending = await recoveryJobs.createTask(parent);
+    assert.equal(await recoveryBus.claim("browser", ["ralph"], 0), undefined, "a queued continuation is discarded when task starts before delivery");
     await staleRejection;
     assert.equal((await requestAction(pending.jobId, { action: "cancel" }, false)).status, 401);
     assert.equal((await requestAction(pending.jobId, { action: "cancel", confirmedStopped: true })).status, 409, "in-flight unknown startup cannot be cancelled");
     await recoveryJobs.recordPreparationFailure(pending.jobId, "unconfirmed startup");
     assert.equal((await requestAction(pending.jobId, { action: "cancel" })).status, 409);
     assert.equal((await requestAction(pending.jobId, { action: "cancel", confirmedStopped: true })).status, 200);
-    const known = await recoveryJobs.createReview(parent);
+    const known = await recoveryJobs.createTask(parent);
     await recoveryJobs.assignChild(known.jobId, child);
     const cancel = requestAction(known.jobId, { action: "cancel" });
     const stop = await recoveryBus.claim("browser", ["threadMessaging"], 1000);
@@ -223,7 +265,7 @@ try {
     const confirmed = await recoveryBus.claim("browser", ["threadMessaging"], 1000);
     recoveryBus.complete({ commandId: confirmed.id, browserId: "browser", kind: "stop_thread", ok: true, result: { status: "stopped", conversationUrl: child.conversationUrl } });
     assert.equal((await retryCancel).status, 200);
-    const undelivered = await recoveryJobs.createReview(parent);
+    const undelivered = await recoveryJobs.createTask(parent);
     await recoveryJobs.complete(undelivered.jobId, "report");
     await recoveryJobs.recordNotificationFailure(undelivered.jobId, "failed", 1);
     assert.equal((await requestAction(undelivered.jobId, { action: "retry" })).status, 200);
@@ -348,7 +390,7 @@ try {
   assert.equal(stopClicks, 1,
     "cancellation waits through hydration and clicks a stop button that appears after the composer");
 
-  console.log("Reviewer tests passed: sequential handoff, explicit threads, checkpoints, cancellation, restart recovery, and rate-limit queueing.");
+  console.log("Worker tests passed: sequential handoff, explicit threads, checkpoints, cancellation, restart recovery, and rate-limit queueing.");
 } finally {
   assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
   assert.ok(path.basename(directory).startsWith("subagent-limits-"));

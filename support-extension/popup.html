@@ -23,7 +23,7 @@
   <nav class="tabs" role="tablist" aria-label="Sections">
     <button id="tab-threads" class="tab" type="button" role="tab" data-panel="panel-threads"
             aria-controls="panel-threads" aria-selected="true">
-      RALPH threads
+      Tasks and threads
     </button>
     <button id="tab-settings" class="tab" type="button" role="tab" data-panel="panel-settings"
             aria-controls="panel-settings" aria-selected="false" tabindex="-1">
@@ -33,7 +33,7 @@
 
   <main>
     <section id="panel-threads" class="panel" role="tabpanel" aria-labelledby="tab-threads">
-      <div class="current-thread">
+      <div class="current-thread" data-legacy-continuation hidden>
         <div>
           <strong>Current thread</strong>
           <p id="currentThreadStatus" class="note">Checking the active tab...</p>
@@ -53,13 +53,13 @@
       </div>
       <div class="thread-section">
         <div class="thread-section-head">
-          <strong>Your RALPH threads</strong>
+          <strong>Your threads</strong>
         </div>
         <ul id="threadList" class="threads"></ul>
       </div>
       <section id="subagentThreadsSection" class="thread-section" hidden>
         <div class="thread-section-head">
-          <strong>Reviews</strong>
+          <strong>Tasks</strong>
           <span id="subagentCount" class="section-count">0</span>
         </div>
         <ul id="subagentThreadList" class="threads"></ul>
@@ -78,27 +78,27 @@
           <span class="toggle-text">Automation browser executor<small>Allow this browser to run automation and reuse managed thread tabs. Enable only in Chrome.</small></span>
           <span class="switch"><input id="automationExecutor" type="checkbox"><i aria-hidden="true"></i></span>
         </label>
-        <label class="toggle">
-          <span class="toggle-text">RALPH automation<small>Resume unfinished work and CI checkpoints. Parents pause during review.</small></span>
+        <label class="toggle" data-legacy-continuation hidden>
+          <span class="toggle-text">RALPH automation<small>Legacy continuation. Parents pause during tasks.</small></span>
           <span class="switch"><input id="ralph" type="checkbox"><i aria-hidden="true"></i></span>
         </label>
         <label class="toggle">
-          <span class="toggle-text">Review and thread messaging<small>Run sequential reviews and explicitly requested thread messages.</small></span>
+          <span class="toggle-text">Task and thread messaging<small>Execute bounded specifications and deliver reports to parents.</small></span>
           <span class="switch"><input id="threadMessaging" type="checkbox"><i aria-hidden="true"></i></span>
         </label>
-        <p class="note">Enable the preparation executor, RALPH, and agent messaging only in the Chrome profile you want Local Codex to automate.</p>
+        <p class="note">Enable the automation executor and task messaging in the Chrome profile that runs ChatGPT workers.</p>
       </div>
 
       <div class="card">
-        <h2><label for="subagentProjectUrl">Reviewer project URL</label></h2>
+        <h2><label for="subagentProjectUrl">ChatGPT worker project URL</label></h2>
         <input id="subagentProjectUrl" type="url" placeholder="https://chatgpt.com/g/.../project">
         <div class="card-footer">
           <button id="saveSubagentProject" class="button" type="button">Save project</button>
-          <p id="subagentProjectStatus" class="note">Stored on the Local Codex server. Leave blank to start reviewers at chatgpt.com.</p>
+          <p id="subagentProjectStatus" class="note">Stored on the Local Codex server. Leave blank to start workers at chatgpt.com.</p>
         </div>
       </div>
 
-      <div class="card">
+      <div class="card" data-legacy-continuation hidden>
         <h2><label for="ralphLoopIntervalSeconds">RALPH check interval (seconds)</label></h2>
         <input id="ralphLoopIntervalSeconds" type="number" min="120" max="86400" step="1" inputmode="numeric">
         <div class="card-footer">
@@ -107,7 +107,7 @@
         </div>
       </div>
 
-      <div class="card">
+      <div class="card" data-legacy-continuation hidden>
         <h2><label for="ralphMinWorkedSeconds">RALPH classifier worked-time threshold (seconds)</label></h2>
         <input id="ralphMinWorkedSeconds" type="number" min="0" max="86400" step="1" inputmode="numeric">
         <div class="card-footer">
@@ -116,12 +116,12 @@
         </div>
       </div>
 
-      <div class="card">
+      <div class="card" data-legacy-continuation hidden>
         <h2><label for="ralphProjects">RALPH projects</label></h2>
         <textarea id="ralphProjects" rows="5" spellcheck="false" placeholder="One project URL or project ID per line"></textarea>
         <div class="card-footer">
           <button id="saveRalphProjects" class="button" type="button">Save projects</button>
-          <p id="ralphProjectsStatus" class="note">These projects are registered automatically. Manual registrations and reviewers are also retained.</p>
+          <p id="ralphProjectsStatus" class="note">These projects are registered automatically. Manual registrations and workers are also retained.</p>
         </div>
       </div>
     </section>

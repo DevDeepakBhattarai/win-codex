@@ -64,15 +64,15 @@ function replayToolRequest(replayKey: string, createResult: () => Promise<CallTo
   return result;
 }
 
-export const SUBAGENT_WIDGET_URI = "ui://local-codex/reviewer-v1.html";
+export const SUBAGENT_WIDGET_URI = "ui://local-codex/task-v1.html";
 export const SUBAGENT_AGENT_INSTRUCTION = [
-  "Implement and verify work in the current conversation. General delegation tools are unavailable.",
-  "Use start_reviewer for the final independent review. Supply requirements, workspace, and exact change scope. After a pending review is returned, end your turn immediately. Do not poll, wait in a tool, or continue implementation. The service wakes you when the review is done.",
-  "Use list_reviewers only when the user asks to inspect reviews or when recovery requires one status snapshot. Never poll it for completion.",
-  "Reviewers work read-only, call review_done once with the complete report, and end their turn. Read the local report before continuing implementation. Sync only when a tool needs the current binding, and reuse it.",
-  "Use start_thread and send_thread_message only when the user explicitly requests a new conversation or a message to an existing conversation. They are not delegation or review tools. After uncertain delivery, inspect the target before sending again.",
+  "Parent agents write the specification and implement changes. Delegate test execution, browser interaction, visual checks, and bug reproduction to ChatGPT with start_task.",
+  "Give the worker one bounded specification with the absolute workspace, revision, URL or command, reproduction steps, expected results, permitted changes, and required evidence. After handoff, end this turn immediately. The service delivers the report and wakes this parent. Do not poll or repeat an uncertain assignment.",
+  "Use list_tasks only when the user asks to inspect tasks or when recovery requires one status snapshot. Never poll it for completion.",
+  "Assigned workers execute their specification themselves, submit observed results or an exact blocker with task_done, and end their turn. Workers never delegate again. Parents read the report before continuing. Reuse the current thread binding.",
+  "Use start_thread and send_thread_message only when the user explicitly requests a new conversation or a message to an existing conversation. They are not delegation or task tools. After uncertain delivery, inspect the target before sending again.",
 ].join(" ");
-const CONTINUOUS_RALPH_INSTRUCTION = "Continue the user-authorized continuous run toward the existing goal. You own all decisions about what to do next. Read the conversation and current state, use completed review reports as evidence, choose useful unfinished work, and verify the result. If progress depends on a pending review, user input, or a message cooldown, state the blocker and end this turn. Do not poll. Continuous RALPH will wake the thread again while the user keeps continuous mode enabled.";
+const CONTINUOUS_RALPH_INSTRUCTION = "Continue the user-authorized continuous run toward the existing goal. You own all decisions about what to do next. Read the conversation and current state, use completed task reports as evidence, choose useful unfinished work, and verify the result. If progress depends on a pending task, user input, or a message cooldown, state the blocker and end this turn. Do not poll. Continuous RALPH will wake the thread again while the user keeps continuous mode enabled.";
 
 export const supportFeatureSchema = z.enum(["ralph", "threadMessaging", "threadPreparation", "threadLifecycle"]);
 export type SupportFeature = z.infer<typeof supportFeatureSchema>;
@@ -149,6 +149,7 @@ const supportCommandSchema = z.union([
     kind: z.literal("send_message"),
     targetUrl: z.string().url(),
     message: z.string(),
+    connectorName: z.string().min(1).optional(),
   }),
   z.object({
     id: z.string(),
@@ -285,7 +286,7 @@ export class SupportCommandBus {
     let targetThreadId: string | undefined;
     try { targetThreadId = parseConversationUrl(targetUrl).threadId; } catch { targetThreadId = undefined; }
     if (command.feature === "ralph" && targetThreadId && this.jobs?.blocksContinuationNow(targetThreadId)) {
-      throw new Error("RALPH is paused for this review handoff.");
+      throw new Error("RALPH is paused for this task handoff.");
     }
     if (allowBrowserLaunch && (command.kind === "send_message" || command.kind === "stop_thread" || command.kind === "prepare_thread") && this.launchBrowser) {
       await this.ensureBrowser(command.feature, this.launchBrowser);
@@ -420,7 +421,7 @@ export class SupportCommandBus {
       const target = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
       if (command.feature === "ralph" && this.jobs?.blocksContinuationNow(parseConversationUrl(target).threadId)) {
         this.removePending(command.id);
-        pending.reject(new Error("RALPH command cancelled because this thread is paused for review."));
+        pending.reject(new Error("RALPH command cancelled because this thread is paused for task."));
       }
     }
     const featureSet = new Set(features);
@@ -1178,8 +1179,8 @@ export class RalphController {
         const resumed = await this.options.commands.execute({
           feature: "ralph", kind: "send_message", targetUrl: thread.conversationUrl,
           message: checkpoint === "WAIT_CI"
-            ? "Resume the saved engineering checkpoint. Inspect CI once for the saved PR head, fix actionable failures, and continue the review and verification loop. If checks are still pending, save the checkpoint and end with RALPH_STATUS: WAIT_CI."
-            : "Resume the saved checkpoint and continue the existing task. Preserve the sequential implementer and reviewer handoff. Do not start duplicate reviews or repeat completed work.",
+            ? "Resume the saved engineering checkpoint. Inspect CI once for the saved PR head, fix actionable failures, and continue the task and verification loop. If checks are still pending, save the checkpoint and end with RALPH_STATUS: WAIT_CI."
+            : "Resume the saved checkpoint and continue the existing task. Preserve the sequential implementer and worker handoff. Do not start duplicate tasks or repeat completed work.",
         });
         if (!resumed.ok) throw new Error(resumed.error);
         if (resumed.kind !== "send_message") throw new Error("Unexpected checkpoint continuation result.");
@@ -1571,21 +1572,21 @@ export function ralphProjectsGetHandler(registry: RalphRegistry, extensionToken:
   };
 }
 
-export function ralphThreadsGetHandler(registry: RalphRegistry, extensionToken: string, jobs?: SubagentJobRegistry): RequestHandler {
+export function ralphThreadsGetHandler(registry: RalphRegistry, extensionToken: string, jobs?: SubagentJobRegistry, continuationEnabled = true): RequestHandler {
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
     res.setHeader("Cache-Control", "no-store");
     const threads = await registry.threads();
-    const reviews = await jobs?.all() ?? [];
+    const tasks = await jobs?.all() ?? [];
     res.json({ threads: threads.map((thread) => ({
       ...thread,
-      waitingForReview: reviews.some((job) => job.parentThreadId === thread.threadId &&
+      waitingForTask: tasks.some((job) => job.parentThreadId === thread.threadId &&
         (job.state === "pending" || (job.state === "complete" && !job.notifiedAt))),
-    })), reviews });
+    })), tasks, continuationEnabled });
   };
 }
 
-export function reviewActionHandler(
+export function taskActionHandler(
   jobs: SubagentJobRegistry, registry: RalphRegistry, commands: SupportCommandBus,
   launchBrowser: () => Promise<void>, extensionToken: string,
 ): RequestHandler {
@@ -1593,10 +1594,10 @@ export function reviewActionHandler(
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
     const input = z.object({ action: z.enum(["cancel", "retry"]), confirmedStopped: z.boolean().optional() }).strict().safeParse(req.body);
     const id = z.string().uuid().safeParse(req.params.jobId);
-    if (!input.success || !id.success) { res.status(400).json({ error: "Invalid review action." }); return; }
+    if (!input.success || !id.success) { res.status(400).json({ error: "Invalid task action." }); return; }
     try {
       const job = await jobs.job(id.data);
-      if (!job) { res.status(404).json({ error: "Review not found." }); return; }
+      if (!job) { res.status(404).json({ error: "Task not found." }); return; }
       if (input.data.action === "retry") {
         await jobs.retryNotification(job.jobId);
       } else if (job.state === "pending") {
@@ -1604,14 +1605,14 @@ export function reviewActionHandler(
           await commands.ensureBrowser("threadMessaging", launchBrowser);
           const stopped = await commands.execute({ feature: "threadMessaging", kind: "stop_thread", targetUrl: job.childConversationUrl });
           if (!stopped.ok) throw new Error(stopped.error);
-          if (stopped.kind !== "stop_thread") throw new Error("Unexpected reviewer stop result.");
+          if (stopped.kind !== "stop_thread") throw new Error("Unexpected worker stop result.");
         } else if (!job.preparationError || input.data.confirmedStopped !== true) {
-          throw new Error("Startup is unresolved. Inspect the automation browser and confirm any untracked reviewer has stopped before cancelling.");
+          throw new Error("Startup is unresolved. Inspect the automation browser and confirm any untracked worker has stopped before cancelling.");
         }
         if (job.childThreadId) await registry.recordComplete(job.childThreadId);
         await jobs.cancel(job.jobId);
       } else {
-        throw new Error("Only pending reviews can be cancelled. Retry delivery for a completed report.");
+        throw new Error("Only pending tasks can be cancelled. Retry delivery for a completed report.");
       }
       res.setHeader("Cache-Control", "no-store");
       res.json({ status: "accepted" });
@@ -1938,30 +1939,19 @@ function agentPrompt(message: string, jobId: string, resultPath: string) {
   return [
     message.trim(),
     "",
-    "You are a local testing agent working in a separate ChatGPT conversation.",
-    "Complete only the bounded task above. Nested delegation is disabled. Perform the work yourself and report concrete observed results and evidence.",
-    "Before review_done, bind this conversation with sync_current_thread. If it reports syncing, follow with get_current_thread_url; if it reports synced, reuse that binding.",
-    "The local API caller does not expect a browser message from you. Do not call send_thread_message to report back.",
-    `When your work is complete, call review_done exactly once with jobId ${JSON.stringify(jobId)} and put your complete final report in its result argument.`,
-    `The application stores that report locally at ${JSON.stringify(resultPath)} for the API caller.`,
-    "After review_done succeeds, end this turn with only a brief acknowledgement.",
+    "ROLE: ChatGPT worker. The specification above is your complete assignment. The parent handles planning and implementation.",
+    "Execute this bounded assignment yourself. Use terminal for specified commands and this server's browser_* tools for browser work. Change files only when the specification authorizes it. Submit a blocker if the specification or access is insufficient. Nested delegation and automatic continuation are disabled.",
+    `For browser work, save important evidence with browser_screenshot and jobId ${JSON.stringify(jobId)}. When recording is requested, start browser_recording before interacting, stop it before releasing the tab, and include the video path.`,
+    "Inspect a fresh browser_snapshot before interacting and verify the observed result after each meaningful action. Never report an unperformed check as passed.",
+    "Write the report with the tested workspace and revision, each check's expected and observed result, pass or fail, reproduction steps, evidence paths, and any blocker. An unsuccessful test or missing login is a reportable result.",
+    "Before task_done, bind this conversation with sync_current_thread. If it reports syncing, follow with get_current_thread_url; if it reports synced, reuse that binding.",
+    "The service routes your report to the parent. Use task_done to report back, not send_thread_message or a final chat answer alone.",
+    `When your work is complete, call task_done exactly once with jobId ${JSON.stringify(jobId)} and put your complete final report in its result argument.`,
+    `The application stores the report at ${JSON.stringify(resultPath)} and handles delivery. If you cannot finish, submit your observed progress and exact blocker now.`,
+    "After task_done succeeds, end this turn with only a brief acknowledgement.",
   ].join("\n");
 }
 
-function reviewerPrompt(message: string, jobId: string, resultPath: string) {
-  return [
-    message.trim(),
-    "",
-    "You are the independent reviewer in a fresh ChatGPT conversation. The implementer is paused.",
-    "Review only the changes against the requirements above. Inspect actual code and validate actionable defects. Remain read-only. Report findings with file locations and evidence, or state that no actionable defects were found. Do not implement fixes, start another thread, or delegate.",
-    "Apply the reviewer skill. For an engineering-loop PR handoff, post one authorized GitHub COMMENT review for the exact reviewed head. Include the review URL and SHA in your report. If posting fails, report the blocker with your findings. If unfinished work needs another turn, save a checkpoint and end with RALPH_STATUS: CONTINUE. If access blocks the review, return the partial report and blocker with review_done.",
-    "Before review_done, bind this reviewer conversation with sync_current_thread. If it reports syncing, follow with get_current_thread_url; if it reports synced, reuse that binding.",
-    "The implementer does not expect a browser message from you. Do not call send_thread_message to report back.",
-    `When your work is complete, call review_done exactly once with jobId ${JSON.stringify(jobId)} and put your complete final report in its result argument.`,
-    `The application stores that report locally at ${JSON.stringify(resultPath)} and wakes the parent automatically.`,
-    "After review_done succeeds, end this reviewer turn with only a brief acknowledgement.",
-  ].join("\n");
-}
 
 async function subagentViews(
   parentThreadId: string,
@@ -2002,7 +1992,7 @@ async function subagentViews(
   return [...views, ...parentJobs.filter((job) => !job.childThreadId || !threads.some((thread) => thread.threadId === job.childThreadId)).map((job) => ({
     conversationUrl: job.childConversationUrl,
     threadId: job.childThreadId,
-    title: job.title ?? "Reviewer startup unconfirmed",
+    title: job.title ?? "Worker startup unconfirmed",
     state: job.state === "pending" ? "active" as const : "complete" as const,
     mode: "normal" as const,
     registeredAt: job.createdAt,
@@ -2014,13 +2004,13 @@ async function subagentViews(
   }))].filter((view) => jobId === undefined || view.jobId === jobId);
 }
 
-function reviewerListText(reviews: Awaited<ReturnType<typeof subagentViews>>) {
-  if (reviews.length === 0) return "No reviewers.";
-  return reviews.map((review, index) => {
-    const status = review.resultState ?? review.state;
+function taskListText(tasks: Awaited<ReturnType<typeof subagentViews>>) {
+  if (tasks.length === 0) return "No workers.";
+  return tasks.map((task, index) => {
+    const status = task.resultState ?? task.state;
     return [
-      `${index + 1}. ${review.title ?? "Reviewer"}`,
-      review.conversationUrl ? `Review thread: ${review.conversationUrl}` : "Review thread: startup unconfirmed",
+      `${index + 1}. ${task.title ?? "Worker"}`,
+      task.conversationUrl ? `Task thread: ${task.conversationUrl}` : "Task thread: startup unconfirmed",
       `Status: ${status}`,
     ].join("\n");
   }).join("\n\n");
@@ -2028,7 +2018,7 @@ function reviewerListText(reviews: Awaited<ReturnType<typeof subagentViews>>) {
 
 const subagentOutputSchema = {
   parentConversationUrl: z.string().url(),
-  reviews: z.array(z.object({
+  tasks: z.array(z.object({
     conversationUrl: z.string().url().optional(),
     threadId: z.string().optional(),
     title: z.string().optional(),
@@ -2070,17 +2060,14 @@ export async function startSubagentJob(job: SubagentJob, message: string,
   const result = await commands.execute({
     feature: "threadMessaging", kind: "send_message", targetUrl: subagentProjectUrl ?? "https://chatgpt.com/",
     message: agentPrompt(message, job.jobId, job.resultPath),
+    ...(!subagentProjectUrl ? { connectorName: process.env.CHATGPT_WORKER_CONNECTOR_NAME ?? "Codex" } : {}),
   });
   if (!result.ok) throw new Error(result.error);
   if (result.kind !== "send_message") throw new Error("Sub-agent creation received the wrong support command result.");
   const child = parseConversationUrl(result.result.conversationUrl);
   await jobs.assignChild(job.jobId, { ...child, title: result.result.title });
   await registry.register(child.conversationUrl, { agentCreated: true, parentThreadId: job.parentThreadId, title: result.result.title });
-  try {
-    await preparer.ensurePrepared(child.conversationUrl);
-  } catch (error) {
-    await jobs.recordPreparationFailure(job.jobId, error instanceof Error ? error.message : String(error));
-  }
+  preparer.markPrepared(child.conversationUrl);
 }
 
 export async function cancelSubagentJob(job: SubagentJob, { commands, registry, jobs, launchBrowser }: AgentServices) {
@@ -2112,53 +2099,53 @@ export function registerChatGptAgents(
   ownerId: string,
   widgetHtml: string,
 ) {
-  server.registerResource("reviewer-widget", SUBAGENT_WIDGET_URI, { mimeType: "text/html;profile=mcp-app" }, async () => ({
+  server.registerResource("task-widget", SUBAGENT_WIDGET_URI, { mimeType: "text/html;profile=mcp-app" }, async () => ({
     contents: [{ uri: SUBAGENT_WIDGET_URI, mimeType: "text/html;profile=mcp-app", text: widgetHtml, _meta: { ui: { prefersBorder: false, csp: { connectDomains: [], resourceDomains: [] } } } }],
   }));
 
-  server.registerTool("start_reviewer", {
-    title: "Start reviewer",
-    description: "Start the final independent, read-only review in a fresh ChatGPT conversation. Requires a synced implementer. One unfinished review per parent. Pass requirements and the exact workspace and diff to inspect, without implementation conversation history. The result includes the exact review-thread URL. Repeated identical briefs reuse the saved review. Once a pending review is returned, end this turn immediately. The service pauses parent continuation and wakes it after review_done and reviewer idle. Do not poll or perform more work after handoff.",
+  server.registerTool("start_task", {
+    title: "Start task",
+    description: "Delegate one bounded testing, browser, or reproduction specification to a fresh ChatGPT worker. Requires a synced parent. Include the absolute workspace, revision, URLs or commands, expected results, permitted changes, and evidence required. The service stores the specification and report. One unfinished task per parent. Identical specifications reuse the saved task. End your turn immediately after handoff. The service wakes the parent after task_done and worker idle. Do not poll or execute the delegated work yourself.",
     inputSchema: {
-      message: z.string().trim().min(1).max(190_000).describe("Review requirements, absolute workspace path, exact change scope or base revision, and relevant validation. The server adds completion instructions."),
+      prompt: z.string().trim().min(1).max(180_000).describe("Bounded specification, absolute workspace, revision, URL or command, expected results, permitted changes, and evidence. The server adds the worker completion contract."),
     },
     outputSchema: subagentOutputSchema,
     _meta: subagentToolMeta,
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-  }, async ({ message }, extra) => {
+  }, async ({ prompt }, extra) => {
     const session = extra.mcpReq._meta?.["openai/session"];
     if (typeof session !== "string" || !session || session.length > 2048) {
       return {
         isError: true,
-        content: [{ type: "text", text: "The client did not provide a valid openai/session. Call sync_current_thread before starting a reviewer." }],
+        content: [{ type: "text", text: "The client did not provide a valid openai/session. Call sync_current_thread before starting a worker." }],
       };
     }
     const parent = await bindings.binding({ ownerId, sessionId: session });
     if (!parent) {
       return {
         isError: true,
-        content: [{ type: "text", text: "This implementer conversation is not synced. Call sync_current_thread now. If it reports syncing, finish with get_current_thread_url, then retry start_reviewer." }],
+        content: [{ type: "text", text: "This implementer conversation is not synced. Call sync_current_thread now. If it reports syncing, finish with get_current_thread_url, then retry start_task." }],
       };
     }
 
     const fingerprint = createHash("sha256")
-      .update(message.trim())
+      .update(prompt.trim())
       .digest("base64url");
-    const replayKey = `start_reviewer:${ownerId}:${session}:${String(extra.mcpReq.id)}:${fingerprint}`;
+    const replayKey = `start_task:${ownerId}:${session}:${String(extra.mcpReq.id)}:${fingerprint}`;
     return await replayToolRequest(replayKey, async () => {
       let job: Awaited<ReturnType<SubagentJobRegistry["create"]>>;
       try {
         if ((await registry.threads()).some((thread) => thread.threadId === parent.threadId && thread.parentThreadId)) {
           throw new SubagentAdmissionError("nested");
         }
-        job = await jobs.createReview(parent, fingerprint);
+        job = await jobs.createTask(parent, fingerprint, prompt);
       } catch (error) {
         return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] };
       }
       if (job.reused) {
         return {
-          content: [{ type: "text", text: `Existing review ${job.jobId}: ${job.state}.\n${job.childConversationUrl ? `Review thread: ${job.childConversationUrl}` : "Review thread: startup unconfirmed; do not start it again."}\nResult file: ${job.resultPath}${job.preparationError ? `\n${job.preparationError}` : ""}\n${job.state === "pending" || (job.state === "complete" && !job.notifiedAt) ? "End this turn now. The parent resumes after review completion." : job.state === "cancelled" ? "This review was cancelled. Resolve its disposition before another assignment." : "Read the existing report before continuing."}` }],
-          structuredContent: { parentConversationUrl: parent.conversationUrl, reviews: await subagentViews(parent.threadId, registry, jobs, job.jobId) },
+          content: [{ type: "text", text: `Existing task ${job.jobId}: ${job.state}.\n${job.childConversationUrl ? `Task thread: ${job.childConversationUrl}` : "Task thread: startup unconfirmed; do not start it again."}\nResult file: ${job.resultPath}${job.preparationError ? `\n${job.preparationError}` : ""}\n${job.state === "pending" || (job.state === "complete" && !job.notifiedAt) ? "End this turn now. The parent resumes after task completion." : job.state === "cancelled" ? "This task was cancelled. Resolve its disposition before another assignment." : "Read the existing report before continuing."}` }],
+          structuredContent: { parentConversationUrl: parent.conversationUrl, tasks: await subagentViews(parent.threadId, registry, jobs, job.jobId) },
         };
       }
       let result: SupportCommandResult;
@@ -2169,16 +2156,17 @@ export function registerChatGptAgents(
           feature: "threadMessaging",
           kind: "send_message",
           targetUrl: subagentProjectUrl ?? "https://chatgpt.com/",
-          message: reviewerPrompt(message, job.jobId, job.resultPath),
+          message: agentPrompt(prompt, job.jobId, job.resultPath),
+          ...(!subagentProjectUrl ? { connectorName: process.env.CHATGPT_WORKER_CONNECTOR_NAME ?? "Codex" } : {}),
         });
         if (!result.ok) throw new Error(result.error);
-        if (result.kind !== "send_message") throw new Error("Reviewer creation received the wrong support command result.");
+        if (result.kind !== "send_message") throw new Error("Worker creation received the wrong support command result.");
       } catch (error) {
         // Delivery can fail after Send was clicked. Keep the reservation until the parent resolves it.
         await jobs.recordPreparationFailure(job.jobId, error instanceof Error ? error.message : String(error));
         return {
           isError: true,
-          content: [{ type: "text", text: `Reviewer startup could not be confirmed. Review ${job.jobId} still reserves the handoff. ${error instanceof Error ? error.message : "Reviewer creation failed."} End this turn. Inspect the review in the Support extension before cancelling an abandoned startup. Do not repeat the start request.` }],
+          content: [{ type: "text", text: `Worker startup could not be confirmed. Task ${job.jobId} still reserves the handoff. ${error instanceof Error ? error.message : "Worker creation failed."} End this turn. Inspect the task in the Support extension before cancelling an abandoned startup. Do not repeat the start request.` }],
         };
       }
 
@@ -2196,18 +2184,18 @@ export function registerChatGptAgents(
       preparer.markPrepared(child.conversationUrl);
       const structuredContent = {
         parentConversationUrl: parent.conversationUrl,
-        reviews: await subagentViews(parent.threadId, registry, jobs, job.jobId),
+        tasks: await subagentViews(parent.threadId, registry, jobs, job.jobId),
       };
       return {
-        content: [{ type: "text", text: `Review thread: ${child.conversationUrl}\nResult file: ${job.resultPath}\nEnd this turn now. Do not wait, poll, or continue implementation. The service will wake this parent when the review is done.` }],
+        content: [{ type: "text", text: `Task thread: ${child.conversationUrl}\nResult file: ${job.resultPath}\nEnd this turn now. Do not wait, poll, or continue implementation. The service will wake this parent when the task is done.` }],
         structuredContent,
       };
     });
   });
 
-  server.registerTool("list_reviewers", {
-    title: "List reviewers",
-    description: "List reviews owned by this synced implementer, including their exact ChatGPT thread URLs, current state, and recovery errors. Use one snapshot only when the user asks to inspect reviews or recovery requires it. Do not poll this tool for completion; the service wakes the parent when a review finishes.",
+  server.registerTool("list_tasks", {
+    title: "List tasks",
+    description: "List tasks owned by this synced implementer, including their exact ChatGPT thread URLs, current state, and recovery errors. Use one snapshot only when the user asks to inspect tasks or recovery requires it. Do not poll this tool for completion; the service wakes the parent when a task finishes.",
     inputSchema: {},
     outputSchema: subagentOutputSchema,
     _meta: subagentToolMeta,
@@ -2217,26 +2205,26 @@ export function registerChatGptAgents(
     if (typeof session !== "string" || !session || session.length > 2048) {
       return {
         isError: true,
-        content: [{ type: "text", text: "The client did not provide a valid openai/session, so reviews cannot be resolved for this conversation." }],
+        content: [{ type: "text", text: "The client did not provide a valid openai/session, so tasks cannot be resolved for this conversation." }],
       };
     }
     const parent = await bindings.binding({ ownerId, sessionId: session });
     if (!parent) {
       return {
         isError: true,
-        content: [{ type: "text", text: "This conversation is not synced. Call sync_current_thread now. If it reports syncing, finish with get_current_thread_url, then retry list_reviewers." }],
+        content: [{ type: "text", text: "This conversation is not synced. Call sync_current_thread now. If it reports syncing, finish with get_current_thread_url, then retry list_tasks." }],
       };
     }
-    const reviews = await subagentViews(parent.threadId, registry, jobs);
+    const tasks = await subagentViews(parent.threadId, registry, jobs);
     return {
-      content: [{ type: "text", text: reviewerListText(reviews) }],
-      structuredContent: { parentConversationUrl: parent.conversationUrl, reviews },
+      content: [{ type: "text", text: taskListText(tasks) }],
+      structuredContent: { parentConversationUrl: parent.conversationUrl, tasks },
     };
   });
 
-  server.registerTool("review_done", {
-    title: "Review done",
-    description: "Store the complete report for the current reviewer or externally started local agent. For reviewer jobs, the service waits for this reviewer to become idle, then wakes the implementer. External API jobs remain local. End the turn immediately after success. Submit once; cancelled jobs reject late results.",
+  server.registerTool("task_done", {
+    title: "Task done",
+    description: "Store the complete report for the current worker or externally started local agent. For worker jobs, the service waits for this worker to become idle, then wakes the implementer. External API jobs remain local. End the turn immediately after success. Submit once; cancelled jobs reject late results.",
     inputSchema: {
       jobId: z.string().uuid(),
       result: z.string().trim().min(1).max(200_000),
@@ -2251,21 +2239,21 @@ export function registerChatGptAgents(
     if (typeof session !== "string" || !session || session.length > 2048) {
       return {
         isError: true,
-        content: [{ type: "text", text: "The client did not provide a valid openai/session. Sync this reviewer conversation before submitting its result." }],
+        content: [{ type: "text", text: "The client did not provide a valid openai/session. Sync this worker conversation before submitting its result." }],
       };
     }
     const child = await bindings.binding({ ownerId, sessionId: session });
     if (!child) {
       return {
         isError: true,
-        content: [{ type: "text", text: "This reviewer conversation is not synced. Call sync_current_thread now and finish the one-time sync before submitting the result." }],
+        content: [{ type: "text", text: "This worker conversation is not synced. Call sync_current_thread now and finish the one-time sync before submitting the result." }],
       };
     }
     const job = await jobs.job(jobId);
     if (!job || job.childThreadId !== child.threadId) {
       return {
         isError: true,
-        content: [{ type: "text", text: "This review does not belong to the current reviewer conversation." }],
+        content: [{ type: "text", text: "This task does not belong to the current worker conversation." }],
       };
     }
     const completed = await jobs.complete(jobId, result);
@@ -2279,7 +2267,7 @@ export function registerChatGptAgents(
 
   server.registerTool("start_thread", {
     title: "Start thread",
-    description: "Create a new ChatGPT conversation only when the user explicitly requests a new thread. This creates no review job or parent callback. Normal project RALPH settings still apply. Do not use it for automatic delegation. Transport retries of the same request are deduplicated. Inspect uncertain delivery before making a new request.",
+    description: "Create a new ChatGPT conversation only when the user explicitly requests a new thread. This creates no task job or parent callback. Do not use it for automatic delegation. Transport retries of the same request are deduplicated. Inspect uncertain delivery before making a new request.",
     inputSchema: {
       message: z.string().trim().min(1).max(190_000),
       projectUrl: z.string().url().optional().describe("Optional ChatGPT project URL ending in /project."),
@@ -2289,8 +2277,8 @@ export function registerChatGptAgents(
   }, async ({ message, projectUrl }, extra) => {
     const session = extra.mcpReq._meta?.["openai/session"];
     const current = typeof session === "string" ? await bindings.binding({ ownerId, sessionId: session }) : undefined;
-    if (current && await jobs.isReviewer(current.threadId)) {
-      return { isError: true, content: [{ type: "text", text: "Reviewers must complete their review and call review_done." }] };
+    if (current && await jobs.isWorker(current.threadId)) {
+      return { isError: true, content: [{ type: "text", text: "Workers must complete their task and call task_done." }] };
     }
     try {
       const targetUrl = projectUrl ? normalizeSubagentProjectUrl(projectUrl) : "https://chatgpt.com/";
@@ -2370,6 +2358,8 @@ export class SubagentResultController {
   private readonly inFlight = new Set<string>();
   private readonly retryAfter = new Map<string, number>();
   private readonly batchAfter = new Map<string, number>();
+  private readonly inspectionAfter = new Map<string, number>();
+  private readonly idleSince = new Map<string, number>();
   private readonly timer: NodeJS.Timeout;
 
   constructor(
@@ -2378,6 +2368,7 @@ export class SubagentResultController {
     private readonly launchBrowser: () => Promise<void>,
     checkEveryMs = 5_000,
     private readonly batchWindowMs = 1_000,
+    private readonly idleGraceMs = 120_000,
   ) {
     this.timer = setInterval(() => void this.tick(), checkEveryMs);
     this.timer.unref();
@@ -2385,8 +2376,20 @@ export class SubagentResultController {
 
   async tick() {
     if (this.commands.messageCooldownUntil()) return;
-    const jobs = await this.jobs.jobsNeedingNotification();
     const now = Date.now();
+    for (const job of await this.jobs.all()) {
+      if (job.state !== "pending" || !job.childConversationUrl || job.preparationError) continue;
+      if (this.inFlight.has(job.jobId) || (this.inspectionAfter.get(job.jobId) ?? Date.parse(job.createdAt) + this.idleGraceMs) > now) continue;
+      this.inFlight.add(job.jobId);
+      void this.inspectUnreportedWorker(job.jobId, job.childConversationUrl).catch((error: unknown) => {
+        console.error(`[tasks] worker_inspection_failed job=${job.jobId} error=${String(error)}`);
+        this.idleSince.delete(job.jobId);
+      }).finally(() => {
+        this.inspectionAfter.set(job.jobId, Date.now() + 30_000);
+        this.inFlight.delete(job.jobId);
+      });
+    }
+    const jobs = await this.jobs.jobsNeedingNotification();
     for (const parentId of new Set(jobs.map((job) => job.parentThreadId))) {
       if (this.inFlight.has(parentId) || (this.retryAfter.get(parentId) ?? 0) > now) continue;
       this.inFlight.add(parentId);
@@ -2399,6 +2402,27 @@ export class SubagentResultController {
 
   close() {
     clearInterval(this.timer);
+  }
+
+  private async inspectUnreportedWorker(jobId: string, conversationUrl: string) {
+    await this.commands.ensureBrowser("threadMessaging", this.launchBrowser);
+    const inspection = await this.commands.execute({ feature: "threadMessaging", kind: "inspect_thread", conversationUrl });
+    if (!inspection.ok) throw new Error(inspection.error);
+    if (inspection.kind !== "inspect_thread") throw new Error("Unexpected worker inspection result.");
+    if (inspection.result.status !== "idle") {
+      this.idleSince.delete(jobId);
+      return;
+    }
+    const since = this.idleSince.get(jobId);
+    if (since === undefined) {
+      this.idleSince.set(jobId, Date.now());
+      return;
+    }
+    if (Date.now() - since < this.idleGraceMs) return;
+    const current = await this.jobs.job(jobId);
+    if (current?.state !== "pending") return;
+    await this.jobs.complete(jobId, `BLOCKED: worker stopped without calling task_done.\n\nThe service observed this conversation idle for at least ${Math.round(this.idleGraceMs / 1_000)} seconds. No test outcome is confirmed. Inspect the conversation before assigning further work.\n\nWorker: ${conversationUrl}\n\nLast observed response:\n${inspection.result.assistant?.text ?? "No final response."}`);
+    this.idleSince.delete(jobId);
   }
 
   private async check(parentId: string) {
@@ -2414,30 +2438,37 @@ export class SubagentResultController {
     const batchAfter = this.batchAfter.get(parentId) ?? Date.now() + this.batchWindowMs;
     this.batchAfter.set(parentId, batchAfter);
     if (Date.now() < batchAfter || this.commands.messageCooldownUntil()) return;
+    let wakeRequested = false;
     try {
       await this.commands.ensureBrowser("threadMessaging", this.launchBrowser);
       for (const job of ready) {
         if (!job.childConversationUrl) continue;
         const inspection = await this.commands.execute({ feature: "threadMessaging", kind: "inspect_thread", conversationUrl: job.childConversationUrl });
         if (!inspection.ok) throw new Error(inspection.error);
-        if (inspection.kind !== "inspect_thread") throw new Error("Unexpected reviewer inspection result.");
+        if (inspection.kind !== "inspect_thread") throw new Error("Unexpected worker inspection result.");
         if (inspection.result.status !== "idle") {
           this.retryAfter.set(parentId, Date.now() + 30_000);
           return;
         }
       }
+      wakeRequested = true;
       const wake = await this.commands.execute({
         feature: "threadMessaging",
         kind: "send_message",
         targetUrl: ready[0].parentConversationUrl,
-        message: `Review done. Read these local files and continue the parent task:\n${ready.map((job) => `Job ${job.jobId}: ${JSON.stringify(job.resultPath)}`).join("\n")}\nThe files contain the reports. Evaluate the findings, fix confirmed defects, and verify the affected behavior. Reuse this report; request another review only for materially changed code.`,
+        message: `Task done. Read these reports before continuing the parent task:\n${ready.map((job) => `Job ${job.jobId}: ${JSON.stringify(job.resultPath)}`).join("\n")}\nEvaluate the observed results and blockers against your specification. Implement confirmed fixes in the parent. Delegate any further tests or browser checks with a new bounded specification. Reuse this report instead of repeating the completed assignment.`,
       });
       if (!wake.ok) throw new Error(wake.error);
-      if (wake.kind !== "send_message") throw new Error("Reviewer wake-up received the wrong support command result.");
+      if (wake.kind !== "send_message") throw new Error("Worker wake-up received the wrong support command result.");
       await this.jobs.markNotified(ready.map((job) => job.jobId));
       this.retryAfter.delete(parentId);
       this.batchAfter.delete(parentId);
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (wakeRequested) {
+        for (const job of ready) await this.jobs.recordNotificationFailure(job.jobId, message, 1);
+        return;
+      }
       if (this.commands.messageCooldownUntil()) {
         if (error instanceof Error && error.message.startsWith("CHATGPT_RATE_LIMITED:")) {
           for (const job of ready) await this.jobs.recordNotificationFailure(job.jobId, error.message, MAX_SUBAGENT_NOTIFICATION_ATTEMPTS);
@@ -2445,7 +2476,6 @@ export class SubagentResultController {
         this.retryAfter.set(parentId, this.commands.messageCooldownUntil());
         return;
       }
-      const message = error instanceof Error ? error.message : String(error);
       const failures = [];
       for (const job of ready) failures.push(await this.jobs.recordNotificationFailure(job.jobId, message, MAX_SUBAGENT_NOTIFICATION_ATTEMPTS));
       const retryMs = Math.min(

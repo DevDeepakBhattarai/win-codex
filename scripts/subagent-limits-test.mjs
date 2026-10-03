@@ -31,7 +31,7 @@ try {
   await afterRestart.create({ threadId: "replacement-parent", conversationUrl: "https://chatgpt.com/c/replacement-parent" });
   await jobs.assignChild(admitted[0].jobId, { threadId: "child", conversationUrl: "https://chatgpt.com/c/child" });
   await assert.rejects(jobs.create({ threadId: "child", conversationUrl: "https://chatgpt.com/c/child" }), /Only root/);
-  await jobs.complete(admitted[0].jobId, "Review complete");
+  await jobs.complete(admitted[0].jobId, "Task complete");
   const replacement = await jobs.create({ threadId: "parent", conversationUrl: "https://chatgpt.com/c/parent" });
   await jobs.cancel(replacement.jobId);
   await assert.rejects(jobs.complete(replacement.jobId, "Late report"), /cancelled/);
@@ -181,8 +181,8 @@ try {
     registry, batchJobs, { async ensurePrepared() {}, markPrepared() {} }, async () => {}, "grant", "");
   try {
     assert.deepEqual([...handlers.keys()].sort(),
-      ["list_reviewers", "review_done", "send_thread_message", "start_reviewer", "start_thread"],
-      "the ChatGPT-facing API exposes sequential reviews and explicit threads, not generic delegation tools");
+      ["list_tasks", "task_done", "send_thread_message", "start_task", "start_thread"],
+      "the ChatGPT-facing API exposes sequential tasks and explicit threads, not generic delegation tools");
     for (const removed of ["start_subagent", "cancel_subagent", "list_subagents", "submit_subagent_result"]) {
       assert.equal(handlers.has(removed), false, `${removed} stays off the ChatGPT-facing tool surface`);
     }

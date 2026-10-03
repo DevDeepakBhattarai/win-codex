@@ -73,7 +73,7 @@ import {
   ralphThreadCompleteHandler,
   ralphThreadModeHandler,
   ralphThreadsGetHandler,
-  reviewActionHandler,
+  taskActionHandler,
   registerChatGptAgents,
   SUBAGENT_AGENT_INSTRUCTION,
   SubagentResultController,
@@ -131,6 +131,7 @@ const BROWSER_BRIDGE_ENABLED = process.env.BROWSER_BRIDGE_ENABLED !== "false";
 const THREAD_SYNC_ENABLED = process.env.THREAD_SYNC_ENABLED !== "false";
 const THREAD_SYNC_PORT = boundedIntegerEnv("THREAD_SYNC_PORT", 6002, 1, 65535);
 const RALPH_MODEL = process.env.RALPH_MODEL ?? "gpt-5.6-terra";
+const RALPH_ENABLED = process.env.RALPH_ENABLED === "true";
 const RALPH_OPENAI_AUDIT_LOG_PATH = path.resolve(DATA_DIR, "ralph-openai.log");
 const BROWSER_BRIDGE_PORT = boundedIntegerEnv(
   "BROWSER_BRIDGE_PORT",
@@ -2781,7 +2782,7 @@ const threadPreparer = supportCommands && threadSync
 const subagentResultController = supportCommands && subagentJobs
   ? new SubagentResultController(subagentJobs, supportCommands, launchChrome)
   : undefined;
-const ralphController = supportCommands && ralphRegistry
+const ralphController = RALPH_ENABLED && supportCommands && ralphRegistry
   ? new RalphController({
       commands: supportCommands,
       registry: ralphRegistry,
@@ -2835,9 +2836,9 @@ const threadSyncHttpServer = threadSync
         syncApp.put("/chatgpt-support/ralph/settings",
           ralphSettingsPutHandler(ralphRegistry, threadSync.extensionToken));
         syncApp.get("/chatgpt-support/ralph/threads",
-          ralphThreadsGetHandler(ralphRegistry, threadSync.extensionToken, subagentJobs));
+          ralphThreadsGetHandler(ralphRegistry, threadSync.extensionToken, subagentJobs, RALPH_ENABLED));
         if (subagentJobs && supportCommands) {
-          syncApp.put("/chatgpt-support/reviews/:jobId", reviewActionHandler(
+          syncApp.put("/chatgpt-support/tasks/:jobId", taskActionHandler(
             subagentJobs, ralphRegistry, supportCommands, () => launchChrome(), threadSync.extensionToken));
         }
         syncApp.put("/chatgpt-support/ralph/threads/:threadId/complete",
@@ -2885,8 +2886,7 @@ const httpServer = app.listen(PORT, HOST, () => {
   if (threadSync) {
     console.log(`Thread sync endpoint: ${threadSync.bindUrl}`);
     console.log(`Local Codex support extension: ${threadSync.extensionDirectory}`);
-    console.log(`RALPH model: ${RALPH_MODEL}`);
-    console.log(`RALPH OpenAI audit log: ${RALPH_OPENAI_AUDIT_LOG_PATH}`);
+    console.log(`Automatic continuation: ${RALPH_ENABLED ? "enabled" : "disabled"}`);
     console.log(`Thread sync store: ${path.resolve(DATA_DIR, "thread-sync.json")}`);
   }
   console.log(

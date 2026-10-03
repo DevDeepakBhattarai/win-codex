@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import os from "node:os";
@@ -41,15 +41,16 @@ try {
   assert.ok(send.message.includes(payload.prompt));
   assert.ok(send.message.includes(jobId));
   assert.match(send.message, /browser_recording/);
-  assert.match(send.message, /review_done/);
-  assert.doesNotMatch(send.message, /independent reviewer/);
+  assert.match(send.message, /task_done/);
+  assert.doesNotMatch(send.message, /independent worker/);
   assert.equal(await commands.claim("other", ["threadMessaging"], 0), undefined);
   const childUrl = `https://chatgpt.com/c/${randomUUID()}`;
   completeCommand(send, { status: "sent", conversationUrl: childUrl });
-  const prepare = await claim();
-  assert.equal(prepare.kind, "prepare_thread");
-  completeCommand(prepare, { status: "prepared", conversationUrl: childUrl });
-  assert.equal((await request(`/${jobId}`)).body.childConversationUrl, childUrl);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(await commands.claim("extension", ["threadPreparation"], 0), undefined, "a newly created worker reuses its prepared tab");
+  const started = (await request(`/${jobId}`)).body;
+  assert.equal(started.childConversationUrl, childUrl);
+  assert.equal((await readFile(started.specPath, "utf8")).trim(), payload.prompt, "the assignment survives in a local specification file");
   assert.equal((await request("", { ...payload, prompt: "different" })).status, 409);
 
   const second = await request("", { prompt: "Second task", requestId: "second" });
@@ -69,13 +70,34 @@ try {
   commands.complete({ commandId: stop.id, browserId: "extension", kind: "stop_thread", ok: false, error: "Stop not confirmed" });
   assert.equal((await cancelling).status, 409);
   assert.equal((await request(`/${jobId}`)).body.state, "pending");
+  const waiting = fetch(`${url}/${jobId}/wait?timeoutMs=1000`, {
+    headers: { authorization: "Bearer test-token" },
+  });
   await jobs.complete(jobId, "Checkout test passed, with evidence.");
+  const waited = await waiting;
+  assert.equal(waited.status, 200, "a caller waits once for completion instead of asking the model to poll");
+  assert.equal((await waited.json()).result, "Checkout test passed, with evidence.\n");
   assert.equal((await request(`/${jobId}`)).body.result, "Checkout test passed, with evidence.\n");
   await writeFile(path.join(directory, "support-extension-token"), "test-token\n");
   const cli = await promisify(execFile)(process.execPath, ["dist/cli.js", "status", jobId], {
     env: { ...process.env, DATA_DIR: directory, THREAD_SYNC_PORT: String(server.address().port) },
   });
   assert.equal(JSON.parse(cli.stdout).result, "Checkout test passed, with evidence.\n", "CLI reads the local token and retrieves the API report");
+  const runPromise = promisify(execFile)(process.execPath, [path.resolve("dist/cli.js"), "run", "--prompt", "Execute the bounded CLI assignment", "--session", "cli-test"], {
+    cwd: directory,
+    env: { ...process.env, DATA_DIR: directory, THREAD_SYNC_PORT: String(server.address().port) },
+  });
+  const cliSend = await claim();
+  completeCommand(cliSend, { status: "sent", conversationUrl: "https://chatgpt.com/c/44444444-4444-4444-8444-444444444444" });
+  const cliJob = (await request("?session=cli-test")).body.jobs[0];
+  const pendingWait = await request(`/${cliJob.jobId}/wait?timeoutMs=1`);
+  assert.equal(pendingWait.status, 200);
+  assert.equal(pendingWait.body.state, "pending", "bounded waits return pending without restarting an assignment");
+  assert.equal((await request(`/${cliJob.jobId}/wait?timeoutMs=0`)).status, 400);
+  await jobs.complete(cliJob.jobId, "CLI received the worker report");
+  const runResult = await runPromise;
+  assert.equal(JSON.parse(runResult.stdout).result.trim(), "CLI received the worker report", "one CLI process dispatches, waits, and returns the report");
+  assert.match(runResult.stderr, /Resume this wait/);
   await controller.tick();
   await new Promise(resolve => setTimeout(resolve, 30));
   assert.equal(await commands.claim("extension", ["threadMessaging"], 0), undefined, "API results never send a parent message");

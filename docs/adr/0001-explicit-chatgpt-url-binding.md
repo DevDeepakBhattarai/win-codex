@@ -1,5 +1,7 @@
 # ADR 0001: explicit ChatGPT URL binding and support automation
 
+The reviewer workflow and default continuation in this historical decision are superseded by [ADR 0002](0002-bounded-task-delegation.md).
+
 ## Status
 
 Accepted on 2026-08-27. Extended through 2026-09-06 with one-time thread binding, backend-owned thread preparation, file-backed reviewer reports, parent wake-ups, reviewer tracking, readable thread titles, explicit continuous RALPH mode, and single-shot browser delivery.
