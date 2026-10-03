@@ -106,10 +106,10 @@ try {
     registry, toolJobs, { markPrepared() { preparations += 1; } }, async () => {
       await toolBus.claim("browser-launch", ["threadMessaging"], 0);
     }, "grant", "");
-  const owner = { requestId: "review", _meta: { "openai/session": "owner" } };
+  const owner = { mcpReq: { id: "review", _meta: { "openai/session": "owner" } } };
   try {
     assert.deepEqual([...handlers.keys()].sort(), ["list_reviewers", "review_done", "send_thread_message", "start_reviewer", "start_thread"]);
-    assert.equal((await handlers.get("start_reviewer")({ message: "review" }, { requestId: "unsynced" })).isError, true);
+    assert.equal((await handlers.get("start_reviewer")({ message: "review" }, { mcpReq: { id: "unsynced" } })).isError, true);
     const start = handlers.get("start_reviewer")({ message: "Review this PR at exact SHA" }, owner);
     const command = await toolBus.claim("browser", ["threadMessaging"], 1000);
     assert.match(command.message, /read-only/);
@@ -124,8 +124,8 @@ try {
     const listed = await handlers.get("list_reviewers")({}, owner);
     assert.equal(listed.structuredContent.reviews.some(review => review.conversationUrl === child.conversationUrl), true);
     assert.match(listed.content[0].text, new RegExp(child.conversationUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-    assert.equal((await handlers.get("start_reviewer")({ message: "another" }, { ...owner, requestId: "another" })).isError, true);
-    assert.equal((await handlers.get("start_thread")({ message: "nested" }, { _meta: { "openai/session": "child" } })).isError, true);
+    assert.equal((await handlers.get("start_reviewer")({ message: "another" }, { mcpReq: { ...owner.mcpReq, id: "another" } })).isError, true);
+    assert.equal((await handlers.get("start_thread")({ message: "nested" }, { mcpReq: { _meta: { "openai/session": "child" } } })).isError, true);
     assert.equal((await handlers.get("review_done")({ jobId: reviewJob.jobId, result: "report" }, owner)).isError, true, "the parent cannot submit the reviewer's report");
     const ralph = new RalphController({ registry, commands: toolBus, jobs: toolJobs, model: "unused", auditLogPath: path.join(directory, "audit.log"), checkEveryMs: 60_000 });
     try {
@@ -140,7 +140,7 @@ try {
         toolBus.complete({ commandId: pendingCommand.id, browserId: "browser", kind: "inspect_thread", ok: true, result: { status: "running" } });
       }
     } finally { ralph.close(); }
-    const explicit = handlers.get("start_thread")({ message: "Explicit user-requested task" }, { ...owner, requestId: "new-thread" });
+    const explicit = handlers.get("start_thread")({ message: "Explicit user-requested task" }, { mcpReq: { ...owner.mcpReq, id: "new-thread" } });
     const newThread = await toolBus.claim("browser", ["threadMessaging"], 1000);
     assert.equal(newThread.message, "Explicit user-requested task", "explicit threads receive no child transport or review instructions");
     toolBus.complete({ commandId: newThread.id, browserId: "browser", kind: "send_message", ok: true, result: { status: "sent", conversationUrl: "https://chatgpt.com/c/33333333-3333-4333-8333-333333333333" } });

@@ -3,7 +3,7 @@ import { copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promis
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Request, RequestHandler, Response } from "express";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { parseConversationUrl } from "./chatgpt-support.js";
 export { parseConversationUrl } from "./chatgpt-support.js";
@@ -297,7 +297,7 @@ export function registerThreadSync(
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true },
     _meta: threadSyncToolMeta(),
   }, async (_args, extra) => {
-    const session = extra._meta?.["openai/session"];
+    const session = extra.mcpReq._meta?.["openai/session"];
     if (typeof session !== "string" || !session || session.length > 2048) {
       return {
         isError: true,
@@ -326,7 +326,7 @@ export function registerThreadSync(
     outputSchema: { conversationUrl: z.string() },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   }, async (_args, extra) => {
-    const session = extra._meta?.["openai/session"];
+    const session = extra.mcpReq._meta?.["openai/session"];
     if (typeof session !== "string" || !session || session.length > 2048) {
       return {
         isError: true,

@@ -71,6 +71,10 @@ Repeated identical review briefs reuse their saved job across restarts. Include 
 
 ChatGPT authenticates with OAuth 2.0 and PKCE. The server uses stateless MCP HTTP requests, so every `/mcp` request must carry a valid access token.
 
+The server implements [MCP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http) with SDK v2. Each request carries `io.modelcontextprotocol/protocolVersion`, `io.modelcontextprotocol/clientInfo`, and `io.modelcontextprotocol/clientCapabilities` in `params._meta`. HTTP headers mirror the protocol version, method, and tool name. Clients can call tools without initialization. `server/discover` returns server information and instructions. The server creates a fresh MCP server for each request, issues no `Mcp-Session-Id`, and accepts only POST on `/mcp`.
+
+The SDK also accepts stateless requests from supported 2025 clients so existing ChatGPT connectors can keep working. OAuth grants, conversation bindings, and saved task reports are application data. They do not create MCP transport sessions.
+
 ```mermaid
 sequenceDiagram
     autonumber

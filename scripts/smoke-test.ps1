@@ -170,54 +170,47 @@ if (-not $Refresh.refresh_token -or $Refresh.refresh_token -eq $Token.refresh_to
 $Headers = @{
   Authorization = "Bearer $($Refresh.access_token)"
   Accept = 'application/json, text/event-stream'
+  'Mcp-Protocol-Version' = '2026-07-28'
+  'Mcp-Method' = 'server/discover'
 }
 
-$InitializeBody = @{
+$RequestMeta = @{
+  'io.modelcontextprotocol/protocolVersion' = '2026-07-28'
+  'io.modelcontextprotocol/clientInfo' = @{
+    name = 'terminal-smoke-test'
+    version = '0.1.0'
+  }
+  'io.modelcontextprotocol/clientCapabilities' = @{}
+}
+
+$DiscoverBody = @{
   jsonrpc = '2.0'
   id = 1
-  method = 'initialize'
+  method = 'server/discover'
   params = @{
-    protocolVersion = '2025-06-18'
-    capabilities = @{}
-    clientInfo = @{
-      name = 'terminal-smoke-test'
-      version = '0.1.0'
-    }
+    _meta = $RequestMeta
   }
 } | ConvertTo-Json -Depth 10
 
-$InitializeResponse = Invoke-WebRequest `
+$DiscoverResponse = Invoke-WebRequest `
   -UseBasicParsing `
   -Method Post `
   -Uri $McpRequestUrl `
   -Headers $Headers `
   -ContentType 'application/json' `
-  -Body $InitializeBody
+  -Body $DiscoverBody
 
-$RawSessionId = $InitializeResponse.Headers['mcp-session-id']
+$RawSessionId = $DiscoverResponse.Headers['mcp-session-id']
 if ($RawSessionId) {
   throw 'Stateless MCP unexpectedly returned an Mcp-Session-Id header.'
 }
-$Headers['Mcp-Protocol-Version'] = '2025-06-18'
-
-$InitializedBody = @{
-  jsonrpc = '2.0'
-  method = 'notifications/initialized'
-} | ConvertTo-Json -Depth 10
-
-Invoke-WebRequest `
-  -UseBasicParsing `
-  -Method Post `
-  -Uri $McpRequestUrl `
-  -Headers $Headers `
-  -ContentType 'application/json' `
-  -Body $InitializedBody | Out-Null
+$Headers['Mcp-Method'] = 'tools/list'
 
 $ToolsBody = @{
   jsonrpc = '2.0'
   id = 2
   method = 'tools/list'
-  params = @{}
+  params = @{ _meta = $RequestMeta }
 } | ConvertTo-Json -Depth 10
 
 $ToolsResponse = Invoke-WebRequest `
@@ -233,12 +226,15 @@ if (-not ($Tools.result.tools.name -contains 'analyze_image')) {
   throw 'analyze_image tool was not advertised by tools/list.'
 }
 
+$Headers['Mcp-Method'] = 'tools/call'
+$Headers['Mcp-Name'] = 'terminal'
 $CallBody = @{
   jsonrpc = '2.0'
   id = 3
   method = 'tools/call'
   params = @{
     name = 'terminal'
+    _meta = $RequestMeta
     arguments = @{
       command = 'node -e "console.log(''mcp-terminal-ok'')"'
       timeoutMs = 10000
@@ -259,12 +255,14 @@ if ($TerminalResult.stdout -notmatch 'mcp-terminal-ok') {
   throw 'Terminal tool did not return the expected smoke-test output.'
 }
 
+$Headers['Mcp-Name'] = 'start_process'
 $BadProcessBody = @{
   jsonrpc = '2.0'
   id = 4
   method = 'tools/call'
   params = @{
     name = 'start_process'
+    _meta = $RequestMeta
     arguments = @{
       command = 'definitely-not-a-real-executable-mcp-test'
       args = @()
@@ -290,11 +288,13 @@ try {
     method = 'tools/call'
     params = @{
       name = 'analyze_image'
+      _meta = $RequestMeta
       arguments = @{
         path = $ImageFile
       }
     }
   } | ConvertTo-Json -Depth 10
+  $Headers['Mcp-Name'] = 'analyze_image'
   $ImageResponse = Invoke-WebRequest -UseBasicParsing -Method Post -Uri $McpRequestUrl -Headers $Headers -ContentType 'application/json' -Body $ImageBody
   $ImageCall = ConvertFrom-SseJson $ImageResponse.Content
   $ImageContent = $ImageCall.result.content | Where-Object { $_.type -eq 'image' } | Select-Object -First 1
@@ -340,6 +340,8 @@ if (-not $RefreshRevoked) {
 }
 
 $AccessRevoked = $false
+$Headers['Mcp-Method'] = 'server/discover'
+$Headers.Remove('Mcp-Name')
 try {
   Invoke-WebRequest `
     -UseBasicParsing `
@@ -347,7 +349,7 @@ try {
     -Uri $McpRequestUrl `
     -Headers $Headers `
     -ContentType 'application/json' `
-    -Body $InitializeBody | Out-Null
+    -Body $DiscoverBody | Out-Null
 } catch {
   if ($_.Exception.Response -and [int] $_.Exception.Response.StatusCode -eq 401) {
     $AccessRevoked = $true

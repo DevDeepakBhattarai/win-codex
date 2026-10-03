@@ -168,6 +168,25 @@ async function postMcp(body, accessToken, extraHeaders = {}) {
   };
 }
 
+function postModernMcp(body, accessToken, extraHeaders = {}) {
+  return postMcp({
+    ...body,
+    params: {
+      ...body.params,
+      _meta: {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": { name: "stateless-test", version: "1.0.0" },
+        "io.modelcontextprotocol/clientCapabilities": {},
+      },
+    },
+  }, accessToken, {
+    "mcp-protocol-version": "2026-07-28",
+    "mcp-method": body.method,
+    ...(body.method === "tools/call" ? { "mcp-name": body.params.name } : {}),
+    ...extraHeaders,
+  });
+}
+
 function parseMcpPayload(responseText) {
   const dataLine = responseText.split(/\r?\n/).find(line => line.startsWith("data: "));
   return JSON.parse(dataLine ? dataLine.slice(6) : responseText);
@@ -236,7 +255,7 @@ try {
       "access-control-request-method": "POST",
     },
   });
-  if (corsResponse.headers.has("access-control-allow-origin")) {
+  if (corsResponse.status !== 403 || corsResponse.headers.has("access-control-allow-origin")) {
     throw new Error("Untrusted CORS origin was allowed.");
   }
 
@@ -332,6 +351,68 @@ try {
   if (tokenResponse.status !== 200 || !token.access_token || !token.refresh_token) {
     throw new Error(`Token exchange failed: ${tokenResponse.status} ${JSON.stringify(token)}`);
   }
+
+  // Execute before either discovery or a legacy initialize. A new client needs no handshake.
+  const directCallBody = {
+    jsonrpc: "2.0", id: "direct-call", method: "tools/call",
+    params: { name: "terminal", arguments: {
+      command: "node -e \"console.log('mcp-direct-stateless-ok')\"", timeoutMs: 10000,
+    } },
+  };
+  const directCall = await postModernMcp(directCallBody, token.access_token);
+  const directPayload = parseMcpPayload(directCall.responseText);
+  if (directCall.status !== 200 || directCall.sessionId !== null ||
+      directPayload.result?.isError || !directCall.responseText.includes("mcp-direct-stateless-ok")) {
+    throw new Error(`Tool call without initialization failed: ${JSON.stringify(directCall)}`);
+  }
+
+  const discovered = await postModernMcp({ jsonrpc: "2.0", id: "discover", method: "server/discover" }, token.access_token);
+  const discovery = parseMcpPayload(discovered.responseText);
+  if (discovered.status !== 200 || discovered.sessionId !== null ||
+      !discovery.result?.supportedVersions.includes("2026-07-28") ||
+      !discovery.result?.instructions.includes("Start each tab exactly once")) {
+    throw new Error(`Modern discovery failed: ${JSON.stringify(discovered)}`);
+  }
+
+  const modernListBody = { jsonrpc: "2.0", id: "modern-list", method: "tools/list" };
+  for (const headers of [
+    { "mcp-method": "tools/call" },
+    { "mcp-protocol-version": "2025-06-18" },
+  ]) {
+    const rejected = await postModernMcp(modernListBody, token.access_token, headers);
+    const payload = parseMcpPayload(rejected.responseText);
+    if (rejected.status !== 400 || payload.error?.code !== -32020) {
+      throw new Error(`Mismatched request headers were accepted: ${JSON.stringify(rejected)}`);
+    }
+  }
+  const wrongToolName = await postModernMcp(directCallBody, token.access_token, { "mcp-name": "analyze_image" });
+  if (wrongToolName.status !== 400 || parseMcpPayload(wrongToolName.responseText).error?.code !== -32020) {
+    throw new Error(`Mismatched tool name was accepted: ${JSON.stringify(wrongToolName)}`);
+  }
+  const unsupported = await postMcp({
+    ...modernListBody,
+    params: { _meta: {
+      "io.modelcontextprotocol/protocolVersion": "2099-01-01",
+      "io.modelcontextprotocol/clientInfo": { name: "stateless-test", version: "1.0.0" },
+      "io.modelcontextprotocol/clientCapabilities": {},
+    } },
+  }, token.access_token, { "mcp-protocol-version": "2099-01-01", "mcp-method": "tools/list" });
+  if (unsupported.status !== 400 ||
+      !parseMcpPayload(unsupported.responseText).error?.data?.supported?.includes("2026-07-28")) {
+    throw new Error(`Unsupported protocol did not advertise supported versions: ${JSON.stringify(unsupported)}`);
+  }
+  for (const method of ["GET", "DELETE"]) {
+    const rejected = await fetch(mcpUrl, { method, headers: { authorization: `Bearer ${token.access_token}` } });
+    if (rejected.status !== 405 || rejected.headers.get("allow") !== "POST" || rejected.headers.has("mcp-session-id")) {
+      throw new Error(`Session operation was accepted: ${method} ${rejected.status}`);
+    }
+  }
+  const modernUnauthenticated = await postModernMcp(modernListBody);
+  if (modernUnauthenticated.status !== 401) throw new Error("Modern MCP bypassed OAuth.");
+  const forbiddenOrigin = await postModernMcp(modernListBody, token.access_token, { origin: "https://evil.example" });
+  if (forbiddenOrigin.status !== 403) throw new Error("An untrusted Origin accessed modern MCP with a token.");
+  const allowedOrigin = await postModernMcp(modernListBody, token.access_token, { origin: "https://chatgpt.com" });
+  if (allowedOrigin.status !== 200) throw new Error(`ChatGPT Origin was rejected: ${JSON.stringify(allowedOrigin)}`);
 
   const initialized = await postMcp(initializeBody, token.access_token);
   if (initialized.status !== 200) {
@@ -451,11 +532,7 @@ try {
   for (let offset = 0; offset < requestCount; offset += 25) {
     const batch = await Promise.all(
       Array.from({ length: Math.min(25, requestCount - offset) }, (_, index) =>
-        postMcp(
-          { ...toolsListBody, id: 1000 + offset + index },
-          token.access_token,
-          protocolHeaders,
-        ),
+        postModernMcp({ ...modernListBody, id: 1000 + offset + index }, token.access_token),
       ),
     );
     const failures = batch.filter(result => result.status !== 200 || result.sessionId !== null);
@@ -481,6 +558,8 @@ try {
   if (afterRevocation.status !== 401) {
     throw new Error(`Revoked grant still accessed MCP: ${JSON.stringify(afterRevocation)}`);
   }
+  const modernRevoked = await postModernMcp(modernListBody, token.access_token);
+  if (modernRevoked.status !== 401) throw new Error("Revoked grant still accessed modern MCP.");
 
   console.log(JSON.stringify({
     transportMode: health.transportMode,
@@ -491,6 +570,11 @@ try {
     unauthenticatedRejected: noToken.status === 401,
     malformedTokenRejected: badToken.status === 401,
     authenticatedInitializeSucceeded: initialized.status === 200,
+    protocolVersion: "2026-07-28",
+    directToolCallWithoutInitializationSucceeded: directCall.status === 200,
+    modernDiscoverySucceeded: discovered.status === 200,
+    metadataMismatchRejected: true,
+    sessionOperationsRejected: true,
     sessionIdIssued: initialized.sessionId !== null,
     authenticatedToolsListSucceeded: toolsList.status === 200,
     hostPlatformAdvertised: health.platform === process.platform,

@@ -3,8 +3,7 @@ import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises
 import path from "node:path";
 
 import type { Request, RequestHandler, Response } from "express";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { McpServer, CallToolResult } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { SubagentAdmissionError, SubagentJobRegistry } from "./subagent-jobs.js";
 
@@ -2127,7 +2126,7 @@ export function registerChatGptAgents(
     _meta: subagentToolMeta,
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   }, async ({ message }, extra) => {
-    const session = extra._meta?.["openai/session"];
+    const session = extra.mcpReq._meta?.["openai/session"];
     if (typeof session !== "string" || !session || session.length > 2048) {
       return {
         isError: true,
@@ -2145,7 +2144,7 @@ export function registerChatGptAgents(
     const fingerprint = createHash("sha256")
       .update(message.trim())
       .digest("base64url");
-    const replayKey = `start_reviewer:${ownerId}:${session}:${String(extra.requestId)}:${fingerprint}`;
+    const replayKey = `start_reviewer:${ownerId}:${session}:${String(extra.mcpReq.id)}:${fingerprint}`;
     return await replayToolRequest(replayKey, async () => {
       let job: Awaited<ReturnType<SubagentJobRegistry["create"]>>;
       try {
@@ -2214,7 +2213,7 @@ export function registerChatGptAgents(
     _meta: subagentToolMeta,
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   }, async (_input, extra) => {
-    const session = extra._meta?.["openai/session"];
+    const session = extra.mcpReq._meta?.["openai/session"];
     if (typeof session !== "string" || !session || session.length > 2048) {
       return {
         isError: true,
@@ -2248,7 +2247,7 @@ export function registerChatGptAgents(
     },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   }, async ({ jobId, result }, extra) => {
-    const session = extra._meta?.["openai/session"];
+    const session = extra.mcpReq._meta?.["openai/session"];
     if (typeof session !== "string" || !session || session.length > 2048) {
       return {
         isError: true,
@@ -2288,7 +2287,7 @@ export function registerChatGptAgents(
     outputSchema: { conversationUrl: z.string().url() },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   }, async ({ message, projectUrl }, extra) => {
-    const session = extra._meta?.["openai/session"];
+    const session = extra.mcpReq._meta?.["openai/session"];
     const current = typeof session === "string" ? await bindings.binding({ ownerId, sessionId: session }) : undefined;
     if (current && await jobs.isReviewer(current.threadId)) {
       return { isError: true, content: [{ type: "text", text: "Reviewers must complete their review and call review_done." }] };
@@ -2296,7 +2295,7 @@ export function registerChatGptAgents(
     try {
       const targetUrl = projectUrl ? normalizeSubagentProjectUrl(projectUrl) : "https://chatgpt.com/";
       const fingerprint = createHash("sha256").update(targetUrl).update("\0").update(message).digest("base64url");
-      return await replayToolRequest(`start_thread:${ownerId}:${String(session)}:${String(extra.requestId)}:${fingerprint}`, async () => {
+      return await replayToolRequest(`start_thread:${ownerId}:${String(session)}:${String(extra.mcpReq.id)}:${fingerprint}`, async () => {
         await commands.ensureBrowser("threadMessaging", launchBrowser);
         const result = await commands.execute({ feature: "threadMessaging", kind: "send_message", targetUrl, message });
         if (!result.ok) throw new Error(result.error);
@@ -2335,10 +2334,10 @@ export function registerChatGptAgents(
       .update("\0")
       .update(message)
       .digest("base64url");
-    const session = typeof extra._meta?.["openai/session"] === "string"
-      ? extra._meta["openai/session"]
+    const session = typeof extra.mcpReq._meta?.["openai/session"] === "string"
+      ? extra.mcpReq._meta["openai/session"]
       : "";
-    const replayKey = `send_thread_message:${ownerId}:${session}:${String(extra.requestId)}:${fingerprint}`;
+    const replayKey = `send_thread_message:${ownerId}:${session}:${String(extra.mcpReq.id)}:${fingerprint}`;
     return await replayToolRequest(replayKey, async (): Promise<CallToolResult> => {
       try {
         await commands.ensureBrowser("threadMessaging", launchBrowser);

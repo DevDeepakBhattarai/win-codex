@@ -34,9 +34,13 @@ import {
 } from "jose";
 import { z } from "zod";
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
+import {
+  createMcpHandler,
+  McpServer,
+  SUPPORTED_PROTOCOL_VERSIONS,
+  type AuthInfo,
+} from "@modelcontextprotocol/server";
+import { toNodeHandler } from "@modelcontextprotocol/node";
 
 import {
   createTerminalInvocation,
@@ -289,6 +293,17 @@ app.use((req, res, next) => {
   }
   next();
 });
+app.use("/mcp", (req, res, next) => {
+  const origin = req.header("origin");
+  if (origin && !CORS_ALLOWED_ORIGINS.has(origin)) {
+    return res.status(403).json({
+      jsonrpc: "2.0",
+      error: { code: -32000, message: "Origin is not allowed." },
+      id: null,
+    });
+  }
+  next();
+});
 app.use(
   cors({
     origin(origin, callback) {
@@ -303,7 +318,8 @@ app.use(
       "Content-Type",
       "Authorization",
       "Mcp-Protocol-Version",
-      "Mcp-Session-Id",
+      "Mcp-Method",
+      "Mcp-Name",
     ],
     methods: ["GET", "POST", "DELETE", "OPTIONS"],
     maxAge: 600,
@@ -337,6 +353,7 @@ app.get("/health", (_req, res) => {
     mcp: MCP_PUBLIC_URL,
     issuer: AUTH_ISSUER,
     transportMode: "stateless",
+    protocolVersions: SUPPORTED_PROTOCOL_VERSIONS,
     authentication: "oauth2-bearer",
     platform: HOST_PLATFORM,
     platformName: HOST_PLATFORM_NAME,
@@ -738,25 +755,15 @@ app.post("/oauth/revoke", revokeRateLimit, async (req, res) => {
   return res.status(200).send("");
 });
 
+const mcpHandler = createMcpHandler(({ authInfo }) => {
+  const grantId = authInfo?.extra?.grantId;
+  if (typeof grantId !== "string") throw new Error("Verified OAuth grant required.");
+  return createMcpServer(grantId);
+});
+const handleMcpRequest = toNodeHandler(mcpHandler);
+
 app.post("/mcp", requireOAuth, async (req: AuthedRequest, res: Response) => {
-  if (!req.authContext) return unauthorized(res);
-  const server = createMcpServer(req.authContext.grantId);
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined,
-  });
-
-  let cleanupStarted = false;
-  const cleanup = () => {
-    if (cleanupStarted) return;
-    cleanupStarted = true;
-    void Promise.allSettled([transport.close(), server.close()]);
-  };
-
-  res.once("finish", cleanup);
-  res.once("close", cleanup);
-
-  await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
+  await handleMcpRequest(req, res, req.body);
 });
 
 app.get("/mcp", requireOAuth, (_req: AuthedRequest, res: Response) => {
@@ -2904,13 +2911,14 @@ async function shutdown(signal: string) {
   forcedExit.unref();
 
   const browserClosed = browserService?.close();
+  const mcpClosed = mcpHandler.close();
   ralphController?.close();
   threadTabCleanupController?.close();
   subagentResultController?.close();
   supportCommands?.close();
 
   try {
-    await Promise.all([browserClosed, ...[httpServer, threadSyncHttpServer].filter(server => server !== undefined).map(server =>
+    await Promise.all([browserClosed, mcpClosed, ...[httpServer, threadSyncHttpServer].filter(server => server !== undefined).map(server =>
       new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())),
     )]);
     clearTimeout(forcedExit);
