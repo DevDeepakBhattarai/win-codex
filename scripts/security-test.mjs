@@ -215,6 +215,7 @@ try {
   if (
     healthResponse.status !== 200 ||
     health.transportMode !== "stateless" ||
+    !health.protocolVersions?.includes("2026-07-28") ||
     health.authentication !== "oauth2-bearer" ||
     health.platform !== process.platform ||
     health.platformName !== formatPlatformName(process.platform)

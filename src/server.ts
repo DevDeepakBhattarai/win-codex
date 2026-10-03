@@ -354,7 +354,7 @@ app.get("/health", (_req, res) => {
     mcp: MCP_PUBLIC_URL,
     issuer: AUTH_ISSUER,
     transportMode: "stateless",
-    protocolVersions: SUPPORTED_PROTOCOL_VERSIONS,
+    protocolVersions: ["2026-07-28", ...SUPPORTED_PROTOCOL_VERSIONS],
     authentication: "oauth2-bearer",
     platform: HOST_PLATFORM,
     platformName: HOST_PLATFORM_NAME,
