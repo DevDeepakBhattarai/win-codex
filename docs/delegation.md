@@ -36,4 +36,6 @@ If the connection failed before a job ID arrived, repeat the same specification,
 
 A failed or uncertain startup returns `preparationError` and a nonzero CLI exit code. Inspect the saved job and worker before another assignment. The Support extension retains operator cancellation for abandoned jobs. A worker that stays idle without publishing a report receives a service-generated BLOCKED report.
 
+A recovery wait returns a definite pre-send startup failure. It continues waiting after an uncertain send because the existing worker may still publish its report.
+
 Remote callers need their own authenticated connection to this machine's loopback API. The CLI does not provide remote transport.

@@ -1948,19 +1948,29 @@ type AgentServices = {
 
 export async function startSubagentJob(job: SubagentJob, message: string,
   { commands, registry, jobs, preparer, launchBrowser }: AgentServices & { preparer: ThreadPreparationCoordinator }) {
-  const { subagentProjectUrl } = await registry.settings();
-  await commands.ensureBrowser("threadMessaging", launchBrowser);
-  const result = await commands.execute({
-    feature: "threadMessaging", kind: "send_message", targetUrl: subagentProjectUrl ?? "https://chatgpt.com/",
-    message: agentPrompt(message, job.jobId, job.resultPath),
-    ...(!subagentProjectUrl ? { connectorName: process.env.CHATGPT_WORKER_CONNECTOR_NAME ?? "Codex" } : {}),
-  });
-  if (!result.ok) throw new Error(result.error);
-  if (result.kind !== "send_message") throw new Error("Sub-agent creation received the wrong support command result.");
-  const child = parseConversationUrl(result.result.conversationUrl);
-  await jobs.assignChild(job.jobId, { ...child, title: result.result.title });
-  await registry.register(child.conversationUrl, { agentCreated: true, parentThreadId: job.parentThreadId, title: result.result.title });
-  preparer.markPrepared(child.conversationUrl);
+  let deliveryUncertain = false;
+  try {
+    const { subagentProjectUrl } = await registry.settings();
+    await commands.ensureBrowser("threadMessaging", launchBrowser);
+    deliveryUncertain = true;
+    const result = await commands.execute({
+      feature: "threadMessaging", kind: "send_message", targetUrl: subagentProjectUrl ?? "https://chatgpt.com/",
+      message: agentPrompt(message, job.jobId, job.resultPath),
+      ...(!subagentProjectUrl ? { connectorName: process.env.CHATGPT_WORKER_CONNECTOR_NAME ?? "Codex" } : {}),
+    });
+    if (!result.ok) {
+      if (result.error.endsWith("The task was not sent.")) deliveryUncertain = false;
+      throw new Error(result.error);
+    }
+    if (result.kind !== "send_message") throw new Error("Sub-agent creation received the wrong support command result.");
+    const child = parseConversationUrl(result.result.conversationUrl);
+    await jobs.assignChild(job.jobId, { ...child, title: result.result.title });
+    await registry.register(child.conversationUrl, { agentCreated: true, parentThreadId: job.parentThreadId, title: result.result.title });
+    preparer.markPrepared(child.conversationUrl);
+  } catch (error) {
+    await jobs.recordPreparationFailure(job.jobId, error instanceof Error ? error.message : String(error), deliveryUncertain);
+    throw error;
+  }
 }
 
 export function registerChatGptAgents(

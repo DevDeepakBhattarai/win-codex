@@ -82,9 +82,7 @@ export function createAgentApi(input: {
 		}
 		if (job.state === "pending" && !job.childThreadId && !job.preparationError && !starting.has(job.jobId)) {
 			starting.add(job.jobId);
-			void startSubagentJob(job, prompt, input).catch(async (error: unknown) => {
-				await input.jobs.recordPreparationFailure(job.jobId, error instanceof Error ? error.message : String(error));
-			}).catch((error: unknown) => console.error("[agents] Could not persist startup failure:", error))
+			void startSubagentJob(job, prompt, input).catch((error: unknown) => console.error("[agents] Worker startup failed:", error))
 				.finally(() => starting.delete(job.jobId));
 		}
 		await wait(job.jobId, res, true);

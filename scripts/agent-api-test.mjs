@@ -15,12 +15,14 @@ const directory = await mkdtemp(path.join(os.tmpdir(), "agent-api-test-"));
 const jobs = await SubagentJobRegistry.open(directory);
 const registry = await RalphRegistry.open(directory);
 const commands = new SupportCommandBus(undefined, undefined, 0);
+let browserLaunch;
 const preparer = new ThreadPreparationCoordinator(commands, { hasThread: async () => true }, async () => {});
 const app = express();
 app.use(express.json());
 const requests = [];
 app.use("/agents", (req, _res, next) => { requests.push({ method: req.method, url: req.url, session: req.body?.session }); next(); });
-app.use("/agents", createAgentApi({ token: "test-token", jobs, registry, commands, preparer, dataDirectory: directory, launchBrowser: async () => {} }));
+app.use("/agents", createAgentApi({ token: "test-token", jobs, registry, commands, preparer, dataDirectory: directory,
+	launchBrowser: async () => { await browserLaunch; } }));
 const server = await new Promise(resolve => { const listening = app.listen(0, "127.0.0.1", () => resolve(listening)); });
 const url = `http://127.0.0.1:${server.address().port}/agents`;
 const headers = { authorization: "Bearer test-token", "content-type": "application/json" };
@@ -39,6 +41,24 @@ try {
 	assert.equal((await request("", { prompt: "x", requestId: "origin" }, { origin: "https://example.com" })).status, 401);
 	assert.equal((await request("", { prompt: " ", requestId: "blank" })).status, 400);
 	assert.equal((await request("", { prompt: "Missing retry ID" })).status, 400);
+	let rejectLaunch;
+	browserLaunch = new Promise((_resolve, reject) => { rejectLaunch = reject; });
+	const startupConnection = new AbortController();
+	const startup = await request("", { prompt: "Unavailable browser", session: "startup", requestId: "no-browser" }, {}, startupConnection.signal);
+	const startupId = startup.headers.get("x-job-id");
+	const startupAborted = assert.rejects(startup.json());
+	startupConnection.abort();
+	await startupAborted;
+	const startupRecovery = await request(`/${startupId}/wait`);
+	rejectLaunch(new Error("browser unavailable before send"));
+	const startupFailure = await startupRecovery.json();
+	assert.match(startupFailure.preparationError, /browser unavailable before send/);
+	assert.equal(startupFailure.deliveryUncertain, false, "definite startup failure releases a recovery wait");
+	assert.equal(startupFailure.childThreadId, undefined);
+	assert.equal((await (await request(`/${startupId}/wait`)).json()).deliveryUncertain, false,
+		"recovery also returns an already saved pre-send failure");
+	await jobs.cancel(startupId);
+	browserLaunch = undefined;
 	const payload = { prompt: "Test the checkout form at http://localhost:3000", requestId: "first" };
 	const starts = await Promise.all([request("", payload), request("", payload)]);
 	assert.equal(starts[0].status, 200);
@@ -71,6 +91,15 @@ try {
 	assert.deepEqual(results[0].screenshots, [path.join(evidenceDirectory, "checkout.png")]);
 	assert.deepEqual(results[0].videos, []);
 	assert.equal((await request("", { ...payload, prompt: "different" })).status, 409);
+	const unsent = await request("", { prompt: "Attachment failed", session: "unsent", requestId: "attachment" });
+	const unsentCommand = await claim();
+	commands.complete({ commandId: unsentCommand.id, browserId: "extension", kind: "send_message", ok: false,
+		error: 'ChatGPT did not attach connector "Codex". The task was not sent.' });
+	const unsentJob = await unsent.json();
+	assert.equal(unsentJob.deliveryUncertain, false);
+	assert.equal((await (await request(`/${unsentJob.jobId}/wait`)).json()).deliveryUncertain, false,
+		"an executor-confirmed unsent assignment cannot leave recovery waiting for a nonexistent worker");
+	await jobs.cancel(unsentJob.jobId);
 
 	const failedPayload = { prompt: "Worker startup failure", requestId: "failed" };
 	const failed = await request("", failedPayload);
@@ -123,7 +152,7 @@ try {
 	assert.equal(JSON.parse(runResult.stdout).result.trim(), "CLI received its report through one held request");
 	assert.match(runResult.stderr, /Recover an interrupted connection/);
 	assert.equal(requests.filter(req => req.session === "cli-test").length, 1);
-	assert.equal(requests.filter(req => req.url.includes("/wait")).length, 2, "only explicit recovery requests use wait");
+	assert.equal(requests.filter(req => req.url.includes("/wait")).length, 5, "only explicit recovery requests use wait");
 	const status = await promisify(execFile)(process.execPath, [cli, "status", cliJob.jobId], {
 		env: { ...process.env, DATA_DIR: directory, THREAD_SYNC_PORT: String(server.address().port) },
 	});

@@ -35,6 +35,7 @@ const subagentJobSchema = z.object({
   createdAt: z.string(),
   completedAt: z.string().optional(),
   preparationError: z.string().optional(),
+  deliveryUncertain: z.boolean().optional(),
 });
 
 const subagentStoreSchema = z.object({
@@ -219,6 +220,7 @@ export class SubagentJobRegistry {
       target.state = "complete";
       target.completedAt = new Date().toISOString();
       target.preparationError = undefined;
+      target.deliveryUncertain = undefined;
       await this.persist(next);
       this.state = next;
       this.changes.emit("change");
@@ -228,12 +230,13 @@ export class SubagentJobRegistry {
     return operation;
   }
 
-  async recordPreparationFailure(jobId: string, error: string) {
+  async recordPreparationFailure(jobId: string, error: string, deliveryUncertain = true) {
     return await this.update((state) => {
       const job = state.jobs.find((entry) => entry.jobId === jobId);
       if (!job) throw new Error("Task job not found.");
       if (job.state !== "pending") return { ...job };
       job.preparationError = error.slice(0, 1_000);
+      job.deliveryUncertain = deliveryUncertain;
       return { ...job };
     });
   }
@@ -271,7 +274,8 @@ export class SubagentJobRegistry {
       };
       const changed = () => {
         const job = this.state.jobs.find((entry) => entry.jobId === jobId);
-        if (!job || job.state !== "pending" || returnStartupFailure && job.preparationError) finish();
+        if (!job || job.state !== "pending" || job.preparationError &&
+            (returnStartupFailure || job.deliveryUncertain === false)) finish();
       };
       const aborted = () => finish(signal.reason ?? new Error("Wait cancelled."));
       this.changes.on("change", changed);

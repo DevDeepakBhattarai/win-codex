@@ -23,6 +23,8 @@ Each session has at most two pending assignments. Capacity returns 429. Malforme
 
 A job has `jobId`, `state`, `resultPath`, `createdAt`, and `parentThreadId`. New assignments have `specPath`. Local parents use `api:SESSION`. Confirmed startup adds `childThreadId` and `childConversationUrl`. Failed or uncertain startup sets `preparationError`. Interrupted startup remains reserved across restarts and is never resent automatically.
 
+`deliveryUncertain` is false when startup failed before dispatch or the executor confirmed that it did not send the task. A recovery wait returns that saved failure. Unknown delivery remains reserved, and recovery waits for a report or operator cancellation.
+
 `state` is `pending`, `complete`, or `cancelled`. Result responses add `result`, `videos`, and `screenshots`. `result` is null until completion. The worker publishes a nonempty report of at most 200000 characters by renaming its temporary file to `resultPath`. The service watches the directory and persists completion. Startup scans collect reports published while the service was stopped. An idle worker without a report receives a service-generated BLOCKED report.
 
 Complete means that a report is available, not that checks passed. No parent notification or callback is sent. Cancellation is an operator action in the Support extension. The computer MCP connector rejects clients that identify themselves as Codex.
