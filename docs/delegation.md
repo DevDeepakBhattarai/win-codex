@@ -2,7 +2,7 @@
 
 Use delegation for a review, browser work, or application testing. For a large task, you may delegate a small, independent assignment. Keep planning and implementation in the parent. Run diagnosis, reproduction, and evidence collection in the parent unless the user assigns them to a worker.
 
-In Codex, use the installed local CLI or HTTP API. Use this server's computer connector only from ChatGPT.
+In Codex, use the installed local CLI or HTTP API. Never call this server's computer connector or its MCP tools from Codex, even if those tools are available. The connector's ChatGPT display name is `Codex`. Use native Codex tools for parent work. Only ChatGPT workers use the computer connector.
 
 ## Write and run the assignment
 

@@ -1,3 +1,3 @@
 # Claude instructions
 
-Follow [AGENTS.md](AGENTS.md). Use [the local delegation workflow](docs/delegation.md) for reviews, browser work, application testing, or bounded parts of large tasks. The CLI waits for a report in one request. Keep the parent turn active until the command returns.
+Follow [AGENTS.md](AGENTS.md) for delegation scope, the blocking CLI command, and completion handling. Local agents use the CLI or HTTP API. This server's computer connector and MCP tools belong only to ChatGPT workers. Keep the parent turn active until the command returns.

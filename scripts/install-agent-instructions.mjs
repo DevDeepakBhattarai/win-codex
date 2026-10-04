@@ -5,9 +5,10 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workflow = path.join(root, "docs", "delegation.md").replaceAll("\\", "/");
+const agentInstructions = path.join(root, "AGENTS.md").replaceAll("\\", "/");
 const marker = "<!-- local-codex-delegation -->";
 const endMarker = "<!-- /local-codex-delegation -->";
-const instruction = `${marker}\nFor reviews, browser work, or application testing, read [the local ChatGPT delegation workflow](${workflow}) and run the blocking local CLI. Large tasks may delegate bounded independent assignments. Keep planning, implementation, diagnosis, reproduction, and evidence collection in the parent unless the user assigns them to a worker. Keep the parent turn active while the command waits. Use the computer connector only in ChatGPT, not Codex. Assigned ChatGPT workers execute their specification and publish the report through the supplied temporary file and rename.\n${endMarker}`;
+const instruction = `${marker}\nIn Codex, never call the local computer connector or its MCP tools, even if available. Its ChatGPT display name is \`Codex\`. Use native Codex tools for parent work. Only ChatGPT workers use this connector.\n\nFor reviews, browser work, application testing, or bounded independent assignments in a large task, follow [the agent instructions](${agentInstructions}) and [the local delegation workflow](${workflow}). Use the blocking local CLI or HTTP API. Keep planning, implementation, diagnosis, reproduction, and evidence collection in the parent unless the user assigns them to a worker. Keep the parent turn active until the command returns. If the shell runner yields, wait on that same command. Read the complete report before continuing. Do not poll task status or schedule wake-ups. Assigned ChatGPT workers publish their complete report through the supplied temporary file and rename.\n${endMarker}`;
 const backupDirectory = path.join(root, ".data", "instruction-backups");
 await mkdir(backupDirectory, { recursive: true });
 for (const [directory, name] of [[".codex", "AGENTS.md"], [".claude", "CLAUDE.md"]]) {
