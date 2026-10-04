@@ -1,29 +1,21 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { copyFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { watch, type FSWatcher } from "node:fs";
+import { copyFile, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { z } from "zod";
 
 const MAX_JOBS = 2_000;
-const RETAINED_NOTIFIED_JOBS = 1_000;
+const RETAINED_COMPLETED_JOBS = 1_000;
 export const MAX_ACTIVE_SUBAGENTS_PER_PARENT = 2;
-const MAX_ACTIVE_TASKS_PER_PARENT = 1;
 const INTERRUPTED_STARTUP_ERROR = "Task startup was interrupted by a service restart. Inspect the browser, stop any running worker, then cancel this job if it is abandoned.";
 
 export class SubagentAdmissionError extends Error {
-  constructor(
-    readonly reason: "capacity" | "nested",
-    readonly activeJobIds: string[] = [],
-    readonly kind: "agent" | "task" = "agent",
-  ) {
+  constructor(readonly reason: "capacity" | "nested", readonly activeJobIds: string[] = []) {
     super(reason === "nested"
-      ? kind === "task"
-        ? "A worker conversation cannot start another task. Complete this assignment and call task_done."
-        : "Only root conversations can start sub-agents. Complete your assigned work and submit its result."
-      : kind === "task"
-        ? `This parent already has an unfinished task. Tasks: ${activeJobIds.join(", ")}. End this turn and wait for the completion notice. Do not retry or poll.`
-        : `This parent already has two active tasks. Active jobs: ${activeJobIds.join(", ")}. Wait for a result notification. Do not retry or poll for capacity.`);
+      ? "Only root conversations can delegate. Execute the assignment and publish its report."
+      : `This parent already has two active assignments: ${activeJobIds.join(", ")}. Wait for a report before another assignment.`);
   }
 }
 
@@ -38,16 +30,12 @@ const subagentJobSchema = z.object({
   title: z.string().optional(),
   resultPath: z.string(),
   specPath: z.string().optional(),
-  taskFingerprint: z.string().optional(),
   state: z.enum(["pending", "complete", "cancelled"]),
   cancelledAt: z.string().optional(),
   createdAt: z.string(),
   completedAt: z.string().optional(),
-  notifiedAt: z.string().optional(),
-  notificationAttempts: z.number().int().nonnegative().default(0),
-  notificationAbandonedAt: z.string().optional(),
-  notificationError: z.string().optional(),
   preparationError: z.string().optional(),
+  deliveryUncertain: z.boolean().optional(),
 });
 
 const subagentStoreSchema = z.object({
@@ -61,6 +49,7 @@ type SubagentStore = z.infer<typeof subagentStoreSchema>;
 export class SubagentJobRegistry {
   private queue: Promise<unknown> = Promise.resolve();
   private readonly changes = new EventEmitter().setMaxListeners(MAX_JOBS);
+  private watcher?: FSWatcher;
 
   private constructor(
     private readonly filePath: string,
@@ -69,8 +58,9 @@ export class SubagentJobRegistry {
   ) {}
 
   static async open(dataDirectory: string) {
-    const resultDirectory = path.resolve(dataDirectory, "tasks");
-    await mkdir(resultDirectory, { recursive: true });
+    await mkdir(path.resolve(dataDirectory, "tasks"), { recursive: true });
+    // Windows temporary paths can contain an 8.3 alias. libuv needs the real path.
+    const resultDirectory = await realpath(path.resolve(dataDirectory, "tasks"));
     const filePath = path.join(resultDirectory, "jobs.json");
     let state: SubagentStore = { version: 1, jobs: [] };
     let needsPersist = false;
@@ -106,12 +96,12 @@ export class SubagentJobRegistry {
       }
     }
 
-    const unfinished = state.jobs.filter((job) => !job.notifiedAt);
-    const notified = state.jobs
-      .filter((job) => job.notifiedAt)
-      .sort((left, right) => Date.parse(right.notifiedAt ?? right.createdAt) - Date.parse(left.notifiedAt ?? left.createdAt))
-      .slice(0, RETAINED_NOTIFIED_JOBS);
-    const retained = [...unfinished, ...notified];
+    const unfinished = state.jobs.filter((job) => job.state === "pending");
+    const completed = state.jobs
+      .filter((job) => job.state !== "pending")
+      .sort((left, right) => Date.parse(right.completedAt ?? right.createdAt) - Date.parse(left.completedAt ?? left.createdAt))
+      .slice(0, RETAINED_COMPLETED_JOBS);
+    const retained = [...unfinished, ...completed];
     if (retained.length !== state.jobs.length) needsPersist = true;
     state.jobs = retained;
 
@@ -120,23 +110,20 @@ export class SubagentJobRegistry {
       await writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
       await rename(temporaryPath, filePath);
     }
-    return new SubagentJobRegistry(filePath, resultDirectory, state);
+    const registry = new SubagentJobRegistry(filePath, resultDirectory, state);
+    registry.watcher = watch(resultDirectory, (_event, filename) => {
+      if (!filename) return;
+      const job = registry.state.jobs.find((entry) => path.basename(entry.resultPath) === filename);
+      if (job) void registry.collectReport(job.jobId).catch((error: unknown) => {
+        console.error(`[tasks] Could not collect report ${job.jobId}:`, error);
+      });
+    });
+    registry.watcher.unref();
+    await Promise.all(state.jobs.filter((job) => job.state === "pending").map((job) => registry.collectReport(job.jobId)));
+    return registry;
   }
 
   async create(parent: { threadId: string; conversationUrl?: string; requestId?: string; promptHash?: string; prompt?: string }) {
-    return await this.createWithPolicy(parent, undefined, MAX_ACTIVE_SUBAGENTS_PER_PARENT, "agent");
-  }
-
-  async createTask(parent: { threadId: string; conversationUrl: string }, taskFingerprint?: string, prompt?: string) {
-    return await this.createWithPolicy({ ...parent, prompt }, taskFingerprint, MAX_ACTIVE_TASKS_PER_PARENT, "task");
-  }
-
-  private async createWithPolicy(
-    parent: { threadId: string; conversationUrl?: string; requestId?: string; promptHash?: string; prompt?: string },
-    taskFingerprint: string | undefined,
-    maxActive: number,
-    kind: "agent" | "task",
-  ) {
     return await this.update(async (state) => {
       const previous = parent.requestId && state.jobs.find((job) =>
         job.parentThreadId === parent.threadId && job.requestId === parent.requestId);
@@ -145,21 +132,17 @@ export class SubagentJobRegistry {
         return { ...previous, reused: true };
       }
       if (state.jobs.some((job) => job.childThreadId === parent.threadId)) {
-        throw new SubagentAdmissionError("nested", [], kind);
+        throw new SubagentAdmissionError("nested");
       }
-      const existing = taskFingerprint && state.jobs.find((job) =>
-        job.parentThreadId === parent.threadId && job.taskFingerprint === taskFingerprint);
-      if (existing) return { ...existing, reused: true };
       const active = state.jobs.filter((job) => job.parentThreadId === parent.threadId &&
-        (job.state === "pending" || (kind === "task" && job.state === "complete" && !job.notifiedAt)));
-      if (active.length >= maxActive) {
-        throw new SubagentAdmissionError("capacity", active.map((job) => job.jobId), kind);
+        job.state === "pending");
+      if (active.length >= MAX_ACTIVE_SUBAGENTS_PER_PARENT) {
+        throw new SubagentAdmissionError("capacity", active.map((job) => job.jobId));
       }
       if (state.jobs.length >= MAX_JOBS) throw new Error("Task job limit reached.");
       const jobId = randomUUID();
       const job: SubagentJob = {
         jobId,
-        taskFingerprint,
         parentThreadId: parent.threadId,
         parentConversationUrl: parent.conversationUrl,
         requestId: parent.requestId,
@@ -168,7 +151,6 @@ export class SubagentJobRegistry {
         specPath: parent.prompt ? path.join(this.resultDirectory, `${jobId}.spec.md`) : undefined,
         state: "pending",
         createdAt: new Date().toISOString(),
-        notificationAttempts: 0,
       };
       if (job.specPath) await writeFile(job.specPath, `${parent.prompt?.trim()}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
       state.jobs.push(job);
@@ -194,7 +176,6 @@ export class SubagentJobRegistry {
       if (job.state === "pending") {
         job.state = "cancelled";
         job.cancelledAt = new Date().toISOString();
-        job.notifiedAt = job.cancelledAt;
       }
       return { ...job };
     });
@@ -218,11 +199,11 @@ export class SubagentJobRegistry {
   blocksContinuationNow(threadId: string) {
     return this.state.jobs.some((job) =>
       (job.childThreadId === threadId && job.state !== "pending") ||
-      (job.parentThreadId === threadId && (job.state === "pending" ||
-        (job.state === "complete" && !job.notifiedAt))));
+      (job.parentThreadId === threadId && job.state === "pending"));
   }
 
   complete(jobId: string, result: string) {
+    if (!result.trim() || result.length > 200_000) throw new Error("Report must contain 1 to 200000 characters.");
     const operation = this.queue.then(async () => {
       const current = this.state.jobs.find((entry) => entry.jobId === jobId);
       if (!current) throw new Error("Task job not found.");
@@ -239,7 +220,7 @@ export class SubagentJobRegistry {
       target.state = "complete";
       target.completedAt = new Date().toISOString();
       target.preparationError = undefined;
-      target.notificationError = undefined;
+      target.deliveryUncertain = undefined;
       await this.persist(next);
       this.state = next;
       this.changes.emit("change");
@@ -249,43 +230,13 @@ export class SubagentJobRegistry {
     return operation;
   }
 
-  async markNotified(jobId: string | string[]) {
-    return await this.update((state) => {
-      const ids = new Set(typeof jobId === "string" ? [jobId] : jobId);
-      for (const job of state.jobs.filter((entry) => ids.has(entry.jobId))) {
-        job.notifiedAt = new Date().toISOString();
-        job.notificationAbandonedAt = undefined;
-        job.notificationError = undefined;
-      }
-    });
-  }
-
-  async recordNotificationFailure(jobId: string, error: string, maxAttempts: number) {
+  async recordPreparationFailure(jobId: string, error: string, deliveryUncertain = true) {
     return await this.update((state) => {
       const job = state.jobs.find((entry) => entry.jobId === jobId);
       if (!job) throw new Error("Task job not found.");
-      job.notificationAttempts += 1;
-      job.notificationError = error.slice(0, 1_000);
-      if (job.notificationAttempts >= maxAttempts) job.notificationAbandonedAt = new Date().toISOString();
-      return { ...job };
-    });
-  }
-
-  async retryNotification(jobId: string) {
-    return this.update((state) => {
-      const job = state.jobs.find((entry) => entry.jobId === jobId);
-      if (!job || job.state !== "complete" || job.notifiedAt) throw new Error("No undelivered task report for this job.");
-      job.notificationAttempts = 0;
-      job.notificationAbandonedAt = undefined;
-      job.notificationError = undefined;
-    });
-  }
-
-  async recordPreparationFailure(jobId: string, error: string) {
-    return await this.update((state) => {
-      const job = state.jobs.find((entry) => entry.jobId === jobId);
-      if (!job) throw new Error("Task job not found.");
+      if (job.state !== "pending") return { ...job };
       job.preparationError = error.slice(0, 1_000);
+      job.deliveryUncertain = deliveryUncertain;
       return { ...job };
     });
   }
@@ -296,10 +247,23 @@ export class SubagentJobRegistry {
     return job ? { ...job } : undefined;
   }
 
-  waitForResult(jobId: string, timeoutMs: number, signal: AbortSignal) {
+  async collectReport(jobId: string) {
+    const job = await this.job(jobId);
+    if (!job || job.state !== "pending") return;
+    let result: string;
+    try {
+      result = await readFile(job.resultPath, "utf8");
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
+      throw error;
+    }
+    if (!result.trim() || result.length > 200_000) return;
+    await this.complete(jobId, result);
+  }
+
+  waitForResult(jobId: string, signal: AbortSignal, returnStartupFailure: boolean) {
     return new Promise<SubagentJob | undefined>((resolve, reject) => {
       const finish = (error?: unknown) => {
-        clearTimeout(timer);
         this.changes.off("change", changed);
         signal.removeEventListener("abort", aborted);
         if (error) reject(error);
@@ -310,22 +274,15 @@ export class SubagentJobRegistry {
       };
       const changed = () => {
         const job = this.state.jobs.find((entry) => entry.jobId === jobId);
-        if (!job || job.state !== "pending" || job.preparationError) finish();
+        if (!job || job.state !== "pending" || job.preparationError &&
+            (returnStartupFailure || job.deliveryUncertain === false)) finish();
       };
       const aborted = () => finish(signal.reason ?? new Error("Wait cancelled."));
-      const timer = setTimeout(finish, timeoutMs);
       this.changes.on("change", changed);
       signal.addEventListener("abort", aborted, { once: true });
       if (signal.aborted) aborted();
       else void this.queue.then(changed, finish);
     });
-  }
-
-  async jobsNeedingNotification() {
-    await this.queue;
-    return this.state.jobs
-      .filter((entry) => entry.state === "complete" && !entry.notifiedAt && !entry.notificationAbandonedAt)
-      .map((entry) => ({ ...entry }));
   }
 
   async forParent(parentThreadId: string) {
@@ -336,6 +293,7 @@ export class SubagentJobRegistry {
   }
 
   async close() {
+    this.watcher?.close();
     await this.queue;
   }
 

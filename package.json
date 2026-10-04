@@ -22,7 +22,7 @@
         "security-test": "pnpm build && node scripts/security-test.mjs",
         "browser-test": "pnpm build && node scripts/browser-test.mjs",
         "support-ui-test": "node scripts/support-ui-test.mjs",
-        "thread-sync-test": "pnpm build && node scripts/browser-launch-test.mjs && node scripts/thread-sync-test.mjs && node scripts/subagent-limits-test.mjs && node scripts/task-test.mjs && node scripts/support-ui-test.mjs && node scripts/browser-presence-test.mjs && node scripts/support-recovery-test.mjs && node scripts/ralph-lifecycle-test.mjs",
+        "thread-sync-test": "pnpm build && node scripts/browser-launch-test.mjs && node scripts/thread-sync-test.mjs && node scripts/subagent-limits-test.mjs && node scripts/task-test.mjs && node scripts/support-ui-test.mjs && node scripts/chatgpt-dom-test.mjs && node scripts/browser-presence-test.mjs && node scripts/support-recovery-test.mjs && node scripts/ralph-lifecycle-test.mjs",
         "support:prepare": "pnpm build && node scripts/prepare-support-extension.mjs",
         "thread-sync:prepare": "pnpm support:prepare"
     },

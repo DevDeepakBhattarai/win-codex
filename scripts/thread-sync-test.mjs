@@ -7,7 +7,7 @@ import vm from "node:vm";
 import { Client } from "@modelcontextprotocol/client";
 import { McpServer, InMemoryTransport } from "@modelcontextprotocol/server";
 import { THREAD_SYNC_AGENT_INSTRUCTION, THREAD_SYNC_WIDGET_URI, ThreadSyncRegistry, parseConversationUrl, prepareThreadSync, registerThreadSync, threadSyncBindHandler, threadSyncBindUrl } from "../dist/thread-sync.js";
-import { RalphController, RalphRegistry, SUBAGENT_WIDGET_URI, SubagentResultController, SupportCommandBus, ThreadPreparationCoordinator, ThreadTabCleanupController, parseRalphProjectId, ralphRegistrationHandler, ralphSettingsGetHandler, ralphSettingsPutHandler, ralphThreadActiveHandler, ralphThreadCheckHandler, ralphThreadCompleteHandler, ralphThreadModeHandler, ralphThreadsGetHandler, registerChatGptAgents, supportCommandClaimHandler, threadObservationHandler } from "../dist/chatgpt-support.js";
+import { RalphController, RalphRegistry, SupportCommandBus, ThreadPreparationCoordinator, ThreadTabCleanupController, parseRalphProjectId, ralphRegistrationHandler, ralphSettingsGetHandler, ralphSettingsPutHandler, ralphThreadActiveHandler, ralphThreadCheckHandler, ralphThreadCompleteHandler, ralphThreadModeHandler, ralphThreadsGetHandler, registerChatGptAgents, supportCommandClaimHandler, threadObservationHandler } from "../dist/chatgpt-support.js";
 import { SubagentJobRegistry } from "../dist/subagent-jobs.js";
 
 const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "win-codex-thread-sync-test-"));
@@ -55,7 +55,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.7.1");
+  assert.equal(manifest.version, "1.7.5");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["alarms", "scripting", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -146,7 +146,7 @@ try {
     "thread sending does not use acknowledgement or DOM-stability heuristics");
   assert.match(preparedContentScript, /const SEND_SETTLE_MS = 5_000;/,
     "thread sending uses the fixed five-second settle requested for typing and sending");
-  assert.match(preparedContentScript, /contentScriptVersion = "1\.7\.1"/,
+  assert.match(preparedContentScript, /contentScriptVersion = "1\.7\.5"/,
     "extension reloads can replace a stale page script with the current content-script version");
   assert.equal(parseRalphProjectId(namedProjectHome), projectId);
   assert.equal(parseRalphProjectId(urlA), projectId);
@@ -710,7 +710,7 @@ try {
   // Exercise actual MCP metadata forwarding without opening an HTTP listener.
   server = new McpServer({ name: "thread-sync-test", version: "1" });
   registerThreadSync(server, sync, "mcp-grant");
-  registerChatGptAgents(server, supportCommands, registry, ralphRegistry, subagentJobs, threadPreparer, launchSupportBrowser, "mcp-grant", sync.subagentWidgetHtml);
+  registerChatGptAgents(server, supportCommands, registry, subagentJobs, threadPreparer, launchSupportBrowser, "mcp-grant");
   client = new Client({ name: "thread-sync-test", version: "1" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -718,29 +718,13 @@ try {
   const tools = (await client.listTools()).tools;
   const syncDefinition = tools.find(tool => tool.name === "sync_current_thread");
   const getDefinition = tools.find(tool => tool.name === "get_current_thread_url");
-  const startSubagentDefinition = tools.find(tool => tool.name === "start_task");
-  const listReviewersDefinition = tools.find(tool => tool.name === "list_tasks");
-  const submitSubagentDefinition = tools.find(tool => tool.name === "task_done");
   const sendThreadDefinition = tools.find(tool => tool.name === "send_thread_message");
-  assert.equal(tools.some(tool => ["list_subagents", "cancel_subagent", "start_subagent", "submit_subagent_result"].includes(tool.name)), false);
-  assert.ok(listReviewersDefinition, "workers expose a worker-named list tool backed by the existing job registry");
   assert.ok(tools.some(tool => tool.name === "start_thread"));
+  assert.equal(tools.some(tool => ["start_task", "list_tasks", "task_done", "start_subagent", "cancel_subagent", "list_subagents", "submit_subagent_result"].includes(tool.name)), false);
   assert.equal(syncDefinition._meta.ui.resourceUri, THREAD_SYNC_WIDGET_URI);
-  assert.match(syncDefinition.description, /not a required startup call/);
-  assert.match(syncDefinition.description, /returns the saved URL without another handshake/);
-  assert.equal(getDefinition._meta?.ui, undefined, "URL lookup must not mount UI");
-  assert.match(getDefinition.description, /after sync_current_thread reports syncing/);
-  assert.equal(startSubagentDefinition._meta.ui.resourceUri, SUBAGENT_WIDGET_URI);
-  assert.equal(listReviewersDefinition._meta.ui.resourceUri, SUBAGENT_WIDGET_URI);
-  assert.doesNotMatch([startSubagentDefinition, listReviewersDefinition, submitSubagentDefinition]
-    .map(tool => `${tool.name} ${tool.title ?? ""} ${tool.description ?? ""}`).join("\n"), /sub[- ]?agent/i,
-    "model-facing worker tools never advertise the underlying sub-agent implementation");
-  assert.match(submitSubagentDefinition.description, /waits for this worker to become idle/);
+  assert.equal(getDefinition._meta?.ui, undefined);
   assert.match(sendThreadDefinition.description, /deduplicated internally/);
-  assert.deepEqual([...sendThreadDefinition.inputSchema.required].sort(), ["message", "targetUrl"],
-    "send_thread_message keeps the public API to targetUrl and message only");
-  assert.match(startSubagentDefinition.description, /End your turn immediately/);
-  assert.equal(tools.some(tool => tool.name === "chatgpt_message"), false, "the ambiguous chatgpt_message tool is removed");
+  assert.deepEqual([...sendThreadDefinition.inputSchema.required].sort(), ["message", "targetUrl"]);
   const syncCall = sessionId => client.callTool({ name: "sync_current_thread", arguments: {}, _meta: { "openai/session": sessionId } });
   const getCall = sessionId => client.callTool({ name: "get_current_thread_url", arguments: {}, _meta: { "openai/session": sessionId } });
   const [mcpA, mcpB] = await Promise.all([syncCall("mcp-A"), syncCall("mcp-B")]);
@@ -857,161 +841,6 @@ try {
   await Promise.all(launchRequests);
   launchDedupBus.close();
 
-  const unsyncedReviewList = await client.callTool({
-    name: "list_tasks",
-    arguments: {},
-    _meta: { "openai/session": "mcp-unsynced" },
-  });
-  assert.equal(unsyncedReviewList.isError, true, "task listing requires the current parent binding");
-
-  const unsyncedSubagent = await client.callTool({
-    name: "start_task",
-    arguments: { prompt: "should fail without parent sync" },
-    _meta: { "openai/session": "mcp-unsynced" },
-  });
-  assert.equal(unsyncedSubagent.isError, true, "sub-agents require a bound parent conversation");
-
-  const startSubagentCall = client.callTool({
-    name: "start_task",
-    arguments: { prompt: "Task the implementation independently." },
-    _meta: { "openai/session": "mcp-A" },
-  });
-  const startSubagentCommand = await supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
-  assert.equal(startSubagentCommand.targetUrl, "https://chatgpt.com/",
-    "an unset Sub-agent project falls back to the normal ChatGPT new-chat page");
-  assert.match(startSubagentCommand.message, /Task the implementation independently/);
-  assert.match(startSubagentCommand.message, /Before task_done, bind this conversation with sync_current_thread/);
-  assert.doesNotMatch(startSubagentCommand.message, /first MCP action/);
-  assert.match(startSubagentCommand.message, /Change files only when the specification authorizes it/);
-  assert.match(startSubagentCommand.message, /task_done exactly once/);
-  assert.match(startSubagentCommand.message, /Use task_done to report back, not send_thread_message/);
-  assert.doesNotMatch(startSubagentCommand.message, new RegExp(urlA.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
-    "the child prompt does not receive the parent URL or callback transport details");
-  supportCommands.complete({
-    commandId: startSubagentCommand.id,
-    browserId: "chrome-browser",
-    kind: "send_message",
-    ok: true,
-    result: { status: "sent", conversationUrl: urlC, title: "Independent implementation task" },
-  });
-  const startSubagentResult = await startSubagentCall;
-  assert.equal(startSubagentResult.structuredContent.parentConversationUrl, urlA);
-  assert.equal(startSubagentResult.structuredContent.tasks.length, 1);
-  const firstSubagent = startSubagentResult.structuredContent.tasks[0];
-  assert.equal(firstSubagent.conversationUrl, urlC);
-  assert.match(startSubagentResult.content[0].text, new RegExp(`Task thread: ${urlC.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
-    "start_task exposes the exact task URL in its visible result");
-  const listedReviews = await client.callTool({
-    name: "list_tasks",
-    arguments: {},
-    _meta: { "openai/session": "mcp-A" },
-  });
-  assert.equal(listedReviews.structuredContent.tasks.some(task => task.conversationUrl === urlC), true,
-    "list_tasks returns the task thread URL for the current parent");
-  assert.match(listedReviews.content[0].text, new RegExp(urlC.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
-    "list_tasks exposes the task URL in its visible text result");
-  assert.equal(firstSubagent.title, "Independent implementation task");
-  assert.match(firstSubagent.jobId, /^[0-9a-f-]{36}$/i);
-  assert.equal(firstSubagent.resultState, "pending");
-  assert.equal(path.dirname(firstSubagent.resultPath), path.resolve(path.join(temporaryRoot, "subagent-jobs", "tasks")));
-  assert.match(startSubagentCommand.message, new RegExp(firstSubagent.jobId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  assert.ok(startSubagentCommand.message.includes(JSON.stringify(firstSubagent.resultPath)),
-    "the child prompt receives the exact local result path");
-  const registeredChild = (await ralphRegistry.threads()).find(thread => thread.conversationUrl === urlC);
-  assert.equal(registeredChild.parentThreadId, parseConversationUrl(urlA).threadId);
-  assert.equal(registeredChild.agentCreated, true);
-  const childSync = await syncCall("mcp-child-C");
-  const childToken = childSync._meta["local-codex/thread-binding"].token;
-  await registry.bind(childToken, urlC);
-  threadPreparer.markBound(parseConversationUrl(urlC).threadId);
-
-  const resultController = new SubagentResultController(subagentJobs, supportCommands, launchSupportBrowser, 60_000, 0);
-  const whitespaceSubmit = await client.callTool({
-    name: "task_done",
-    arguments: { jobId: firstSubagent.jobId, result: "   " },
-    _meta: { "openai/session": "mcp-child-C" },
-  });
-  assert.equal(whitespaceSubmit.isError, true, "a whitespace-only sub-agent report is rejected");
-  const childReport = "Independent task complete. No blocking defects found.";
-  const [submitResult, duplicateSubmit] = await Promise.all([
-    client.callTool({
-      name: "task_done",
-      arguments: { jobId: firstSubagent.jobId, result: childReport },
-      _meta: { "openai/session": "mcp-child-C" },
-    }),
-    client.callTool({
-      name: "task_done",
-      arguments: { jobId: firstSubagent.jobId, result: "Transport retry must not replace the first report." },
-      _meta: { "openai/session": "mcp-child-C" },
-    }),
-  ]);
-  assert.equal(submitResult.structuredContent.status, "stored");
-  assert.equal(duplicateSubmit.structuredContent.status, "stored");
-  assert.equal(submitResult.structuredContent.resultPath, firstSubagent.resultPath);
-  assert.equal((await readFile(firstSubagent.resultPath, "utf8")).trim(), childReport,
-    "concurrent result submissions are idempotent and the first complete report wins");
-  await resultController.tick();
-  const reviewerIdle = await supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
-  assert.equal(reviewerIdle.kind, "inspect_thread");
-  supportCommands.complete({ commandId: reviewerIdle.id, browserId: "chrome-browser", kind: "inspect_thread", ok: true,
-    result: { status: "idle", workedSeconds: null, users: [], assistant: { synthetic: false, text: "Task done." } } });
-  const wakeCommand = await supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
-  assert.equal(wakeCommand.targetUrl, urlA);
-  assert.ok(wakeCommand.message.includes(JSON.stringify(firstSubagent.resultPath)),
-    "the wake-up points the parent at the exact local result file");
-  assert.doesNotMatch(wakeCommand.message, /Independent task complete/,
-    "the application wake-up carries only the result location, not the sub-agent report");
-  supportCommands.complete({
-    commandId: wakeCommand.id,
-    browserId: "chrome-browser",
-    kind: "send_message",
-    ok: true,
-    result: { status: "sent", conversationUrl: urlA },
-  });
-  await new Promise(resolve => setTimeout(resolve, 25));
-  assert.ok((await subagentJobs.job(firstSubagent.jobId)).notifiedAt,
-    "the application marks the local result as notified only after waking the parent");
-  resultController.close();
-
-  const retryRegistryRoot = path.join(temporaryRoot, "notification-retry-cap");
-  const retryRegistry = await SubagentJobRegistry.open(retryRegistryRoot);
-  const retryJob = await retryRegistry.create({ threadId: parseConversationUrl(urlA).threadId, conversationUrl: urlA });
-  let failedRetryJob;
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    failedRetryJob = await retryRegistry.recordNotificationFailure(retryJob.jobId, "parent unavailable", 5);
-  }
-  assert.equal(failedRetryJob.notificationAttempts, 5);
-  assert.ok(failedRetryJob.notificationAbandonedAt, "parent wake-up retries enter a persisted terminal state after five failures");
-  assert.equal((await retryRegistry.jobsNeedingNotification()).some(job => job.jobId === retryJob.jobId), false,
-    "an abandoned wake-up job is no longer retried forever");
-  await retryRegistry.close();
-  const reopenedRetryRegistry = await SubagentJobRegistry.open(retryRegistryRoot);
-  assert.ok((await reopenedRetryRegistry.job(retryJob.jobId)).notificationAbandonedAt,
-    "wake-up abandonment survives backend restarts");
-  await reopenedRetryRegistry.close();
-
-  await ralphRegistry.setSubagentProjectUrl(namedProjectHome);
-  const configuredSubagentCall = client.callTool({
-    name: "start_task",
-    arguments: { prompt: "Use the server-configured project." },
-    _meta: { "openai/session": "mcp-A" },
-  });
-  const configuredSubagentCommand = await supportCommands.claim("helium-browser", ["threadMessaging"], 1000);
-  assert.equal(configuredSubagentCommand.targetUrl, namedProjectHome,
-    "the server resolves the Sub-agent project before any browser claims the command");
-  supportCommands.complete({
-    commandId: configuredSubagentCommand.id,
-    browserId: "helium-browser",
-    kind: "send_message",
-    ok: true,
-    result: { status: "sent", conversationUrl: urlD, title: "Configured project child" },
-  });
-  await configuredSubagentCall;
-
-  for (const job of await subagentJobs.forParent(parseConversationUrl(urlA).threadId)) {
-    if (job.state === "pending") await subagentJobs.cancel(job.jobId);
-  }
-
   const projectMessage = await client.callTool({
     name: "send_thread_message",
     arguments: {
@@ -1052,7 +881,7 @@ try {
       if (name === "send_thread_message") firstReplayHandler = handler;
     },
   };
-  registerChatGptAgents(firstReplayServer, supportCommands, registry, ralphRegistry, subagentJobs, threadPreparer, launchSupportBrowser, "mcp-grant", sync.subagentWidgetHtml);
+  registerChatGptAgents(firstReplayServer, supportCommands, registry, subagentJobs, threadPreparer, launchSupportBrowser, "mcp-grant");
   assert.equal(typeof firstReplayHandler, "function");
   const retryArguments = { targetUrl: urlB, message: "Transport retry probe." };
   const retryExtra = { mcpReq: { id: "same-mcp-request", _meta: { "openai/session": "mcp-A" } } };
@@ -1076,54 +905,11 @@ try {
       if (name === "send_thread_message") secondReplayHandler = handler;
     },
   };
-  registerChatGptAgents(secondReplayServer, supportCommands, registry, ralphRegistry, subagentJobs, threadPreparer, launchSupportBrowser, "mcp-grant", sync.subagentWidgetHtml);
+  registerChatGptAgents(secondReplayServer, supportCommands, registry, subagentJobs, threadPreparer, launchSupportBrowser, "mcp-grant");
   const replayedRetryResult = await secondReplayHandler(retryArguments, retryExtra);
   assert.equal(replayedRetryResult.structuredContent.conversationUrl, urlB);
   assert.equal(await supportCommands.claim("chrome-browser", ["threadMessaging"], 0), undefined,
     "the same MCP request id and payload is deduplicated across stateless server instances");
-  let firstSubagentReplayHandler;
-  const firstSubagentReplayServer = {
-    registerResource() {},
-    registerTool(name, _definition, handler) {
-      if (name === "start_task") firstSubagentReplayHandler = handler;
-    },
-  };
-  registerChatGptAgents(firstSubagentReplayServer, supportCommands, registry, ralphRegistry, subagentJobs, threadPreparer, launchSupportBrowser, "mcp-grant", sync.subagentWidgetHtml);
-  let secondSubagentReplayHandler;
-  const secondSubagentReplayServer = {
-    registerResource() {},
-    registerTool(name, _definition, handler) {
-      if (name === "start_task") secondSubagentReplayHandler = handler;
-    },
-  };
-  registerChatGptAgents(secondSubagentReplayServer, supportCommands, registry, ralphRegistry, subagentJobs, threadPreparer, launchSupportBrowser, "mcp-grant", sync.subagentWidgetHtml);
-  assert.equal(typeof firstSubagentReplayHandler, "function");
-  assert.equal(typeof secondSubagentReplayHandler, "function");
-  const subagentRetryArguments = { prompt: "Start exactly one child for this transport request." };
-  const subagentRetryExtra = { mcpReq: { id: "same-start-subagent-request", _meta: { "openai/session": "mcp-A" } } };
-  const firstSubagentRetryCall = firstSubagentReplayHandler(subagentRetryArguments, subagentRetryExtra);
-  const secondSubagentRetryCall = secondSubagentReplayHandler(subagentRetryArguments, { mcpReq: { ...subagentRetryExtra.mcpReq, id: "different-request-same-task" } });
-  await new Promise(resolve => setImmediate(resolve));
-  const subagentRetryCommand = await supportCommands.claim("chrome-browser", ["threadMessaging"], 1000);
-  assert.equal(subagentRetryCommand.message.includes(subagentRetryArguments.prompt), true);
-  assert.equal(await supportCommands.claim("helium-browser", ["threadMessaging"], 0), undefined,
-    "a transport retry of the same start_task request must not create a second child command");
-  supportCommands.complete({
-    commandId: subagentRetryCommand.id,
-    browserId: "chrome-browser",
-    kind: "send_message",
-    ok: true,
-    result: { status: "sent", conversationUrl: urlE, title: "Replay-safe child" },
-  });
-  const [firstSubagentRetryResult, secondSubagentRetryResult] = await Promise.all([
-    firstSubagentRetryCall,
-    secondSubagentRetryCall,
-  ]);
-  assert.equal(firstSubagentRetryResult.structuredContent.tasks.at(-1).conversationUrl, urlE);
-  const startedJobId = firstSubagentRetryResult.structuredContent.tasks.at(-1).jobId;
-  assert.ok(secondSubagentRetryResult.structuredContent.tasks.some(job => job.jobId === startedJobId),
-    "a different request ID reuses the saved child job");
-
   const abandonedController = new AbortController();
   const abandonedClaim = supportCommands.claim("chrome-browser", ["ralph"], 1000, abandonedController.signal);
   abandonedController.abort();
@@ -1743,20 +1529,6 @@ try {
   assert.match(resource.contents[0].text, /Thread Sync/);
   assert.ok(!resource.contents[0].text.includes(sync.extensionToken));
 
-  const subagentResource = await client.readResource({ uri: SUBAGENT_WIDGET_URI });
-  const subagentHtml = subagentResource.contents[0].text;
-  assert.match(subagentHtml, /height:\s*336px/,
-    "the inline Sub-agent app reserves enough height to avoid a clipped outer ChatGPT scroller");
-  assert.match(subagentHtml, /html, body[\s\S]*overflow:\s*hidden/,
-    "the Sub-agent app never scrolls at the outer document level");
-  assert.match(subagentHtml, /\.list[\s\S]*overflow-y:\s*auto/,
-    "only the Sub-agent list is scrollable");
-  assert.match(subagentHtml, /No task started/,
-    "the Sub-agent app renders a designed empty state");
-  assert.match(subagentHtml, /agent\.resultState/, "the worker app renders local result state");
-  assert.match(subagentHtml, /textContent: agent\.conversationUrl/, "the worker app visibly renders the exact task-thread URL");
-  assert.doesNotMatch(subagentHtml, /textContent: agent\.resultPath/, "the worker app does not substitute a local result file for the thread link");
-  assert.match(subagentHtml, /local-codex-workers/, "the worker app does not expose sub-agent naming to ChatGPT");
   await testContentScript(a.ticket.token, b.ticket.token);
   await testWorkerKeepsLongAutomationAlive(sync);
   await testWorkerNeverRedispatchesAfterLostResponse(sync);
@@ -1791,6 +1563,8 @@ try {
   console.log("Thread sync passed: one-time binding, backend thread preparation, local sub-agent results, browser launch gating, long automation keepalive, single-shot sends, RALPH behavior, persistence, auth, and MCP App routing.");
   console.log("All tests were isolated. No network listener or browser was started.");
 } finally {
+  supportCommands?.close();
+  await subagentJobs?.close();
   await client?.close();
   await server?.close();
   // Only remove this test's own mkdtemp directory, never a configured data directory.
@@ -2359,6 +2133,7 @@ async function testRunningHydrationDetection() {
       return null;
     },
     querySelectorAll(selector) {
+      if (selector === 'section[data-turn="user"]') return [userTurn];
       return selector === "section[data-turn]" ? [userTurn] : [];
     },
   };
@@ -2453,6 +2228,7 @@ async function testWorkedDurationDetection() {
       return null;
     },
     querySelectorAll(selector) {
+      if (selector === 'section[data-turn="user"]') return [userTurn];
       if (selector === "section[data-turn]") return [userTurn, assistantTurn];
       if (selector === 'section[data-turn="assistant"]') return [assistantTurn];
       return [];
@@ -3016,7 +2792,7 @@ async function testWorkerNeverRedispatchesAfterLostResponse(sync) {
   assert.equal(injected, 2, "the health check and command content script are established before the side-effecting dispatch");
   assert.equal(automationDispatches, 1,
     "a lost tabs.sendMessage response must never cause the same side-effecting command to be dispatched again");
-  assert.equal(reloads, 1, "the page is refreshed once after a lost response");
+  assert.equal(reloads, 0, "an uncertain send must preserve the running worker and its original error");
   assert.equal(postedResults.length, 1);
   assert.equal(postedResults[0].ok, false,
     "an ambiguous post-delivery failure is surfaced instead of being hidden behind an unsafe retry");
@@ -3294,6 +3070,8 @@ async function testWidget(html, ticket) {
 }
 
 function configureAutomationContext(context) {
+  // Stop the startup poller. These fixtures invoke commands directly.
+  vm.runInNewContext("pollGeneration += 1; pollController?.abort();", context);
   context.restartPolling = () => {};
   context.getSettings = async () => ({ threadSync: true, automationExecutor: true });
   const sendMessage = context.browser.tabs.sendMessage;

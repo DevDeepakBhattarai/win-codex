@@ -4,11 +4,12 @@ import vm from "node:vm";
 import os from "node:os";
 import path from "node:path";
 import { SubagentJobRegistry } from "../dist/subagent-jobs.js";
-import { RalphController, RalphRegistry, SubagentResultController, SupportCommandBus, registerChatGptAgents } from "../dist/chatgpt-support.js";
+import { RalphController, RalphRegistry, SupportCommandBus, registerChatGptAgents } from "../dist/chatgpt-support.js";
 
 const directory = await mkdtemp(path.join(os.tmpdir(), "subagent-limits-"));
+let jobs, beforeRestart, afterRestart, batchJobs;
 try {
-  const jobs = await SubagentJobRegistry.open(directory);
+  jobs = await SubagentJobRegistry.open(directory);
   const attempts = await Promise.allSettled(Array.from({ length: 8 }, (_, index) => {
     const parentIndex = index < 4 ? "a" : "b";
     return jobs.create({
@@ -21,9 +22,10 @@ try {
   assert.equal(admitted.filter(job => job.parentThreadId === "parent-a").length, 2);
   assert.equal(admitted.filter(job => job.parentThreadId === "parent-b").length, 2);
   const restartRoot = path.join(directory, "restart");
-  const beforeRestart = await SubagentJobRegistry.open(restartRoot);
+  beforeRestart = await SubagentJobRegistry.open(restartRoot);
   const interrupted = await beforeRestart.create({ threadId: "restart-parent", conversationUrl: "https://chatgpt.com/c/restart-parent" });
-  const afterRestart = await SubagentJobRegistry.open(restartRoot);
+  await beforeRestart.close();
+  afterRestart = await SubagentJobRegistry.open(restartRoot);
   assert.match((await afterRestart.job(interrupted.jobId)).preparationError, /interrupted by a service restart/,
     "restart marks an unfinished startup as interrupted instead of leaving it permanently in flight");
   await afterRestart.cancel(interrupted.jobId);
@@ -36,55 +38,10 @@ try {
   await jobs.cancel(replacement.jobId);
   await assert.rejects(jobs.complete(replacement.jobId, "Late report"), /cancelled/);
   await jobs.cancel(replacement.jobId);
-  assert.equal((await jobs.jobsNeedingNotification()).some(job => job.jobId === replacement.jobId), false);
   await jobs.cancel(admitted[1].jobId);
 
-  const batchJobs = await SubagentJobRegistry.open(path.join(directory, "batch"));
+  batchJobs = await SubagentJobRegistry.open(path.join(directory, "batch"));
   const parent = { threadId: "11111111-1111-4111-8111-111111111111", conversationUrl: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111" };
-  const first = await batchJobs.create(parent);
-  const second = await batchJobs.create(parent);
-  const bus = new SupportCommandBus();
-  const controller = new SubagentResultController(batchJobs, bus, async () => {}, 60_000, 0);
-  try {
-    await batchJobs.complete(first.jobId, "First private report");
-    await batchJobs.complete(second.jobId, "Second private report");
-    await Promise.all([controller.tick(), controller.tick()]);
-    const notice = await bus.claim("browser", ["threadMessaging"], 1000);
-    assert.ok(notice.message.includes(first.resultPath.replaceAll("\\", "\\\\")));
-    assert.ok(notice.message.includes(JSON.stringify(second.resultPath)));
-    assert.doesNotMatch(notice.message, /private report/);
-    assert.equal(await bus.claim("other-browser", ["threadMessaging"], 0), undefined,
-      "overlapping scheduler ticks emit one batched notice");
-    assert.equal(await batchJobs.blocksContinuation(parent.threadId), true);
-    bus.complete({ commandId: notice.id, browserId: "browser", kind: "send_message", ok: true,
-      result: { status: "sent", conversationUrl: parent.conversationUrl } });
-    await new Promise(resolve => setTimeout(resolve, 30));
-    assert.equal(await batchJobs.blocksContinuation(parent.threadId), false);
-    assert.ok((await batchJobs.job(first.jobId)).notifiedAt);
-    assert.ok((await batchJobs.job(second.jobId)).notifiedAt);
-  } finally { controller.close(); bus.close(); }
-
-  const damagedJobs = await SubagentJobRegistry.open(path.join(directory, "damaged"));
-  const damaged = await damagedJobs.create(parent);
-  const healthy = await damagedJobs.create(parent);
-  await mkdir(damaged.resultPath);
-  await damagedJobs.complete(healthy.jobId, "Valid sibling report");
-  const damagedBus = new SupportCommandBus();
-  const damagedController = new SubagentResultController(damagedJobs, damagedBus, async () => {}, 60_000, 0);
-  try {
-    await damagedController.tick();
-    const notice = await damagedBus.claim("browser", ["threadMessaging"], 1000);
-    assert.ok(notice.message.includes(healthy.jobId), "an unreadable result must not block a healthy sibling");
-    assert.ok(!notice.message.includes(damaged.jobId));
-    damagedBus.complete({ commandId: notice.id, browserId: "browser", kind: "send_message", ok: true,
-      result: { status: "sent", conversationUrl: parent.conversationUrl } });
-    await new Promise(resolve => setTimeout(resolve, 30));
-    assert.equal((await damagedJobs.job(damaged.jobId)).notificationError, undefined,
-      "an unfinished result artifact is ignored until the child explicitly submits completion");
-    assert.equal((await damagedJobs.job(damaged.jobId)).state, "pending");
-    assert.ok((await damagedJobs.job(healthy.jobId)).notifiedAt);
-  } finally { damagedController.close(); damagedBus.close(); }
-
   const cooldownBus = new SupportCommandBus(undefined, 30, 15);
   try {
     const firstSend = cooldownBus.execute(
@@ -178,11 +135,11 @@ try {
   const toolBus = new SupportCommandBus(undefined, 30, 15);
   registerChatGptAgents({ registerResource() {}, registerTool(name, definition, handler) { handlers.set(name, handler); } },
     toolBus, { async binding({ sessionId }) { return sessionId === "owner" ? parent : { threadId: "other" }; } },
-    registry, batchJobs, { async ensurePrepared() {}, markPrepared() {} }, async () => {}, "grant", "");
+    batchJobs, { async ensurePrepared() {}, markPrepared() {} }, async () => {}, "grant");
   try {
     assert.deepEqual([...handlers.keys()].sort(),
-      ["list_tasks", "task_done", "send_thread_message", "start_task", "start_thread"],
-      "the ChatGPT-facing API exposes sequential tasks and explicit threads, not generic delegation tools");
+      ["send_thread_message", "start_thread"],
+      "the ChatGPT connector retains explicit thread operations without task lifecycle tools");
     for (const removed of ["start_subagent", "cancel_subagent", "list_subagents", "submit_subagent_result"]) {
       assert.equal(handlers.has(removed), false, `${removed} stays off the ChatGPT-facing tool surface`);
     }
@@ -248,6 +205,7 @@ try {
 
   console.log("Sub-agent limits tests passed.");
 } finally {
+  await Promise.all([jobs?.close(), beforeRestart?.close(), afterRestart?.close(), batchJobs?.close()]);
   assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
   assert.ok(path.basename(directory).startsWith("subagent-limits-"));
   await rm(directory, { recursive: true, force: true });

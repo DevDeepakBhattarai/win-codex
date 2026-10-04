@@ -764,6 +764,17 @@ const mcpHandler = createMcpHandler(({ authInfo }) => {
 const handleMcpRequest = toNodeHandler(mcpHandler);
 
 app.post("/mcp", requireOAuth, async (req: AuthedRequest, res: Response) => {
+  const client = z.object({ id: z.union([z.string(), z.number(), z.null()]).optional(), params: z.object({
+    clientInfo: z.object({ name: z.string() }).optional(),
+    _meta: z.object({ "io.modelcontextprotocol/clientInfo": z.object({ name: z.string() }).optional() }).optional(),
+  }).optional() }).safeParse(req.body);
+  const name = client.success ? client.data.params?._meta?.["io.modelcontextprotocol/clientInfo"]?.name
+    ?? client.data.params?.clientInfo?.name : undefined;
+  if (name && /codex/i.test(name)) {
+    res.status(403).json({ jsonrpc: "2.0", id: client.success ? client.data.id ?? null : null,
+      error: { code: -32000, message: "This computer connector is for ChatGPT. Codex delegates through the local CLI or /agents API." } });
+    return;
+  }
   await handleMcpRequest(req, res, req.body);
 });
 
@@ -1628,12 +1639,10 @@ function createMcpServer(ownerId: string) {
       server,
       supportCommands,
       threadSync.registry,
-      ralphRegistry,
       subagentJobs,
       threadPreparer,
       launchChrome,
       ownerId,
-      threadSync.subagentWidgetHtml,
     );
   }
 
@@ -2779,8 +2788,8 @@ const supportCommands = threadSync
 const threadPreparer = supportCommands && threadSync
   ? new ThreadPreparationCoordinator(supportCommands, threadSync.registry, launchChrome)
   : undefined;
-const subagentResultController = supportCommands && subagentJobs
-  ? new SubagentResultController(subagentJobs, supportCommands, launchChrome)
+const subagentResultController = supportCommands && subagentJobs && ralphRegistry
+  ? new SubagentResultController(subagentJobs, supportCommands, launchChrome, ralphRegistry)
   : undefined;
 const ralphController = RALPH_ENABLED && supportCommands && ralphRegistry
   ? new RalphController({

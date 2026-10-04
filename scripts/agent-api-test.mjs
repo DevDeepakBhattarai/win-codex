@@ -1,130 +1,182 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { setTimeout as delay } from "node:timers/promises";
 import os from "node:os";
 import path from "node:path";
 import express from "express";
 import { createAgentApi } from "../dist/agent-api.js";
 import { SubagentJobRegistry } from "../dist/subagent-jobs.js";
-import { RalphRegistry, SupportCommandBus, SubagentResultController, ThreadPreparationCoordinator } from "../dist/chatgpt-support.js";
+import { RalphRegistry, SupportCommandBus, ThreadPreparationCoordinator } from "../dist/chatgpt-support.js";
 
 const directory = await mkdtemp(path.join(os.tmpdir(), "agent-api-test-"));
 const jobs = await SubagentJobRegistry.open(directory);
 const registry = await RalphRegistry.open(directory);
 const commands = new SupportCommandBus(undefined, undefined, 0);
+let browserLaunch;
 const preparer = new ThreadPreparationCoordinator(commands, { hasThread: async () => true }, async () => {});
-const controller = new SubagentResultController(jobs, commands, async () => {}, 60_000, 0);
 const app = express();
 app.use(express.json());
-app.use("/agents", createAgentApi({ token: "test-token", jobs, registry, commands, preparer, dataDirectory: directory, launchBrowser: async () => {} }));
+const requests = [];
+app.use("/agents", (req, _res, next) => { requests.push({ method: req.method, url: req.url, session: req.body?.session }); next(); });
+app.use("/agents", createAgentApi({ token: "test-token", jobs, registry, commands, preparer, dataDirectory: directory,
+	launchBrowser: async () => { await browserLaunch; } }));
 const server = await new Promise(resolve => { const listening = app.listen(0, "127.0.0.1", () => resolve(listening)); });
 const url = `http://127.0.0.1:${server.address().port}/agents`;
-const request = async (suffix = "", body, headers = {}) => {
-  const response = await fetch(url + suffix, { method: body ? "POST" : "GET", headers: { authorization: "Bearer test-token", "content-type": "application/json", ...headers }, body: body && JSON.stringify(body) });
-  return { status: response.status, body: await response.json() };
-};
-const completeCommand = (command, result) => commands.complete({ commandId: command.id, browserId: "extension", kind: command.kind, ok: true, result });
+const headers = { authorization: "Bearer test-token", "content-type": "application/json" };
+const request = (suffix = "", body, extraHeaders = {}, signal = AbortSignal.timeout(30_000)) =>
+	fetch(url + suffix, { method: body ? "POST" : "GET", headers: { ...headers, ...extraHeaders }, body: body && JSON.stringify(body), signal });
 const claim = () => commands.claim("extension", ["threadMessaging", "threadPreparation"], 1000);
+const sent = command => commands.complete({ commandId: command.id, browserId: "extension", kind: "send_message", ok: true,
+	result: { status: "sent", conversationUrl: `https://chatgpt.com/c/${randomUUID()}` } });
+const publish = async (job, report) => {
+	await writeFile(job.resultPath + ".tmp", report);
+	await rename(job.resultPath + ".tmp", job.resultPath);
+};
+let reopened;
 try {
-  assert.equal((await request("", undefined, { authorization: "Bearer wrong" })).status, 401);
-  assert.equal((await request("", { prompt: "x" }, { origin: "https://example.com" })).status, 401);
-  assert.equal((await request("", { prompt: " " })).status, 400);
-  const payload = { prompt: "Test the checkout form at http://localhost:3000", requestId: "first" };
-  const starts = await Promise.all([request("", payload), request("", payload)]);
-  assert.equal(starts[0].status, 202);
-  assert.equal(starts[0].body.jobId, starts[1].body.jobId, "retries reserve and send only one child");
-  const jobId = starts[0].body.jobId;
-  const send = await claim();
-  assert.equal(send.kind, "send_message");
-  assert.ok(send.message.includes(payload.prompt));
-  assert.ok(send.message.includes(jobId));
-  assert.match(send.message, /browser_recording/);
-  assert.match(send.message, /task_done/);
-  assert.doesNotMatch(send.message, /independent worker/);
-  assert.equal(await commands.claim("other", ["threadMessaging"], 0), undefined);
-  const childUrl = `https://chatgpt.com/c/${randomUUID()}`;
-  completeCommand(send, { status: "sent", conversationUrl: childUrl });
-  await new Promise(resolve => setTimeout(resolve, 20));
-  assert.equal(await commands.claim("extension", ["threadPreparation"], 0), undefined, "a newly created worker reuses its prepared tab");
-  const started = (await request(`/${jobId}`)).body;
-  assert.equal(started.childConversationUrl, childUrl);
-  assert.equal((await readFile(started.specPath, "utf8")).trim(), payload.prompt, "the assignment survives in a local specification file");
-  assert.equal((await request("", { ...payload, prompt: "different" })).status, 409);
+	assert.equal((await request("", undefined, { authorization: "Bearer wrong" })).status, 401);
+	assert.equal((await request("", { prompt: "x", requestId: "origin" }, { origin: "https://example.com" })).status, 401);
+	assert.equal((await request("", { prompt: " ", requestId: "blank" })).status, 400);
+	assert.equal((await request("", { prompt: "Missing retry ID" })).status, 400);
+	let rejectLaunch;
+	browserLaunch = new Promise((_resolve, reject) => { rejectLaunch = reject; });
+	const startupConnection = new AbortController();
+	const startup = await request("", { prompt: "Unavailable browser", session: "startup", requestId: "no-browser" }, {}, startupConnection.signal);
+	const startupId = startup.headers.get("x-job-id");
+	const startupAborted = assert.rejects(startup.json());
+	startupConnection.abort();
+	await startupAborted;
+	const startupRecovery = await request(`/${startupId}/wait`);
+	rejectLaunch(new Error("browser unavailable before send"));
+	const startupFailure = await startupRecovery.json();
+	assert.match(startupFailure.preparationError, /browser unavailable before send/);
+	assert.equal(startupFailure.deliveryUncertain, false, "definite startup failure releases a recovery wait");
+	assert.equal(startupFailure.childThreadId, undefined);
+	assert.equal((await (await request(`/${startupId}/wait`)).json()).deliveryUncertain, false,
+		"recovery also returns an already saved pre-send failure");
+	await jobs.cancel(startupId);
+	browserLaunch = undefined;
+	const payload = { prompt: "Test the checkout form at http://localhost:3000", requestId: "first" };
+	const starts = await Promise.all([request("", payload), request("", payload)]);
+	assert.equal(starts[0].status, 200);
+	const jobId = starts[0].headers.get("x-job-id");
+	assert.equal(jobId, starts[1].headers.get("x-job-id"), "retries hold the same assignment");
+	const send = await claim();
+	assert.equal(send.kind, "send_message");
+	assert.ok(send.message.includes(payload.prompt));
+	assert.ok(send.message.includes(jobId));
+	assert.match(send.message, /rename that file/);
+	assert.doesNotMatch(send.message, /task_done|start_task|sync_current_thread/);
+	assert.equal(await commands.claim("other", ["threadMessaging"], 0), undefined, "duplicate requests dispatch one worker");
+	sent(send);
+	const job = await jobs.job(jobId);
+	assert.equal((await readFile(job.specPath, "utf8")).trim(), payload.prompt);
+	const bodies = starts.map(response => response.json());
+	await writeFile(job.resultPath + ".tmp", "Partial report");
+	assert.equal(await Promise.race([bodies[0].then(() => "returned"), delay(80, "waiting")]), "waiting", "temporary files do not release the caller");
+	await writeFile(job.resultPath, "   ");
+	assert.equal(await Promise.race([bodies[0].then(() => "returned"), delay(80, "waiting")]), "waiting", "empty final files do not signal completion");
+	const evidenceDirectory = path.join(directory, "recordings", jobId);
+	await mkdir(evidenceDirectory, { recursive: true });
+	await writeFile(path.join(evidenceDirectory, "checkout.png"), "fixture");
+	await writeFile(path.join(evidenceDirectory, "unfinished.partial.webm"), "fixture");
+	await publish(job, "Checkout passed with observed evidence.");
+	const results = await Promise.all(bodies);
+	assert.equal(results[0].state, "complete");
+	assert.equal(results[0].result.trim(), "Checkout passed with observed evidence.");
+	assert.equal(results[1].result, results[0].result);
+	assert.deepEqual(results[0].screenshots, [path.join(evidenceDirectory, "checkout.png")]);
+	assert.deepEqual(results[0].videos, []);
+	assert.equal((await request("", { ...payload, prompt: "different" })).status, 409);
+	const unsent = await request("", { prompt: "Attachment failed", session: "unsent", requestId: "attachment" });
+	const unsentCommand = await claim();
+	commands.complete({ commandId: unsentCommand.id, browserId: "extension", kind: "send_message", ok: false,
+		error: "ChatGPT send button did not become actionable.", deliveryUncertain: false });
+	const unsentJob = await unsent.json();
+	assert.equal(unsentJob.deliveryUncertain, false);
+	assert.equal((await (await request(`/${unsentJob.jobId}/wait`)).json()).deliveryUncertain, false,
+		"an executor-confirmed unsent assignment cannot leave recovery waiting for a nonexistent worker");
+	await jobs.cancel(unsentJob.jobId);
 
-  const second = await request("", { prompt: "Second task", requestId: "second" });
-  const failedSend = await claim();
-  commands.complete({ commandId: failedSend.id, browserId: "extension", kind: "send_message", ok: false, error: "Delivery uncertain after Send" });
-  await new Promise(resolve => setTimeout(resolve, 20));
-  const failure = await request(`/${second.body.jobId}`);
-  assert.match(failure.body.preparationError, /Delivery uncertain/);
-  assert.equal((await request("", { prompt: "Third task" })).status, 429, "uncertain delivery keeps its slot");
-  await request("", { prompt: "Second task", requestId: "second" });
-  assert.equal(await commands.claim("extension", ["threadMessaging"], 0), undefined, "failed sends are never replayed");
-  assert.equal((await request(`/${second.body.jobId}/cancel`, {})).body.state, "cancelled");
+	const failedPayload = { prompt: "Worker startup failure", requestId: "failed" };
+	const failed = await request("", failedPayload);
+	const failedCommand = await claim();
+	commands.complete({ commandId: failedCommand.id, browserId: "extension", kind: "send_message", ok: false, error: "Delivery uncertain after Send" });
+	const failedJob = await failed.json();
+	assert.match(failedJob.preparationError, /Delivery uncertain/);
+	assert.equal((await (await request("", failedPayload)).json()).jobId, failedJob.jobId);
+	assert.equal(await commands.claim("extension", ["threadMessaging"], 0), undefined, "uncertain sends are not replayed");
+	const reserved = await jobs.create({ threadId: "api:local" });
+	assert.equal((await request("", { prompt: "Capacity", requestId: "capacity" })).status, 429);
+	await jobs.cancel(reserved.jobId);
+	const uncertainRecovery = await request(`/${failedJob.jobId}/wait`);
+	const uncertainBody = uncertainRecovery.json();
+	assert.equal(await Promise.race([uncertainBody.then(() => "returned"), delay(80, "waiting")]), "waiting",
+		"recovery waits for a report even when the send acknowledgement was lost");
+	await publish(await jobs.job(failedJob.jobId), "Worker ran despite a lost send acknowledgement");
+	assert.equal((await uncertainBody).state, "complete");
 
-  const cancelling = request(`/${jobId}/cancel`, {});
-  const stop = await claim();
-  assert.equal(stop.kind, "stop_thread");
-  commands.complete({ commandId: stop.id, browserId: "extension", kind: "stop_thread", ok: false, error: "Stop not confirmed" });
-  assert.equal((await cancelling).status, 409);
-  assert.equal((await request(`/${jobId}`)).body.state, "pending");
-  const waiting = fetch(`${url}/${jobId}/wait?timeoutMs=1000`, {
-    headers: { authorization: "Bearer test-token" },
-  });
-  await jobs.complete(jobId, "Checkout test passed, with evidence.");
-  const waited = await waiting;
-  assert.equal(waited.status, 200, "a caller waits once for completion instead of asking the model to poll");
-  assert.equal((await waited.json()).result, "Checkout test passed, with evidence.\n");
-  assert.equal((await request(`/${jobId}`)).body.result, "Checkout test passed, with evidence.\n");
-  await writeFile(path.join(directory, "support-extension-token"), "test-token\n");
-  const cli = await promisify(execFile)(process.execPath, ["dist/cli.js", "status", jobId], {
-    env: { ...process.env, DATA_DIR: directory, THREAD_SYNC_PORT: String(server.address().port) },
-  });
-  assert.equal(JSON.parse(cli.stdout).result, "Checkout test passed, with evidence.\n", "CLI reads the local token and retrieves the API report");
-  const runPromise = promisify(execFile)(process.execPath, [path.resolve("dist/cli.js"), "run", "--prompt", "Execute the bounded CLI assignment", "--session", "cli-test"], {
-    cwd: directory,
-    env: { ...process.env, DATA_DIR: directory, THREAD_SYNC_PORT: String(server.address().port) },
-  });
-  const cliSend = await claim();
-  completeCommand(cliSend, { status: "sent", conversationUrl: "https://chatgpt.com/c/44444444-4444-4444-8444-444444444444" });
-  const cliJob = (await request("?session=cli-test")).body.jobs[0];
-  const pendingWait = await request(`/${cliJob.jobId}/wait?timeoutMs=1`);
-  assert.equal(pendingWait.status, 200);
-  assert.equal(pendingWait.body.state, "pending", "bounded waits return pending without restarting an assignment");
-  assert.equal((await request(`/${cliJob.jobId}/wait?timeoutMs=0`)).status, 400);
-  await jobs.complete(cliJob.jobId, "CLI received the worker report");
-  const runResult = await runPromise;
-  assert.equal(JSON.parse(runResult.stdout).result.trim(), "CLI received the worker report", "one CLI process dispatches, waits, and returns the report");
-  assert.match(runResult.stderr, /Resume this wait/);
-  await controller.tick();
-  await new Promise(resolve => setTimeout(resolve, 30));
-  assert.equal(await commands.claim("extension", ["threadMessaging"], 0), undefined, "API results never send a parent message");
-  assert.equal((await request()).body.jobs.length, 2);
+	const connection = new AbortController();
+	const interruptedPayload = { prompt: "Continue after client disconnect", session: "disconnect", requestId: "same" };
+	const disconnected = await request("", interruptedPayload, {}, connection.signal);
+	const disconnectedId = disconnected.headers.get("x-job-id");
+	const disconnectedBody = disconnected.json();
+	const rejectedBody = assert.rejects(disconnectedBody);
+	const disconnectedSend = await claim();
+	sent(disconnectedSend);
+	connection.abort();
+	await rejectedBody;
+	const recovered = await request(`/${disconnectedId}/wait`);
+	const retried = await request("", interruptedPayload);
+	assert.equal(retried.headers.get("x-job-id"), disconnectedId);
+	assert.equal(await commands.claim("extension", ["threadMessaging"], 0), undefined, "reconnecting does not create another worker");
+	await publish(await jobs.job(disconnectedId), "Report survives caller disconnection");
+	assert.equal((await recovered.json()).result.trim(), "Report survives caller disconnection");
+	assert.equal((await retried.json()).state, "complete");
 
-  // Local callers can submit again immediately after reading completed reports.
-  // Their jobs do not need to reserve slots for ChatGPT parent notifications.
-  for (let index = 0; index < 2; index++) {
-    const finished = await jobs.create({ threadId: "api:completed-capacity" });
-    await jobs.complete(finished.jobId, `Finished test ${index}`);
-  }
-  const replacement = await request("", { session: "completed-capacity", prompt: "Next browser test" });
-  assert.equal(replacement.status, 202, "completed API jobs release capacity before notification cleanup");
-  const replacementSend = await claim();
-  commands.complete({ commandId: replacementSend.id, browserId: "extension", kind: "send_message", ok: false, error: "Test executor unavailable" });
-  await new Promise(resolve => setTimeout(resolve, 20));
-  assert.equal((await request(`/${replacement.body.jobId}/cancel`, {})).body.state, "cancelled");
+	await writeFile(path.join(directory, "support-extension-token"), "test-token\n");
+	const cli = path.resolve("dist/cli.js");
+	const run = promisify(execFile)(process.execPath, [cli, "run", "--prompt", "Test one long request", "--session", "cli-test", "--request-id", "cli-one"], {
+		cwd: directory, timeout: 30_000,
+		env: { ...process.env, DATA_DIR: directory, THREAD_SYNC_PORT: String(server.address().port) },
+	});
+	const cliSend = await claim();
+	sent(cliSend);
+	const cliJob = (await jobs.forParent("api:cli-test"))[0];
+	await delay(16_000);
+	await publish(cliJob, "CLI received its report through one held request");
+	const runResult = await run;
+	assert.equal(JSON.parse(runResult.stdout).result.trim(), "CLI received its report through one held request");
+	assert.match(runResult.stderr, /Recover an interrupted connection/);
+	assert.equal(requests.filter(req => req.session === "cli-test").length, 1);
+	assert.equal(requests.filter(req => req.url.includes("/wait")).length, 5, "only explicit recovery requests use wait");
+	const status = await promisify(execFile)(process.execPath, [cli, "status", cliJob.jobId], {
+		env: { ...process.env, DATA_DIR: directory, THREAD_SYNC_PORT: String(server.address().port) },
+	});
+	assert.equal(JSON.parse(status.stdout).state, "complete");
+	assert.equal((await request("/not-a-job/wait")).status, 404);
+	assert.equal((await request(`/${jobId}/cancel`, {})).status, 404, "local callers have no cancel endpoint");
 
-  const interrupted = await jobs.create({ threadId: "api:restart", requestId: "restart", promptHash: "hash" });
-  const reopened = await SubagentJobRegistry.open(directory);
-  assert.match((await reopened.job(interrupted.jobId)).preparationError, /interrupted/);
-  assert.equal((await reopened.create({ threadId: "api:restart", requestId: "restart", promptHash: "hash" })).jobId, interrupted.jobId);
-  console.log("Agent API: async dispatch, retry deduplication, results, capacity, failed stop, and restart recovery passed.");
+	const restartJob = await jobs.create({ threadId: "api:restart", requestId: "restart", promptHash: "hash" });
+	await jobs.close();
+	await publish(restartJob, "Published while the service was stopped");
+	reopened = await SubagentJobRegistry.open(directory);
+	assert.equal((await reopened.job(restartJob.jobId)).state, "complete");
+	assert.equal((await reopened.job(restartJob.jobId)).preparationError, undefined);
+	assert.equal((await reopened.create({ threadId: "api:restart", requestId: "restart", promptHash: "hash" })).jobId, restartJob.jobId);
+	const restartedRegistry = await RalphRegistry.open(directory);
+	assert.ok((await restartedRegistry.threads()).some(thread => thread.parentThreadId === "api:local"),
+		"the service can reload worker registrations with local API parent sessions");
+	console.log("Agent API passed: one blocking request, file completion, retry deduplication, disconnect recovery, startup failure, capacity, evidence, CLI keepalive, and restart recovery.");
 } finally {
-  controller.close();
-  commands.close();
-  await new Promise(resolve => server.close(resolve));
-  assert.equal(path.dirname(directory), os.tmpdir());
-  await rm(directory, { recursive: true, force: true });
+	commands.close();
+	await jobs.close();
+	await reopened?.close();
+	server.closeAllConnections();
+	await new Promise(resolve => server.close(resolve));
+	assert.equal(path.dirname(directory), os.tmpdir());
+	await rm(directory, { recursive: true, force: true });
 }

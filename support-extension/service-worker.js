@@ -513,7 +513,7 @@ async function executeCommandOnce(command, browserId) {
   let tabId;
   let created = false;
   let keepCreatedTab = false;
-  let automationStarted = false;
+  let deliveryUncertain = false;
   let refreshed = false;
 
   try {
@@ -589,24 +589,23 @@ async function executeCommandOnce(command, browserId) {
     }
 
     const runPageCommand = async () => {
+      deliveryUncertain = true;
       const response = await sendAutomationMessageWithTimeout(tabId, command);
       if (response?.ok) return response;
+      deliveryUncertain = response?.retryable !== true;
       const error = new Error(response?.error || "ChatGPT page automation failed.");
       error.retryable = response?.retryable === true;
       throw error;
     };
-    automationStarted = true;
     let response;
     try {
       response = await runPageCommand();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (refreshed || /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(message)) throw error;
+      if (command.kind === "send_message" && error?.retryable !== true) throw error;
       await reloadPageAfterFailure(tabId, targetUrl);
       refreshed = true;
-      if (command.kind === "send_message" && error?.retryable !== true) {
-        throw error;
-      }
       if (command.kind !== "stop_thread") await recoverPage(tabId);
       response = await runPageCommand();
     }
@@ -643,7 +642,7 @@ async function executeCommandOnce(command, browserId) {
         result: { status: "loading" } }).catch(() => undefined);
       return;
     }
-    if (command.kind === "send_message" && !automationStarted && errorMessage.startsWith("CHATGPT_RATE_LIMITED:")) {
+    if (command.kind === "send_message" && !deliveryUncertain && errorMessage.startsWith("CHATGPT_RATE_LIMITED:")) {
       errorMessage = errorMessage.replace("CHATGPT_RATE_LIMITED:", "CHATGPT_RATE_LIMITED_RETRYABLE:");
     }
     if (Number.isInteger(tabId) && /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(errorMessage)) {
@@ -672,6 +671,7 @@ async function executeCommandOnce(command, browserId) {
       kind: command.kind,
       ok: false,
       error: errorMessage,
+      ...(command.kind === "send_message" ? { deliveryUncertain: deliveryUncertain && error?.retryable !== true } : {}),
     }).catch(() => undefined);
   } finally {
     if (created && Number.isInteger(tabId) && !keepCreatedTab) {

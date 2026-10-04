@@ -8,9 +8,9 @@ Set **ChatGPT worker project URL** to your existing ChatGPT project. Connect the
 
 After an update, reload the generated extension in `chrome://extensions` and reload ChatGPT pages. A running page can retain an older content script until navigation or reload.
 
-Use **Tasks** to open worker conversations and inspect job or notification errors. Inspect uncertain delivery before retrying a parent wake-up or cancelling an abandoned startup. A known worker must stop before cancellation releases the reservation.
+Use **Tasks** to open worker conversations and inspect startup errors. Inspect uncertain delivery before cancelling an abandoned startup. A known worker must stop before cancellation releases the reservation.
 
-Follow [the delegation workflow](../docs/delegation.md) for parent and worker prompts. Workers report once through `task_done`. The service stores their reports and routes completion. A final chat answer alone does not finish the job.
+Follow [the delegation workflow](../docs/delegation.md) for parent and worker prompts. Workers publish reports through the supplied temporary file and rename. The local request waits until the server collects the report. A final chat answer alone does not finish the job.
 
 Automatic continuation is disabled by default. Legacy RALPH controls appear only when the server uses `RALPH_ENABLED=true`. Normal task delegation does not need that setting or an OpenAI API key.
 
