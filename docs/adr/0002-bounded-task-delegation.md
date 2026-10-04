@@ -1,13 +1,13 @@
-# ADR 0002: bounded ChatGPT task delegation
+# ADR 0002: blocking local delegation
 
-This decision replaces the reviewer-only handoff and default automatic continuation described in ADR 0001. Explicit URL binding, tab ownership, authentication, and the existing command bus remain in use.
+This decision replaces the task handoff and parent notification flow. Explicit URL binding, browser ownership, authentication, and the command bus remain in use.
 
-Parents write specifications and implement changes. ChatGPT workers execute a bounded specification for tests, browser work, visual checks, or reproduction. `start_task`, `list_tasks`, and `task_done` replace the reviewer tools. `start_thread` remains an explicitly requested standalone conversation with no callback.
+Local agents delegate through one CLI or authenticated loopback HTTP request. The request stays open until completion, cancellation, or startup failure. The parent keeps its turn active. HTTP keepalive whitespace preserves the response during long assignments. An interrupted client reconnects to the existing job.
 
-Completion requires an explicit report. Specifications and reports live in `.data/tasks` with an atomic job registry. Legacy review and subagent stores migrate on first open. Duplicate completion preserves the first report. Uncertain startup preserves the reservation. Uncertain notification requires operator inspection before retry.
+The worker publishes its report through a temporary file and an atomic rename. The server watches for that file, validates it, persists the completed state, and returns the report. Startup scans recover reports published during downtime. A worker that stays idle without a report produces a BLOCKED outcome.
 
-ChatGPT parents end their turn and receive a service message after worker completion and idle. Local agents use one CLI process with bounded HTTP waits. A custom runner must persist its parent session and resume it on completion. An indefinitely held MCP call is not the resume mechanism.
+The ChatGPT computer connector has no task lifecycle tools. It retains explicit thread creation and messaging. Codex uses the local CLI or API, and the MCP endpoint rejects clients that identify themselves as Codex.
 
-The service detects workers that stay idle without submitting a report and records a BLOCKED outcome. It does not call a model or restart the worker. Automatic RALPH continuation is disabled by default. `RALPH_ENABLED=true` retains the legacy runtime as an explicit opt-in.
+Automatic delegation applies to reviews, browser work, and application testing. Large tasks may delegate bounded independent assignments. Diagnosis, reproduction, and evidence collection stay in the parent unless the user assigns them to a worker.
 
-Windows sign-in starts a hidden supervisor. The supervisor reuses a healthy server and the configured Cloudflare tunnel, logs failures, and restarts exited processes. It does not replace the user's ChatGPT login or silently refresh connector permissions.
+The service owns dispatch, completion detection, and recovery state. The agent does not schedule wake-ups or poll job state.

@@ -1,3 +1,3 @@
 # Claude instructions
 
-Follow [AGENTS.md](AGENTS.md). For test execution, browser interaction, visual checks, or reproduction, use [the local ChatGPT delegation workflow](docs/delegation.md). The `run` CLI waits inside one process. Use your native task-completion notification and end the parent turn after dispatch.
+Follow [AGENTS.md](AGENTS.md). Use [the local delegation workflow](docs/delegation.md) for reviews, browser work, application testing, or bounded parts of large tasks. The CLI waits for a report in one request. Keep the parent turn active until the command returns.

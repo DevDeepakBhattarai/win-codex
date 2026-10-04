@@ -5,7 +5,7 @@ import path from "node:path";
 import type { Request, RequestHandler, Response } from "express";
 import type { McpServer, CallToolResult } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import { SubagentAdmissionError, SubagentJobRegistry } from "./subagent-jobs.js";
+import { SubagentJobRegistry } from "./subagent-jobs.js";
 
 const MAX_RALPH_THREADS = 2_000;
 const MAX_RALPH_PROJECTS = 100;
@@ -23,9 +23,6 @@ const RALPH_BROWSER_INSPECTION_TIMEOUT_MS = 3 * 60_000;
 const SUPPORT_BROWSER_HEARTBEAT_GRACE_MS = 90_000;
 const SUPPORT_BROWSER_LAUNCH_COOLDOWN_MS = 60_000;
 const SUPPORT_BROWSER_CONNECT_TIMEOUT_MS = 10_000;
-const SUBAGENT_RESULT_MISSING_RETRY_MS = 30_000;
-const MAX_SUBAGENT_NOTIFICATION_ATTEMPTS = 5;
-const MAX_SUBAGENT_NOTIFICATION_RETRY_MS = 10 * 60_000;
 const MAX_CONCURRENT_THREAD_PREPARATIONS = 3;
 const RALPH_PREPARE_TIMEOUT_MS = 3 * 60 * 1000;
 const THREAD_PREPARATION_HOLD_MS = 2 * 60 * 1000;
@@ -64,14 +61,7 @@ function replayToolRequest(replayKey: string, createResult: () => Promise<CallTo
   return result;
 }
 
-export const SUBAGENT_WIDGET_URI = "ui://local-codex/task-v1.html";
-export const SUBAGENT_AGENT_INSTRUCTION = [
-  "Parent agents write the specification and implement changes. Delegate test execution, browser interaction, visual checks, and bug reproduction to ChatGPT with start_task.",
-  "Give the worker one bounded specification with the absolute workspace, revision, URL or command, reproduction steps, expected results, permitted changes, and required evidence. After handoff, end this turn immediately. The service delivers the report and wakes this parent. Do not poll or repeat an uncertain assignment.",
-  "Use list_tasks only when the user asks to inspect tasks or when recovery requires one status snapshot. Never poll it for completion.",
-  "Assigned workers execute their specification themselves, submit observed results or an exact blocker with task_done, and end their turn. Workers never delegate again. Parents read the report before continuing. Reuse the current thread binding.",
-  "Use start_thread and send_thread_message only when the user explicitly requests a new conversation or a message to an existing conversation. They are not delegation or task tools. After uncertain delivery, inspect the target before sending again.",
-].join(" ");
+export const SUBAGENT_AGENT_INSTRUCTION = "This connector provides computer access for ChatGPT. Local agents use the installed CLI for delegation. Delegate reviews, browser work, application testing, or a bounded part of a large task. Keep diagnosis, reproduction, and evidence collection in the parent. Assigned workers execute their specification themselves and publish the report at the supplied file path. The local request waits for that report. Workers do not delegate again.";
 const CONTINUOUS_RALPH_INSTRUCTION = "Continue the user-authorized continuous run toward the existing goal. You own all decisions about what to do next. Read the conversation and current state, use completed task reports as evidence, choose useful unfinished work, and verify the result. If progress depends on a pending task, user input, or a message cooldown, state the blocker and end this turn. Do not poll. Continuous RALPH will wake the thread again while the user keeps continuous mode enabled.";
 
 export const supportFeatureSchema = z.enum(["ralph", "threadMessaging", "threadPreparation", "threadLifecycle"]);
@@ -1581,7 +1571,7 @@ export function ralphThreadsGetHandler(registry: RalphRegistry, extensionToken: 
     res.json({ threads: threads.map((thread) => ({
       ...thread,
       waitingForTask: tasks.some((job) => job.parentThreadId === thread.threadId &&
-        (job.state === "pending" || (job.state === "complete" && !job.notifiedAt))),
+        job.state === "pending"),
     })), tasks, continuationEnabled });
   };
 }
@@ -1592,15 +1582,13 @@ export function taskActionHandler(
 ): RequestHandler {
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
-    const input = z.object({ action: z.enum(["cancel", "retry"]), confirmedStopped: z.boolean().optional() }).strict().safeParse(req.body);
+    const input = z.object({ action: z.literal("cancel"), confirmedStopped: z.boolean().optional() }).strict().safeParse(req.body);
     const id = z.string().uuid().safeParse(req.params.jobId);
     if (!input.success || !id.success) { res.status(400).json({ error: "Invalid task action." }); return; }
     try {
       const job = await jobs.job(id.data);
       if (!job) { res.status(404).json({ error: "Task not found." }); return; }
-      if (input.data.action === "retry") {
-        await jobs.retryNotification(job.jobId);
-      } else if (job.state === "pending") {
+      if (job.state === "pending") {
         if (job.childConversationUrl) {
           await commands.ensureBrowser("threadMessaging", launchBrowser);
           const stopped = await commands.execute({ feature: "threadMessaging", kind: "stop_thread", targetUrl: job.childConversationUrl });
@@ -1612,7 +1600,7 @@ export function taskActionHandler(
         if (job.childThreadId) await registry.recordComplete(job.childThreadId);
         await jobs.cancel(job.jobId);
       } else {
-        throw new Error("Only pending tasks can be cancelled. Retry delivery for a completed report.");
+        throw new Error("Only pending tasks can be cancelled.");
       }
       res.setHeader("Cache-Control", "no-store");
       res.json({ status: "accepted" });
@@ -1944,106 +1932,11 @@ function agentPrompt(message: string, jobId: string, resultPath: string) {
     `For browser work, save important evidence with browser_screenshot and jobId ${JSON.stringify(jobId)}. When recording is requested, start browser_recording before interacting, stop it before releasing the tab, and include the video path.`,
     "Inspect a fresh browser_snapshot before interacting and verify the observed result after each meaningful action. Never report an unperformed check as passed.",
     "Write the report with the tested workspace and revision, each check's expected and observed result, pass or fail, reproduction steps, evidence paths, and any blocker. An unsuccessful test or missing login is a reportable result.",
-    "Before task_done, bind this conversation with sync_current_thread. If it reports syncing, follow with get_current_thread_url; if it reports synced, reuse that binding.",
-    "The service routes your report to the parent. Use task_done to report back, not send_thread_message or a final chat answer alone.",
-    `When your work is complete, call task_done exactly once with jobId ${JSON.stringify(jobId)} and put your complete final report in its result argument.`,
-    `The application stores the report at ${JSON.stringify(resultPath)} and handles delivery. If you cannot finish, submit your observed progress and exact blocker now.`,
-    "After task_done succeeds, end this turn with only a brief acknowledgement.",
+    `When finished, write your complete report to ${JSON.stringify(resultPath + ".tmp")} with terminal, then rename that file to ${JSON.stringify(resultPath)}. The rename marks the assignment done and releases the waiting parent request.`,
+    "Publish a report even if checks fail or access is blocked. Include observed progress and the exact blocker. After the rename succeeds, end the turn. No thread binding or completion tool is required.",
   ].join("\n");
 }
 
-
-async function subagentViews(
-  parentThreadId: string,
-  registry: RalphRegistry,
-  jobs: SubagentJobRegistry,
-  jobId?: string,
-) {
-  const [threads, parentJobs] = await Promise.all([
-    registry.subagents(parentThreadId),
-    jobs.forParent(parentThreadId),
-  ]);
-  const jobsByChild = new Map(parentJobs.flatMap((job) => job.childThreadId ? [[job.childThreadId, job] as const] : []));
-  const views = threads.map((thread) => {
-    const job = jobsByChild.get(thread.threadId);
-    return {
-      conversationUrl: thread.conversationUrl,
-      threadId: thread.threadId,
-      title: thread.title,
-      state: thread.state,
-      mode: thread.mode,
-      registeredAt: thread.registeredAt,
-      nextCheckAt: thread.nextCheckAt,
-      lastCheckedAt: thread.lastCheckedAt,
-      lastContinuationAt: thread.lastContinuationAt,
-      lastError: thread.lastError,
-      ...(job ? {
-        jobId: job.jobId,
-        resultPath: job.resultPath,
-        resultState: job.state,
-        notifiedAt: job.notifiedAt,
-        notificationAttempts: job.notificationAttempts,
-        notificationAbandonedAt: job.notificationAbandonedAt,
-        notificationError: job.notificationError,
-        preparationError: job.preparationError,
-      } : {}),
-    };
-  });
-  return [...views, ...parentJobs.filter((job) => !job.childThreadId || !threads.some((thread) => thread.threadId === job.childThreadId)).map((job) => ({
-    conversationUrl: job.childConversationUrl,
-    threadId: job.childThreadId,
-    title: job.title ?? "Worker startup unconfirmed",
-    state: job.state === "pending" ? "active" as const : "complete" as const,
-    mode: "normal" as const,
-    registeredAt: job.createdAt,
-    nextCheckAt: 0,
-    jobId: job.jobId,
-    resultPath: job.resultPath,
-    resultState: job.state,
-    preparationError: job.preparationError,
-  }))].filter((view) => jobId === undefined || view.jobId === jobId);
-}
-
-function taskListText(tasks: Awaited<ReturnType<typeof subagentViews>>) {
-  if (tasks.length === 0) return "No workers.";
-  return tasks.map((task, index) => {
-    const status = task.resultState ?? task.state;
-    return [
-      `${index + 1}. ${task.title ?? "Worker"}`,
-      task.conversationUrl ? `Task thread: ${task.conversationUrl}` : "Task thread: startup unconfirmed",
-      `Status: ${status}`,
-    ].join("\n");
-  }).join("\n\n");
-}
-
-const subagentOutputSchema = {
-  parentConversationUrl: z.string().url(),
-  tasks: z.array(z.object({
-    conversationUrl: z.string().url().optional(),
-    threadId: z.string().optional(),
-    title: z.string().optional(),
-    state: z.enum(["active", "complete"]),
-    mode: z.enum(["normal", "continuous"]),
-    registeredAt: z.string(),
-    nextCheckAt: z.number(),
-    lastCheckedAt: z.string().optional(),
-    lastContinuationAt: z.string().optional(),
-    lastError: z.string().optional(),
-    jobId: z.string().uuid().optional(),
-    resultPath: z.string().optional(),
-    resultState: z.enum(["pending", "complete", "cancelled"]).optional(),
-    notifiedAt: z.string().optional(),
-    notificationAttempts: z.number().int().nonnegative().optional(),
-    notificationAbandonedAt: z.string().optional(),
-    notificationError: z.string().optional(),
-    preparationError: z.string().optional(),
-  })),
-};
-
-const subagentToolMeta = {
-  ui: { resourceUri: SUBAGENT_WIDGET_URI },
-  "openai/outputTemplate": SUBAGENT_WIDGET_URI,
-};
 
 type SubagentJob = NonNullable<Awaited<ReturnType<SubagentJobRegistry["job"]>>>;
 type AgentServices = {
@@ -2070,201 +1963,15 @@ export async function startSubagentJob(job: SubagentJob, message: string,
   preparer.markPrepared(child.conversationUrl);
 }
 
-export async function cancelSubagentJob(job: SubagentJob, { commands, registry, jobs, launchBrowser }: AgentServices) {
-  if (job.state !== "pending") return job;
-  if (!job.childThreadId && !job.preparationError) throw new Error("Child startup is still in progress. Wait for its startup result before cancelling this job.");
-  if (job.childThreadId && !job.childConversationUrl) throw new Error("This child has no stored conversation URL. The job remains pending.");
-  if (job.childConversationUrl) {
-    try {
-      await commands.ensureBrowser("threadMessaging", launchBrowser);
-      const stopped = await commands.execute({ feature: "threadMessaging", kind: "stop_thread", targetUrl: job.childConversationUrl });
-      if (!stopped.ok) throw new Error(stopped.error);
-      if (stopped.kind !== "stop_thread") throw new Error("Unexpected stop result.");
-    } catch (error) {
-      throw new Error(`Could not confirm that the child stopped. Job ${job.jobId} remains pending. ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-  if (job.childThreadId) await registry.recordComplete(job.childThreadId);
-  return await jobs.cancel(job.jobId);
-}
-
 export function registerChatGptAgents(
   server: McpServer,
   commands: SupportCommandBus,
   bindings: ThreadBindingLookup,
-  registry: RalphRegistry,
   jobs: SubagentJobRegistry,
   preparer: ThreadPreparationCoordinator,
   launchBrowser: () => Promise<void>,
   ownerId: string,
-  widgetHtml: string,
 ) {
-  server.registerResource("task-widget", SUBAGENT_WIDGET_URI, { mimeType: "text/html;profile=mcp-app" }, async () => ({
-    contents: [{ uri: SUBAGENT_WIDGET_URI, mimeType: "text/html;profile=mcp-app", text: widgetHtml, _meta: { ui: { prefersBorder: false, csp: { connectDomains: [], resourceDomains: [] } } } }],
-  }));
-
-  server.registerTool("start_task", {
-    title: "Start task",
-    description: "Delegate one bounded testing, browser, or reproduction specification to a fresh ChatGPT worker. Requires a synced parent. Include the absolute workspace, revision, URLs or commands, expected results, permitted changes, and evidence required. The service stores the specification and report. One unfinished task per parent. Identical specifications reuse the saved task. End your turn immediately after handoff. The service wakes the parent after task_done and worker idle. Do not poll or execute the delegated work yourself.",
-    inputSchema: {
-      prompt: z.string().trim().min(1).max(180_000).describe("Bounded specification, absolute workspace, revision, URL or command, expected results, permitted changes, and evidence. The server adds the worker completion contract."),
-    },
-    outputSchema: subagentOutputSchema,
-    _meta: subagentToolMeta,
-    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-  }, async ({ prompt }, extra) => {
-    const session = extra.mcpReq._meta?.["openai/session"];
-    if (typeof session !== "string" || !session || session.length > 2048) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: "The client did not provide a valid openai/session. Call sync_current_thread before starting a worker." }],
-      };
-    }
-    const parent = await bindings.binding({ ownerId, sessionId: session });
-    if (!parent) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: "This implementer conversation is not synced. Call sync_current_thread now. If it reports syncing, finish with get_current_thread_url, then retry start_task." }],
-      };
-    }
-
-    const fingerprint = createHash("sha256")
-      .update(prompt.trim())
-      .digest("base64url");
-    const replayKey = `start_task:${ownerId}:${session}:${String(extra.mcpReq.id)}:${fingerprint}`;
-    return await replayToolRequest(replayKey, async () => {
-      let job: Awaited<ReturnType<SubagentJobRegistry["create"]>>;
-      try {
-        if ((await registry.threads()).some((thread) => thread.threadId === parent.threadId && thread.parentThreadId)) {
-          throw new SubagentAdmissionError("nested");
-        }
-        job = await jobs.createTask(parent, fingerprint, prompt);
-      } catch (error) {
-        return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] };
-      }
-      if (job.reused) {
-        return {
-          content: [{ type: "text", text: `Existing task ${job.jobId}: ${job.state}.\n${job.childConversationUrl ? `Task thread: ${job.childConversationUrl}` : "Task thread: startup unconfirmed; do not start it again."}\nResult file: ${job.resultPath}${job.preparationError ? `\n${job.preparationError}` : ""}\n${job.state === "pending" || (job.state === "complete" && !job.notifiedAt) ? "End this turn now. The parent resumes after task completion." : job.state === "cancelled" ? "This task was cancelled. Resolve its disposition before another assignment." : "Read the existing report before continuing."}` }],
-          structuredContent: { parentConversationUrl: parent.conversationUrl, tasks: await subagentViews(parent.threadId, registry, jobs, job.jobId) },
-        };
-      }
-      let result: SupportCommandResult;
-      try {
-        const { subagentProjectUrl } = await registry.settings();
-        await commands.ensureBrowser("threadMessaging", launchBrowser);
-        result = await commands.execute({
-          feature: "threadMessaging",
-          kind: "send_message",
-          targetUrl: subagentProjectUrl ?? "https://chatgpt.com/",
-          message: agentPrompt(prompt, job.jobId, job.resultPath),
-          ...(!subagentProjectUrl ? { connectorName: process.env.CHATGPT_WORKER_CONNECTOR_NAME ?? "Codex" } : {}),
-        });
-        if (!result.ok) throw new Error(result.error);
-        if (result.kind !== "send_message") throw new Error("Worker creation received the wrong support command result.");
-      } catch (error) {
-        // Delivery can fail after Send was clicked. Keep the reservation until the parent resolves it.
-        await jobs.recordPreparationFailure(job.jobId, error instanceof Error ? error.message : String(error));
-        return {
-          isError: true,
-          content: [{ type: "text", text: `Worker startup could not be confirmed. Task ${job.jobId} still reserves the handoff. ${error instanceof Error ? error.message : "Worker creation failed."} End this turn. Inspect the task in the Support extension before cancelling an abandoned startup. Do not repeat the start request.` }],
-        };
-      }
-
-      const child = parseConversationUrl(result.result.conversationUrl);
-      await jobs.assignChild(job.jobId, {
-        threadId: child.threadId,
-        conversationUrl: child.conversationUrl,
-        title: result.result.title,
-      });
-      await registry.register(child.conversationUrl, {
-        agentCreated: true,
-        parentThreadId: parent.threadId,
-        title: result.result.title,
-      });
-      preparer.markPrepared(child.conversationUrl);
-      const structuredContent = {
-        parentConversationUrl: parent.conversationUrl,
-        tasks: await subagentViews(parent.threadId, registry, jobs, job.jobId),
-      };
-      return {
-        content: [{ type: "text", text: `Task thread: ${child.conversationUrl}\nResult file: ${job.resultPath}\nEnd this turn now. Do not wait, poll, or continue implementation. The service will wake this parent when the task is done.` }],
-        structuredContent,
-      };
-    });
-  });
-
-  server.registerTool("list_tasks", {
-    title: "List tasks",
-    description: "List tasks owned by this synced implementer, including their exact ChatGPT thread URLs, current state, and recovery errors. Use one snapshot only when the user asks to inspect tasks or recovery requires it. Do not poll this tool for completion; the service wakes the parent when a task finishes.",
-    inputSchema: {},
-    outputSchema: subagentOutputSchema,
-    _meta: subagentToolMeta,
-    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  }, async (_input, extra) => {
-    const session = extra.mcpReq._meta?.["openai/session"];
-    if (typeof session !== "string" || !session || session.length > 2048) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: "The client did not provide a valid openai/session, so tasks cannot be resolved for this conversation." }],
-      };
-    }
-    const parent = await bindings.binding({ ownerId, sessionId: session });
-    if (!parent) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: "This conversation is not synced. Call sync_current_thread now. If it reports syncing, finish with get_current_thread_url, then retry list_tasks." }],
-      };
-    }
-    const tasks = await subagentViews(parent.threadId, registry, jobs);
-    return {
-      content: [{ type: "text", text: taskListText(tasks) }],
-      structuredContent: { parentConversationUrl: parent.conversationUrl, tasks },
-    };
-  });
-
-  server.registerTool("task_done", {
-    title: "Task done",
-    description: "Store the complete report for the current worker or externally started local agent. For worker jobs, the service waits for this worker to become idle, then wakes the implementer. External API jobs remain local. End the turn immediately after success. Submit once; cancelled jobs reject late results.",
-    inputSchema: {
-      jobId: z.string().uuid(),
-      result: z.string().trim().min(1).max(200_000),
-    },
-    outputSchema: {
-      resultPath: z.string(),
-      status: z.literal("stored"),
-    },
-    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-  }, async ({ jobId, result }, extra) => {
-    const session = extra.mcpReq._meta?.["openai/session"];
-    if (typeof session !== "string" || !session || session.length > 2048) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: "The client did not provide a valid openai/session. Sync this worker conversation before submitting its result." }],
-      };
-    }
-    const child = await bindings.binding({ ownerId, sessionId: session });
-    if (!child) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: "This worker conversation is not synced. Call sync_current_thread now and finish the one-time sync before submitting the result." }],
-      };
-    }
-    const job = await jobs.job(jobId);
-    if (!job || job.childThreadId !== child.threadId) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: "This task does not belong to the current worker conversation." }],
-      };
-    }
-    const completed = await jobs.complete(jobId, result);
-    await registry.recordComplete(child.threadId);
-    const structuredContent = { resultPath: completed.job.resultPath, status: "stored" as const };
-    return {
-      content: [{ type: "text", text: completed.job.resultPath }],
-      structuredContent,
-    };
-  });
-
   server.registerTool("start_thread", {
     title: "Start thread",
     description: "Create a new ChatGPT conversation only when the user explicitly requests a new thread. This creates no task job or parent callback. Do not use it for automatic delegation. Transport retries of the same request are deduplicated. Inspect uncertain delivery before making a new request.",
@@ -2278,7 +1985,7 @@ export function registerChatGptAgents(
     const session = extra.mcpReq._meta?.["openai/session"];
     const current = typeof session === "string" ? await bindings.binding({ ownerId, sessionId: session }) : undefined;
     if (current && await jobs.isWorker(current.threadId)) {
-      return { isError: true, content: [{ type: "text", text: "Workers must complete their task and call task_done." }] };
+      return { isError: true, content: [{ type: "text", text: "Workers must execute their assignment and publish the report at its supplied path." }] };
     }
     try {
       const targetUrl = projectUrl ? normalizeSubagentProjectUrl(projectUrl) : "https://chatgpt.com/";
@@ -2356,8 +2063,7 @@ export function registerChatGptAgents(
 
 export class SubagentResultController {
   private readonly inFlight = new Set<string>();
-  private readonly retryAfter = new Map<string, number>();
-  private readonly batchAfter = new Map<string, number>();
+  private readonly completedThreads = new Set<string>();
   private readonly inspectionAfter = new Map<string, number>();
   private readonly idleSince = new Map<string, number>();
   private readonly timer: NodeJS.Timeout;
@@ -2366,19 +2072,26 @@ export class SubagentResultController {
     private readonly jobs: SubagentJobRegistry,
     private readonly commands: SupportCommandBus,
     private readonly launchBrowser: () => Promise<void>,
+    private readonly registry: RalphRegistry,
     checkEveryMs = 5_000,
-    private readonly batchWindowMs = 1_000,
     private readonly idleGraceMs = 120_000,
   ) {
-    this.timer = setInterval(() => void this.tick(), checkEveryMs);
+    this.timer = setInterval(() => void this.tick().catch((error: unknown) => console.error("[tasks] Report check failed:", error)), checkEveryMs);
     this.timer.unref();
   }
 
   async tick() {
-    if (this.commands.messageCooldownUntil()) return;
     const now = Date.now();
     for (const job of await this.jobs.all()) {
-      if (job.state !== "pending" || !job.childConversationUrl || job.preparationError) continue;
+      if (job.state !== "pending") {
+        if (job.childThreadId && !this.completedThreads.has(job.childThreadId)) {
+          await this.registry.recordComplete(job.childThreadId);
+          this.completedThreads.add(job.childThreadId);
+        }
+        continue;
+      }
+      await this.jobs.collectReport(job.jobId).catch((error: unknown) => console.error("[tasks] Report read failed:", error));
+      if (job.preparationError || !job.childConversationUrl || this.commands.messageCooldownUntil()) continue;
       if (this.inFlight.has(job.jobId) || (this.inspectionAfter.get(job.jobId) ?? Date.parse(job.createdAt) + this.idleGraceMs) > now) continue;
       this.inFlight.add(job.jobId);
       void this.inspectUnreportedWorker(job.jobId, job.childConversationUrl).catch((error: unknown) => {
@@ -2388,15 +2101,6 @@ export class SubagentResultController {
         this.inspectionAfter.set(job.jobId, Date.now() + 30_000);
         this.inFlight.delete(job.jobId);
       });
-    }
-    const jobs = await this.jobs.jobsNeedingNotification();
-    for (const parentId of new Set(jobs.map((job) => job.parentThreadId))) {
-      if (this.inFlight.has(parentId) || (this.retryAfter.get(parentId) ?? 0) > now) continue;
-      this.inFlight.add(parentId);
-      void this.check(parentId).catch((error: unknown) => {
-        console.error(`[subagents] notification_check_failed parent=${parentId} error=${String(error)}`);
-        this.retryAfter.set(parentId, Date.now() + SUBAGENT_RESULT_MISSING_RETRY_MS);
-      }).finally(() => this.inFlight.delete(parentId));
     }
   }
 
@@ -2419,70 +2123,17 @@ export class SubagentResultController {
       return;
     }
     if (Date.now() - since < this.idleGraceMs) return;
+    await this.jobs.collectReport(jobId);
     const current = await this.jobs.job(jobId);
     if (current?.state !== "pending") return;
-    await this.jobs.complete(jobId, `BLOCKED: worker stopped without calling task_done.\n\nThe service observed this conversation idle for at least ${Math.round(this.idleGraceMs / 1_000)} seconds. No test outcome is confirmed. Inspect the conversation before assigning further work.\n\nWorker: ${conversationUrl}\n\nLast observed response:\n${inspection.result.assistant?.text ?? "No final response."}`);
-    this.idleSince.delete(jobId);
-  }
+    await this.jobs.complete(jobId, `BLOCKED: worker stopped without publishing its report.
 
-  private async check(parentId: string) {
-    const ready: Awaited<ReturnType<SubagentJobRegistry["forParent"]>> = [];
-    for (const job of await this.jobs.forParent(parentId)) {
-      if (job.state === "complete" && !job.notifiedAt && !job.notificationAbandonedAt) ready.push(job);
-    }
-    if (!ready.length) return;
-    if (!ready[0].parentConversationUrl) {
-      await this.jobs.markNotified(ready.map((job) => job.jobId));
-      return;
-    }
-    const batchAfter = this.batchAfter.get(parentId) ?? Date.now() + this.batchWindowMs;
-    this.batchAfter.set(parentId, batchAfter);
-    if (Date.now() < batchAfter || this.commands.messageCooldownUntil()) return;
-    let wakeRequested = false;
-    try {
-      await this.commands.ensureBrowser("threadMessaging", this.launchBrowser);
-      for (const job of ready) {
-        if (!job.childConversationUrl) continue;
-        const inspection = await this.commands.execute({ feature: "threadMessaging", kind: "inspect_thread", conversationUrl: job.childConversationUrl });
-        if (!inspection.ok) throw new Error(inspection.error);
-        if (inspection.kind !== "inspect_thread") throw new Error("Unexpected worker inspection result.");
-        if (inspection.result.status !== "idle") {
-          this.retryAfter.set(parentId, Date.now() + 30_000);
-          return;
-        }
-      }
-      wakeRequested = true;
-      const wake = await this.commands.execute({
-        feature: "threadMessaging",
-        kind: "send_message",
-        targetUrl: ready[0].parentConversationUrl,
-        message: `Task done. Read these reports before continuing the parent task:\n${ready.map((job) => `Job ${job.jobId}: ${JSON.stringify(job.resultPath)}`).join("\n")}\nEvaluate the observed results and blockers against your specification. Implement confirmed fixes in the parent. Delegate any further tests or browser checks with a new bounded specification. Reuse this report instead of repeating the completed assignment.`,
-      });
-      if (!wake.ok) throw new Error(wake.error);
-      if (wake.kind !== "send_message") throw new Error("Worker wake-up received the wrong support command result.");
-      await this.jobs.markNotified(ready.map((job) => job.jobId));
-      this.retryAfter.delete(parentId);
-      this.batchAfter.delete(parentId);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (wakeRequested) {
-        for (const job of ready) await this.jobs.recordNotificationFailure(job.jobId, message, 1);
-        return;
-      }
-      if (this.commands.messageCooldownUntil()) {
-        if (error instanceof Error && error.message.startsWith("CHATGPT_RATE_LIMITED:")) {
-          for (const job of ready) await this.jobs.recordNotificationFailure(job.jobId, error.message, MAX_SUBAGENT_NOTIFICATION_ATTEMPTS);
-        }
-        this.retryAfter.set(parentId, this.commands.messageCooldownUntil());
-        return;
-      }
-      const failures = [];
-      for (const job of ready) failures.push(await this.jobs.recordNotificationFailure(job.jobId, message, MAX_SUBAGENT_NOTIFICATION_ATTEMPTS));
-      const retryMs = Math.min(
-        SUBAGENT_RESULT_MISSING_RETRY_MS * 2 ** Math.max(0, ...failures.map((job) => job.notificationAttempts - 1)),
-        MAX_SUBAGENT_NOTIFICATION_RETRY_MS,
-      );
-      this.retryAfter.set(parentId, Date.now() + retryMs);
-    }
+The service observed this conversation idle for at least ${Math.round(this.idleGraceMs / 1_000)} seconds. No test outcome is confirmed.
+
+Worker: ${conversationUrl}
+
+Last observed response:
+${inspection.result.assistant?.text ?? "No final response."}`);
+    this.idleSince.delete(jobId);
   }
 }

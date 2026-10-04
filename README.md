@@ -22,7 +22,7 @@ graph TD
 
 ## What the server provides
 
-For a local parent agent, use `pnpm agent run --file spec.md --session PARENT_ID --request-id ASSIGNMENT_ID`. One CLI process dispatches and waits for the report without model polling. See [the delegation workflow](docs/delegation.md) and [the API reference](docs/agent-api-reference.md).
+For a local parent agent, use `pnpm agent run --file spec.md --session PARENT_ID --request-id ASSIGNMENT_ID`. Keep the command alive until it returns the report. See [the delegation workflow](docs/delegation.md) and [the API reference](docs/agent-api-reference.md).
 
 ### Local computer tools
 
@@ -49,19 +49,16 @@ When `BROWSER_BRIDGE_ENABLED` is not `false`, the server also exposes:
 
 A normal browser workflow is `browser_open`, or `browser_tabs` followed by `browser_claim`, then `browser_snapshot` and actions, and finally `browser_release`.
 
-### ChatGPT task and thread tools
+### ChatGPT thread tools
 
 When `THREAD_SYNC_ENABLED` is not `false`, the server exposes:
 
 - `sync_current_thread` binds the ChatGPT conversation identifier supplied in request metadata to its URL once.
 - `get_current_thread_url` finishes a pending binding.
-- `start_task` accepts a bounded specification in `prompt` and starts one worker. The parent ends its turn after handoff.
-- `list_tasks` returns an inspection snapshot for the synced parent.
-- `task_done` stores the worker report. The service waits for worker idle before notifying the ChatGPT parent.
 - `start_thread` creates a standalone conversation on explicit user request. It adds no task or callback.
 - `send_thread_message` sends an explicitly requested message to an existing conversation.
 
-A ChatGPT parent has one unfinished task, including delivery. Workers cannot start nested workers. Identical specifications reuse their saved job. Include the revision and assignment identifier so changed work receives a new job. Local API sessions support two pending jobs.
+Local agents delegate through [the blocking CLI or HTTP API](docs/agent-api.md). The request waits for the report. Include the revision and a unique request ID. Retries of the same request reuse its saved job. Each local session supports two pending assignments. The computer connector is for ChatGPT. Codex uses the local interface.
 
 State, specifications, and reports live under `<DATA_DIR>/tasks`. Legacy reviews and subagents migrate on first open. The worker project uses the existing `subagentProjectUrl` setting. Cancellation and uncertain-delivery recovery remain operator actions in the Support extension.
 
@@ -214,7 +211,7 @@ See [support-extension/README.md](support-extension/README.md) for the exact sup
 
 ## Task result delivery
 
-Workers call `task_done` with their complete report. Writing a file or a final chat answer alone does not complete a job. Duplicate submissions preserve the first report. The service checks completed jobs every five seconds and notifies a ChatGPT parent only after worker idle. API jobs return their report through the local wait endpoint and do not message a ChatGPT parent.
+Workers write their complete report to the supplied temporary file and rename it to the final report path. The server watches the directory, persists completion, and returns the report through the waiting request. It collects reports published during downtime when it restarts. There are no completion tools, parent wake-up messages, or scheduled callbacks.
 
 Safe failures before Send use bounded retry. Uncertain delivery after Send requires operator inspection. The Support extension shows saved errors and offers recovery controls. Recognized rate limits defer queued sends, while Stop remains available.
 
@@ -312,6 +309,8 @@ pnpm thread-sync-test
 
 ## Design docs
 
+- [Blocking local delegation](docs/adr/0002-bounded-task-delegation.md)
+
 - [Local Codex Support extension](support-extension/README.md)
 - [ADR 0001: explicit ChatGPT URL binding and support automation](docs/adr/0001-explicit-chatgpt-url-binding.md)
 
@@ -322,4 +321,4 @@ pnpm thread-sync-test
 
 ## Agent instructions
 
-Repository agents read [AGENTS.md](AGENTS.md) and [the delegation workflow](docs/delegation.md). Parent agents write specifications and implement fixes. Workers execute and report. Instruction text directs this behavior; it does not remove tools from an arbitrary client's permissions.
+Repository agents follow [AGENTS.md](AGENTS.md) and [the delegation workflow](docs/delegation.md). Local parents call the blocking CLI and read the returned report. ChatGPT workers publish reports through a file rename. The computer connector is for ChatGPT and rejects clients that identify themselves as Codex.

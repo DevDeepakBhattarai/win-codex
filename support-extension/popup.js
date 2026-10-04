@@ -382,7 +382,7 @@ function renderThreads() {
   renderThreadList(element("threadList"), regular, "regular");
   const section = element("subagentThreadsSection");
   section.hidden = loadedTasks.length === 0;
-  const tasks = loadedTasks.filter((job) => (job.state === "pending" || (job.state === "complete" && !job.notifiedAt)) === (threadFilter === "active"));
+  const tasks = loadedTasks.filter((job) => (job.state === "pending") === (threadFilter === "active"));
   element("subagentCount").textContent = String(tasks.length);
   const list = element("subagentThreadList");
   list.replaceChildren(...tasks.map(renderTask));
@@ -392,9 +392,9 @@ function renderThreads() {
 function renderTask(job) {
   const item = document.createElement("li");
   const card = Object.assign(document.createElement("div"), { className: "thread" });
-  const label = job.preparationError || job.notificationError ? "Needs attention"
-    : job.notifiedAt ? (job.state === "cancelled" ? "Cancelled" : "Delivered")
-    : job.state === "complete" ? "Waiting to resume parent" : "Task in progress";
+  const label = job.preparationError ? "Needs attention"
+    : job.state === "cancelled" ? "Cancelled"
+    : job.state === "complete" ? "Report available" : "Task in progress";
   const title = document.createElement(job.childConversationUrl ? "a" : "strong");
   title.className = "thread-id";
   title.textContent = job.title || "Worker startup";
@@ -418,11 +418,11 @@ function renderTask(job) {
     });
     card.append(reviewUrl);
   }
-  const error = job.preparationError || job.notificationError;
+  const error = job.preparationError;
   if (error) card.append(Object.assign(document.createElement("p"), { className: "thread-error", textContent: error }));
-  if (job.state === "pending" || (job.state === "complete" && !job.notifiedAt && job.notificationAbandonedAt)) {
-    const action = job.state === "pending" ? "cancel" : "retry";
-    const button = Object.assign(document.createElement("button"), { className: "button", type: "button", textContent: action === "cancel" ? "Cancel task" : "Retry parent wake-up" });
+  if (job.state === "pending") {
+    const action = "cancel";
+    const button = Object.assign(document.createElement("button"), { className: "button", type: "button", textContent: "Cancel task" });
     button.addEventListener("click", () => void changeReview(job, action, button));
     card.append(button);
   }

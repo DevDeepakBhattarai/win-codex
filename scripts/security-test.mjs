@@ -353,6 +353,18 @@ try {
     throw new Error(`Token exchange failed: ${tokenResponse.status} ${JSON.stringify(token)}`);
   }
 
+  const codexDenied = await postMcp({
+    jsonrpc: "2.0", id: "codex-denied", method: "tools/list",
+    params: { _meta: {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { name: "codex-desktop", version: "1" },
+      "io.modelcontextprotocol/clientCapabilities": {},
+    } },
+  }, token.access_token, { "mcp-protocol-version": "2026-07-28", "mcp-method": "tools/list" });
+  if (codexDenied.status !== 403 || !codexDenied.responseText.includes("local CLI")) {
+    throw new Error("Codex must use the local API rather than the ChatGPT computer connector.");
+  }
+
   // Execute before either discovery or a legacy initialize. A new client needs no handshake.
   const directCallBody = {
     jsonrpc: "2.0", id: "direct-call", method: "tools/call",

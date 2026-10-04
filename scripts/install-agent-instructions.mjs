@@ -7,7 +7,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workflow = path.join(root, "docs", "delegation.md").replaceAll("\\", "/");
 const marker = "<!-- local-codex-delegation -->";
 const endMarker = "<!-- /local-codex-delegation -->";
-const instruction = `${marker}\nFor test execution, browser checks, visual checks, or failure reproduction, read [the ChatGPT delegation workflow](${workflow}) and delegate a bounded specification. Keep planning and implementation in the parent. End the parent turn after dispatch and use the runner's completion notification. Do not poll with model calls. If you are the assigned ChatGPT worker with a job ID, execute and report through task_done without nested delegation.\n${endMarker}`;
+const instruction = `${marker}\nFor reviews, browser work, or application testing, read [the local ChatGPT delegation workflow](${workflow}) and run the blocking local CLI. Large tasks may delegate bounded independent assignments. Keep planning, implementation, diagnosis, reproduction, and evidence collection in the parent unless the user assigns them to a worker. Keep the parent turn active while the command waits. Use the computer connector only in ChatGPT, not Codex. Assigned ChatGPT workers execute their specification and publish the report through the supplied temporary file and rename.\n${endMarker}`;
 const backupDirectory = path.join(root, ".data", "instruction-backups");
 await mkdir(backupDirectory, { recursive: true });
 for (const [directory, name] of [[".codex", "AGENTS.md"], [".claude", "CLAUDE.md"]]) {

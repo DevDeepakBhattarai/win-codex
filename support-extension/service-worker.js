@@ -602,11 +602,9 @@ async function executeCommandOnce(command, browserId) {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (refreshed || /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(message)) throw error;
+      if (command.kind === "send_message" && error?.retryable !== true) throw error;
       await reloadPageAfterFailure(tabId, targetUrl);
       refreshed = true;
-      if (command.kind === "send_message" && error?.retryable !== true) {
-        throw error;
-      }
       if (command.kind !== "stop_thread") await recoverPage(tabId);
       response = await runPageCommand();
     }

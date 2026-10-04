@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.7.1";
+  const contentScriptVersion = "1.7.4";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -154,14 +154,18 @@
     while (Date.now() < deadline) {
       assertNoPageError(true);
       const ready = getComposer();
-      const hasUserTurn = Boolean(document.querySelector('section[data-turn="user"]'));
-      if (!ready || document.readyState === "loading" || !hasUserTurn) {
+      if (!ready || document.readyState === "loading") {
         idleSince = 0;
         await sleep(100);
         continue;
       }
-      const stopButton = ready.composer.querySelector('button[data-testid="stop-button"]');
+      const stopButton = getStopButton(ready.composer);
       if (stopButton) return { ...ready, stopButton };
+      if (!document.querySelector('section[data-turn="user"]') && !userTurns().length) {
+        idleSince = 0;
+        await sleep(100);
+        continue;
+      }
       if (!idleSince) idleSince = Date.now();
       if (Date.now() - idleSince >= 1_500) return { ...ready, stopButton: null };
       await sleep(100);
@@ -175,7 +179,7 @@
     while (Date.now() < deadline) {
       assertNoPageError(true);
       const ready = getComposer();
-      const stopButton = ready?.composer.querySelector('button[data-testid="stop-button"]');
+      const stopButton = ready && getStopButton(ready.composer);
       if (!ready || stopButton) {
         stoppedSince = 0;
       } else {
@@ -193,7 +197,7 @@
     if (!ready) return { status: "loading", ...(title ? { title } : {}) };
     assertNoPageError();
 
-    const stopButton = ready.composer.querySelector('button[data-testid="stop-button"]');
+    const stopButton = getStopButton(ready.composer);
     if (stopButton) return { status: "running", ...(title ? { title } : {}) };
 
     const settled = await waitForStableTurns(20_000);
@@ -201,6 +205,20 @@
     if (isRunning()) return { status: "running", ...(title ? { title } : {}) };
     const workedSeconds = getWorkedDurationSeconds(await getRalphMinWorkedSeconds());
     const turns = [...document.querySelectorAll("section[data-turn]")];
+    if (!turns.length) {
+      const users = userTurns().map(turn => ({ id: userTurnId(turn), text: extractText(userContent(turn)) }));
+      const lastTurn = userTurns().at(-1)?.closest("[data-turn-key]") ??
+        [...document.querySelectorAll("[data-turn-key]")].at(-1);
+      const finalMessage = [...(lastTurn?.querySelectorAll('[data-markdown-text-tone="primary"]') ?? [])].at(-1);
+      if (isRunning()) return { status: "running", ...(title ? { title } : {}) };
+      return {
+        status: "idle", ...(title ? { title } : {}), workedSeconds, users,
+        assistant: {
+          synthetic: !finalMessage,
+          text: finalMessage ? extractText(finalMessage) : "[Thread stopped before an assistant response was produced.]",
+        },
+      };
+    }
     const users = [];
     let lastUserIndex = -1;
 
@@ -284,7 +302,8 @@
       const existingConversationUrl = conversationUrl();
       if (existingConversationUrl) {
         const loadedUserTurn = await waitFor(
-          () => document.querySelector('section[data-turn="user"] [data-message-author-role="user"]'),
+          () => document.querySelector('section[data-turn="user"] [data-message-author-role="user"]') ??
+            document.querySelector('[data-chatgpt-search-unit-key$=":user"] [data-markdown-text-tone="user-message"]'),
           SEND_READY_TIMEOUT_MS,
         );
         if (!loadedUserTurn) throw new Error("The existing ChatGPT thread did not load a user message.");
@@ -311,8 +330,7 @@
       }, SEND_READY_TIMEOUT_MS);
       if (!current) throw new Error("ChatGPT send button did not become actionable.");
 
-      const previousTurns = new Set([...document.querySelectorAll('section[data-turn="user"]')]
-        .map(turn => turn.dataset?.turnId ?? turn));
+      const previousTurns = new Set(userTurns().map(userTurnId));
       sendClicked = true;
       current.button.click();
       await sleep(SEND_SETTLE_MS);
@@ -327,11 +345,15 @@
       const normalizedMessage = message.replace(/\s+/g, " ").trim();
       const accepted = await waitFor(() => {
         assertNoPageError();
-        return [...document.querySelectorAll('section[data-turn="user"]')].some(turn => {
-          if (previousTurns.has(turn.dataset?.turnId ?? turn)) return false;
-          const user = turn.querySelector('[data-message-author-role="user"]') ?? turn;
-          const content = user.querySelector('[data-testid="collapsible-user-message-content"]') ?? user;
-          const text = content.textContent?.replace(/\s+/g, " ").trim();
+        // ChatGPT can hide the user message while a new worker runs.
+        const composer = getComposer();
+        if (!existingConversationUrl && conversationUrl() === savedUrl && isRunning() && composer &&
+            !(composer.editor.value ?? composer.editor.textContent ?? "").trim()) return true;
+        return userTurns().some(turn => {
+          if (previousTurns.has(userTurnId(turn))) return false;
+          const content = userContent(turn);
+          const text = (turn.hasAttribute?.("data-chatgpt-search-unit-key") ? extractText(content) : content.textContent)
+            ?.replace(/\s+/g, " ").trim();
           return text === normalizedMessage || (connectorName && text === submittedMessage);
         });
       }, SEND_NAVIGATION_TIMEOUT_MS);
@@ -355,7 +377,7 @@
     }
   }
 
-  async function attachConnector({ composer, editor }, name) {
+  async function attachConnector({ composer }, name) {
     const add = await waitFor(() => {
       const button = composer.querySelector('button[aria-label="Add files and more"]');
       return isActionableButton(button) ? button : null;
@@ -369,7 +391,7 @@
     }, 30_000);
     if (!button) throw new Error(`ChatGPT connector ${JSON.stringify(name)} was not found in the composer menu.`);
     button.click();
-    const mention = await waitFor(() => [...editor.querySelectorAll("[app-mention-display-name]")]
+    const mention = await waitFor(() => [...(getComposer()?.editor.querySelectorAll("[app-mention-display-name]") ?? [])]
       .find(mention => mention.getAttribute("app-mention-display-name") === name), 10_000);
     if (!mention) throw new Error(`ChatGPT did not attach connector ${JSON.stringify(name)}. The task was not sent.`);
   }
@@ -580,8 +602,9 @@
         await sleep(100);
         continue;
       }
-      if (ready.composer.querySelector('button[data-testid="stop-button"]')) return ready;
-      if (document.querySelector('section[data-turn="user"]')) return ready;
+      if (getStopButton(ready.composer)) return ready;
+      if (userTurns().length) return ready;
+      if (document.querySelector("[data-turn-key]")) return ready;
       await sleep(100);
     }
     return null;
@@ -592,6 +615,20 @@
       if (isRunning()) return { value: true, signature: "running", quietMs: 0 };
 
       const turns = [...document.querySelectorAll("section[data-turn]")];
+      if (!turns.length) {
+        const users = userTurns();
+        const lastTurn = users.at(-1)?.closest("[data-turn-key]") ??
+          [...document.querySelectorAll("[data-turn-key]")].at(-1);
+        if (!lastTurn) return null;
+        const hasAssistant = Boolean(lastTurn.querySelector('[data-markdown-text-tone="primary"]'));
+        const signature = location.href + lastTurn.textContent;
+        if (signature !== inspectionSignature) {
+          inspectionSignature = signature;
+          inspectionStableSince = Date.now();
+        }
+        const quietMs = hasAssistant ? THREAD_ASSISTANT_SETTLE_MS : THREAD_UNCERTAIN_SETTLE_MS;
+        return { value: true, signature, quietMs: Date.now() - inspectionStableSince >= quietMs ? 0 : quietMs };
+      }
       const lastUserIndex = turns.findLastIndex((turn) => turn.dataset.turn === "user");
       if (lastUserIndex < 0) return null;
       const hasAssistantAfterLastUser = turns.slice(lastUserIndex + 1).some((turn) => turn.dataset.turn === "assistant");
@@ -639,7 +676,27 @@
 
   function isRunning() {
     return Boolean(document.querySelector('form[data-type="unified-composer"] button[data-testid="stop-button"]') ??
-      document.querySelector('[data-composer-body] button[data-testid="stop-button"]'));
+      document.querySelector('[data-composer-body] button[data-testid="stop-button"]') ??
+      document.querySelector('[data-composer-body] button[aria-label="Stop"]'));
+  }
+
+  function getStopButton(composer) {
+    return composer.querySelector('button[data-testid="stop-button"]') ?? composer.querySelector('button[aria-label="Stop"]');
+  }
+
+  function userTurns() {
+    const legacy = [...document.querySelectorAll('section[data-turn="user"]')];
+    return legacy.length ? legacy : [...document.querySelectorAll('[data-chatgpt-search-unit-key$=":user"]')];
+  }
+
+  function userTurnId(turn) {
+    return turn.getAttribute?.("data-chatgpt-search-message-ids") ?? turn.dataset?.turnId ?? turn;
+  }
+
+  function userContent(turn) {
+    const user = turn.querySelector('[data-message-author-role="user"]') ?? turn;
+    return user.querySelector('[data-markdown-text-tone="user-message"]') ??
+      user.querySelector('[data-testid="collapsible-user-message-content"]') ?? user;
   }
 
   async function getRalphMinWorkedSeconds() {
@@ -675,7 +732,7 @@
 
   function extractText(element) {
     const clone = element.cloneNode(true);
-    clone.querySelectorAll("button, script, style, svg, [role='tooltip']").forEach((node) => node.remove());
+    clone.querySelectorAll("button, script, style, svg, [role='tooltip'], a[href^='/plugins/']").forEach((node) => node.remove());
     const container = document.createElement("div");
     container.style.cssText = "position:fixed;left:-10000px;top:0;width:800px;opacity:0;pointer-events:none;";
     container.setAttribute("aria-hidden", "true");

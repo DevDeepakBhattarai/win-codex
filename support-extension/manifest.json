@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Local Codex Support",
-  "version": "1.7.1",
+  "version": "1.7.4",
   "description": "Runs bounded ChatGPT tasks, stores reports, and delivers completion to parent agents.",
   "permissions": ["alarms", "scripting", "storage", "tabs", "webNavigation"],
   "host_permissions": ["https://chatgpt.com/*", "http://127.0.0.1/*"],

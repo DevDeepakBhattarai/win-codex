@@ -157,7 +157,7 @@ for (const failure of [new Error("Timed out waiting for ChatGPT page automation.
 
 {
   const run = await runWorker(sendCommand("uncertain-send"), [new Error("The message port closed after delivery.")]);
-  assert.equal(run.reloads, 1, "an uncertain send still refreshes the broken page");
+  assert.equal(run.reloads, 0, "an uncertain send preserves the worker that may already be running");
   assert.equal(run.dispatches, 1, "an uncertain send must not duplicate the message");
   assert.equal(run.results[0].ok, false);
 }

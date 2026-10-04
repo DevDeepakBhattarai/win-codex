@@ -1,107 +1,46 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import vm from "node:vm";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { SubagentJobRegistry } from "../dist/subagent-jobs.js";
-import { RalphController, RalphRegistry, SubagentResultController, SupportCommandBus, registerChatGptAgents, taskActionHandler } from "../dist/chatgpt-support.js";
+import { RalphController, RalphRegistry, SubagentResultController, SupportCommandBus, taskActionHandler } from "../dist/chatgpt-support.js";
 
-const directory = await mkdtemp(path.join(os.tmpdir(), "subagent-limits-"));
+const directory = await mkdtemp(path.join(os.tmpdir(), "task-test-"));
+const jobs = await SubagentJobRegistry.open(directory);
+const parent = { threadId: "11111111-1111-4111-8111-111111111111", conversationUrl: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111" };
+const child = { threadId: "22222222-2222-4222-8222-222222222222", conversationUrl: "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222" };
 try {
-  const parent = { threadId: "11111111-1111-4111-8111-111111111111", conversationUrl: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111" };
-  const child = { threadId: "22222222-2222-4222-8222-222222222222", conversationUrl: "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222" };
-  const jobs = await SubagentJobRegistry.open(directory);
-  const attempts = await Promise.allSettled(Array.from({ length: 8 }, () => jobs.createTask(parent)));
-  assert.equal(attempts.filter(result => result.status === "fulfilled").length, 1, "concurrent starts reserve only one worker per parent");
-  const job = attempts.find(result => result.status === "fulfilled").value;
-  await jobs.assignChild(job.jobId, child);
-  await assert.rejects(jobs.createTask(child), /cannot start another task/);
-  await writeFile(job.resultPath, "An unfinished report file");
-  assert.deepEqual(await jobs.jobsNeedingNotification(), [], "writing a file cannot complete a task");
-  await jobs.complete(job.jobId, "Task report");
-  await assert.rejects(jobs.createTask(parent), /unfinished task/, "submission alone does not release the parent's handoff");
-  await jobs.recordNotificationFailure(job.jobId, "delivery failed", 1);
-  assert.equal(await jobs.blocksContinuation(parent.threadId), true, "failed wake-up must not silently resume the parent");
-  await jobs.retryNotification(job.jobId);
-
-  const bus = new SupportCommandBus();
-  const controller = new SubagentResultController(jobs, bus, async () => {}, 60_000, 0);
-  const finish = (command, result) => bus.complete({ commandId: command.id, browserId: "browser", kind: command.kind, ok: true, result });
-  try {
-    await controller.tick();
-    let inspection = await bus.claim("browser", ["threadMessaging"], 1000);
-    assert.equal(inspection.kind, "inspect_thread");
-    finish(inspection, { status: "running" });
-    await new Promise(resolve => setTimeout(resolve, 10));
-    assert.equal(await bus.claim("browser", ["threadMessaging"], 0), undefined, "task_done cannot wake the parent while the worker is still running");
-    await controller.tick();
-    assert.equal(await bus.claim("browser", ["threadMessaging"], 0), undefined, "running worker checks back off");
-  } finally { controller.close(); bus.close(); }
-
-  const wakeBus = new SupportCommandBus();
-  const wakeController = new SubagentResultController(jobs, wakeBus, async () => {}, 60_000, 0);
-  try {
-    await Promise.all([wakeController.tick(), wakeController.tick()]);
-    const inspection = await wakeBus.claim("browser", ["threadMessaging"], 1000);
-    wakeBus.complete({ commandId: inspection.id, browserId: "browser", kind: "inspect_thread", ok: true,
-      result: { status: "idle", users: [], workedSeconds: null, assistant: { synthetic: false, text: "Task done" } } });
-    const notice = await wakeBus.claim("browser", ["threadMessaging"], 1000);
-    assert.equal(notice.targetUrl, parent.conversationUrl);
-    assert.ok(notice.message.includes(JSON.stringify(job.resultPath)));
-    assert.equal(await wakeBus.claim("browser", ["threadMessaging"], 0), undefined, "overlapping ticks emit one wake-up");
-    wakeBus.complete({ commandId: notice.id, browserId: "browser", kind: "send_message", ok: true, result: { status: "sent", conversationUrl: parent.conversationUrl } });
-    await new Promise(resolve => setTimeout(resolve, 10));
-    assert.equal(await jobs.blocksContinuation(parent.threadId), false);
-    assert.equal(await jobs.blocksContinuation(child.threadId), true);
-  } finally { wakeController.close(); wakeBus.close(); }
-
+  const registry = await RalphRegistry.open(path.join(directory, "ralph"), 1);
+  await registry.register(child.conversationUrl, { agentCreated: true });
   const unreported = await jobs.create({ threadId: "api:unreported" });
   await jobs.assignChild(unreported.jobId, child);
-  const monitoringBus = new SupportCommandBus(undefined, undefined, 0);
-  const monitor = new SubagentResultController(jobs, monitoringBus, async () => {}, 60_000, 0, 0);
-  try {
+  const bus = new SupportCommandBus(undefined, undefined, 0);
+  const monitor = new SubagentResultController(jobs, bus, async () => {}, registry, 60_000, 0);
+  const inspect = async status => {
     await monitor.tick();
-    const first = await monitoringBus.claim("browser", ["threadMessaging"], 1000);
-    monitoringBus.complete({ commandId: first.id, browserId: "browser", kind: "inspect_thread", ok: true,
-      result: { status: "idle", users: [], workedSeconds: null, assistant: { synthetic: false, text: "Stopped before reporting" } } });
+    const command = await bus.claim("browser", ["threadMessaging"], 1000);
+    assert.equal(command.kind, "inspect_thread");
+    bus.complete({ commandId: command.id, browserId: "browser", kind: "inspect_thread", ok: true,
+      result: status === "idle" ? { status, users: [], workedSeconds: null, assistant: { synthetic: false, text: "Stopped before reporting" } } : { status } });
     await new Promise(resolve => setTimeout(resolve, 10));
-    assert.equal((await jobs.job(unreported.jobId)).state, "pending", "a single idle observation cannot declare a stopped worker");
-    const originalNow = Date.now;
-    try {
-      Date.now = () => originalNow() + 31_000;
-      await monitor.tick();
-      const second = await monitoringBus.claim("browser", ["threadMessaging"], 1000);
-      monitoringBus.complete({ commandId: second.id, browserId: "browser", kind: "inspect_thread", ok: true,
-        result: { status: "idle", users: [], workedSeconds: null, assistant: { synthetic: false, text: "Stopped before reporting" } } });
-      await new Promise(resolve => setTimeout(resolve, 10));
-    } finally { Date.now = originalNow; }
-    assert.equal((await jobs.job(unreported.jobId)).state, "complete");
-    assert.match(await readFile(unreported.resultPath, "utf8"), /BLOCKED: worker stopped without calling task_done/);
-    assert.equal(await monitoringBus.claim("browser", ["threadMessaging"], 0), undefined, "the monitor never starts a continuation");
-  } finally { monitor.close(); monitoringBus.close(); }
-
-  const uncertain = await jobs.createTask(parent, "uncertain-wakeup");
-  await jobs.complete(uncertain.jobId, "Stored report");
-  const uncertainBus = new SupportCommandBus(undefined, undefined, 0);
-  const uncertainController = new SubagentResultController(jobs, uncertainBus, async () => {}, 60_000, 0);
+  };
+  const realNow = Date.now;
   try {
-    await uncertainController.tick();
-    const notice = await uncertainBus.claim("browser", ["threadMessaging"], 1000);
-    uncertainBus.complete({ commandId: notice.id, browserId: "browser", kind: "send_message", ok: false,
-      error: "Delivery uncertain after Send: message not confirmed" });
-    await new Promise(resolve => setTimeout(resolve, 10));
-    assert.ok((await jobs.job(uncertain.jobId)).notificationAbandonedAt, "uncertain wake-up requires operator inspection instead of a duplicate send");
-    await jobs.markNotified(uncertain.jobId);
-  } finally { uncertainController.close(); uncertainBus.close(); }
-
-  const duplicates = await Promise.all(Array.from({ length: 8 }, () => jobs.createTask(parent, "same-task-sha")));
-  assert.equal(new Set(duplicates.map(job => job.jobId)).size, 1);
-  const reopened = await SubagentJobRegistry.open(directory);
-  assert.equal((await reopened.createTask(parent, "same-task-sha")).jobId, duplicates[0].jobId);
-  assert.match((await reopened.job(duplicates[0].jobId)).preparationError, /interrupted/);
-  await reopened.cancel(duplicates[0].jobId);
-  await assert.rejects(reopened.complete(duplicates[0].jobId, "late"), /cancelled/);
-
+    await inspect("idle");
+    assert.equal((await jobs.job(unreported.jobId)).state, "pending", "one idle observation cannot complete a worker");
+    Date.now = () => realNow() + 31_000;
+    await inspect("running");
+    assert.equal((await jobs.job(unreported.jobId)).state, "pending", "a resumed worker clears the idle observation");
+    Date.now = () => realNow() + 62_000;
+    await inspect("idle");
+    Date.now = () => realNow() + 93_000;
+    await inspect("idle");
+    assert.equal((await jobs.job(unreported.jobId)).state, "complete");
+    assert.match(await readFile(unreported.resultPath, "utf8"), /BLOCKED: worker stopped without publishing its report/);
+    await monitor.tick();
+    assert.equal(await registry.isActive(child.threadId), false);
+    assert.equal(await bus.claim("browser", ["threadMessaging"], 0), undefined, "completion never sends a parent wake-up");
+  } finally { Date.now = realNow; monitor.close(); bus.close(); }
   const legacyRoot = path.join(directory, "legacy-task-storage");
   const legacyDirectory = path.join(legacyRoot, "subagents");
   await mkdir(legacyDirectory, { recursive: true });
@@ -126,69 +65,13 @@ try {
   }));
   const migratedJobs = await SubagentJobRegistry.open(legacyRoot);
   const migratedJob = await migratedJobs.job(legacyJobId);
-  assert.equal(path.dirname(migratedJob.resultPath), path.join(legacyRoot, "tasks"),
+  assert.equal(path.dirname(migratedJob.resultPath), await realpath(path.join(legacyRoot, "tasks")),
     "legacy sub-agent storage migrates to worker-named storage without changing the internal job registry");
   assert.equal((await readFile(migratedJob.resultPath, "utf8")).trim(), "Legacy task report");
   const migratedStore = JSON.parse(await readFile(path.join(legacyRoot, "tasks", "jobs.json"), "utf8"));
   assert.equal(migratedStore.jobs[0].resultPath, migratedJob.resultPath,
     "the canonical worker store persists the migrated report path");
-
-  const registry = await RalphRegistry.open(path.join(directory, "ralph"), 1);
-  await registry.register(parent.conversationUrl, { agentCreated: true });
-  await registry.scheduleNow(parent.threadId);
-  const handlers = new Map();
-  const toolJobs = await SubagentJobRegistry.open(path.join(directory, "tools"));
-  const toolBus = new SupportCommandBus();
-  let preparations = 0;
-  registerChatGptAgents({ registerResource() {}, registerTool(name, definition, handler) { handlers.set(name, handler); } },
-    toolBus, { async binding({ sessionId }) { return sessionId === "owner" ? parent : sessionId === "child" ? child : undefined; } },
-    registry, toolJobs, { markPrepared() { preparations += 1; } }, async () => {
-      await toolBus.claim("browser-launch", ["threadMessaging"], 0);
-    }, "grant", "");
-  const owner = { mcpReq: { id: "task", _meta: { "openai/session": "owner" } } };
-  try {
-    assert.equal((await handlers.get("start_task")({ prompt: "task" }, { mcpReq: { id: "unsynced" } })).isError, true);
-    const specification = "Reproduce the checkout failure at http://localhost:3000 in D:/workspace at SHA abc123. Report the observed validation and screenshots.";
-    const start = handlers.get("start_task")({ prompt: specification }, owner);
-    const command = await toolBus.claim("browser", ["threadMessaging"], 1000);
-    assert.ok(command.message.includes(specification));
-    assert.equal(command.connectorName, "Codex", "a default worker chat attaches the local connector");
-    assert.match(command.message, /ROLE: ChatGPT worker/);
-    assert.match(command.message, /task_done/);
-    assert.doesNotMatch(command.message, /GitHub COMMENT|RALPH_STATUS/);
-    toolBus.complete({ commandId: command.id, browserId: "browser", kind: "send_message", ok: true, result: { status: "sent", conversationUrl: child.conversationUrl } });
-    const started = await start;
-    assert.match(started.content[0].text, /End this turn now/);
-    assert.equal(preparations, 1);
-    assert.equal(await toolBus.claim("browser", ["threadPreparation"], 0), undefined, "new worker tabs need no redundant preparation command");
-    const reviewJob = started.structuredContent.tasks[0];
-    assert.equal(reviewJob.conversationUrl, child.conversationUrl);
-    const listed = await handlers.get("list_tasks")({}, owner);
-    assert.equal(listed.structuredContent.tasks.some(task => task.conversationUrl === child.conversationUrl), true);
-    assert.match(listed.content[0].text, new RegExp(child.conversationUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-    assert.equal((await handlers.get("start_task")({ prompt: "another" }, { mcpReq: { ...owner.mcpReq, id: "another" } })).isError, true);
-    assert.equal((await handlers.get("start_thread")({ message: "nested" }, { mcpReq: { _meta: { "openai/session": "child" } } })).isError, true);
-    assert.equal((await handlers.get("task_done")({ jobId: reviewJob.jobId, result: "report" }, owner)).isError, true, "the parent cannot submit the worker's report");
-    const ralph = new RalphController({ registry, commands: toolBus, jobs: toolJobs, model: "unused", auditLogPath: path.join(directory, "audit.log"), checkEveryMs: 60_000 });
-    try {
-      await registry.setMode(parent.threadId, "continuous");
-      await registry.scheduleNow(parent.threadId);
-      await ralph.tick();
-      await new Promise(resolve => setTimeout(resolve, 10));
-      // Child may be inspected, but the parent may not be inspected or continued.
-      const pendingCommand = await toolBus.claim("browser", ["ralph"], 0);
-      if (pendingCommand) {
-        assert.equal(pendingCommand.conversationUrl, child.conversationUrl);
-        toolBus.complete({ commandId: pendingCommand.id, browserId: "browser", kind: "inspect_thread", ok: true, result: { status: "running" } });
-      }
-    } finally { ralph.close(); }
-    const explicit = handlers.get("start_thread")({ message: "Explicit user-requested task" }, { mcpReq: { ...owner.mcpReq, id: "new-thread" } });
-    const newThread = await toolBus.claim("browser", ["threadMessaging"], 1000);
-    assert.equal(newThread.message, "Explicit user-requested task", "explicit threads receive no child transport or task instructions");
-    toolBus.complete({ commandId: newThread.id, browserId: "browser", kind: "send_message", ok: true, result: { status: "sent", conversationUrl: "https://chatgpt.com/c/33333333-3333-4333-8333-333333333333" } });
-    assert.equal((await explicit).isError, undefined);
-    assert.equal((await toolJobs.all()).length, 1, "explicit thread creation creates no task job");
-  } finally { toolBus.close(); }
+  await migratedJobs.close();
 
   const checkpointRegistry = await RalphRegistry.open(path.join(directory, "checkpoint"), 1);
   await checkpointRegistry.register(parent.conversationUrl, { agentCreated: true });
@@ -229,6 +112,7 @@ try {
     assert.equal(await checkpointRegistry.isActive(parent.threadId), false);
   } finally { ralph.close(); checkpointBus.close(); }
 
+
   const recoveryJobs = await SubagentJobRegistry.open(path.join(directory, "recovery"));
   const recoveryBus = new SupportCommandBus(undefined, undefined, undefined, undefined, registry, recoveryJobs);
   const recovery = taskActionHandler(recoveryJobs, registry, recoveryBus, async () => {
@@ -242,157 +126,30 @@ try {
     return { status, result };
   };
   try {
-    const staleSend = recoveryBus.execute({ feature: "ralph", kind: "send_message", targetUrl: parent.conversationUrl, message: "stale continuation" });
-    const staleRejection = assert.rejects(staleSend, /paused for task/);
-    const pending = await recoveryJobs.createTask(parent);
-    assert.equal(await recoveryBus.claim("browser", ["ralph"], 0), undefined, "a queued continuation is discarded when task starts before delivery");
-    await staleRejection;
+    const pending = await recoveryJobs.create(parent);
     assert.equal((await requestAction(pending.jobId, { action: "cancel" }, false)).status, 401);
-    assert.equal((await requestAction(pending.jobId, { action: "cancel", confirmedStopped: true })).status, 409, "in-flight unknown startup cannot be cancelled");
+    assert.equal((await requestAction(pending.jobId, { action: "cancel", confirmedStopped: true })).status, 409);
     await recoveryJobs.recordPreparationFailure(pending.jobId, "unconfirmed startup");
     assert.equal((await requestAction(pending.jobId, { action: "cancel" })).status, 409);
     assert.equal((await requestAction(pending.jobId, { action: "cancel", confirmedStopped: true })).status, 200);
-    const known = await recoveryJobs.createTask(parent);
+    const known = await recoveryJobs.create(parent);
     await recoveryJobs.assignChild(known.jobId, child);
     const cancel = requestAction(known.jobId, { action: "cancel" });
     const stop = await recoveryBus.claim("browser", ["threadMessaging"], 1000);
     assert.equal(stop.kind, "stop_thread");
-    assert.equal((await recoveryJobs.job(known.jobId)).state, "pending");
     recoveryBus.complete({ commandId: stop.id, browserId: "browser", kind: "stop_thread", ok: false, error: "cannot confirm stop" });
     assert.equal((await cancel).status, 409);
-    assert.equal((await recoveryJobs.job(known.jobId)).state, "pending", "failed stop retains reservation");
+    assert.equal((await recoveryJobs.job(known.jobId)).state, "pending");
     const retryCancel = requestAction(known.jobId, { action: "cancel" });
     const confirmed = await recoveryBus.claim("browser", ["threadMessaging"], 1000);
     recoveryBus.complete({ commandId: confirmed.id, browserId: "browser", kind: "stop_thread", ok: true, result: { status: "stopped", conversationUrl: child.conversationUrl } });
     assert.equal((await retryCancel).status, 200);
-    const undelivered = await recoveryJobs.createTask(parent);
-    await recoveryJobs.complete(undelivered.jobId, "report");
-    await recoveryJobs.recordNotificationFailure(undelivered.jobId, "failed", 1);
-    assert.equal((await requestAction(undelivered.jobId, { action: "retry" })).status, 200);
-    assert.equal((await recoveryJobs.job(undelivered.jobId)).notificationAbandonedAt, undefined);
-  } finally { recoveryBus.close(); }
-
-  const cooldownBus = new SupportCommandBus(undefined, 30, 15);
-  try {
-    const firstSend = cooldownBus.execute(
-      { feature: "threadMessaging", kind: "send_message", targetUrl: parent.conversationUrl, message: "first" },
-      20,
-    );
-    const claimed = await cooldownBus.claim("browser", ["threadMessaging"], 0);
-    const secondSend = cooldownBus.execute({ feature: "ralph", kind: "send_message", targetUrl: parent.conversationUrl, message: "second" });
-    cooldownBus.complete({ commandId: claimed.id, browserId: "browser", kind: "send_message", ok: false,
-      error: "CHATGPT_RATE_LIMITED_RETRYABLE: Too many messages" });
-    const thirdSend = cooldownBus.execute({ feature: "threadMessaging", kind: "send_message", targetUrl: parent.conversationUrl, message: "third" });
-    assert.ok(cooldownBus.messageCooldownUntil() > Date.now());
-    assert.equal(await cooldownBus.claim("browser", ["ralph", "threadMessaging"], 0), undefined,
-      "rate-limited sends stay queued during cooldown");
-
-    const stop = cooldownBus.execute({ feature: "threadMessaging", kind: "stop_thread", targetUrl: parent.conversationUrl });
-    const stopCommand = await cooldownBus.claim("browser", ["threadMessaging"], 0);
-    assert.equal(stopCommand.kind, "stop_thread", "cancellation is not blocked by message cooldown");
-    cooldownBus.complete({ commandId: stopCommand.id, browserId: "browser", kind: "stop_thread", ok: true,
-      result: { status: "idle", conversationUrl: parent.conversationUrl } });
-    await stop;
-
-    await new Promise(resolve => setTimeout(resolve, 35));
-    const retryFirst = await cooldownBus.claim("browser", ["ralph", "threadMessaging"], 0);
-    assert.equal(retryFirst.id, claimed.id, "a pre-click rate-limited send retries before later queued sends");
-    cooldownBus.complete({ commandId: retryFirst.id, browserId: "browser", kind: "send_message", ok: true,
-      result: { status: "sent", conversationUrl: parent.conversationUrl } });
-    await firstSend;
-
-    assert.equal(await cooldownBus.claim("browser", ["ralph", "threadMessaging"], 0), undefined,
-      "message pacing prevents an immediate second send");
-    await new Promise(resolve => setTimeout(resolve, 20));
-    const second = await cooldownBus.claim("browser", ["ralph", "threadMessaging"], 0);
-    assert.equal(second.message, "second");
-    cooldownBus.complete({ commandId: second.id, browserId: "browser", kind: "send_message", ok: true,
-      result: { status: "sent", conversationUrl: parent.conversationUrl } });
-    await secondSend;
-
-    await new Promise(resolve => setTimeout(resolve, 20));
-    const third = await cooldownBus.claim("browser", ["ralph", "threadMessaging"], 0);
-    assert.equal(third.message, "third");
-    cooldownBus.complete({ commandId: third.id, browserId: "browser", kind: "send_message", ok: true,
-      result: { status: "sent", conversationUrl: parent.conversationUrl } });
-    await thirdSend;
-
-    const uncertainSend = cooldownBus.execute({ feature: "threadMessaging", kind: "send_message", targetUrl: parent.conversationUrl, message: "uncertain" });
-    const uncertain = await cooldownBus.claim("browser", ["threadMessaging"], 0);
-    cooldownBus.complete({ commandId: uncertain.id, browserId: "browser", kind: "send_message", ok: false,
-      error: "CHATGPT_RATE_LIMITED: Provider notice appeared after click" });
-    assert.equal((await uncertainSend).ok, false, "post-click rate limits surface as uncertain instead of replaying the send");
-    await new Promise(resolve => setTimeout(resolve, 35));
-    assert.equal((await cooldownBus.claim("browser", ["threadMessaging"], 0))?.id, undefined,
-      "an uncertain send is never requeued after cooldown");
-
-    const normalSend = cooldownBus.execute({ feature: "threadMessaging", kind: "send_message", targetUrl: parent.conversationUrl, message: "normal" });
-    const normal = await cooldownBus.claim("browser", ["threadMessaging"], 0);
-    assert.equal(normal.message, "normal", "pacing turns off after the deferred backlog is drained");
-    cooldownBus.complete({ commandId: normal.id, browserId: "browser", kind: "send_message", ok: true,
-      result: { status: "sent", conversationUrl: parent.conversationUrl } });
-    await normalSend;
-  } finally { cooldownBus.close(); }
-
-  const contentScript = await readFile("support-extension/content-script.js", "utf8");
-  for (const visible of [true, false]) {
-    let listener;
-    const notice = { textContent: "Too many messages. Please try again later.", getClientRects: () => visible ? [{}] : [] };
-    const document = {
-      title: "ChatGPT",
-      querySelector: () => null,
-      querySelectorAll: selector => selector.includes('[role="alert"]') ? [notice] : [],
-    };
-    vm.runInNewContext(contentScript, {
-      document, location: new URL(parent.conversationUrl), window: { addEventListener() {} },
-      browser: { runtime: { async sendMessage() {}, onMessage: { addListener(value) { listener = value; } } } },
-    });
-    const response = await new Promise(resolve => listener({ type: "local-codex-support/automation-v1",
-      command: { kind: "send_message", message: "" } }, {}, resolve));
-    assert.equal(response.ok, false);
-    if (visible) assert.match(response.error, /^CHATGPT_RATE_LIMITED_RETRYABLE:/);
-    else assert.match(response.error, /non-empty ChatGPT message/,
-      "hidden notices must not trigger account cooldowns");
-  }
-
-  let stopListener;
-  let running = false;
-  let stopClicks = 0;
-  const stopButton = { click() { stopClicks += 1; running = false; } };
-  setTimeout(() => { running = true; }, 200);
-  const editor = {};
-  const composer = {
-    querySelector(selector) {
-      if (selector.includes("prompt-textarea")) return editor;
-      if (selector.includes("stop-button")) return running ? stopButton : null;
-      return null;
-    },
-  };
-  const stopDocument = {
-    title: "Running child - ChatGPT",
-    readyState: "complete",
-    documentElement: null,
-    querySelector(selector) {
-      if (selector === 'form[data-type="unified-composer"]') return composer;
-      if (selector === 'section[data-turn="user"]') return {};
-      return null;
-    },
-    querySelectorAll: () => [],
-  };
-  vm.runInNewContext(contentScript, {
-    document: stopDocument, location: new URL(parent.conversationUrl), window: { addEventListener() {} }, setTimeout,
-    browser: { runtime: { async sendMessage() {}, onMessage: { addListener(value) { stopListener = value; } } } },
-  });
-  const stopped = await new Promise(resolve => stopListener({ type: "local-codex-support/automation-v1",
-    command: { kind: "stop_thread" } }, {}, resolve));
-  assert.equal(stopped.ok, true);
-  assert.equal(stopped.result.status, "stopped");
-  assert.equal(stopClicks, 1,
-    "cancellation waits through hydration and clicks a stop button that appears after the composer");
-
-  console.log("Worker tests passed: sequential handoff, explicit threads, checkpoints, cancellation, restart recovery, and rate-limit queueing.");
+    assert.equal((await requestAction(known.jobId, { action: "retry" })).status, 400, "parent notification retries no longer exist");
+  } finally { recoveryBus.close(); await recoveryJobs.close(); }
+  console.log("Task service passed: missing reports, resumed workers, operator cancellation, migration, and continuation checkpoints.");
 } finally {
+  await jobs.close();
   assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir()));
-  assert.ok(path.basename(directory).startsWith("subagent-limits-"));
+  assert.ok(path.basename(directory).startsWith("task-test-"));
   await rm(directory, { recursive: true, force: true });
 }

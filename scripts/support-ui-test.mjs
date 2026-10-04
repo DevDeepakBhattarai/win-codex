@@ -32,7 +32,6 @@ try {
       assert.equal(route.request().postDataJSON().action, "cancel");
       cancelled = true;
       task.state = "cancelled";
-      task.notifiedAt = new Date().toISOString();
       thread.waitingForTask = false;
       data = { status: "accepted" };
     }
