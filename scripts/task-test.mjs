@@ -14,7 +14,7 @@ try {
   await registry.register(child.conversationUrl, { agentCreated: true });
   const unreported = await jobs.create({ threadId: "api:unreported" });
   await jobs.assignChild(unreported.jobId, child);
-  const bus = new SupportCommandBus(undefined, undefined, 0);
+  const bus = new SupportCommandBus(undefined, undefined, 0, undefined, registry);
   await registry.setLoopIntervalSeconds(1800);
   const monitor = new SubagentResultController(jobs, bus, async () => {}, registry, 60_000);
   const inspect = async status => {
@@ -46,8 +46,10 @@ try {
     await writeFile(unreported.resultPath + ".tmp", "Completed assigned check. PASS.\n");
     await rename(unreported.resultPath + ".tmp", unreported.resultPath);
     Date.now = () => realNow() + 5400_200;
+    await bus.pauseAutomation();
     await monitor.tick();
-    assert.equal((await jobs.job(unreported.jobId)).state, "complete");
+    assert.equal((await jobs.job(unreported.jobId)).state, "complete", "local report collection continues through a global browser pause");
+    assert.ok(bus.automationPausedUntil() > Date.now());
     assert.match(await readFile(unreported.resultPath, "utf8"), /PASS/);
     await monitor.tick();
     assert.equal(await registry.isActive(child.threadId), false);
@@ -126,8 +128,9 @@ try {
 
 
   const recoveryJobs = await SubagentJobRegistry.open(path.join(directory, "recovery"));
-  const recoveryBus = new SupportCommandBus(undefined, undefined, undefined, undefined, registry, recoveryJobs);
-  const recovery = taskActionHandler(recoveryJobs, registry, recoveryBus, async () => {
+  const recoveryRegistry = await RalphRegistry.open(path.join(directory, "recovery"));
+  const recoveryBus = new SupportCommandBus(undefined, undefined, undefined, undefined, recoveryRegistry, recoveryJobs);
+  const recovery = taskActionHandler(recoveryJobs, recoveryRegistry, recoveryBus, async () => {
     await recoveryBus.claim("browser-launch", ["threadMessaging"], 0);
   }, "test-token");
   const requestAction = async (jobId, body, authorized = true) => {

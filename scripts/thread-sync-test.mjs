@@ -55,7 +55,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.8.2");
+  assert.equal(manifest.version, "1.8.4");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["alarms", "scripting", "sidePanel", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -102,7 +102,7 @@ try {
     "thread sending does not use acknowledgement or DOM-stability heuristics");
   assert.match(preparedContentScript, /const SEND_SETTLE_MS = 5_000;/,
     "thread sending uses the fixed five-second settle requested for typing and sending");
-  assert.match(preparedContentScript, /contentScriptVersion = "1\.8\.2"/,
+  assert.match(preparedContentScript, /contentScriptVersion = "1\.8\.4"/,
     "extension reloads can replace a stale page script with the current content-script version");
   assert.equal(parseRalphProjectId(namedProjectHome), projectId);
   assert.equal(parseRalphProjectId(urlA), projectId);
@@ -890,6 +890,61 @@ try {
     return { req, res };
   };
 
+  // The authenticated extension protocol owns the pause, so it must withhold every command kind.
+  const pauseRegistry = await RalphRegistry.open(path.join(temporaryRoot, "global-pause"));
+  await pauseRegistry.register(urlA, { manual: true, activity: "running", title: "Preserved work" });
+  const pauseBus = new SupportCommandBus(0, undefined, undefined, undefined, pauseRegistry);
+  const pauseHandler = supportCommandClaimHandler(pauseBus, sync.extensionToken);
+  const realNow = Date.now;
+  let pauseNow = realNow();
+  Date.now = () => pauseNow;
+  try {
+    const inputs = [
+      { feature: "ralph", kind: "inspect_thread", conversationUrl: urlA },
+      { feature: "threadPreparation", kind: "prepare_thread", conversationUrl: urlA },
+      { feature: "threadLifecycle", kind: "close_thread", conversationUrl: urlA },
+      { feature: "threadMessaging", kind: "stop_thread", targetUrl: urlA },
+      { feature: "threadMessaging", kind: "send_message", targetUrl: urlA, message: "Queued assignment" },
+    ];
+    const features = ["ralph", "threadPreparation", "threadLifecycle", "threadMessaging"];
+    const promises = inputs.map(input => pauseBus.execute(input, 40));
+    await new Promise(resolve => setImmediate(resolve));
+    const beforePause = await pauseBus.claim("pause-browser", features, 0);
+    const request = makeClaimRequest("notice-browser");
+    request.req.body = { browserId: "notice-browser", features: [], statusOnly: true, conversationUnavailable: true };
+    const headers = {};
+    request.res.setHeader = (name, value) => { headers[name] = value; };
+    await pauseHandler(request.req, request.res);
+    assert.equal(request.res.statusCode, 204, "the empty-conversation event pauses without claiming or losing a command");
+    const until = Number(headers["X-Automation-Paused-Until"]);
+    assert.equal(until, pauseNow + 300_000, "the global pause lasts exactly five minutes");
+    assert.equal(await pauseBus.claim("pause-browser", features, 0), undefined, "even a resumable inspection cannot bypass the pause");
+    assert.equal(await pauseBus.claim("another-browser", features, 0), undefined, "the pause applies to every browser");
+    pauseNow += 30_000;
+    await pauseHandler(request.req, request.res);
+    assert.equal(Number(headers["X-Automation-Paused-Until"]), until, "repeated notices do not extend an active pause");
+    const restarted = await RalphRegistry.open(path.join(temporaryRoot, "global-pause"));
+    assert.equal(restarted.automationPausedUntil(), until, "a server restart retains the deadline");
+    assert.deepEqual(await restarted.threads(), await pauseRegistry.threads(), "the pause does not alter thread state");
+    await new Promise(resolve => setTimeout(resolve, 60));
+    pauseNow = until;
+    for (let index = 0; index < inputs.length; index++) {
+      const command = await pauseBus.claim("pause-browser", features, 0);
+      assert.equal(command.kind, inputs[index].kind, "queued and claimed work resumes in order after the deadline");
+      if (index === 0) assert.equal(command.id, beforePause.id, "the claimed command retains its identity");
+      const result = command.kind === "inspect_thread" ? { status: "running" }
+        : command.kind === "prepare_thread" ? { status: "prepared", conversationUrl: urlA }
+        : command.kind === "close_thread" ? { status: "closed", conversationUrl: urlA }
+        : command.kind === "stop_thread" ? { status: "idle", conversationUrl: urlA }
+        : { status: "sent", conversationUrl: urlA };
+      pauseBus.complete({ commandId: command.id, browserId: "pause-browser", kind: command.kind, ok: true, result });
+      assert.equal((await promises[index]).ok, true, "the pause preserves pending requests beyond their original timeout");
+    }
+  } finally {
+    Date.now = realNow;
+    pauseBus.close();
+  }
+
   const healthyPoll = makeClaimRequest("healthy-browser");
   const healthyPollResult = claimHandler(healthyPoll.req, healthyPoll.res, error => { throw error; });
   await new Promise(resolve => setImmediate(resolve));
@@ -1662,8 +1717,8 @@ async function testSendWaitsForLoadedConversationAndClicksOnce(acceptSend = true
     },
     storage: {
       local: {
-        get: async defaults => ({ ...defaults, ralphMinWorkedSeconds }),
-        set: async values => { if (Number.isInteger(values.ralphMinWorkedSeconds)) ralphMinWorkedSeconds = values.ralphMinWorkedSeconds; },
+        get: async defaults => typeof defaults === "string" ? {} : ({ ...defaults }),
+        set: async () => {},
       },
     },
   };
@@ -2021,8 +2076,8 @@ async function testRunningHydrationDetection() {
     },
     storage: {
       local: {
-        get: async defaults => ({ ...defaults, ralphMinWorkedSeconds }),
-        set: async values => { if (Number.isInteger(values.ralphMinWorkedSeconds)) ralphMinWorkedSeconds = values.ralphMinWorkedSeconds; },
+        get: async defaults => typeof defaults === "string" ? {} : ({ ...defaults }),
+        set: async () => {},
       },
     },
   };
@@ -2130,7 +2185,7 @@ async function testWorkedDurationDetection() {
     },
     storage: {
       local: {
-        get: async defaults => ({ ...defaults, ralphMinWorkedSeconds }),
+        get: async defaults => typeof defaults === "string" ? {} : ({ ...defaults, ralphMinWorkedSeconds }),
         set: async values => { if (Number.isInteger(values.ralphMinWorkedSeconds)) ralphMinWorkedSeconds = values.ralphMinWorkedSeconds; },
       },
     },

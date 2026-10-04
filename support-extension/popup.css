@@ -94,6 +94,7 @@ summary:focus-visible, input[type="search"]:focus-visible { outline: 2px solid v
   white-space: nowrap;
 }
 .connection i { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
+.connection[data-state="paused"] i { background: var(--accent); }
 .connection[data-state="online"] i { background: var(--active); }
 .connection[data-state="offline"] i { background: var(--danger); }
 .connection[data-state="offline"] {

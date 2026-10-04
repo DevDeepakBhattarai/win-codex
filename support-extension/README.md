@@ -20,4 +20,6 @@ Set **RALPH check interval** to change the default 1800-second worker recovery i
 
 When a managed temporary chat displays the connection-interrupted notice, the extension checks three times, 30 seconds apart, then stops and resumes a stuck turn. It does not refresh temporary chats because that discards their conversation. Saved managed threads refresh at each check. A recovered stream continues without a Stop or another message.
 
+When an empty conversation displays **Could not load this ChatGPT conversation**, browser automation pauses globally for five minutes. Checks, recovery clicks, refreshes, sends, and automatic tab closure wait. Queued commands and task state stay intact. Local report collection continues. The pause deadline survives service and extension restarts. Automation resumes after the deadline and retries the visible page action. The sidebar and popup display the pause and resumption time.
+
 For automatic Windows sign-in startup, build the project and run `scripts/install-startup.ps1`. Inspect `.data/runtime/watchdog.log` if the server or tunnel fails to start.

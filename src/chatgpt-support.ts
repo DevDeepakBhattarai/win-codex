@@ -213,6 +213,7 @@ interface PendingCommand {
   reject: (error: Error) => void;
   timeout: NodeJS.Timeout;
   timeoutMs: number;
+  deadline: number;
   claimedBy?: string;
   claimedAt?: number;
   inspectionFallback?: NodeJS.Timeout;
@@ -239,9 +240,41 @@ export class SupportCommandBus {
   private cooldownUntil = 0;
   private nextMessageClaimAt = 0;
   private messagePacingActive = false;
+  private pauseInFlight?: Promise<number>;
 
   messageCooldownUntil() {
     return this.cooldownUntil > Date.now() ? this.cooldownUntil : 0;
+  }
+
+  automationPausedUntil() {
+    return this.registry?.automationPausedUntil() ?? 0;
+  }
+
+  async pauseAutomation() {
+    if (this.pauseInFlight) return this.pauseInFlight;
+    const operation = this.persistAutomationPause();
+    this.pauseInFlight = operation;
+    try { return await operation; } finally { if (this.pauseInFlight === operation) this.pauseInFlight = undefined; }
+  }
+
+  private async persistAutomationPause() {
+    if (!this.registry) throw new Error("Automation pause requires the persistent registry.");
+    const previous = this.automationPausedUntil();
+    const until = await this.registry.pauseAutomation();
+    const extension = until - Math.max(Date.now(), previous);
+    if (extension > 0) {
+      for (const pending of this.pending.values()) {
+        pending.deadline += extension;
+        clearTimeout(pending.timeout);
+        pending.timeout = setTimeout(() => {
+          this.removePending(pending.command.id);
+          pending.reject(new Error(`ChatGPT support command timed out: ${pending.command.kind}`));
+        }, Math.max(1, pending.deadline - Date.now()));
+        pending.timeout.unref();
+      }
+    }
+    for (const waiter of [...this.waiters]) this.resolveWaiter(waiter, undefined);
+    return until;
   }
 
   cancelThreadChecks(threadId: string) {
@@ -270,6 +303,9 @@ export class SupportCommandBus {
     options: { allowBrowserLaunch?: boolean } = {},
   ) {
     const allowBrowserLaunch = options.allowBrowserLaunch !== false;
+    while (this.automationPausedUntil()) {
+      await new Promise<void>(resolve => setTimeout(resolve, Math.min(1000, this.automationPausedUntil() - Date.now())));
+    }
     const targetUrl = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
     let targetThreadId: string | undefined;
     try { targetThreadId = parseConversationUrl(targetUrl).threadId; } catch { targetThreadId = undefined; }
@@ -297,6 +333,7 @@ export class SupportCommandBus {
           reject(new Error(`ChatGPT support command timed out: ${fullCommand.kind}`));
         }, timeoutMs),
         timeoutMs,
+        deadline: Date.now() + timeoutMs,
         allowBrowserLaunch,
       };
       pending.timeout.unref();
@@ -373,6 +410,7 @@ export class SupportCommandBus {
   }
 
   async ensureBackgroundBrowserOnce(feature: SupportFeature) {
+    if (this.automationPausedUntil()) return;
     if (this.hasBrowser(feature)) {
       this.backgroundLaunchPending.delete(feature);
       return;
@@ -423,6 +461,7 @@ export class SupportCommandBus {
     for (const pending of this.pending.values()) this.scheduleInspectionFallback(pending);
     const resumable = [...this.pending.values()].find((pending) =>
       (pending.command.kind === "inspect_thread" || pending.command.kind === "prepare_thread") &&
+      this.canClaim(pending.command) &&
       this.browserCanClaim(browserId, pending.command) &&
       (pending.claimedBy === browserId ||
         (pending.claimedAt !== undefined && Date.now() - pending.claimedAt >= this.inspectClaimLeaseMs)));
@@ -477,6 +516,7 @@ export class SupportCommandBus {
       pending.claimedBy = undefined;
       pending.claimedAt = undefined;
       clearTimeout(pending.timeout);
+      pending.deadline = Date.now() + this.messageCooldownMs + pending.timeoutMs;
       pending.timeout = setTimeout(() => {
         this.removePending(pending.command.id);
         pending.reject(new Error(`ChatGPT support command timed out after rate-limit cooldown: ${pending.command.kind}`));
@@ -550,6 +590,7 @@ export class SupportCommandBus {
       clearTimeout(pending.inspectionFallback);
       pending.inspectionFallback = undefined;
     }
+    if (this.automationPausedUntil()) return;
     if (!this.launchBrowser || pending.command.kind !== "inspect_thread" || !pending.allowBrowserLaunch) return;
     if (pending.command.executorOnly) {
       if (pending.claimedBy) return;
@@ -588,6 +629,7 @@ export class SupportCommandBus {
   }
 
   private canClaim(command: SupportCommand) {
+    if (this.automationPausedUntil()) return false;
     if (command.kind !== "send_message") return true;
     if (this.messageCooldownUntil()) return false;
     return !this.messagePacingActive || Date.now() >= this.nextMessageClaimAt;
@@ -659,6 +701,7 @@ const ralphStoreSchema = z.object({
   threads: z.array(ralphThreadSchema).max(MAX_RALPH_THREADS),
   loopIntervalMs: z.number().int().positive().max(MAX_RALPH_INTERVAL_SECONDS * 1000).default(DEFAULT_RALPH_CHECK_INTERVAL_MS),
   subagentProjectUrl: z.string().url().optional(),
+  automationPausedUntil: z.number().int().nonnegative().optional(),
 });
 type RalphStore = z.infer<typeof ralphStoreSchema>;
 const ralphLoopIntervalSecondsSchema = z.number().int()
@@ -729,6 +772,20 @@ export class RalphRegistry {
   async projects() {
     await this.queue;
     return [...this.state.projects];
+  }
+
+  automationPausedUntil() {
+    const until = this.state.automationPausedUntil ?? 0;
+    return until > Date.now() ? until : 0;
+  }
+
+  async pauseAutomation() {
+    return this.update(state => {
+      const current = state.automationPausedUntil ?? 0;
+      const until = current > Date.now() ? current : Date.now() + 5 * 60_000;
+      state.automationPausedUntil = until;
+      return until;
+    });
   }
 
   async threads() {
@@ -1145,6 +1202,7 @@ export class RalphController {
   }
 
   async tick() {
+    if (this.options.commands.automationPausedUntil()) return;
     const due = await this.options.registry.due();
     for (const thread of due) {
       if (this.inFlight.has(thread.threadId)) continue;
@@ -1159,6 +1217,7 @@ export class RalphController {
 
   private async check(thread: z.infer<typeof ralphThreadSchema>) {
     try {
+      if (this.options.commands.automationPausedUntil()) return;
       if (this.options.commands.messageCooldownUntil() || await this.options.jobs?.blocksContinuation(thread.threadId)) {
         await this.options.registry.recordRunning(thread.threadId);
         return;
@@ -1325,6 +1384,7 @@ export class ThreadTabCleanupController {
   }
 
   async tick(now = Date.now()) {
+    if (this.options.commands.automationPausedUntil()) return;
     const retentionMs = this.options.retentionMs ?? COMPLETED_THREAD_TAB_RETENTION_MS;
     const threads = await this.options.registry.threads();
     for (const thread of threads) {
@@ -1521,6 +1581,8 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
   const bodySchema = z.object({
     browserId: z.string().min(1).max(200),
     features: z.array(supportFeatureSchema).max(4),
+    conversationUnavailable: z.boolean().optional(),
+    statusOnly: z.boolean().optional(),
     openThreads: z.array(z.string().max(2048).refine(value => {
       try { parseConversationUrl(value); return true; } catch { return false; }
     })).max(2000).optional(),
@@ -1537,9 +1599,16 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
     req.once("aborted", onDisconnect);
     res.once("close", onDisconnect);
     try {
+      if (parsed.data.conversationUnavailable) await commands.pauseAutomation();
+      if (parsed.data.statusOnly) {
+        res.setHeader("X-Automation-Paused-Until", String(commands.automationPausedUntil()));
+        res.status(204).end();
+        return;
+      }
       const command = await commands.claim(parsed.data.browserId, parsed.data.features, CLAIM_WAIT_MS, abortController.signal, parsed.data.openThreads);
       if (abortController.signal.aborted) return;
       res.setHeader("Cache-Control", "no-store");
+      res.setHeader("X-Automation-Paused-Until", String(commands.automationPausedUntil()));
       if (!command) {
         res.status(204).end();
         return;
@@ -1623,7 +1692,7 @@ export function ralphThreadsGetHandler(registry: RalphRegistry, extensionToken: 
       ...thread,
       waitingForTask: tasks.some((job) => job.parentThreadId === thread.threadId &&
         job.state === "pending"),
-    })), tasks, continuationEnabled });
+    })), tasks, continuationEnabled, automationPausedUntil: registry.automationPausedUntil() });
   };
 }
 
@@ -2151,7 +2220,7 @@ export class SubagentResultController {
       }
       await this.jobs.collectReport(job.jobId).catch((error: unknown) => console.error("[tasks] Report read failed:", error));
       if ((await this.jobs.job(job.jobId))?.state !== "pending") continue;
-      if (job.preparationError || !job.childConversationUrl || this.commands.messageCooldownUntil()) continue;
+      if (job.preparationError || !job.childConversationUrl || this.commands.automationPausedUntil() || this.commands.messageCooldownUntil()) continue;
       if (this.inFlight.has(job.jobId) || (this.inspectionAfter.get(job.jobId) ?? Date.parse(job.createdAt) + intervalMs) > now) continue;
       this.inFlight.add(job.jobId);
       void this.inspectUnreportedWorker(job.jobId, job.childConversationUrl).catch((error: unknown) => {

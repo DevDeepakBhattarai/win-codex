@@ -18,6 +18,7 @@ try {
   const settled = { ...ready, threadId: "55555555-5555-4555-8555-555555555555", title: "Old closed tab", settledAt: "2026-10-03T12:00:00Z" };
   let settingsRequests = 0;
   let cancelled = false;
+  let automationPausedUntil = 0;
   await page.addInitScript(() => {
     globalThis.closedViews = 0;
     globalThis.openedPanels = [];
@@ -32,7 +33,7 @@ try {
   await page.route("http://127.0.0.1:19999/**", async route => {
     const pathname = new URL(route.request().url()).pathname;
     let data;
-    if (pathname === "/chatgpt-support/ralph/threads") data = { threads: [older, thread, ready, settled, { ...thread, threadId: reviewId, activity: "running", waitingForTask: false }], tasks: [task] };
+    if (pathname === "/chatgpt-support/ralph/threads") data = { threads: [older, thread, ready, settled, { ...thread, threadId: reviewId, activity: "running", waitingForTask: false }], tasks: [task], automationPausedUntil };
     else if (pathname === "/chatgpt-support/ralph/settings") { settingsRequests += 1; data = { loopIntervalSeconds: 1800 }; }
     else if (pathname === "/chatgpt-support/ralph/projects") data = { projects: [] };
     else if (pathname === `/chatgpt-support/tasks/${reviewId}`) {
@@ -99,6 +100,18 @@ try {
   await page.locator("#workingSection summary").click();
   await page.getByText("running", { exact: true }).waitFor();
   await page.getByRole("searchbox", { name: "Search threads" }).fill("");
+  automationPausedUntil = Date.now() + 300_000;
+  await page.locator("#refreshThreads").click();
+  await page.locator('#connection[data-state="paused"]').waitFor();
+  assert.equal(await page.locator("#connectionLabel").textContent(), "Paused");
+  assert.match(await page.locator("#threadsStatus").textContent(), /Tasks stay queued.*resumes at/);
+  await page.setViewportSize({ width: 320, height: 900 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, "the pause indicator fits the narrow sidebar");
+  await page.screenshot({ path: ".data/global-pause-sidebar.png", fullPage: true });
+  automationPausedUntil = 0;
+  await page.locator("#refreshThreads").click();
+  await page.locator('#connection[data-state="online"]').waitFor();
+  assert.equal(await page.locator("#connectionLabel").textContent(), "Connected");
   await page.screenshot({ path: ".data/thread-sidebar.png", fullPage: true });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
   assert.deepEqual(errors, []);

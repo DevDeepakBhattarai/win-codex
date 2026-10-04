@@ -455,7 +455,7 @@ async function loadThreads() {
   const status = element("threadsStatus");
   button.disabled = true;
   try {
-    const { threads, tasks = [], continuationEnabled: enabled } = await callServer(ralphThreadsEndpoint);
+    const { threads, tasks = [], continuationEnabled: enabled, automationPausedUntil = 0 } = await callServer(ralphThreadsEndpoint);
     continuationEnabled = enabled === true;
     for (const node of document.querySelectorAll("[data-legacy-continuation]")) node.hidden = !continuationEnabled;
     loadedThreads = threads;
@@ -465,8 +465,9 @@ async function loadThreads() {
       renderThreads();
       renderedSnapshot = snapshot;
     }
-    setNote(status, "");
-    setConnection("online", "Connected");
+    const paused = automationPausedUntil > Date.now();
+    setNote(status, paused ? `ChatGPT could not load a conversation. Tasks stay queued. Automation resumes at ${new Date(automationPausedUntil).toLocaleTimeString()}.` : "");
+    setConnection(paused ? "paused" : "online", paused ? "Paused" : "Connected");
   } catch (error) {
     setNote(status, errorMessage(error, "Could not reach Local Codex."), "error");
     setConnection("offline", "Offline");

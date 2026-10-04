@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.8.2";
+  const contentScriptVersion = "1.8.4";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -11,11 +11,37 @@
   const responseType = "local-codex-thread-sync/result-v1";
   const automationType = "local-codex-support/automation-v1";
   const reactivateRalphType = "local-codex-support/ralph-reactivate-v1";
+  const conversationUnavailableType = "local-codex-support/conversation-unavailable-v1";
   const titleObservedType = "local-codex-support/title-observed-v1";
   const sourceRoutes = new WeakMap();
   const pending = new Set();
   let route = location.pathname;
   let generation = 0;
+
+  let pauseUntil = 0;
+  let pauseStartedAt = 0;
+  let pausedTime = 0;
+  function updatePause(until) {
+    if (!Number.isSafeInteger(until) || until < 0 || until === pauseUntil) return;
+    if (pauseStartedAt) pausedTime += Math.max(0, Math.min(Date.now(), pauseUntil) - pauseStartedAt);
+    pauseUntil = until;
+    pauseStartedAt = until > Date.now() ? Date.now() : 0;
+  }
+  function automationNow() {
+    return Date.now() - pausedTime - (pauseStartedAt ? Math.max(0, Math.min(Date.now(), pauseUntil) - pauseStartedAt) : 0);
+  }
+  async function waitForAutomationResume() {
+    const stored = await extensionApi.storage?.local?.get("automationPausedUntil");
+    updatePause(stored?.automationPausedUntil ?? 0);
+    while (pauseUntil > Date.now()) {
+      await new Promise(resolve => setTimeout(resolve, Math.min(1000, pauseUntil - Date.now())));
+      const latest = await extensionApi.storage?.local?.get("automationPausedUntil");
+      updatePause(latest?.automationPausedUntil ?? pauseUntil);
+    }
+  }
+  extensionApi.storage?.onChanged?.addListener((changes, area) => {
+    if (area === "local" && changes.automationPausedUntil) updatePause(changes.automationPausedUntil.newValue ?? 0);
+  });
 
   const SEND_SETTLE_MS = 5_000;
   const SEND_READY_TIMEOUT_MS = 5 * 60_000;
@@ -114,6 +140,7 @@
   });
 
   async function runAutomation(command) {
+    await waitForAutomationResume();
     if (command.kind === "page_health") return pageHealth();
     if (command.kind === "dismiss_rate_limit") {
       const notice = rateLimitNotice();
@@ -129,8 +156,8 @@
       return await sendMessage(command.message, undefined, false, true);
     }
     if (command.kind === "recover_page") {
-      const notice = pageErrorNotice();
-      const retry = notice && [...document.querySelectorAll('main button, [role="alert"] button, [role="dialog"] button')]
+      const notice = conversationUnavailableNotice() ?? pageErrorNotice();
+      const retry = notice && [...document.querySelectorAll('main button, [role="alert"] button, [role="dialog"] button, body > div button')]
         .find(button => isActionableButton(button) && /^(?:retry|try again|regenerate response|continue generating)$/i.test(button.getAttribute("aria-label") ?? button.textContent?.trim() ?? ""));
       if (!retry) return { status: "unavailable" };
       retry.click();
@@ -162,9 +189,9 @@
   }
 
   async function waitForCancellationState(timeoutMs) {
-    const deadline = Date.now() + timeoutMs;
+    const deadline = automationNow() + timeoutMs;
     let idleSince = 0;
-    while (Date.now() < deadline) {
+    while (automationNow() < deadline) {
       assertNoPageError(true, true);
       const ready = getComposer();
       if (!ready || document.readyState === "loading") {
@@ -179,25 +206,25 @@
         await sleep(100);
         continue;
       }
-      if (!idleSince) idleSince = Date.now();
-      if (Date.now() - idleSince >= 1_500) return { ...ready, stopButton: null };
+      if (!idleSince) idleSince = automationNow();
+      if (automationNow() - idleSince >= 1_500) return { ...ready, stopButton: null };
       await sleep(100);
     }
     return null;
   }
 
   async function waitForStableStop(timeoutMs) {
-    const deadline = Date.now() + timeoutMs;
+    const deadline = automationNow() + timeoutMs;
     let stoppedSince = 0;
-    while (Date.now() < deadline) {
+    while (automationNow() < deadline) {
       assertNoPageError(true, true);
       const ready = getComposer();
       const stopButton = ready && getStopButton(ready.composer);
       if (!ready || stopButton) {
         stoppedSince = 0;
       } else {
-        if (!stoppedSince) stoppedSince = Date.now();
-        if (Date.now() - stoppedSince >= 500) return true;
+        if (!stoppedSince) stoppedSince = automationNow();
+        if (automationNow() - stoppedSince >= 500) return true;
       }
       await sleep(100);
     }
@@ -316,10 +343,10 @@
       const existingConversationUrl = conversationUrl();
       if (temporary && !existingConversationUrl) {
         await waitForComposer(SEND_READY_TIMEOUT_MS);
-        const deadline = Date.now() + SEND_READY_TIMEOUT_MS;
+        const deadline = automationNow() + SEND_READY_TIMEOUT_MS;
         while (!document.querySelector('button[aria-label="Turn off temporary chat"]')) {
           checkPage();
-          if (Date.now() >= deadline) throw new Error("Temporary chat did not become active. The task was not sent.");
+          if (automationNow() >= deadline) throw new Error("Temporary chat did not become active. The task was not sent.");
           // An early click can precede page hydration. Recheck the current control before retrying.
           document.querySelector('button[aria-label="Temporary chat"]')?.click();
           await sleep(SEND_SETTLE_MS);
@@ -428,7 +455,14 @@
       /too many (?:messages|requests)|rate limit|message limit|usage limit|usage cap|message cap|you(?:'ve| have) (?:reached|hit).{0,60}limit|limit reached|quota exceeded/i.test(element.textContent ?? ""));
   }
 
+  function conversationUnavailableNotice() {
+    if (userTurns().length || document.querySelector('section[data-turn], [data-message-author-role="assistant"], [data-markdown-text-tone="primary"]')) return null;
+    return [...document.querySelectorAll('h1, h2, h3, [role="heading"], main div, body > div div')].find(element =>
+      element.getClientRects?.().length && /^Could not load this ChatGPT conversation$/i.test(element.textContent?.trim() ?? ""));
+  }
+
   function pageHealth() {
+    if (conversationUnavailableNotice()) return { status: "conversation_unavailable" };
     if (rateLimitNotice()) return { status: "rate_limited" };
     if (connectionInterruptedNotice()) return { status: "connection_interrupted" };
     return { status: pageErrorNotice() ? "recoverable_error" : "ok" };
@@ -455,6 +489,7 @@
   }
 
   function assertNoPageError(allowRateLimit = false, allowInterrupted = false) {
+    if (conversationUnavailableNotice()) throw new Error("CHATGPT_CONVERSATION_UNAVAILABLE: Could not load this ChatGPT conversation.");
     if (allowRateLimit && rateLimitNotice()) return;
     assertNotRateLimited();
     if (!allowInterrupted && connectionInterruptedNotice()) throw new Error("CHATGPT_CONNECTION_INTERRUPTED: Waiting for the complete answer.");
@@ -546,14 +581,26 @@
     let observedConversationUrl = null;
     let previousComposerAction = null;
     let reporting = false;
+    let reportedUnavailable = false;
+    let reportingUnavailable = false;
 
     const observeComposerAction = () => {
       const currentUrl = conversationUrl();
       if (currentUrl !== observedConversationUrl) {
         observedConversationUrl = currentUrl;
         previousComposerAction = null;
+        reportedUnavailable = false;
       }
 
+      const unavailable = Boolean(conversationUnavailableNotice());
+      if (!unavailable) reportedUnavailable = false;
+      if (currentUrl && unavailable && !reportedUnavailable && !reportingUnavailable) {
+        reportingUnavailable = true;
+        void Promise.resolve(extensionApi.runtime.sendMessage({ type: conversationUnavailableType, conversationUrl: currentUrl }))
+          .then(result => { if (result?.ok) reportedUnavailable = true; })
+          .catch(() => undefined).finally(() => { reportingUnavailable = false; });
+      }
+      if (pauseUntil > Date.now()) return;
       const composer = getComposer()?.composer;
       if (!composer) return;
       const interrupted = Boolean(connectionInterruptedNotice());
@@ -633,9 +680,9 @@
   }
 
   async function waitForConversationReady(timeoutMs) {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const ready = await waitForComposer(Math.min(1_000, deadline - Date.now()));
+    const deadline = automationNow() + timeoutMs;
+    while (automationNow() < deadline) {
+      const ready = await waitForComposer(Math.min(1_000, deadline - automationNow()));
       if (!ready) continue;
       if (document.readyState === "loading") {
         await sleep(100);
@@ -663,10 +710,10 @@
         const signature = location.href + lastTurn.textContent;
         if (signature !== inspectionSignature) {
           inspectionSignature = signature;
-          inspectionStableSince = Date.now();
+          inspectionStableSince = automationNow();
         }
         const quietMs = hasAssistant ? THREAD_ASSISTANT_SETTLE_MS : THREAD_UNCERTAIN_SETTLE_MS;
-        return { value: true, signature, quietMs: Date.now() - inspectionStableSince >= quietMs ? 0 : quietMs };
+        return { value: true, signature, quietMs: automationNow() - inspectionStableSince >= quietMs ? 0 : quietMs };
       }
       const lastUserIndex = turns.findLastIndex((turn) => turn.dataset.turn === "user");
       if (lastUserIndex < 0) return null;
@@ -678,23 +725,23 @@
       ].join(":")).join("|");
       if (signature !== inspectionSignature) {
         inspectionSignature = signature;
-        inspectionStableSince = Date.now();
+        inspectionStableSince = automationNow();
       }
       const quietMs = hasAssistantAfterLastUser ? THREAD_ASSISTANT_SETTLE_MS : THREAD_UNCERTAIN_SETTLE_MS;
       return {
         value: true,
         signature,
-        quietMs: Date.now() - inspectionStableSince >= quietMs ? 0 : quietMs,
+        quietMs: automationNow() - inspectionStableSince >= quietMs ? 0 : quietMs,
       };
     }, timeoutMs);
     return Boolean(settled);
   }
 
   async function waitForAllSettled(sample, timeoutMs) {
-    const deadline = timeoutMs === undefined ? Infinity : Date.now() + timeoutMs;
+    const deadline = timeoutMs === undefined ? Infinity : automationNow() + timeoutMs;
     let previousSignature = null;
     let stableSince = 0;
-    while (Date.now() < deadline) {
+    while (automationNow() < deadline) {
       assertNoPageError();
       const state = sample();
       if (!state) {
@@ -704,8 +751,8 @@
         return state.value;
       } else if (state.signature !== previousSignature) {
         previousSignature = state.signature;
-        stableSince = Date.now();
-      } else if (Date.now() - stableSince >= state.quietMs) {
+        stableSince = automationNow();
+      } else if (automationNow() - stableSince >= state.quietMs) {
         return state.value;
       }
       await sleep(100);
@@ -783,8 +830,8 @@
   }
 
   async function waitFor(getElement, timeoutMs, recovering = false) {
-    const deadline = timeoutMs === undefined ? Infinity : Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
+    const deadline = timeoutMs === undefined ? Infinity : automationNow() + timeoutMs;
+    while (automationNow() < deadline) {
       assertNoPageError(false, recovering);
       const value = getElement();
       if (value) return value;
@@ -793,7 +840,9 @@
     return null;
   }
 
-  function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  async function sleep(ms) {
+    await waitForAutomationResume();
+    await new Promise((resolve) => setTimeout(resolve, ms));
+    await waitForAutomationResume();
   }
 })();

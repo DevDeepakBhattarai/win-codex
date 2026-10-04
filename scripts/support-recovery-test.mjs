@@ -14,23 +14,29 @@ const config = {
   extensionToken: "x".repeat(32),
 };
 
-async function runWorker(command, responses, healthResponses = [], injectionFailures = [], temporary = false) {
+async function runWorker(command, responses, healthResponses = [], injectionFailures = [], temporary = false, globalPause = false) {
   const results = [];
   let dispatches = 0;
   let reloads = 0;
   const calls = [];
   const waits = [];
-  const tabUrl = url + (temporary ? "?temporary-chat=true" : "");
+  let tabUrl = url + (temporary ? "?temporary-chat=true" : "");
   let activeInjectionFailures = [];
-  const storage = {};
+  let clock = 1_800_000_000_000;
+  let sharedPauseUntil = globalPause === "restart" ? clock + 300_000 : 0;
+  const storage = globalPause === "restart" ? { automationPausedUntil: sharedPauseUntil } : {};
+  if (globalPause === "stale") storage["pageRecovery:11"] = { conversationUnavailableAt: clock - 300_001, conversationUnavailableUrl: tabUrl };
+  let messageListener;
+  const dispatchTimes = [];
   const context = {
+    Date: globalPause ? class extends Date { static now() { return clock; } } : Date,
     URL, AbortSignal, AbortController, crypto: globalThis.crypto, Response, Error,
     setTimeout, clearTimeout, console, importScripts() {},
     LOCAL_CODEX_THREAD_SYNC: config,
     browser: {
       runtime: {
         id: "a".repeat(32), getPlatformInfo: async () => {},
-        onMessage: { addListener() {} }, onInstalled: { addListener() {} }, onStartup: { addListener() {} },
+        onMessage: { addListener(listener) { messageListener = listener; } }, onInstalled: { addListener() {} }, onStartup: { addListener() {} },
       },
       tabs: {
         onUpdated: { addListener() {} }, query: async () => [{ id: 11, status: "complete", url: tabUrl }],
@@ -39,6 +45,7 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
         reload: async () => { reloads += 1; },
         sendMessage: async (_tabId, payload) => {
           calls.push(payload.command.kind);
+          dispatchTimes.push(clock);
           if (payload.command.kind === "page_health") {
             const response = healthResponses.shift();
             if (response instanceof Error) throw response;
@@ -58,6 +65,10 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
       } },
     },
     fetch: async (endpoint, options) => {
+      if (globalPause && endpoint === config.commandClaimUrl) {
+        if (JSON.parse(options.body).conversationUnavailable && sharedPauseUntil <= clock) sharedPauseUntil = clock + 300_000;
+        return new Response(null, { status: 204, headers: { "X-Automation-Paused-Until": String(sharedPauseUntil > clock ? sharedPauseUntil : 0) } });
+      }
       if (endpoint !== config.commandResultUrl) return new Response(null, { status: 204 });
       results.push(JSON.parse(options.body));
       return new Response("", { status: 200 });
@@ -65,12 +76,20 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
   };
   vm.runInNewContext(workerScript, context);
   await new Promise(resolve => setImmediate(resolve));
+  vm.runInNewContext("pollGeneration += 1; pollController?.abort();", context);
   activeInjectionFailures = injectionFailures;
   context.restartPolling = () => {};
-  context.sleep = async ms => { waits.push(ms); };
+  context.sleep = async ms => { waits.push(ms); if (globalPause) clock += ms; };
   context.getSettings = async () => ({ threadSync: true, automationExecutor: true });
   await context.executeCommand(command, "browser-a");
-  return { results, dispatches, reloads, calls, waits };
+  return { results, dispatches, reloads, calls, waits, dispatchTimes, storage,
+    advanceTime(ms) { clock += ms; },
+    notifyUnavailable(nextUrl) {
+      tabUrl = nextUrl;
+      return new Promise(resolve => messageListener({ type: "local-codex-support/conversation-unavailable-v1", conversationUrl: nextUrl },
+        { id: "a".repeat(32), frameId: 0, tab: { id: 11 }, url: nextUrl }, resolve));
+    },
+  };
 }
 
 function inspectCommand(id) {
@@ -79,6 +98,32 @@ function inspectCommand(id) {
 
 function sendCommand(id) {
   return { id, feature: "threadMessaging", kind: "send_message", targetUrl: url, message: "Continue" };
+}
+
+{
+  const run = await runWorker({ ...inspectCommand("empty-conversation"), conversationUrl: url + "?temporary-chat=true" }, [
+    { ok: true, result: { status: "recovery_started" } }, { ok: true, result: { status: "running" } },
+  ], [{ ok: true, result: { status: "conversation_unavailable" } }], [], true, true);
+  assert.equal(run.reloads, 0, "an empty temporary conversation is never refreshed");
+  assert.deepEqual(run.calls, ["page_health", "recover_page", "inspect_thread"]);
+  assert.equal(run.dispatchTimes[1] - run.dispatchTimes[0], 300_000, "Retry waits for the entire shared five-minute pause");
+  assert.equal(run.results[0].result.status, "running", "the original request continues after the pause");
+}
+{
+  const run = await runWorker(inspectCommand("restart-during-pause"), [{ ok: true, result: { status: "running" } }], [], [], false, "restart");
+  assert.ok(run.dispatchTimes.every(time => time >= 1_800_000_300_000), "a restarted extension performs no page checks before the persisted deadline");
+  assert.equal(run.results[0].result.status, "running");
+}
+
+{
+  const run = await runWorker(inspectCommand("healthy-after-pause"), [{ ok: true, result: { status: "running" } }], [], [], false, "stale");
+  assert.equal(run.storage["pageRecovery:11"]?.conversationUnavailableAt, undefined, "healthy pages clear old recovery markers instead of being checked forever");
+  assert.equal((await run.notifyUnavailable(url)).ok, true);
+  const firstUntil = run.storage.automationPausedUntil;
+  run.advanceTime(300_001);
+  const nextUrl = url.replace("11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222");
+  assert.equal((await run.notifyUnavailable(nextUrl)).ok, true);
+  assert.ok(run.storage.automationPausedUntil > firstUntil, "a different failed conversation in the same tab starts a fresh pause after the first expires");
 }
 
 for (const kind of ["inspect_thread", "prepare_thread"]) {

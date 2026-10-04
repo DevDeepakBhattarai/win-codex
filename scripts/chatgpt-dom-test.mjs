@@ -156,6 +156,43 @@ try {
 	assert.equal(hiddenIdle.result.status, "idle");
 	assert.deepEqual(hiddenIdle.result.users, []);
 	assert.equal(hiddenIdle.result.assistant.text, "Stopped after the assigned check.");
+	await page.evaluate(() => {
+		history.pushState({}, "", "/c/11111111-1111-4111-8111-111111111111");
+		const heading = document.createElement("h2");
+		heading.textContent = "Could not load this ChatGPT conversation";
+		document.querySelector("main").appendChild(heading);
+	});
+	assert.equal((await execute({ kind: "page_health" })).result.status, "ok", "error text quoted beside loaded messages does not pause work");
+	await page.evaluate(() => {
+		document.querySelector("main").innerHTML = '<div><h2>Could not load this ChatGPT conversation</h2><button>Retry</button></div>';
+		document.querySelector('[data-composer-body]').remove();
+		globalThis.retryClicks = 0;
+		document.querySelector("main button").onclick = () => { globalThis.retryClicks++; document.querySelector("main").replaceChildren(); };
+	});
+	assert.equal((await execute({ kind: "page_health" })).result.status, "conversation_unavailable", "the screenshot error is recognized without a composer or an alert role");
+	await page.waitForFunction(() => globalThis.observedActivity.some(message => message.type === "local-codex-support/conversation-unavailable-v1"));
+	assert.equal(await page.evaluate(() => globalThis.retryClicks), 0, "observing the error never clicks Retry");
+	await page.evaluate(() => {
+		history.pushState({}, "", "/c/22222222-2222-4222-8222-222222222222");
+		document.querySelector("main").appendChild(document.createElement("div"));
+	});
+	await page.waitForFunction(() => globalThis.observedActivity.some(message => message.type === "local-codex-support/conversation-unavailable-v1" && message.conversationUrl.endsWith("22222222-2222-4222-8222-222222222222")));
+
+	await page.clock.install();
+	await page.evaluate(() => {
+		globalThis.pauseUntil = Date.now() + 300_000;
+		chrome.storage = { local: { async get() { return { automationPausedUntil: globalThis.pauseUntil }; } } };
+		globalThis.recoveryResult = null;
+		globalThis.automationListener({ type: "local-codex-support/automation-v1", command: { kind: "recover_page" } }, {}, result => { globalThis.recoveryResult = result; });
+	});
+	await page.clock.runFor(1000);
+	assert.equal(await page.evaluate(() => globalThis.retryClicks), 0, "an already loaded content script honors the global pause before Retry");
+	assert.equal(await page.evaluate(() => globalThis.recoveryResult), null);
+	await page.clock.fastForward(299_000);
+	await page.clock.runFor(1000);
+	assert.notEqual(await page.evaluate(() => globalThis.recoveryResult), null);
+	assert.equal(await page.evaluate(() => globalThis.recoveryResult.result.status), "recovery_started");
+	assert.equal(await page.evaluate(() => globalThis.retryClicks), 1, "the same request resumes at five minutes without another command");
 	console.log("ChatGPT DOM passed: visible and hidden user delivery, app links, running detection, stop confirmation, and idle inspection.");
 } finally {
 	await browser.close();
