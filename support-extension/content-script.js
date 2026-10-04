@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.7.5";
+  const contentScriptVersion = "1.8.1";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -32,9 +32,9 @@
   function conversationUrl() {
     const match = location.pathname.match(/^(?:\/g\/([A-Za-z0-9_-]+))?\/c\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/?$/i);
     if (!match) return null;
-    return match[1]
+    return (match[1]
       ? `https://chatgpt.com/g/${match[1]}/c/${match[2].toLowerCase()}`
-      : `https://chatgpt.com/c/${match[2].toLowerCase()}`;
+      : `https://chatgpt.com/c/${match[2].toLowerCase()}`) + (/[?&]temporary-chat=true(?:&|$)/.test(location.search) ? "?temporary-chat=true" : "");
   }
 
   function threadTitle() {
@@ -123,7 +123,19 @@
       return { status: button ? "dismissed" : "not_found" };
     }
     if (command.kind === "stop_thread") return await stopThread();
-    if (command.kind === "send_message") return await sendMessage(command.message, command.connectorName);
+    if (command.kind === "resume_interrupted") {
+      await stopThread();
+      return await sendMessage(command.message, undefined, false, true);
+    }
+    if (command.kind === "recover_page") {
+      const notice = pageErrorNotice();
+      const retry = notice && [...document.querySelectorAll('main button, [role="alert"] button, [role="dialog"] button')]
+        .find(button => isActionableButton(button) && /^(?:retry|try again|regenerate response|continue generating)$/i.test(button.getAttribute("aria-label") ?? button.textContent?.trim() ?? ""));
+      if (!retry) return { status: "unavailable" };
+      retry.click();
+      return { status: "recovery_started" };
+    }
+    if (command.kind === "send_message") return await sendMessage(command.message, command.connectorName, command.temporary);
     assertNoPageError();
     if (command.kind === "inspect_thread") {
       const url = conversationUrl();
@@ -152,7 +164,7 @@
     const deadline = Date.now() + timeoutMs;
     let idleSince = 0;
     while (Date.now() < deadline) {
-      assertNoPageError(true);
+      assertNoPageError(true, true);
       const ready = getComposer();
       if (!ready || document.readyState === "loading") {
         idleSince = 0;
@@ -177,7 +189,7 @@
     const deadline = Date.now() + timeoutMs;
     let stoppedSince = 0;
     while (Date.now() < deadline) {
-      assertNoPageError(true);
+      assertNoPageError(true, true);
       const ready = getComposer();
       const stopButton = ready && getStopButton(ready.composer);
       if (!ready || stopButton) {
@@ -293,27 +305,39 @@
     };
   }
 
-  async function sendMessage(message, connectorName) {
+  async function sendMessage(message, connectorName, temporary = false, recovering = false) {
     let sendClicked = false;
+    const checkPage = () => assertNoPageError(false, recovering);
     try {
-      assertNoPageError();
+      checkPage();
       if (typeof message !== "string" || !message.trim()) throw new Error("A non-empty ChatGPT message is required.");
 
       const existingConversationUrl = conversationUrl();
+      if (temporary && !existingConversationUrl) {
+        await waitForComposer(SEND_READY_TIMEOUT_MS);
+        const deadline = Date.now() + SEND_READY_TIMEOUT_MS;
+        while (!document.querySelector('button[aria-label="Turn off temporary chat"]')) {
+          checkPage();
+          if (Date.now() >= deadline) throw new Error("Temporary chat did not become active. The task was not sent.");
+          // An early click can precede page hydration. Recheck the current control before retrying.
+          document.querySelector('button[aria-label="Temporary chat"]')?.click();
+          await sleep(SEND_SETTLE_MS);
+        }
+      }
       if (existingConversationUrl) {
         const loadedUserTurn = await waitFor(
           () => document.querySelector('section[data-turn="user"] [data-message-author-role="user"]') ??
             document.querySelector('[data-chatgpt-search-unit-key$=":user"] [data-markdown-text-tone="user-message"]'),
-          SEND_READY_TIMEOUT_MS,
+          SEND_READY_TIMEOUT_MS, recovering,
         );
         if (!loadedUserTurn) throw new Error("The existing ChatGPT thread did not load a user message.");
       }
 
       await sleep(SEND_SETTLE_MS);
 
-      const ready = await waitForComposer(SEND_READY_TIMEOUT_MS);
+      const ready = await waitForComposer(SEND_READY_TIMEOUT_MS, recovering);
       if (!ready) throw new Error("ChatGPT composer did not become available.");
-      assertNoPageError();
+      checkPage();
       insertMessage(ready.editor, message);
 
       if (connectorName) await attachConnector(ready, connectorName);
@@ -322,29 +346,29 @@
       await sleep(SEND_SETTLE_MS);
 
       const current = await waitFor(() => {
-        assertNoPageError();
+        checkPage();
         const composer = getComposer();
         if (!composer) return null;
         const button = getSendButton(composer.composer);
         return isActionableButton(button) ? { ...composer, button } : null;
-      }, SEND_READY_TIMEOUT_MS);
+      }, SEND_READY_TIMEOUT_MS, recovering);
       if (!current) throw new Error("ChatGPT send button did not become actionable.");
 
       const previousTurns = new Set(userTurns().map(userTurnId));
       sendClicked = true;
       current.button.click();
       await sleep(SEND_SETTLE_MS);
-      assertNoPageError();
+      checkPage();
 
       const savedUrl = existingConversationUrl ?? await waitFor(() => {
-        assertNoPageError();
+        checkPage();
         return conversationUrl();
-      }, SEND_NAVIGATION_TIMEOUT_MS);
+      }, SEND_NAVIGATION_TIMEOUT_MS, recovering);
       if (!savedUrl) throw new Error("ChatGPT did not navigate to the newly created conversation after sending.");
 
       const normalizedMessage = message.replace(/\s+/g, " ").trim();
       const accepted = await waitFor(() => {
-        assertNoPageError();
+        checkPage();
         // ChatGPT can hide the user message while a new worker runs.
         const composer = getComposer();
         if (!existingConversationUrl && conversationUrl() === savedUrl && isRunning() && composer &&
@@ -356,7 +380,7 @@
             ?.replace(/\s+/g, " ").trim();
           return text === normalizedMessage || (connectorName && text === submittedMessage);
         });
-      }, SEND_NAVIGATION_TIMEOUT_MS);
+      }, SEND_NAVIGATION_TIMEOUT_MS, recovering);
       if (!accepted) throw new Error("Delivery uncertain after Send: the submitted message was not confirmed as a new user turn. Inspect the conversation before retrying.");
 
       const title = threadTitle();
@@ -405,7 +429,13 @@
 
   function pageHealth() {
     if (rateLimitNotice()) return { status: "rate_limited" };
+    if (connectionInterruptedNotice()) return { status: "connection_interrupted" };
     return { status: pageErrorNotice() ? "recoverable_error" : "ok" };
+  }
+
+  function connectionInterruptedNotice() {
+    return [...document.querySelectorAll('[role="status"] .text-chatgpt-recovery')].find(element =>
+      element.getClientRects?.().length && /^Connection interrupted\. Waiting for the complete answer$/i.test(element.textContent?.trim() ?? ""));
   }
 
   function pageErrorNotice() {
@@ -423,9 +453,10 @@
     if (notice) throw new Error(`CHATGPT_RATE_LIMITED: ${(notice.textContent ?? "").trim().slice(0, 500)}`);
   }
 
-  function assertNoPageError(allowRateLimit = false) {
+  function assertNoPageError(allowRateLimit = false, allowInterrupted = false) {
     if (allowRateLimit && rateLimitNotice()) return;
     assertNotRateLimited();
+    if (!allowInterrupted && connectionInterruptedNotice()) throw new Error("CHATGPT_CONNECTION_INTERRUPTED: Waiting for the complete answer.");
     const notice = pageErrorNotice();
     if (notice) throw new Error(`CHATGPT_PAGE_ERROR: ${(notice.textContent ?? "").trim().slice(0, 500)}`);
   }
@@ -464,7 +495,7 @@
     const report = () => {
       const currentUrl = conversationUrl();
       const title = threadTitle();
-      if (!currentUrl?.startsWith("https://chatgpt.com/g/") || !title ||
+      if (!currentUrl || !title ||
           (reportedUrl === currentUrl && reportedTitle === title)) return;
       try {
         const delivery = extensionApi.runtime.sendMessage({
@@ -513,6 +544,7 @@
     if (typeof document === "undefined" || typeof MutationObserver !== "function") return;
     let observedConversationUrl = null;
     let previousComposerAction = null;
+    let reporting = false;
 
     const observeComposerAction = () => {
       const currentUrl = conversationUrl();
@@ -521,27 +553,32 @@
         previousComposerAction = null;
       }
 
-      const composer = document.querySelector('form[data-type="unified-composer"]');
+      const composer = getComposer()?.composer;
       if (!composer) return;
-      const action = composer.querySelector('button[data-testid="stop-button"]')
-        ? "stop"
-        : getSendButton(composer) ? "send" : null;
+      const interrupted = Boolean(connectionInterruptedNotice());
+      const action = interrupted || rateLimitNotice() || pageErrorNotice() ? "blocked"
+        : isRunning() ? "running" : getSendButton(composer) && userTurns().length ? "idle" : null;
       if (!action) return;
+      const signature = `${action}:${interrupted}`;
 
-      if (currentUrl && ((action === "stop" && previousComposerAction === "send") ||
-          (action === "send" && previousComposerAction === "stop"))) {
+      if (currentUrl && signature !== previousComposerAction && !reporting) {
+        reporting = true;
         try {
           const delivery = extensionApi.runtime.sendMessage({
             type: reactivateRalphType,
             conversationUrl: currentUrl,
-            ...(action === "send" ? { completed: true } : {}),
+            activity: action,
+            title: threadTitle(),
+            completed: action !== "running",
+            interrupted,
           });
-          void Promise.resolve(delivery).catch(() => undefined);
+          void Promise.resolve(delivery).then((result) => {
+            if (result?.ok && observedConversationUrl === currentUrl) previousComposerAction = signature;
+          }).catch(() => undefined).finally(() => { reporting = false; });
         } catch {
-          // An extension reload invalidates this script while its page observer remains alive.
+          reporting = false;
         }
       }
-      previousComposerAction = action;
     };
 
     const refresh = () => {
@@ -563,6 +600,7 @@
     };
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start, { once: true });
     else start();
+    if (typeof setInterval === "function") setInterval(refresh, 1_000);
   }
 
   function getComposer() {
@@ -589,8 +627,8 @@
   }
 
 
-  async function waitForComposer(timeoutMs) {
-    return await waitFor(() => getComposer(), timeoutMs);
+  async function waitForComposer(timeoutMs, recovering = false) {
+    return await waitFor(() => getComposer(), timeoutMs, recovering);
   }
 
   async function waitForConversationReady(timeoutMs) {
@@ -743,10 +781,10 @@
     return text;
   }
 
-  async function waitFor(getElement, timeoutMs) {
+  async function waitFor(getElement, timeoutMs, recovering = false) {
     const deadline = timeoutMs === undefined ? Infinity : Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      assertNoPageError();
+      assertNoPageError(false, recovering);
       const value = getElement();
       if (value) return value;
       await sleep(50);

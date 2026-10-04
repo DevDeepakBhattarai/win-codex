@@ -189,6 +189,7 @@ function worker() {
         async sendMessage(_id, { command }) {
           if (command.kind === 'page_health') return { ok: true, result: { status: health } };
           if (command.kind === 'dismiss_rate_limit') { clicks++; health = 'ok'; return { ok: true, result: { status: 'dismissed' } }; }
+          if (command.kind === 'inspect_thread' && health === 'rate_limited') return { ok: false, error: 'CHATGPT_RATE_LIMITED: Too many requests.' };
           return { ok: true, result: { status: 'running', title: 'Helium title' } };
         },
       },
@@ -209,8 +210,8 @@ function worker() {
 let context = worker();
 await new Promise(resolve => setImmediate(resolve));
 assert.deepEqual(presenceClaims.at(-1).openThreads, [], 'an idle observer publishes empty presence before stopping its poll loop');
-const inspect = () => context.executeCommand({ id: String(now), kind: 'inspect_thread', feature: 'ralph', conversationUrl: url,
-  refreshRevision: 'external-change' }, 'helium');
+const inspect = (externalUpdate = true) => context.executeCommand({ id: String(now), kind: 'inspect_thread', feature: 'ralph', conversationUrl: url,
+  ...(externalUpdate ? { refreshRevision: 'external-change' } : {}) }, 'helium');
 await context.executeCommand({ id: 'observer-prepare', kind: 'prepare_thread', feature: 'threadPreparation', conversationUrl: url }, 'helium');
 assert.equal(results.at(-1).ok, false, 'observer-only workers reject executor preparation commands');
 assert.match(results.at(-1).error, /only available for thread observation/);
@@ -228,13 +229,18 @@ context = worker();
 await new Promise(resolve => setImmediate(resolve));
 now += 1;
 await inspect();
+assert.match(results.at(-1).error, /CHATGPT_RATE_LIMITED/);
+assert.equal(clicks, 0, 'an observer never dismisses a provider notice, even after restart');
+assert.equal(reloads, 0, 'an observer never refreshes a blocked page');
+context.getSettings = async () => ({ threadSync: true, automationExecutor: true });
+await inspect(false);
 assert.equal(clicks, 1, 'persisted cooldown survives a worker restart and permits dismissal at ten minutes');
 assert.equal(results.at(-1).ok, true);
 health = 'recoverable_error';
-await inspect();
+await inspect(false);
 assert.equal(reloads, 1, 'recognized timeout errors refresh the existing tab once');
 now += 120_000;
-await inspect();
+await inspect(false);
 assert.equal(reloads, 2, 'a later inspection can retry recovery on the same tab');
 assert.equal(creations, 0);
 

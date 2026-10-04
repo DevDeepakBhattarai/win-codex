@@ -11,22 +11,29 @@ try {
   const reviewId = "22222222-2222-4222-8222-222222222222";
   const parentUrl = `https://chatgpt.com/c/${parentId}`;
   const reviewUrl = `https://chatgpt.com/c/${reviewId}`;
-  const thread = { threadId: parentId, conversationUrl: parentUrl, title: "Implement feature", state: "active", mode: "continuous", waitingForTask: true, registeredAt: new Date().toISOString(), nextCheckAt: Date.now() + 180000 };
-  const task = { jobId: reviewId, childConversationUrl: reviewUrl, parentThreadId: parentId, title: "Independent PR task", resultPath: "D:\\workspace\\task.md", state: "pending" };
+  const thread = { threadId: parentId, conversationUrl: parentUrl, title: "Implement feature", state: "active", mode: "continuous", waitingForTask: true, registeredAt: new Date().toISOString(), nextCheckAt: Date.now() + 1800_000 };
+  const task = { jobId: reviewId, childThreadId: reviewId, childConversationUrl: reviewUrl + "?temporary-chat=true", parentThreadId: parentId, title: "Independent PR task", resultPath: "D:\\workspace\\task.md", state: "pending" };
+  const ready = { ...thread, threadId: "33333333-3333-4333-8333-333333333333", conversationUrl: "https://chatgpt.com/c/33333333-3333-4333-8333-333333333333", title: "Recent completion", waitingForTask: false, activity: "idle", attentionAt: "2026-10-04T02:00:00Z" };
+  const older = { ...ready, threadId: "44444444-4444-4444-8444-444444444444", title: "Earlier completion", attentionAt: "2026-10-04T01:00:00Z", agentCreated: true };
+  const settled = { ...ready, threadId: "55555555-5555-4555-8555-555555555555", title: "Old closed tab", settledAt: "2026-10-03T12:00:00Z" };
   let settingsRequests = 0;
   let cancelled = false;
   await page.addInitScript(() => {
+    globalThis.closedViews = 0;
+    globalThis.openedPanels = [];
+    globalThis.close = () => { globalThis.closedViews += 1; };
     globalThis.chrome = {
       storage: { local: { async get(defaults) { return defaults; }, async set() {}, async remove() {} } },
       runtime: { async sendMessage() {} },
-      tabs: { async query() { return []; }, async create() {}, async update() {} },
+      sidePanel: { async open(options) { globalThis.openedPanels.push(options); } },
+      tabs: { async query() { return [{ id: 7, windowId: 3, url: "https://example.com" }]; }, async create() {}, async update() {} },
     };
   });
   await page.route("http://127.0.0.1:19999/**", async route => {
     const pathname = new URL(route.request().url()).pathname;
     let data;
-    if (pathname === "/chatgpt-support/ralph/threads") data = { threads: [thread], tasks: [task] };
-    else if (pathname === "/chatgpt-support/ralph/settings") { settingsRequests += 1; data = { loopIntervalSeconds: 180 }; }
+    if (pathname === "/chatgpt-support/ralph/threads") data = { threads: [older, thread, ready, settled, { ...thread, threadId: reviewId, activity: "running", waitingForTask: false }], tasks: [task] };
+    else if (pathname === "/chatgpt-support/ralph/settings") { settingsRequests += 1; data = { loopIntervalSeconds: 1800 }; }
     else if (pathname === "/chatgpt-support/ralph/projects") data = { projects: [] };
     else if (pathname === `/chatgpt-support/tasks/${reviewId}`) {
       assert.equal(route.request().postDataJSON().action, "cancel");
@@ -46,19 +53,29 @@ try {
     await route.fulfill({ contentType: file.endsWith("html") ? "text/html" : file.endsWith("css") ? "text/css" : "text/javascript", body: await readFile(`support-extension/${file}`, "utf8") });
   });
   await page.goto("http://127.0.0.1:19999/popup.html");
+  await page.locator("#readyCount").getByText("2", { exact: true }).waitFor();
+  assert.deepEqual(await page.locator("#threadList .thread-id").allTextContents(), ["Recent completion", "Earlier completion"]);
+  assert.equal(await page.locator("#workingSection").getAttribute("open"), null, "running work is collapsed by default");
+  assert.equal(await page.locator("#workingCount").textContent(), "1");
+  assert.equal(await page.locator("#settledCount").textContent(), "1");
+  await page.locator("#workingSection summary").click();
+  await page.locator("#subagentThreadsSection summary").click();
   await page.getByText("waiting for task", { exact: true }).waitFor();
   assert.equal(await page.getByRole("button", { name: "Check now", exact: true }).count(), 0);
   assert.equal(settingsRequests, 0, "opening the thread view does not fetch settings");
-  const reviewLink = page.locator('#subagentThreadList a.thread-url');
-  assert.equal(await reviewLink.textContent(), reviewUrl, "RALPH renders the exact worker conversation URL");
-  assert.equal(await reviewLink.getAttribute("href"), reviewUrl, "the visible worker URL opens the worker conversation");
+  const reviewLink = page.locator('#subagentThreadList a.inspect-task');
+  assert.equal(await reviewLink.textContent(), "Inspect");
+  assert.equal(await reviewLink.getAttribute("href"), task.childConversationUrl, "worker inspection preserves temporary chat mode");
   assert.equal(await page.getByText(task.resultPath, { exact: true }).count(), 0,
     "RALPH does not substitute the local result file for worker navigation");
   await mkdir(".data", { recursive: true });
   await page.screenshot({ path: ".data/worker-popup.png", fullPage: true });
+  await page.getByRole("button", { name: "Sidebar", exact: true }).click();
+  assert.deepEqual(await page.evaluate(() => globalThis.openedPanels), [{ windowId: 3 }]);
+  assert.equal(await page.evaluate(() => globalThis.closedViews), 1);
   await page.getByRole("tab", { name: "Settings", exact: true }).click();
-  await page.locator("#subagentProjectUrl").waitFor({ state: "visible" });
-  assert.equal(await page.locator("#ralphLoopIntervalSeconds").isVisible(), false, "bounded tasks do not expose continuation controls");
+  await page.locator("#ralphLoopIntervalSeconds").waitFor({ state: "visible" });
+  assert.equal(await page.locator("#ralphLoopIntervalSeconds").inputValue(), "1800");
   assert.equal(settingsRequests, 1);
   await page.getByRole("tab", { name: "Tasks and threads", exact: true }).click();
   await page.getByRole("tab", { name: "Settings", exact: true }).click();
@@ -66,11 +83,24 @@ try {
   await page.getByRole("tab", { name: "Tasks and threads", exact: true }).click();
   page.once("dialog", dialog => dialog.accept());
   await page.getByRole("button", { name: "Cancel task", exact: true }).click();
-  await page.getByRole("button", { name: "Completed", exact: true }).waitFor();
+  await page.locator("#subagentThreadsSection").waitFor({ state: "hidden" });
   assert.equal(await page.getByRole("button", { name: "Run continuously", exact: true }).count(), 0);
   assert.equal(cancelled, true);
-  await page.getByRole("button", { name: "Completed", exact: true }).click();
-  await page.getByText("Cancelled", { exact: true }).waitFor();
+  await page.goto("http://127.0.0.1:19999/popup.html?view=sidepanel");
+  await page.locator("#threadList .thread-id").first().waitFor();
+  assert.equal(await page.locator("#openSidePanel").isVisible(), false);
+  await page.getByRole("link", { name: /Recent completion/ }).click();
+  assert.equal(await page.evaluate(() => globalThis.closedViews), 0, "the sidebar remains open during inspection");
+  thread.activity = "running";
+  ready.settledAt = new Date().toISOString();
+  await page.locator("#readyCount").getByText("1", { exact: true }).waitFor();
+  assert.equal(await page.locator("#threadList .thread-id").textContent(), "Earlier completion", "the sidebar updates without Refresh");
+  await page.getByRole("searchbox", { name: "Search threads" }).fill("Implement");
+  await page.locator("#workingSection summary").click();
+  await page.getByText("running", { exact: true }).waitFor();
+  await page.getByRole("searchbox", { name: "Search threads" }).fill("");
+  await page.screenshot({ path: ".data/thread-sidebar.png", fullPage: true });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
   assert.deepEqual(errors, []);
-  console.log("Support popup passed: paused parent, task cancellation, completed reports, and lazy settings. All API responses were local fixtures.");
+  console.log("Support UI passed: completion ordering, collapsed work, separate tasks, settlement, live updates, search, popup/sidebar navigation, and lazy settings. API responses were fixtures.");
 } finally { await browser.close(); }

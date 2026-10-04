@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { SubagentJobRegistry } from "../dist/subagent-jobs.js";
@@ -15,7 +15,8 @@ try {
   const unreported = await jobs.create({ threadId: "api:unreported" });
   await jobs.assignChild(unreported.jobId, child);
   const bus = new SupportCommandBus(undefined, undefined, 0);
-  const monitor = new SubagentResultController(jobs, bus, async () => {}, registry, 60_000, 0);
+  await registry.setLoopIntervalSeconds(1800);
+  const monitor = new SubagentResultController(jobs, bus, async () => {}, registry, 60_000);
   const inspect = async status => {
     await monitor.tick();
     const command = await bus.claim("browser", ["threadMessaging"], 1000);
@@ -26,17 +27,28 @@ try {
   };
   const realNow = Date.now;
   try {
-    await inspect("idle");
-    assert.equal((await jobs.job(unreported.jobId)).state, "pending", "one idle observation cannot complete a worker");
-    Date.now = () => realNow() + 31_000;
+    await monitor.tick();
+    assert.equal(await bus.claim("browser", ["threadMessaging"], 0), undefined, "workers are not inspected before thirty minutes");
+    Date.now = () => realNow() + 1800_001;
     await inspect("running");
-    assert.equal((await jobs.job(unreported.jobId)).state, "pending", "a resumed worker clears the idle observation");
-    Date.now = () => realNow() + 62_000;
+    assert.equal((await jobs.job(unreported.jobId)).state, "pending", "a running worker remains pending");
+    assert.equal(await bus.claim("browser", ["threadMessaging"], 0), undefined, "running work receives no continuation");
+    Date.now = () => realNow() + 3600_100;
     await inspect("idle");
-    Date.now = () => realNow() + 93_000;
-    await inspect("idle");
+    const resumed = await bus.claim("browser", ["threadMessaging"], 0);
+    assert.ok(resumed, "an idle unfinished worker must receive a continuation");
+    assert.equal(resumed.kind, "send_message", "a worker that stops without a report resumes instead of being declared complete");
+    assert.match(resumed.message, /rename/);
+    bus.complete({ commandId: resumed.id, browserId: "browser", kind: "send_message", ok: true,
+      result: { status: "sent", conversationUrl: child.conversationUrl } });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal((await jobs.job(unreported.jobId)).state, "pending");
+    await writeFile(unreported.resultPath + ".tmp", "Completed assigned check. PASS.\n");
+    await rename(unreported.resultPath + ".tmp", unreported.resultPath);
+    Date.now = () => realNow() + 5400_200;
+    await monitor.tick();
     assert.equal((await jobs.job(unreported.jobId)).state, "complete");
-    assert.match(await readFile(unreported.resultPath, "utf8"), /BLOCKED: worker stopped without publishing its report/);
+    assert.match(await readFile(unreported.resultPath, "utf8"), /PASS/);
     await monitor.tick();
     assert.equal(await registry.isActive(child.threadId), false);
     assert.equal(await bus.claim("browser", ["threadMessaging"], 0), undefined, "completion never sends a parent wake-up");

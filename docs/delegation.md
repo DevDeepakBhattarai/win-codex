@@ -14,7 +14,9 @@ Use delegation for a review, browser work, or application testing. For a large t
 3. Keep the parent turn active until the command returns. If the shell runner yields a session, wait on that same command. The CLI holds one HTTP request while the server watches for the worker's report.
 4. Read the returned JSON and the complete report. Evaluate observed results and blockers against the assignment. Implement confirmed fixes in the parent.
 
-The CLI loads configuration from its installation directory, so you can run it from another workspace. It uses the caller's thread identifier when available, otherwise the workspace directory, to group assignments. It creates a unique request ID and prints recovery details. The service opens a worker and supplies the completion path. The caller does not bind or sync a conversation.
+The CLI loads configuration from its installation directory, so you can run it from another workspace. It uses the caller's thread identifier when available, otherwise the workspace directory, to group assignments. It creates a unique request ID and prints recovery details. The service opens a temporary worker chat and supplies the completion path. The caller does not bind or sync a conversation.
+
+The service checks unfinished workers every 30 minutes. It waits while a worker runs and resumes an idle worker that has not published its report. After report collection, the service closes the worker's tab. Reports remain in the local task directory. The parent keeps waiting through recovery.
 
 ## Finish as a worker
 
@@ -38,7 +40,7 @@ If the connection failed before a job ID arrived, rerun from the same workspace 
 
 The service reuses the assignment without sending a second worker message. If you change caller or workspace during recovery, use the printed job ID with `wait`.
 
-A failed or uncertain startup returns `preparationError` and a nonzero CLI exit code. Inspect the saved job and worker before another assignment. The Support extension retains operator cancellation for abandoned jobs. A worker that stays idle without publishing a report receives a service-generated BLOCKED report.
+A failed or uncertain startup returns `preparationError` and a nonzero CLI exit code. Inspect the saved job and worker before another assignment. The Support extension retains operator cancellation for abandoned jobs. A closed temporary chat cannot be reopened. Cancel an abandoned assignment after confirming that its worker has stopped.
 
 A recovery wait returns a definite pre-send startup failure. It continues waiting after an uncertain send because the existing worker may still publish its report.
 

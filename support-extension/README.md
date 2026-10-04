@@ -4,14 +4,18 @@ Generate the private extension with `pnpm support:prepare`. Load `.data/support-
 
 Enable **Thread sync**, **Automation browser executor**, and **Agent thread messaging** in your automation profile. Thread sync can also run in an observer browser. Enable the executor and messaging in the browser that owns automated ChatGPT work.
 
-Set **ChatGPT worker project URL** to your existing ChatGPT project. Connect the refreshed MCP tools to that project. The default is the ChatGPT new-chat page.
+Workers start in temporary chats and use the configured worker plugin. Their tabs close after the service collects the report.
 
-After an update, reload the generated extension in `chrome://extensions` and reload ChatGPT pages. A running page can retain an older content script until navigation or reload.
+After an update, reload the generated extension in `chrome://extensions`. Reload saved ChatGPT pages after their work finishes. Keep temporary task chats open without refreshing. A running page can retain an older content script until the extension injects its current version.
 
-Use **Tasks** to open worker conversations and inspect startup errors. Inspect uncertain delivery before cancelling an abandoned startup. A known worker must stop before cancellation releases the reservation.
+Open the extension popup and click **Sidebar** to keep the thread list beside your browser. The popup remains available. **Ready for you** lists finished manual threads with recent completions first. **Working** groups running threads. **Tasks** groups active workers and offers **Inspect** and **Cancel task**. Finished tasks leave the list. After you view a finished manual thread and move away, or close its tab, the thread moves to **Settled**. Running and blocked threads keep their active status.
+
+Inspect uncertain delivery before cancelling an abandoned startup. A known worker must stop before cancellation releases the reservation.
 
 Follow [the delegation workflow](../docs/delegation.md) for parent and worker prompts. Workers publish reports through the supplied temporary file and rename. The local request waits until the server collects the report. A final chat answer alone does not finish the job.
 
-Automatic continuation is disabled by default. Legacy RALPH controls appear only when the server uses `RALPH_ENABLED=true`. Normal task delegation does not need that setting or an OpenAI API key.
+Set **RALPH check interval** to change the default 1800-second worker recovery interval. The service resumes an idle worker until its report arrives. Marked manual-thread continuation uses the separate **RALPH automation** switch and server setting. Worker recovery needs no OpenAI API key.
+
+When a managed temporary chat displays the connection-interrupted notice, the extension checks three times, 30 seconds apart, then stops and resumes a stuck turn. It does not refresh temporary chats because that discards their conversation. Saved managed threads refresh at each check. A recovered stream continues without a Stop or another message.
 
 For automatic Windows sign-in startup, build the project and run `scripts/install-startup.ps1`. Inspect `.data/runtime/watchdog.log` if the server or tunnel fails to start.

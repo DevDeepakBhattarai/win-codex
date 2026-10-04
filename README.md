@@ -60,7 +60,7 @@ When `THREAD_SYNC_ENABLED` is not `false`, the server exposes:
 
 Local agents delegate through [the blocking CLI or HTTP API](docs/agent-api.md). The request waits for the report. Include the revision in the specification. The CLI supplies a unique request ID, and retries with that ID reuse the saved job. Each caller group supports two pending assignments. The local caller requires no ChatGPT conversation binding.
 
-State, specifications, and reports live under `<DATA_DIR>/tasks`. Legacy reviews and subagents migrate on first open. The worker project uses the existing `subagentProjectUrl` setting. Cancellation and uncertain-delivery recovery remain operator actions in the Support extension.
+State, specifications, and reports live under `<DATA_DIR>/tasks`. Legacy reviews and subagents migrate on first open. Workers use temporary chats. Cancellation and uncertain-delivery recovery remain operator actions in the Support extension.
 
 ## OAuth and MCP flow
 
@@ -134,9 +134,9 @@ BROWSER_BRIDGE_ENABLED=true
 THREAD_SYNC_ENABLED=true
 # THREAD_SYNC_PORT=6002
 
-# Automatic continuation is disabled by default.
-RALPH_ENABLED=false
-# Required only for the legacy continuation classifier.
+# Marked manual-thread continuation is enabled by default.
+RALPH_ENABLED=true
+# Required only for the marked manual-thread continuation classifier.
 OPENAI_API_KEY=
 # RALPH_MODEL=gpt-5.6-terra
 ```
@@ -202,7 +202,7 @@ The popup configures these browser responsibilities:
 
 - Thread sync. This can be enabled in more than one compatible browser because binding is idempotent.
 - Automation browser executor. Enable this only in the Chrome automation profile. It opens or reuses persistent thread tabs for active registered conversations.
-- Legacy RALPH automation, visible only when `RALPH_ENABLED=true`.
+- RALPH automation for marked manual threads, visible when the server enables it.
 - Agent thread messaging. Normally enable this in only one browser.
 
 Automation commands are claimed atomically by one enabled browser instance. This prevents two support extensions from executing the same queued command.
@@ -215,11 +215,13 @@ Workers write their complete report to the supplied temporary file and rename it
 
 Safe failures before Send use bounded retry. Uncertain delivery after Send requires operator inspection. The Support extension shows saved errors and offers recovery controls. Recognized rate limits defer queued sends, while Stop remains available.
 
-The service also inspects unreported workers without model calls. A worker that remains idle for two minutes receives a BLOCKED report with its last observed response. The parent must treat that report as incomplete validation.
+The service checks unfinished workers every 30 minutes without classifier calls. It waits while a worker runs and resumes an idle worker until the worker publishes its report. Report collection releases the waiting parent and closes the owned worker tab. A chat answer alone never marks an assignment complete.
 
 ## Automatic continuation
 
-`RALPH_ENABLED` defaults to false. Normal task delegation does not use a classifier or automatic continuation. The legacy runtime remains available with `RALPH_ENABLED=true`; its controls are hidden by default. The thread registry and tab cleanup continue to support worker lifecycle management.
+`RALPH_ENABLED` defaults to true and controls continuation of marked manual threads. Worker recovery uses task messaging and needs no classifier API key. The default interval is 1800 seconds. Observing an ordinary manual conversation updates its sidebar status without enabling continuation.
+
+The extension detects the visible "Connection interrupted. Waiting for the complete answer" notice. For saved, managed threads, it refreshes up to three times, 30 seconds apart. For temporary task chats, it checks at the same interval without refreshing because a refresh discards the conversation. If the notice persists after all three checks, it stops the stuck turn and sends one continuation message.
 
 ## Windows startup
 

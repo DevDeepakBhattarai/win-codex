@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 
-const workerScript = await readFile("support-extension/service-worker.js", "utf8");
+const workerScript = await readFile(process.argv[2] ?? "support-extension/service-worker.js", "utf8");
 const contentScript = await readFile("support-extension/content-script.js", "utf8");
 const url = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
 const config = {
@@ -14,10 +14,13 @@ const config = {
   extensionToken: "x".repeat(32),
 };
 
-async function runWorker(command, responses, healthResponses = [], injectionFailures = []) {
+async function runWorker(command, responses, healthResponses = [], injectionFailures = [], temporary = false) {
   const results = [];
   let dispatches = 0;
   let reloads = 0;
+  const calls = [];
+  const waits = [];
+  const tabUrl = url + (temporary ? "?temporary-chat=true" : "");
   let activeInjectionFailures = [];
   const storage = {};
   const context = {
@@ -30,11 +33,12 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
         onMessage: { addListener() {} }, onInstalled: { addListener() {} }, onStartup: { addListener() {} },
       },
       tabs: {
-        onUpdated: { addListener() {} }, query: async () => [{ id: 11, status: "complete", url }],
+        onUpdated: { addListener() {} }, query: async () => [{ id: 11, status: "complete", url: tabUrl }],
         create: async () => ({ id: 11 }),
-        get: async () => ({ id: 11, status: "complete", url }),
+        get: async () => ({ id: 11, status: "complete", url: tabUrl }),
         reload: async () => { reloads += 1; },
         sendMessage: async (_tabId, payload) => {
+          calls.push(payload.command.kind);
           if (payload.command.kind === "page_health") {
             const response = healthResponses.shift();
             if (response instanceof Error) throw response;
@@ -63,9 +67,10 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
   await new Promise(resolve => setImmediate(resolve));
   activeInjectionFailures = injectionFailures;
   context.restartPolling = () => {};
+  context.sleep = async ms => { waits.push(ms); };
   context.getSettings = async () => ({ threadSync: true, automationExecutor: true });
   await context.executeCommand(command, "browser-a");
-  return { results, dispatches, reloads };
+  return { results, dispatches, reloads, calls, waits };
 }
 
 function inspectCommand(id) {
@@ -87,15 +92,36 @@ for (const kind of ["inspect_thread", "prepare_thread"]) {
   assert.equal(run.results[0].result.status, kind === "inspect_thread" ? "running" : "prepared");
 }
 
+for (const temporary of [false, true]) {
+  const target = url + (temporary ? "?temporary-chat=true" : "");
+  const run = await runWorker({ ...inspectCommand("stuck-stream"), conversationUrl: target }, [
+    { ok: true, result: { status: "sent", conversationUrl: target } },
+    { ok: true, result: { status: "running" } },
+  ], Array.from({ length: 4 }, () => ({ ok: true, result: { status: "connection_interrupted" } })), [], temporary);
+  assert.equal(run.reloads, temporary ? 0 : 3, "temporary workers preserve their conversation, saved threads refresh three times");
+  assert.deepEqual(run.waits.filter(ms => ms === 30_000), [30_000, 30_000, 30_000]);
+  assert.equal(run.calls.filter(kind => kind === "resume_interrupted").length, 1, "one Stop-and-continue command follows three failed recovery checks");
+  assert.equal(run.results[0].result.status, "running", "the original inspection observes the resumed turn");
+}
+{
+  const run = await runWorker(inspectCommand("stream-recovers"), [{ ok: true, result: { status: "running" } }], [
+    { ok: true, result: { status: "connection_interrupted" } }, { ok: true, result: { status: "ok" } },
+  ]);
+  assert.equal(run.reloads, 1);
+  assert.equal(run.calls.includes("resume_interrupted"), false, "a recovered stream keeps running without Stop or another message");
+}
+
 {
   const run = await runWorker(inspectCommand("persistently-blocked"), [], [
     { ok: true, result: { status: "recoverable_error" } },
     { ok: true, result: { status: "recoverable_error" } },
   ]);
   assert.equal(run.reloads, 1);
-  assert.equal(run.dispatches, 0, "a refresh must recheck page health before inspecting a still-blocked page");
+  assert.equal(run.dispatches, 2, "each blocked page attempts its visible recovery action");
+  assert.equal(run.calls.includes("inspect_thread"), false, "a still-blocked page is never inspected as complete");
   assert.equal(run.results[0].result.status, "loading");
 }
+
 
 {
   const run = await runWorker(inspectCommand("inspection-timeout"), [
