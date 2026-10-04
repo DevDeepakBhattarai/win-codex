@@ -121,6 +121,14 @@ try {
 		status.setAttribute("role", "status");
 		status.innerHTML = '<span class="text-chatgpt-recovery">Connection interrupted. Waiting for the complete answer</span>';
 		document.body.appendChild(status);
+	});
+	assert.equal((await execute({ kind: "page_health" })).result.status, "connection_interrupted", "the exact supplied recovery notice is detected");
+	const alreadyFinished = await execute({ kind: "resume_interrupted", message: "Continue the remaining assignment." });
+	assert.equal(alreadyFinished.ok, true, alreadyFinished.error);
+	assert.equal(alreadyFinished.result.status, "idle", "a turn that finishes before Stop receives no recovery continuation");
+	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1);
+	await page.evaluate(() => {
+		const status = document.querySelector('[role="status"]');
 		const button = document.querySelector('button[aria-label="Send"]');
 		button.setAttribute("aria-label", "Stop");
 		button.onclick = () => {
@@ -128,7 +136,6 @@ try {
 			button.onclick = () => { status.remove(); globalThis.hostSend(); };
 		};
 	});
-	assert.equal((await execute({ kind: "page_health" })).result.status, "connection_interrupted", "the exact supplied recovery notice is detected");
 	const recovered = await execute({ kind: "resume_interrupted", message: "Continue the remaining assignment." });
 	assert.equal(recovered.ok, true, recovered.error);
 	assert.equal(recovered.result.status, "sent", "a stuck turn stops before continuation even while the recovery notice remains visible");

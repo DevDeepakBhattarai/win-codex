@@ -104,6 +104,15 @@ for (const temporary of [false, true]) {
   assert.equal(run.results[0].result.status, "running", "the original inspection observes the resumed turn");
 }
 {
+  const temporaryUrl = url + "?temporary-chat=true";
+  const run = await runWorker({ ...inspectCommand("finishes-during-recovery"), conversationUrl: temporaryUrl }, [
+    { ok: true, result: { status: "idle", conversationUrl: temporaryUrl } },
+    { ok: true, result: { status: "idle" } },
+  ], Array.from({ length: 4 }, () => ({ ok: true, result: { status: "connection_interrupted" } })), [], true);
+  assert.equal(run.results[0].result.status, "idle", "an already-finished recovery result reaches the original inspection");
+  assert.equal(run.reloads, 0);
+}
+{
   const run = await runWorker(inspectCommand("stream-recovers"), [{ ok: true, result: { status: "running" } }], [
     { ok: true, result: { status: "connection_interrupted" } }, { ok: true, result: { status: "ok" } },
   ]);

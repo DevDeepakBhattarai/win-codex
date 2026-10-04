@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Local Codex Support",
-  "version": "1.8.1",
+  "version": "1.8.2",
   "description": "Runs bounded ChatGPT tasks, stores reports, and delivers completion to parent agents.",
   "permissions": ["alarms", "scripting", "sidePanel", "storage", "tabs", "webNavigation"],
   "side_panel": { "default_path": "popup.html?view=sidepanel" },

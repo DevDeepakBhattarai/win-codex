@@ -831,6 +831,9 @@ export class RalphRegistry {
         }
         return "active" as const;
       }
+      if (state.threads.length >= MAX_RALPH_THREADS) {
+        state.threads = state.threads.filter((thread) => !thread.settledAt);
+      }
       if (state.threads.length >= MAX_RALPH_THREADS) throw new Error("RALPH thread registration limit reached.");
       state.threads.push({
         conversationUrl: conversation.conversationUrl,

@@ -10,6 +10,8 @@ After an update, reload the generated extension in `chrome://extensions`. Reload
 
 Open the extension popup and click **Sidebar** to keep the thread list beside your browser. The popup remains available. **Ready for you** lists finished manual threads with recent completions first. **Working** groups running threads. **Tasks** groups active workers and offers **Inspect** and **Cancel task**. Finished tasks leave the list. After you view a finished manual thread and move away, or close its tab, the thread moves to **Settled**. Running and blocked threads keep their active status.
 
+Settlements retry after a server outage. The registry discards settled history when it needs space for a new thread.
+
 Inspect uncertain delivery before cancelling an abandoned startup. A known worker must stop before cancellation releases the reservation.
 
 Follow [the delegation workflow](../docs/delegation.md) for parent and worker prompts. Workers publish reports through the supplied temporary file and rename. The local request waits until the server collects the report. A final chat answer alone does not finish the job.

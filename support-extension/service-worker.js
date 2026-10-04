@@ -91,6 +91,9 @@ function trackThreadTab(tabId, value) {
 async function reportClosedThreadTabs() {
   const stored = await extensionApi.storage.local.get(null);
   for (const [key, url] of Object.entries(stored)) {
+    if (key.startsWith("viewedCompletion:") && url) {
+      await settleViewedThread(key.slice("viewedCompletion:".length));
+    }
     if (!key.startsWith("closedRalphTab:") || !url) continue;
     const response = await fetch(ralphRegisterEndpoint.href, {
       method: "POST",
@@ -786,7 +789,7 @@ async function recoverPageOnce(tabId) {
     const resumed = await sendAutomationMessageWithTimeout(tabId, {
       kind: "resume_interrupted", message: "Continue your existing assignment from its current state. Complete the remaining work and publish the required report. Do not repeat completed work.",
     });
-    if (!resumed?.ok || resumed.result?.status !== "sent") throw new Error(resumed?.error || "The interrupted turn could not resume.");
+    if (!resumed?.ok || !["sent", "idle"].includes(resumed.result?.status)) throw new Error(resumed?.error || "The interrupted turn could not resume.");
     return true;
   }
   if (health.result?.status === "rate_limited") {

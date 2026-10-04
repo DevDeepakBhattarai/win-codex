@@ -221,7 +221,7 @@ The service checks unfinished workers every 30 minutes without classifier calls.
 
 `RALPH_ENABLED` defaults to true and controls continuation of marked manual threads. Worker recovery uses task messaging and needs no classifier API key. The default interval is 1800 seconds. Observing an ordinary manual conversation updates its sidebar status without enabling continuation.
 
-The extension detects the visible "Connection interrupted. Waiting for the complete answer" notice. For saved, managed threads, it refreshes up to three times, 30 seconds apart. For temporary task chats, it checks at the same interval without refreshing because a refresh discards the conversation. If the notice persists after all three checks, it stops the stuck turn and sends one continuation message.
+The extension detects the visible "Connection interrupted. Waiting for the complete answer" notice. For saved, managed threads, it refreshes up to three times, 30 seconds apart. For temporary task chats, it checks at the same interval without refreshing because a refresh discards the conversation. If the notice persists after all three checks, it stops the stuck turn and sends one continuation message. A turn that finishes before Stop receives no recovery message.
 
 ## Windows startup
 

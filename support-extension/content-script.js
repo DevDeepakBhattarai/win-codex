@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.8.1";
+  const contentScriptVersion = "1.8.2";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -124,7 +124,8 @@
     }
     if (command.kind === "stop_thread") return await stopThread();
     if (command.kind === "resume_interrupted") {
-      await stopThread();
+      const stopped = await stopThread();
+      if (stopped.status === "idle") return stopped;
       return await sendMessage(command.message, undefined, false, true);
     }
     if (command.kind === "recover_page") {
