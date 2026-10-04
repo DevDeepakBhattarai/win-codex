@@ -48,14 +48,16 @@ async function syncAutomationPause(unavailable = false) {
   }
   const operation = (async () => {
     const stored = await extensionApi.storage.local.get("automationPausedUntil");
+    let until = stored.automationPausedUntil ?? 0;
     if (unavailable && !(stored.automationPausedUntil > Date.now())) {
-      await extensionApi.storage.local.set({ automationPausedUntil: Date.now() + AUTOMATION_PAUSE_MS, automationPausePending: true });
+      until = Date.now() + AUTOMATION_PAUSE_MS;
+      await extensionApi.storage.local.set({ automationPausedUntil: until, automationPausePending: true });
     }
     const pending = await extensionApi.storage.local.get("automationPausePending");
     const response = await fetch(claimEndpoint.href, {
       method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${config.extensionToken}` },
       body: JSON.stringify({ browserId: await getBrowserId(), features: [], statusOnly: true,
-        conversationUnavailable: unavailable || pending.automationPausePending === true }),
+        conversationUnavailable: unavailable || pending.automationPausePending === true, automationPausedUntil: until }),
       signal: AbortSignal.timeout(5000), redirect: "error",
     });
     if (!response.ok) throw new Error(`Automation pause synchronization returned ${response.status}.`);

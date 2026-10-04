@@ -24,6 +24,7 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
   let activeInjectionFailures = [];
   let clock = 1_800_000_000_000;
   let sharedPauseUntil = globalPause === "restart" ? clock + 300_000 : 0;
+  let serviceOnline = true;
   const storage = globalPause === "restart" ? { automationPausedUntil: sharedPauseUntil } : {};
   if (globalPause === "stale") storage["pageRecovery:11"] = { conversationUnavailableAt: clock - 300_001, conversationUnavailableUrl: tabUrl };
   let messageListener;
@@ -66,7 +67,11 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
     },
     fetch: async (endpoint, options) => {
       if (globalPause && endpoint === config.commandClaimUrl) {
-        if (JSON.parse(options.body).conversationUnavailable && sharedPauseUntil <= clock) sharedPauseUntil = clock + 300_000;
+        if (!serviceOnline) throw new Error("Local service unavailable");
+        const request = JSON.parse(options.body);
+        if (request.conversationUnavailable && sharedPauseUntil <= clock) {
+          sharedPauseUntil = Math.min(request.automationPausedUntil ?? clock + 300_000, clock + 300_000);
+        }
         return new Response(null, { status: 204, headers: { "X-Automation-Paused-Until": String(sharedPauseUntil > clock ? sharedPauseUntil : 0) } });
       }
       if (endpoint !== config.commandResultUrl) return new Response(null, { status: 204 });
@@ -84,6 +89,8 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
   await context.executeCommand(command, "browser-a");
   return { results, dispatches, reloads, calls, waits, dispatchTimes, storage,
     advanceTime(ms) { clock += ms; },
+    setServiceOnline(online) { serviceOnline = online; },
+    syncPause() { return context.syncAutomationPause(); },
     notifyUnavailable(nextUrl) {
       tabUrl = nextUrl;
       return new Promise(resolve => messageListener({ type: "local-codex-support/conversation-unavailable-v1", conversationUrl: nextUrl },
@@ -124,6 +131,19 @@ function sendCommand(id) {
   const nextUrl = url.replace("11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222");
   assert.equal((await run.notifyUnavailable(nextUrl)).ok, true);
   assert.ok(run.storage.automationPausedUntil > firstUntil, "a different failed conversation in the same tab starts a fresh pause after the first expires");
+}
+
+{
+  const run = await runWorker(inspectCommand("service-outage"), [{ ok: true, result: { status: "running" } }], [], [], false, "outage");
+  run.setServiceOnline(false);
+  await run.notifyUnavailable(url);
+  const originalUntil = run.storage.automationPausedUntil;
+  assert.equal(run.storage.automationPausePending, true);
+  run.advanceTime(120_000);
+  run.setServiceOnline(true);
+  await run.syncPause();
+  assert.equal(run.storage.automationPausedUntil, originalUntil, "reconnecting after an outage preserves the original five-minute deadline");
+  assert.equal(run.storage.automationPausePending, false);
 }
 
 for (const kind of ["inspect_thread", "prepare_thread"]) {

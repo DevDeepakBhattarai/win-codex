@@ -55,7 +55,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.8.4");
+  assert.equal(manifest.version, "1.8.5");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["alarms", "scripting", "sidePanel", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
@@ -908,8 +908,11 @@ try {
     ];
     const features = ["ralph", "threadPreparation", "threadLifecycle", "threadMessaging"];
     const promises = inputs.map(input => pauseBus.execute(input, 40));
+    for (const promise of promises) promise.catch(() => undefined);
     await new Promise(resolve => setImmediate(resolve));
     const beforePause = await pauseBus.claim("pause-browser", features, 0);
+    const preparedBeforePause = await pauseBus.claim("pause-browser", ["threadPreparation"], 0);
+    const closedBeforePause = await pauseBus.claim("pause-browser", ["threadLifecycle"], 0);
     const request = makeClaimRequest("notice-browser");
     request.req.body = { browserId: "notice-browser", features: [], statusOnly: true, conversationUnavailable: true };
     const headers = {};
@@ -929,17 +932,26 @@ try {
     await new Promise(resolve => setTimeout(resolve, 60));
     pauseNow = until;
     for (let index = 0; index < inputs.length; index++) {
-      const command = await pauseBus.claim("pause-browser", features, 0);
+      const browserId = index === 2 ? "replacement-browser" : "pause-browser";
+      const command = await pauseBus.claim(browserId, features, 0);
       assert.equal(command.kind, inputs[index].kind, "queued and claimed work resumes in order after the deadline");
       if (index === 0) assert.equal(command.id, beforePause.id, "the claimed command retains its identity");
+      if (index === 1) assert.equal(command.id, preparedBeforePause.id);
+      if (index === 2) assert.equal(command.id, closedBeforePause.id, "a replacement extension reclaims an interrupted close with its original identity");
       const result = command.kind === "inspect_thread" ? { status: "running" }
         : command.kind === "prepare_thread" ? { status: "prepared", conversationUrl: urlA }
         : command.kind === "close_thread" ? { status: "closed", conversationUrl: urlA }
         : command.kind === "stop_thread" ? { status: "idle", conversationUrl: urlA }
         : { status: "sent", conversationUrl: urlA };
-      pauseBus.complete({ commandId: command.id, browserId: "pause-browser", kind: command.kind, ok: true, result });
+      pauseBus.complete({ commandId: command.id, browserId, kind: command.kind, ok: true, result });
       assert.equal((await promises[index]).ok, true, "the pause preserves pending requests beyond their original timeout");
     }
+    request.req.body.automationPausedUntil = pauseNow + 180_000;
+    await pauseHandler(request.req, request.res);
+    assert.equal(Number(headers["X-Automation-Paused-Until"]), pauseNow + 180_000, "an offline extension reconciles its remaining cooldown without restarting the clock");
+    pauseNow += 180_001;
+    await pauseHandler(request.req, request.res);
+    assert.equal(Number(headers["X-Automation-Paused-Until"]), 0, "replaying an expired offline notice cannot start another pause");
   } finally {
     Date.now = realNow;
     pauseBus.close();

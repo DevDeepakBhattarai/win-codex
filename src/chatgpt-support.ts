@@ -250,17 +250,17 @@ export class SupportCommandBus {
     return this.registry?.automationPausedUntil() ?? 0;
   }
 
-  async pauseAutomation() {
+  async pauseAutomation(until?: number) {
     if (this.pauseInFlight) return this.pauseInFlight;
-    const operation = this.persistAutomationPause();
+    const operation = this.persistAutomationPause(until);
     this.pauseInFlight = operation;
     try { return await operation; } finally { if (this.pauseInFlight === operation) this.pauseInFlight = undefined; }
   }
 
-  private async persistAutomationPause() {
+  private async persistAutomationPause(requestedUntil?: number) {
     if (!this.registry) throw new Error("Automation pause requires the persistent registry.");
     const previous = this.automationPausedUntil();
-    const until = await this.registry.pauseAutomation();
+    const until = await this.registry.pauseAutomation(requestedUntil);
     const extension = until - Math.max(Date.now(), previous);
     if (extension > 0) {
       for (const pending of this.pending.values()) {
@@ -460,7 +460,7 @@ export class SupportCommandBus {
     this.dispatchQueuedCommandsToWaiters();
     for (const pending of this.pending.values()) this.scheduleInspectionFallback(pending);
     const resumable = [...this.pending.values()].find((pending) =>
-      (pending.command.kind === "inspect_thread" || pending.command.kind === "prepare_thread") &&
+      (pending.command.kind === "inspect_thread" || pending.command.kind === "prepare_thread" || pending.command.kind === "close_thread") &&
       this.canClaim(pending.command) &&
       this.browserCanClaim(browserId, pending.command) &&
       (pending.claimedBy === browserId ||
@@ -779,10 +779,10 @@ export class RalphRegistry {
     return until > Date.now() ? until : 0;
   }
 
-  async pauseAutomation() {
+  async pauseAutomation(requestedUntil = Date.now() + 5 * 60_000) {
     return this.update(state => {
       const current = state.automationPausedUntil ?? 0;
-      const until = current > Date.now() ? current : Date.now() + 5 * 60_000;
+      const until = current > Date.now() ? current : Math.min(requestedUntil, Date.now() + 5 * 60_000);
       state.automationPausedUntil = until;
       return until;
     });
@@ -1582,6 +1582,7 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
     browserId: z.string().min(1).max(200),
     features: z.array(supportFeatureSchema).max(4),
     conversationUnavailable: z.boolean().optional(),
+    automationPausedUntil: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
     statusOnly: z.boolean().optional(),
     openThreads: z.array(z.string().max(2048).refine(value => {
       try { parseConversationUrl(value); return true; } catch { return false; }
@@ -1599,7 +1600,7 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
     req.once("aborted", onDisconnect);
     res.once("close", onDisconnect);
     try {
-      if (parsed.data.conversationUnavailable) await commands.pauseAutomation();
+      if (parsed.data.conversationUnavailable) await commands.pauseAutomation(parsed.data.automationPausedUntil);
       if (parsed.data.statusOnly) {
         res.setHeader("X-Automation-Paused-Until", String(commands.automationPausedUntil()));
         res.status(204).end();
