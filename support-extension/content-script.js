@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.7.4";
+  const contentScriptVersion = "1.7.5";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -364,7 +364,7 @@
     } catch (error) {
       if (error instanceof Error && error.message.startsWith("CHATGPT_RATE_LIMITED:")) {
         const detail = error.message.slice("CHATGPT_RATE_LIMITED:".length).trim();
-        if (!sendClicked) throw new Error(`CHATGPT_RATE_LIMITED_RETRYABLE: ${detail}`);
+        if (!sendClicked) throw Object.assign(new Error(`CHATGPT_RATE_LIMITED_RETRYABLE: ${detail}`), { retryable: true });
         throw new Error(`CHATGPT_RATE_LIMITED: Delivery is uncertain after Send was clicked. ${detail}`);
       }
       if (!sendClicked && typeof message === "string" && message.trim() && error instanceof Error) {

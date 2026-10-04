@@ -205,6 +205,7 @@ const commandResultSchema = z.union([
     kind: z.union([z.literal("inspect_thread"), z.literal("prepare_thread"), z.literal("close_thread"), z.literal("send_message"), z.literal("stop_thread")]),
     ok: z.literal(false),
     error: z.string().min(1).max(2_000),
+    deliveryUncertain: z.boolean().optional(),
   }),
 ]);
 export type SupportCommandResult = z.infer<typeof commandResultSchema>;
@@ -1959,7 +1960,7 @@ export async function startSubagentJob(job: SubagentJob, message: string,
       ...(!subagentProjectUrl ? { connectorName: process.env.CHATGPT_WORKER_CONNECTOR_NAME ?? "Codex" } : {}),
     });
     if (!result.ok) {
-      if (result.error.endsWith("The task was not sent.")) deliveryUncertain = false;
+      deliveryUncertain = result.deliveryUncertain ?? true;
       throw new Error(result.error);
     }
     if (result.kind !== "send_message") throw new Error("Sub-agent creation received the wrong support command result.");

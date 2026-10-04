@@ -94,7 +94,7 @@ try {
 	const unsent = await request("", { prompt: "Attachment failed", session: "unsent", requestId: "attachment" });
 	const unsentCommand = await claim();
 	commands.complete({ commandId: unsentCommand.id, browserId: "extension", kind: "send_message", ok: false,
-		error: 'ChatGPT did not attach connector "Codex". The task was not sent.' });
+		error: "ChatGPT send button did not become actionable.", deliveryUncertain: false });
 	const unsentJob = await unsent.json();
 	assert.equal(unsentJob.deliveryUncertain, false);
 	assert.equal((await (await request(`/${unsentJob.jobId}/wait`)).json()).deliveryUncertain, false,

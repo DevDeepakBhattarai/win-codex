@@ -160,6 +160,17 @@ for (const failure of [new Error("Timed out waiting for ChatGPT page automation.
   assert.equal(run.reloads, 0, "an uncertain send preserves the worker that may already be running");
   assert.equal(run.dispatches, 1, "an uncertain send must not duplicate the message");
   assert.equal(run.results[0].ok, false);
+  assert.equal(run.results[0].deliveryUncertain, true, "lost acknowledgement preserves uncertain delivery");
+}
+
+{
+  const run = await runWorker(sendCommand("failed-before-send"), [
+    { ok: false, error: "ChatGPT send button did not become actionable.", retryable: true },
+    { ok: false, error: "ChatGPT send button did not become actionable.", retryable: true },
+  ]);
+  assert.equal(run.dispatches, 2);
+  assert.equal(run.results[0].ok, false);
+  assert.equal(run.results[0].deliveryUncertain, false, "a persistent pre-Send failure remains definitely unsent");
 }
 
 {
