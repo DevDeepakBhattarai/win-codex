@@ -131,7 +131,7 @@ const BROWSER_BRIDGE_ENABLED = process.env.BROWSER_BRIDGE_ENABLED !== "false";
 const THREAD_SYNC_ENABLED = process.env.THREAD_SYNC_ENABLED !== "false";
 const THREAD_SYNC_PORT = boundedIntegerEnv("THREAD_SYNC_PORT", 6002, 1, 65535);
 const RALPH_MODEL = process.env.RALPH_MODEL ?? "gpt-5.6-terra";
-const RALPH_ENABLED = process.env.RALPH_ENABLED === "true";
+const RALPH_ENABLED = process.env.RALPH_ENABLED !== "false";
 const RALPH_OPENAI_AUDIT_LOG_PATH = path.resolve(DATA_DIR, "ralph-openai.log");
 const BROWSER_BRIDGE_PORT = boundedIntegerEnv(
   "BROWSER_BRIDGE_PORT",

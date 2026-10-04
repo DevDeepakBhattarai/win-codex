@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
@@ -33,11 +33,49 @@ try {
   assert.deepEqual(await (await RalphRegistry.open(directory)).threads(), [], "removal survives a server restart");
   assert.equal(await commands.claim("existing", ["ralph"], 0, undefined, [url]), undefined);
 
+  await registry.register(url, { manual: true, activity: "running", reactivate: true });
+  assert.equal(await registry.settle(threadId), false, "closing a running tab cannot settle its work");
+  await registry.register(url, { manual: true, activity: "blocked" });
+  assert.equal(await registry.settle(threadId), false, "a blocked thread still needs attention");
+  await registry.register(url, { manual: true, activity: "idle" });
+  assert.equal(await registry.settle(threadId), true);
+  const settled = (await (await RalphRegistry.open(directory)).threads())[0];
+  assert.ok(settled.settledAt, "settlement survives restart without deleting the conversation");
+  assert.deepEqual(await registry.due(Date.now() + 24 * 60 * 60_000), []);
+  await registry.register(url, { manual: true, activity: "running", reactivate: true });
+  assert.equal((await registry.threads())[0].settledAt, undefined, "new work returns a settled thread to the active list");
+  assert.deepEqual(await registry.due(Date.now() + 24 * 60 * 60_000), [], "observed manual threads never receive unsolicited continuation");
+
+  const capacityDirectory = path.join(directory, "capacity");
+  await mkdir(capacityDirectory);
+  const completedAt = new Date().toISOString();
+  const retained = Array.from({ length: 2000 }, (_, index) => {
+    const id = `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
+    return { threadId: id, conversationUrl: `https://chatgpt.com/c/${id}?temporary-chat=true`,
+      parentThreadId: "api:old", agentCreated: true, state: "complete", activity: "idle",
+      registeredAt: completedAt, nextCheckAt: 0, mode: "normal", settledAt: completedAt };
+  });
+  delete retained[0].settledAt;
+  delete retained[0].parentThreadId;
+  retained[1].state = "active";
+  retained[1].activity = "running";
+  delete retained[1].settledAt;
+  await writeFile(path.join(capacityDirectory, "ralph.json"), JSON.stringify({
+    version: 2, projects: [], loopIntervalMs: 1800_000, threads: retained,
+  }));
+  const capacityRegistry = await RalphRegistry.open(capacityDirectory);
+  assert.equal(await capacityRegistry.register(url, { agentCreated: true, parentThreadId: "api:new" }), "registered",
+    "settled history cannot exhaust registration capacity");
+  const remaining = await capacityRegistry.threads();
+  assert.equal(remaining.length, 3);
+  assert.ok(remaining.some(thread => thread.threadId === retained[0].threadId), "unviewed manual completions retain their place");
+  assert.ok(remaining.some(thread => thread.threadId === retained[1].threadId), "running workers retain their registration");
+
   const startupCommands = new SupportCommandBus(undefined, undefined, undefined, async () => {
     launches++;
     await startupCommands.claim("startup-chrome-launch", ["ralph"], 0);
   });
-  const startupRegistry = await RalphRegistry.open(directory, 1);
+  const startupRegistry = await RalphRegistry.open(path.join(directory, "startup"), 1);
   await startupRegistry.register(url, { manual: true });
   const controller = new RalphController({ registry: startupRegistry, commands: startupCommands,
     model: "unused", auditLogPath: path.join(directory, "audit.log"), checkEveryMs: 60_000 });
@@ -146,7 +184,7 @@ await assert.rejects(context.threadTabRemoved(7), /offline/);
 assert.equal(storage["closedRalphTab:7"], url, "closure is retained while the server is offline");
 offline = false;
 await context.reportClosedThreadTabs();
-assert.deepEqual(removals, [{ conversationUrl: url, removed: true }]);
+assert.deepEqual(removals, [{ conversationUrl: url, settled: true }]);
 assert.equal(storage["closedRalphTab:7"], undefined);
 await inspect("after-close");
 assert.equal(creations.length, 0, "a stale RALPH check cannot reopen the closed tab");
@@ -158,12 +196,12 @@ tabs.set(9, { id: 9, windowId: 3, url: "https://example.com" });
 await context.acquireAutomationTab(url, false);
 assert.equal(creations[0].windowId, 3, "new tabs target an existing window explicitly");
 await context.threadTabRemoved(8, { isWindowClosing: true });
-assert.equal(storage["closedThread:" + url], false, "closing Chrome preserves the thread for recovery");
+assert.equal(storage["closedThread:" + url], true, "closing a window also settles its old idle threads");
 tabs.delete(8);
 await inspect("after-browser-close");
-assert.equal(creations.length, 2, "an executor reopens the thread after Chrome restarts");
+assert.equal(creations.length, 1, "a closed window does not reopen idle threads");
 await inspect("reuse-reopened-thread");
-assert.equal(creations.length, 2, "subsequent inspections reuse the reopened tab");
+assert.equal(creations.length, 1, "later inspections still respect closed tabs");
 const raceUrl = "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222";
 tabs.set(10, { id: 10, windowId: 3, url: raceUrl, status: "complete" });
 holdTracking = true;
@@ -179,5 +217,23 @@ assert.equal(removals.at(-1).conversationUrl, raceUrl, "closure during tracking 
 assert.equal(storage["closedThread:" + raceUrl], true, "a late tracking write must not erase deliberate closure");
 assert.equal(storage["ralphTab:10"], undefined, "late tracking must not restore a removed tab");
 await context.executeCommand({ id: "closed-during-tracking", feature: "ralph", kind: "inspect_thread", conversationUrl: raceUrl }, "existing");
-assert.equal(creations.length, 2, "a stale inspection cannot recreate the tab closed during tracking");
+assert.equal(creations.length, 1, "a stale inspection cannot recreate the tab closed during tracking");
+const temporaryUrl = url + "?temporary-chat=true";
+await assert.rejects(context.acquireAutomationTab(temporaryUrl, false), /cannot be reopened/);
+assert.equal(creations.length, 1, "a missing temporary worker cannot become a saved conversation");
+tabs.set(11, { id: 11, windowId: 3, active: true, url, status: "complete" });
+storage[`threadActivity:${url}`] = "idle";
+await context.trackViewedThread(tabs.get(11));
+const beforeLeaving = removals.length;
+await context.reportClosedThreadTabs();
+assert.equal(removals.length, beforeLeaving, "a viewed completion stays ready while its tab is active");
+offline = true;
+tabs.get(11).active = false;
+tabs.set(12, { id: 12, windowId: 3, active: true, url: "https://example.com", status: "complete" });
+await assert.rejects(context.trackViewedThread(tabs.get(12)), /offline/);
+assert.equal(storage[`viewedCompletion:${url}`], true);
+offline = false;
+await context.reportClosedThreadTabs();
+assert.deepEqual(removals.at(-1), { conversationUrl: url, settled: true }, "monitoring retries settlement after the server returns");
+assert.equal(storage[`viewedCompletion:${url}`], undefined);
 console.log("RALPH lifecycle tests passed.");

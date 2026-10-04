@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 
-const workerScript = await readFile("support-extension/service-worker.js", "utf8");
+const workerScript = await readFile(process.argv[2] ?? "support-extension/service-worker.js", "utf8");
 const contentScript = await readFile("support-extension/content-script.js", "utf8");
 const url = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
 const config = {
@@ -14,27 +14,39 @@ const config = {
   extensionToken: "x".repeat(32),
 };
 
-async function runWorker(command, responses, healthResponses = [], injectionFailures = []) {
+async function runWorker(command, responses, healthResponses = [], injectionFailures = [], temporary = false, globalPause = false) {
   const results = [];
   let dispatches = 0;
   let reloads = 0;
+  const calls = [];
+  const waits = [];
+  let tabUrl = url + (temporary ? "?temporary-chat=true" : "");
   let activeInjectionFailures = [];
-  const storage = {};
+  let clock = 1_800_000_000_000;
+  let sharedPauseUntil = globalPause === "restart" ? clock + 300_000 : 0;
+  let serviceOnline = true;
+  const storage = globalPause === "restart" ? { automationPausedUntil: sharedPauseUntil } : {};
+  if (globalPause === "stale") storage["pageRecovery:11"] = { conversationUnavailableAt: clock - 300_001, conversationUnavailableUrl: tabUrl };
+  let messageListener;
+  const dispatchTimes = [];
   const context = {
+    Date: globalPause ? class extends Date { static now() { return clock; } } : Date,
     URL, AbortSignal, AbortController, crypto: globalThis.crypto, Response, Error,
     setTimeout, clearTimeout, console, importScripts() {},
     LOCAL_CODEX_THREAD_SYNC: config,
     browser: {
       runtime: {
         id: "a".repeat(32), getPlatformInfo: async () => {},
-        onMessage: { addListener() {} }, onInstalled: { addListener() {} }, onStartup: { addListener() {} },
+        onMessage: { addListener(listener) { messageListener = listener; } }, onInstalled: { addListener() {} }, onStartup: { addListener() {} },
       },
       tabs: {
-        onUpdated: { addListener() {} }, query: async () => [{ id: 11, status: "complete", url }],
+        onUpdated: { addListener() {} }, query: async () => [{ id: 11, status: "complete", url: tabUrl }],
         create: async () => ({ id: 11 }),
-        get: async () => ({ id: 11, status: "complete", url }),
+        get: async () => ({ id: 11, status: "complete", url: tabUrl }),
         reload: async () => { reloads += 1; },
         sendMessage: async (_tabId, payload) => {
+          calls.push(payload.command.kind);
+          dispatchTimes.push(clock);
           if (payload.command.kind === "page_health") {
             const response = healthResponses.shift();
             if (response instanceof Error) throw response;
@@ -54,6 +66,14 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
       } },
     },
     fetch: async (endpoint, options) => {
+      if (globalPause && endpoint === config.commandClaimUrl) {
+        if (!serviceOnline) throw new Error("Local service unavailable");
+        const request = JSON.parse(options.body);
+        if (request.conversationUnavailable && sharedPauseUntil <= clock) {
+          sharedPauseUntil = Math.min(request.automationPausedUntil ?? clock + 300_000, clock + 300_000);
+        }
+        return new Response(null, { status: 204, headers: { "X-Automation-Paused-Until": String(sharedPauseUntil > clock ? sharedPauseUntil : 0) } });
+      }
       if (endpoint !== config.commandResultUrl) return new Response(null, { status: 204 });
       results.push(JSON.parse(options.body));
       return new Response("", { status: 200 });
@@ -61,11 +81,22 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
   };
   vm.runInNewContext(workerScript, context);
   await new Promise(resolve => setImmediate(resolve));
+  vm.runInNewContext("pollGeneration += 1; pollController?.abort();", context);
   activeInjectionFailures = injectionFailures;
   context.restartPolling = () => {};
+  context.sleep = async ms => { waits.push(ms); if (globalPause) clock += ms; };
   context.getSettings = async () => ({ threadSync: true, automationExecutor: true });
   await context.executeCommand(command, "browser-a");
-  return { results, dispatches, reloads };
+  return { results, dispatches, reloads, calls, waits, dispatchTimes, storage,
+    advanceTime(ms) { clock += ms; },
+    setServiceOnline(online) { serviceOnline = online; },
+    syncPause() { return context.syncAutomationPause(); },
+    notifyUnavailable(nextUrl) {
+      tabUrl = nextUrl;
+      return new Promise(resolve => messageListener({ type: "local-codex-support/conversation-unavailable-v1", conversationUrl: nextUrl },
+        { id: "a".repeat(32), frameId: 0, tab: { id: 11 }, url: nextUrl }, resolve));
+    },
+  };
 }
 
 function inspectCommand(id) {
@@ -74,6 +105,45 @@ function inspectCommand(id) {
 
 function sendCommand(id) {
   return { id, feature: "threadMessaging", kind: "send_message", targetUrl: url, message: "Continue" };
+}
+
+{
+  const run = await runWorker({ ...inspectCommand("empty-conversation"), conversationUrl: url + "?temporary-chat=true" }, [
+    { ok: true, result: { status: "recovery_started" } }, { ok: true, result: { status: "running" } },
+  ], [{ ok: true, result: { status: "conversation_unavailable" } }], [], true, true);
+  assert.equal(run.reloads, 0, "an empty temporary conversation is never refreshed");
+  assert.deepEqual(run.calls, ["page_health", "recover_page", "inspect_thread"]);
+  assert.equal(run.dispatchTimes[1] - run.dispatchTimes[0], 300_000, "Retry waits for the entire shared five-minute pause");
+  assert.equal(run.results[0].result.status, "running", "the original request continues after the pause");
+}
+{
+  const run = await runWorker(inspectCommand("restart-during-pause"), [{ ok: true, result: { status: "running" } }], [], [], false, "restart");
+  assert.ok(run.dispatchTimes.every(time => time >= 1_800_000_300_000), "a restarted extension performs no page checks before the persisted deadline");
+  assert.equal(run.results[0].result.status, "running");
+}
+
+{
+  const run = await runWorker(inspectCommand("healthy-after-pause"), [{ ok: true, result: { status: "running" } }], [], [], false, "stale");
+  assert.equal(run.storage["pageRecovery:11"]?.conversationUnavailableAt, undefined, "healthy pages clear old recovery markers instead of being checked forever");
+  assert.equal((await run.notifyUnavailable(url)).ok, true);
+  const firstUntil = run.storage.automationPausedUntil;
+  run.advanceTime(300_001);
+  const nextUrl = url.replace("11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222");
+  assert.equal((await run.notifyUnavailable(nextUrl)).ok, true);
+  assert.ok(run.storage.automationPausedUntil > firstUntil, "a different failed conversation in the same tab starts a fresh pause after the first expires");
+}
+
+{
+  const run = await runWorker(inspectCommand("service-outage"), [{ ok: true, result: { status: "running" } }], [], [], false, "outage");
+  run.setServiceOnline(false);
+  await run.notifyUnavailable(url);
+  const originalUntil = run.storage.automationPausedUntil;
+  assert.equal(run.storage.automationPausePending, true);
+  run.advanceTime(120_000);
+  run.setServiceOnline(true);
+  await run.syncPause();
+  assert.equal(run.storage.automationPausedUntil, originalUntil, "reconnecting after an outage preserves the original five-minute deadline");
+  assert.equal(run.storage.automationPausePending, false);
 }
 
 for (const kind of ["inspect_thread", "prepare_thread"]) {
@@ -87,15 +157,45 @@ for (const kind of ["inspect_thread", "prepare_thread"]) {
   assert.equal(run.results[0].result.status, kind === "inspect_thread" ? "running" : "prepared");
 }
 
+for (const temporary of [false, true]) {
+  const target = url + (temporary ? "?temporary-chat=true" : "");
+  const run = await runWorker({ ...inspectCommand("stuck-stream"), conversationUrl: target }, [
+    { ok: true, result: { status: "sent", conversationUrl: target } },
+    { ok: true, result: { status: "running" } },
+  ], Array.from({ length: 4 }, () => ({ ok: true, result: { status: "connection_interrupted" } })), [], temporary);
+  assert.equal(run.reloads, temporary ? 0 : 3, "temporary workers preserve their conversation, saved threads refresh three times");
+  assert.deepEqual(run.waits.filter(ms => ms === 30_000), [30_000, 30_000, 30_000]);
+  assert.equal(run.calls.filter(kind => kind === "resume_interrupted").length, 1, "one Stop-and-continue command follows three failed recovery checks");
+  assert.equal(run.results[0].result.status, "running", "the original inspection observes the resumed turn");
+}
+{
+  const temporaryUrl = url + "?temporary-chat=true";
+  const run = await runWorker({ ...inspectCommand("finishes-during-recovery"), conversationUrl: temporaryUrl }, [
+    { ok: true, result: { status: "idle", conversationUrl: temporaryUrl } },
+    { ok: true, result: { status: "idle" } },
+  ], Array.from({ length: 4 }, () => ({ ok: true, result: { status: "connection_interrupted" } })), [], true);
+  assert.equal(run.results[0].result.status, "idle", "an already-finished recovery result reaches the original inspection");
+  assert.equal(run.reloads, 0);
+}
+{
+  const run = await runWorker(inspectCommand("stream-recovers"), [{ ok: true, result: { status: "running" } }], [
+    { ok: true, result: { status: "connection_interrupted" } }, { ok: true, result: { status: "ok" } },
+  ]);
+  assert.equal(run.reloads, 1);
+  assert.equal(run.calls.includes("resume_interrupted"), false, "a recovered stream keeps running without Stop or another message");
+}
+
 {
   const run = await runWorker(inspectCommand("persistently-blocked"), [], [
     { ok: true, result: { status: "recoverable_error" } },
     { ok: true, result: { status: "recoverable_error" } },
   ]);
   assert.equal(run.reloads, 1);
-  assert.equal(run.dispatches, 0, "a refresh must recheck page health before inspecting a still-blocked page");
+  assert.equal(run.dispatches, 2, "each blocked page attempts its visible recovery action");
+  assert.equal(run.calls.includes("inspect_thread"), false, "a still-blocked page is never inspected as complete");
   assert.equal(run.results[0].result.status, "loading");
 }
+
 
 {
   const run = await runWorker(inspectCommand("inspection-timeout"), [

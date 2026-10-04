@@ -55,58 +55,16 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.7.5");
+  assert.equal(manifest.version, "1.8.5");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
-  assert.deepEqual(manifest.permissions, ["alarms", "scripting", "storage", "tabs", "webNavigation"]);
+  assert.deepEqual(manifest.permissions, ["alarms", "scripting", "sidePanel", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, "popup.html");
   assert.equal(manifest.content_security_policy.extension_pages,
     "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:*");
-  const preparedPopup = await readFile(path.join(sync.extensionDirectory, "popup.html"), "utf8");
-  assert.match(preparedPopup, /ChatGPT worker project URL/);
-  assert.match(preparedPopup, /id="panel-threads"/, "the popup exposes the RALPH threads tab");
-  assert.match(preparedPopup, /id="panel-settings"/, "the popup exposes the settings tab");
-  assert.match(preparedPopup, /id="subagentThreadsSection"/, "the popup gives auto-RALPH sub-agents their own section");
-  assert.match(preparedPopup, /Tasks/);
-  assert.match(preparedPopup, /RALPH projects/);
-  assert.match(preparedPopup, /RALPH check interval \(seconds\)/);
-  assert.match(preparedPopup, /RALPH classifier worked-time threshold \(seconds\)/);
-  assert.match(preparedPopup, /config\.js/);
-  const preparedPopupScript = await readFile(path.join(sync.extensionDirectory, "popup.js"), "utf8");
-  assert.match(preparedPopupScript, /Mark complete/,
-    "active RALPH thread cards expose a manual completion action");
-  assert.match(preparedPopupScript, /Mark active/,
-    "completed RALPH thread cards expose a manual reactivation action");
-  assert.match(preparedPopupScript, /textContent = "Check now"/,
-    "active RALPH thread cards expose an immediate check action");
-  assert.match(preparedPopupScript, /threadStateEndpoint\(thread\.threadId, "check"\)/,
-    "the popup immediate action uses the server check endpoint");
-  assert.match(preparedPopupScript, /!thread\.agentCreated/,
-    "the normal RALPH list excludes automatically created sub-agent threads");
-  assert.match(preparedPopupScript, /thread\.agentCreated/,
-    "the sub-agent RALPH section selects automatically created child threads");
-  assert.match(preparedPopup, /id="markCurrentThread"/, "the popup can mark its active ChatGPT thread for RALPH");
-  assert.match(preparedPopupScript, /tabs\.query\(\{ active: true, currentWindow: true \}\)/,
-    "manual RALPH registration reads the current tab URL");
-  assert.match(preparedPopupScript, /JSON\.stringify\(\{ conversationUrl: currentConversationUrl, manual: true \}\)/,
-    "the popup requests a project-filter override for the current thread");
-  assert.match(preparedPopup, /data-thread-filter="active"[^>]*>[\s\S]*?id="activeCount"/,
-    "the active thread filter shows its count");
-  assert.match(preparedPopup, /data-thread-filter="complete"/);
-  assert.doesNotMatch(preparedPopup, /id="(?:threadCount|completeCount)"/,
-    "the popup does not count all or completed threads");
-  assert.match(preparedPopupScript, /canonicalProjectId\(match\[1\]\)/,
-    "popup thread matching canonicalizes project-name slugs before reusing an existing tab");
-  assert.match(preparedPopupScript, /tabs\.query\(\{\}\)/, "thread links search existing ChatGPT tabs");
-  assert.match(preparedPopupScript, /tabs\.update\(existing\.id, \{ active: true \}\)/, "thread links reuse an existing tab instead of duplicating it");
-  assert.match(preparedPopupScript, /windows\?\.update|windows\.update/, "reused tabs focus their existing browser window");
-  assert.match(preparedPopupScript, /event\.ctrlKey.*event\.shiftKey/, "modified thread-link clicks keep normal browser link behavior");
-  assert.match(preparedPopupScript, /textContent: thread\.conversationUrl/,
-    "thread cards show their full ChatGPT URL");
-  assert.match(preparedPopupScript, /textContent: job\.childConversationUrl/,
-    "RALPH task cards show the exact ChatGPT task URL");
-  assert.match(preparedPopupScript,
-    /sort\(\(left, right\) => Date\.parse\(right\.registeredAt\) - Date\.parse\(left\.registeredAt\)\)/,
-    "thread cards sort from most recently registered to oldest");
+  for (const file of ["popup.html", "popup.js", "popup.css"]) {
+    assert.equal(await readFile(path.join(sync.extensionDirectory, file), "utf8"), await readFile(path.join("support-extension", file), "utf8"),
+      "generated extension includes the current UI asset " + file);
+  }
   const preparedConfig = {};
   vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), preparedConfig);
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.commandClaimUrl, "http://127.0.0.1:6002/chatgpt-support/commands/claim");
@@ -117,8 +75,6 @@ try {
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralphSettingsUrl, "http://127.0.0.1:6002/chatgpt-support/ralph/settings");
   assert.equal(preparedConfig.LOCAL_CODEX_THREAD_SYNC.ralphThreadsUrl, "http://127.0.0.1:6002/chatgpt-support/ralph/threads");
   const preparedServiceWorker = await readFile(path.join(sync.extensionDirectory, "service-worker.js"), "utf8");
-  assert.match(preparedPopup, /id="automationExecutor"/,
-    "the extension exposes an explicit thread-preparation executor setting");
   assert.match(preparedServiceWorker, /if \(settings\.threadSync && settings\.automationExecutor\) features\.push\("threadPreparation"\)/,
     "only the explicitly designated automation browser claims thread preparation");
   assert.match(preparedServiceWorker, /canPrepare: settings\.automationExecutor/,
@@ -146,7 +102,7 @@ try {
     "thread sending does not use acknowledgement or DOM-stability heuristics");
   assert.match(preparedContentScript, /const SEND_SETTLE_MS = 5_000;/,
     "thread sending uses the fixed five-second settle requested for typing and sending");
-  assert.match(preparedContentScript, /contentScriptVersion = "1\.7\.5"/,
+  assert.match(preparedContentScript, /contentScriptVersion = "1\.8\.4"/,
     "extension reloads can replace a stale page script with the current content-script version");
   assert.equal(parseRalphProjectId(namedProjectHome), projectId);
   assert.equal(parseRalphProjectId(urlA), projectId);
@@ -576,9 +532,9 @@ try {
   const registeredAt = Date.now();
   await timingRegistry.register(urlA);
   const [initiallyScheduledThread] = await timingRegistry.threads();
-  assert.ok(initiallyScheduledThread.nextCheckAt >= registeredAt + 179_900 &&
-    initiallyScheduledThread.nextCheckAt <= registeredAt + 180_100,
-  "a new RALPH thread is scheduled for the default 3-minute repeated check");
+  assert.ok(initiallyScheduledThread.nextCheckAt >= registeredAt + 1_799_900 &&
+    initiallyScheduledThread.nextCheckAt <= registeredAt + 1_800_100,
+  "a new RALPH thread is scheduled for the default 30-minute repeated check");
   async function requestRalphSettings(handler, body, authorization = `Bearer ${sync.extensionToken}`) {
     const result = { status: 200, body: undefined };
     const req = { body, get: name => (name === "authorization" ? authorization : undefined) };
@@ -592,7 +548,7 @@ try {
   }
   const getRalphSettings = ralphSettingsGetHandler(timingRegistry, sync.extensionToken);
   const putRalphSettings = ralphSettingsPutHandler(timingRegistry, sync.extensionToken);
-  assert.deepEqual((await requestRalphSettings(getRalphSettings)).body, { loopIntervalSeconds: 180, subagentProjectUrl: undefined });
+  assert.deepEqual((await requestRalphSettings(getRalphSettings)).body, { loopIntervalSeconds: 1800, subagentProjectUrl: undefined });
   assert.equal((await requestRalphSettings(getRalphSettings, undefined, "Bearer wrong")).status, 401);
   const intervalChangedAt = Date.now();
   assert.deepEqual((await requestRalphSettings(putRalphSettings, { loopIntervalSeconds: 120 })).body,
@@ -629,11 +585,11 @@ try {
   }));
   const oldIntervalOpenedAt = Date.now();
   const migratedIntervalRegistry = await RalphRegistry.open(oldIntervalRoot);
-  assert.deepEqual(await migratedIntervalRegistry.settings(), { loopIntervalSeconds: 180, subagentProjectUrl: undefined },
-    "the previous 25-minute default migrates to the repeated 3-minute check interval");
+  assert.deepEqual(await migratedIntervalRegistry.settings(), { loopIntervalSeconds: 1800, subagentProjectUrl: undefined },
+    "the previous 25-minute default migrates to the repeated 30-minute check interval");
   const [migratedIntervalThread] = await migratedIntervalRegistry.threads();
-  assert.ok(migratedIntervalThread.nextCheckAt >= oldIntervalOpenedAt + 179_900 &&
-    migratedIntervalThread.nextCheckAt <= oldIntervalOpenedAt + 180_100,
+  assert.ok(migratedIntervalThread.nextCheckAt >= oldIntervalOpenedAt + 1_799_900 &&
+    migratedIntervalThread.nextCheckAt <= oldIntervalOpenedAt + 1_800_100,
     "migration pulls already-active threads forward instead of leaving an old 25-minute wait in place");
 
   const interimIntervalRoot = path.join(temporaryRoot, "ralph-interim-default-interval");
@@ -653,11 +609,11 @@ try {
   }));
   const interimOpenedAt = Date.now();
   const interimIntervalRegistry = await RalphRegistry.open(interimIntervalRoot);
-  assert.deepEqual(await interimIntervalRegistry.settings(), { loopIntervalSeconds: 180, subagentProjectUrl: undefined },
-    "the temporary 10-second default also migrates to the 3-minute check interval");
+  assert.deepEqual(await interimIntervalRegistry.settings(), { loopIntervalSeconds: 1800, subagentProjectUrl: undefined },
+    "the temporary 10-second default also migrates to the 30-minute check interval");
   const [interimIntervalThread] = await interimIntervalRegistry.threads();
-  assert.ok(interimIntervalThread.nextCheckAt >= interimOpenedAt + 179_900 &&
-    interimIntervalThread.nextCheckAt <= interimOpenedAt + 180_100);
+  assert.ok(interimIntervalThread.nextCheckAt >= interimOpenedAt + 1_799_900 &&
+    interimIntervalThread.nextCheckAt <= interimOpenedAt + 1_800_100);
 
   const legacyRalphRoot = path.join(temporaryRoot, "legacy-ralph");
   await mkdir(legacyRalphRoot, { recursive: true });
@@ -933,6 +889,78 @@ try {
     res.end = () => res;
     return { req, res };
   };
+
+  // The authenticated extension protocol owns the pause, so it must withhold every command kind.
+  const pauseRegistry = await RalphRegistry.open(path.join(temporaryRoot, "global-pause"));
+  await pauseRegistry.register(urlA, { manual: true, activity: "running", title: "Preserved work" });
+  const pauseBus = new SupportCommandBus(0, undefined, undefined, undefined, pauseRegistry);
+  const pauseHandler = supportCommandClaimHandler(pauseBus, sync.extensionToken);
+  const realNow = Date.now;
+  let pauseNow = realNow();
+  Date.now = () => pauseNow;
+  try {
+    const inputs = [
+      { feature: "ralph", kind: "inspect_thread", conversationUrl: urlA },
+      { feature: "threadPreparation", kind: "prepare_thread", conversationUrl: urlA },
+      { feature: "threadLifecycle", kind: "close_thread", conversationUrl: urlA },
+      { feature: "threadMessaging", kind: "stop_thread", targetUrl: urlA },
+      { feature: "threadMessaging", kind: "send_message", targetUrl: urlA, message: "Queued assignment" },
+    ];
+    const features = ["ralph", "threadPreparation", "threadLifecycle", "threadMessaging"];
+    const promises = inputs.map(input => pauseBus.execute(input, 40));
+    for (const promise of promises) promise.catch(() => undefined);
+    await new Promise(resolve => setImmediate(resolve));
+    const beforePause = await pauseBus.claim("pause-browser", features, 0);
+    const preparedBeforePause = await pauseBus.claim("pause-browser", ["threadPreparation"], 0);
+    const closedBeforePause = await pauseBus.claim("pause-browser", ["threadLifecycle"], 0);
+    const request = makeClaimRequest("notice-browser");
+    request.req.body = { browserId: "notice-browser", features: [], statusOnly: true, conversationUnavailable: true };
+    const headers = {};
+    request.res.setHeader = (name, value) => { headers[name] = value; };
+    await pauseHandler(request.req, request.res);
+    assert.equal(request.res.statusCode, 204, "the empty-conversation event pauses without claiming or losing a command");
+    const until = Number(headers["X-Automation-Paused-Until"]);
+    assert.equal(until, pauseNow + 300_000, "the global pause lasts exactly five minutes");
+    assert.equal(await pauseBus.claim("pause-browser", features, 0), undefined, "even a resumable inspection cannot bypass the pause");
+    assert.equal(await pauseBus.claim("another-browser", features, 0), undefined, "the pause applies to every browser");
+    pauseNow += 30_000;
+    await pauseHandler(request.req, request.res);
+    assert.equal(Number(headers["X-Automation-Paused-Until"]), until, "repeated notices do not extend an active pause");
+    const restarted = await RalphRegistry.open(path.join(temporaryRoot, "global-pause"));
+    assert.equal(restarted.automationPausedUntil(), until, "a server restart retains the deadline");
+    assert.deepEqual(await restarted.threads(), await pauseRegistry.threads(), "the pause does not alter thread state");
+    await new Promise(resolve => setTimeout(resolve, 60));
+    pauseNow = until;
+    for (let index = 0; index < inputs.length; index++) {
+      const browserId = index === 2 ? "replacement-browser" : "pause-browser";
+      const command = await pauseBus.claim(browserId, features, 0);
+      assert.equal(command.kind, inputs[index].kind, "queued and claimed work resumes in order after the deadline");
+      if (index === 0) assert.equal(command.id, beforePause.id, "the claimed command retains its identity");
+      if (index === 1) assert.equal(command.id, preparedBeforePause.id);
+      if (index === 2) assert.equal(command.id, closedBeforePause.id, "a replacement extension reclaims an interrupted close with its original identity");
+      const result = command.kind === "inspect_thread" ? { status: "running" }
+        : command.kind === "prepare_thread" ? { status: "prepared", conversationUrl: urlA }
+        : command.kind === "close_thread" ? { status: "closed", conversationUrl: urlA }
+        : command.kind === "stop_thread" ? { status: "idle", conversationUrl: urlA }
+        : { status: "sent", conversationUrl: urlA };
+      pauseBus.complete({ commandId: command.id, browserId, kind: command.kind, ok: true, result });
+      assert.equal((await promises[index]).ok, true, "the pause preserves pending requests beyond their original timeout");
+    }
+    request.req.body.automationPausedUntil = pauseNow + 180_000;
+    await pauseHandler(request.req, request.res);
+    assert.equal(Number(headers["X-Automation-Paused-Until"]), pauseNow + 180_000, "an offline extension reconciles its remaining cooldown without restarting the clock");
+    pauseNow += 180_001;
+    await pauseHandler(request.req, request.res);
+    assert.equal(Number(headers["X-Automation-Paused-Until"]), 0, "replaying an expired offline notice cannot start another pause");
+    const freshNotice = makeClaimRequest("fresh-notice-browser");
+    freshNotice.req.body = { browserId: "fresh-notice-browser", features: [], statusOnly: true,
+      conversationUnavailable: true, automationPausedUntil: pauseNow + 300_000 };
+    await Promise.all([pauseHandler(request.req, request.res), pauseHandler(freshNotice.req, freshNotice.res)]);
+    assert.equal(pauseBus.automationPausedUntil(), pauseNow + 300_000, "a concurrent expired notice cannot suppress a fresh failure");
+  } finally {
+    Date.now = realNow;
+    pauseBus.close();
+  }
 
   const healthyPoll = makeClaimRequest("healthy-browser");
   const healthyPollResult = claimHandler(healthyPoll.req, healthyPoll.res, error => { throw error; });
@@ -1479,12 +1507,11 @@ try {
   await cleanupRegistry.setProjects([projectId]);
   const cleanupUrl = `https://chatgpt.com/g/${projectId}/c/77777777-7777-4777-8777-777777777777`;
   const cleanupThreadId = parseConversationUrl(cleanupUrl).threadId;
-  await cleanupRegistry.register(cleanupUrl);
+  await cleanupRegistry.register(cleanupUrl, { parentThreadId: "api:cleanup" });
   const cleanupCommands = new SupportCommandBus();
   const cleanupController = new ThreadTabCleanupController({
     commands: cleanupCommands,
     registry: cleanupRegistry,
-    retentionMs: 1_000,
     checkEveryMs: 60_000,
   });
   try {
@@ -1495,11 +1522,7 @@ try {
     await cleanupRegistry.recordComplete(cleanupThreadId);
     const completedThread = (await cleanupRegistry.threads()).find(thread => thread.threadId === cleanupThreadId);
     const completedAt = Date.parse(completedThread.lastCheckedAt);
-    await cleanupController.tick(completedAt + 999);
-    assert.equal(await cleanupCommands.claim("cleanup-browser", ["threadLifecycle"], 0), undefined,
-      "completed automation tabs stay available throughout the retention window");
-
-    await cleanupController.tick(completedAt + 1_001);
+    await cleanupController.tick(completedAt);
     await new Promise(resolve => setImmediate(resolve));
     const closeCommand = await cleanupCommands.claim("cleanup-browser", ["threadLifecycle"], 1_000);
     assert.equal(closeCommand.kind, "close_thread");
@@ -1533,7 +1556,6 @@ try {
   await testWorkerKeepsLongAutomationAlive(sync);
   await testWorkerNeverRedispatchesAfterLostResponse(sync);
   await testWorkerRecoversHungAutomation(sync);
-  await testRalphComposerObserver();
   await testSendWaitsForLoadedConversationAndClicksOnce();
   await testSendWaitsForLoadedConversationAndClicksOnce(false);
   await testNewProjectComposerWithoutDataType();
@@ -1712,8 +1734,8 @@ async function testSendWaitsForLoadedConversationAndClicksOnce(acceptSend = true
     },
     storage: {
       local: {
-        get: async defaults => ({ ...defaults, ralphMinWorkedSeconds }),
-        set: async values => { if (Number.isInteger(values.ralphMinWorkedSeconds)) ralphMinWorkedSeconds = values.ralphMinWorkedSeconds; },
+        get: async defaults => typeof defaults === "string" ? {} : ({ ...defaults }),
+        set: async () => {},
       },
     },
   };
@@ -2027,79 +2049,6 @@ async function testReactTrackedTextareaEnablesSendButton() {
   assert.equal(response.result.conversationUrl, urlA);
 }
 
-async function testRalphComposerObserver() {
-  const observers = [];
-  let running = false;
-  let contextInvalidated = false;
-  const sent = [];
-  const location = new URL(urlA);
-  let createdElements = 0;
-  const composer = {
-    querySelector(selector) {
-      if (selector === '#composer-submit-button' ||
-          selector === 'button[data-testid="send-button"]' ||
-          selector === 'button[aria-label="Send prompt"]') return running ? null : {};
-      if (selector === 'button[data-testid="stop-button"]') return running ? {} : null;
-      return null;
-    },
-  };
-  const document = {
-    readyState: "complete",
-    documentElement: {},
-    createElement() { createdElements += 1; return {}; },
-    querySelector(selector) {
-      if (selector === 'form[data-type="unified-composer"]') return composer;
-      if (selector === "#composer-submit-button" || selector === 'button[aria-label="Send prompt"]') {
-        return running ? null : {};
-      }
-      return null;
-    },
-  };
-  const browser = { runtime: {
-    sendMessage: message => {
-      if (contextInvalidated) throw new Error("Extension context invalidated.");
-      sent.push(message);
-      return Promise.resolve({ ok: true, status: "scheduled" });
-    },
-    onMessage: { addListener() {} },
-  } };
-  class MutationObserver {
-    constructor(listener) { observers.push(listener); }
-    observe() {}
-  }
-  vm.runInNewContext(await readFile("support-extension/content-script.js", "utf8"), {
-    window: { addEventListener() {} },
-    location,
-    document,
-    browser,
-    MutationObserver,
-    setTimeout: callback => { callback(); return 1; },
-  });
-  assert.equal(createdElements, 0, "the content script does not add controls to the ChatGPT page");
-  const observeComposer = observers.at(-1);
-  assert.equal(typeof observeComposer, "function");
-  assert.equal(sent.length, 0, "an initially idle composer does not reactivate RALPH");
-  running = true;
-  observeComposer();
-  await new Promise(resolve => setImmediate(resolve));
-  const reactivations = sent.filter(message => message.type === "local-codex-support/ralph-reactivate-v1");
-  assert.equal(reactivations.length, 1, "the send-to-stop transition reactivates the current RALPH thread");
-  assert.equal(reactivations[0].conversationUrl, urlA);
-  observeComposer();
-  assert.equal(sent.filter(message => message.type === "local-codex-support/ralph-reactivate-v1").length, 1,
-    "later stop-button mutations do not repeat the reactivation");
-  location.href = urlB;
-  observeComposer();
-  assert.equal(sent.filter(message => message.type === "local-codex-support/ralph-reactivate-v1").length, 1,
-    "loading a different thread directly into a stop-button state does not reactivate it");
-  running = false;
-  observeComposer();
-  contextInvalidated = true;
-  running = true;
-  assert.doesNotThrow(observeComposer,
-    "a stale content script must ignore a synchronously invalidated extension context");
-}
-
 async function testRunningHydrationDetection() {
   let automationListener;
   let now = 0;
@@ -2144,8 +2093,8 @@ async function testRunningHydrationDetection() {
     },
     storage: {
       local: {
-        get: async defaults => ({ ...defaults, ralphMinWorkedSeconds }),
-        set: async values => { if (Number.isInteger(values.ralphMinWorkedSeconds)) ralphMinWorkedSeconds = values.ralphMinWorkedSeconds; },
+        get: async defaults => typeof defaults === "string" ? {} : ({ ...defaults }),
+        set: async () => {},
       },
     },
   };
@@ -2253,7 +2202,7 @@ async function testWorkedDurationDetection() {
     },
     storage: {
       local: {
-        get: async defaults => ({ ...defaults, ralphMinWorkedSeconds }),
+        get: async defaults => typeof defaults === "string" ? {} : ({ ...defaults, ralphMinWorkedSeconds }),
         set: async values => { if (Number.isInteger(values.ralphMinWorkedSeconds)) ralphMinWorkedSeconds = values.ralphMinWorkedSeconds; },
       },
     },

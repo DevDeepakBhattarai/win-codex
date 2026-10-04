@@ -11,7 +11,7 @@ const MAX_RALPH_THREADS = 2_000;
 const MAX_RALPH_PROJECTS = 100;
 const LEGACY_RALPH_DEFAULT_INTERVAL_MS = 25 * 60 * 1000;
 const INTERIM_RALPH_DEFAULT_INTERVAL_MS = 10 * 1000;
-const DEFAULT_RALPH_CHECK_INTERVAL_MS = 3 * 60 * 1000;
+const DEFAULT_RALPH_CHECK_INTERVAL_MS = 30 * 60 * 1000;
 const MIN_RALPH_INTERVAL_SECONDS = 2 * 60;
 const MAX_RALPH_INTERVAL_SECONDS = 24 * 60 * 60;
 const RALPH_SCHEDULER_TICK_MS = 1_000;
@@ -26,8 +26,8 @@ const SUPPORT_BROWSER_CONNECT_TIMEOUT_MS = 10_000;
 const MAX_CONCURRENT_THREAD_PREPARATIONS = 3;
 const RALPH_PREPARE_TIMEOUT_MS = 3 * 60 * 1000;
 const THREAD_PREPARATION_HOLD_MS = 2 * 60 * 1000;
-const COMPLETED_THREAD_TAB_RETENTION_MS = 10 * 60 * 1000;
-const THREAD_TAB_CLEANUP_TICK_MS = 60 * 1000;
+const COMPLETED_THREAD_TAB_RETENTION_MS = 0;
+const THREAD_TAB_CLEANUP_TICK_MS = 5 * 1000;
 const MAX_CONTINUATION_CHARS = 500;
 const TOOL_REQUEST_REPLAY_TTL_MS = 30 * 60 * 1000;
 const MAX_TOOL_REQUEST_REPLAYS = 1_000;
@@ -140,6 +140,7 @@ const supportCommandSchema = z.union([
     targetUrl: z.string().url(),
     message: z.string(),
     connectorName: z.string().min(1).optional(),
+    temporary: z.boolean().optional(),
   }),
   z.object({
     id: z.string(),
@@ -150,12 +151,8 @@ const supportCommandSchema = z.union([
   }),
 ]);
 export type SupportCommand = z.infer<typeof supportCommandSchema>;
-type SupportCommandInput =
-  | Omit<Extract<SupportCommand, { kind: "inspect_thread" }>, "id">
-  | Omit<Extract<SupportCommand, { kind: "prepare_thread" }>, "id">
-  | Omit<Extract<SupportCommand, { kind: "close_thread" }>, "id">
-  | Omit<Extract<SupportCommand, { kind: "send_message" }>, "id">
-  | Omit<Extract<SupportCommand, { kind: "stop_thread" }>, "id">;
+type WithoutCommandId<T> = T extends { id: string } ? Omit<T, "id"> : never;
+type SupportCommandInput = WithoutCommandId<SupportCommand>;
 
 const commandResultSchema = z.union([
   z.object({
@@ -216,6 +213,7 @@ interface PendingCommand {
   reject: (error: Error) => void;
   timeout: NodeJS.Timeout;
   timeoutMs: number;
+  deadline: number;
   claimedBy?: string;
   claimedAt?: number;
   inspectionFallback?: NodeJS.Timeout;
@@ -242,9 +240,41 @@ export class SupportCommandBus {
   private cooldownUntil = 0;
   private nextMessageClaimAt = 0;
   private messagePacingActive = false;
+  private pauseInFlight?: Promise<number>;
 
   messageCooldownUntil() {
     return this.cooldownUntil > Date.now() ? this.cooldownUntil : 0;
+  }
+
+  automationPausedUntil() {
+    return this.registry?.automationPausedUntil() ?? 0;
+  }
+
+  async pauseAutomation(until?: number) {
+    while (this.pauseInFlight) await this.pauseInFlight;
+    const operation = this.persistAutomationPause(until);
+    this.pauseInFlight = operation;
+    try { return await operation; } finally { if (this.pauseInFlight === operation) this.pauseInFlight = undefined; }
+  }
+
+  private async persistAutomationPause(requestedUntil?: number) {
+    if (!this.registry) throw new Error("Automation pause requires the persistent registry.");
+    const previous = this.automationPausedUntil();
+    const until = await this.registry.pauseAutomation(requestedUntil);
+    const extension = until - Math.max(Date.now(), previous);
+    if (extension > 0) {
+      for (const pending of this.pending.values()) {
+        pending.deadline += extension;
+        clearTimeout(pending.timeout);
+        pending.timeout = setTimeout(() => {
+          this.removePending(pending.command.id);
+          pending.reject(new Error(`ChatGPT support command timed out: ${pending.command.kind}`));
+        }, Math.max(1, pending.deadline - Date.now()));
+        pending.timeout.unref();
+      }
+    }
+    for (const waiter of [...this.waiters]) this.resolveWaiter(waiter, undefined);
+    return until;
   }
 
   cancelThreadChecks(threadId: string) {
@@ -273,6 +303,9 @@ export class SupportCommandBus {
     options: { allowBrowserLaunch?: boolean } = {},
   ) {
     const allowBrowserLaunch = options.allowBrowserLaunch !== false;
+    while (this.automationPausedUntil()) {
+      await new Promise<void>(resolve => setTimeout(resolve, Math.min(1000, this.automationPausedUntil() - Date.now())));
+    }
     const targetUrl = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
     let targetThreadId: string | undefined;
     try { targetThreadId = parseConversationUrl(targetUrl).threadId; } catch { targetThreadId = undefined; }
@@ -300,6 +333,7 @@ export class SupportCommandBus {
           reject(new Error(`ChatGPT support command timed out: ${fullCommand.kind}`));
         }, timeoutMs),
         timeoutMs,
+        deadline: Date.now() + timeoutMs,
         allowBrowserLaunch,
       };
       pending.timeout.unref();
@@ -376,6 +410,7 @@ export class SupportCommandBus {
   }
 
   async ensureBackgroundBrowserOnce(feature: SupportFeature) {
+    if (this.automationPausedUntil()) return;
     if (this.hasBrowser(feature)) {
       this.backgroundLaunchPending.delete(feature);
       return;
@@ -425,7 +460,8 @@ export class SupportCommandBus {
     this.dispatchQueuedCommandsToWaiters();
     for (const pending of this.pending.values()) this.scheduleInspectionFallback(pending);
     const resumable = [...this.pending.values()].find((pending) =>
-      (pending.command.kind === "inspect_thread" || pending.command.kind === "prepare_thread") &&
+      (pending.command.kind === "inspect_thread" || pending.command.kind === "prepare_thread" || pending.command.kind === "close_thread") &&
+      this.canClaim(pending.command) &&
       this.browserCanClaim(browserId, pending.command) &&
       (pending.claimedBy === browserId ||
         (pending.claimedAt !== undefined && Date.now() - pending.claimedAt >= this.inspectClaimLeaseMs)));
@@ -480,6 +516,7 @@ export class SupportCommandBus {
       pending.claimedBy = undefined;
       pending.claimedAt = undefined;
       clearTimeout(pending.timeout);
+      pending.deadline = Date.now() + this.messageCooldownMs + pending.timeoutMs;
       pending.timeout = setTimeout(() => {
         this.removePending(pending.command.id);
         pending.reject(new Error(`ChatGPT support command timed out after rate-limit cooldown: ${pending.command.kind}`));
@@ -553,6 +590,7 @@ export class SupportCommandBus {
       clearTimeout(pending.inspectionFallback);
       pending.inspectionFallback = undefined;
     }
+    if (this.automationPausedUntil()) return;
     if (!this.launchBrowser || pending.command.kind !== "inspect_thread" || !pending.allowBrowserLaunch) return;
     if (pending.command.executorOnly) {
       if (pending.claimedBy) return;
@@ -591,6 +629,7 @@ export class SupportCommandBus {
   }
 
   private canClaim(command: SupportCommand) {
+    if (this.automationPausedUntil()) return false;
     if (command.kind !== "send_message") return true;
     if (this.messageCooldownUntil()) return false;
     return !this.messagePacingActive || Date.now() >= this.nextMessageClaimAt;
@@ -633,6 +672,11 @@ const ralphThreadSchema = z.object({
   registeredAt: z.string(),
   nextCheckAt: z.number(),
   state: z.enum(["active", "complete"]),
+  activity: z.enum(["running", "idle", "blocked"]).optional(),
+  activityAt: z.string().optional(),
+  attentionAt: z.string().optional(),
+  settledAt: z.string().optional(),
+  observedOnly: z.boolean().optional(),
   mode: z.enum(["normal", "continuous"]).default("normal"),
   externalRevision: z.string().optional(),
   lastCheckedAt: z.string().optional(),
@@ -657,6 +701,7 @@ const ralphStoreSchema = z.object({
   threads: z.array(ralphThreadSchema).max(MAX_RALPH_THREADS),
   loopIntervalMs: z.number().int().positive().max(MAX_RALPH_INTERVAL_SECONDS * 1000).default(DEFAULT_RALPH_CHECK_INTERVAL_MS),
   subagentProjectUrl: z.string().url().optional(),
+  automationPausedUntil: z.number().int().nonnegative().optional(),
 });
 type RalphStore = z.infer<typeof ralphStoreSchema>;
 const ralphLoopIntervalSecondsSchema = z.number().int()
@@ -705,7 +750,8 @@ export class RalphRegistry {
     }
     if (intervalMs === undefined &&
         (state.loopIntervalMs === LEGACY_RALPH_DEFAULT_INTERVAL_MS ||
-         state.loopIntervalMs === INTERIM_RALPH_DEFAULT_INTERVAL_MS)) {
+         state.loopIntervalMs === INTERIM_RALPH_DEFAULT_INTERVAL_MS ||
+         state.loopIntervalMs === 3 * 60 * 1000)) {
       state.loopIntervalMs = DEFAULT_RALPH_CHECK_INTERVAL_MS;
       const nextCheckAt = Date.now() + DEFAULT_RALPH_CHECK_INTERVAL_MS;
       for (const thread of state.threads) {
@@ -726,6 +772,20 @@ export class RalphRegistry {
   async projects() {
     await this.queue;
     return [...this.state.projects];
+  }
+
+  automationPausedUntil() {
+    const until = this.state.automationPausedUntil ?? 0;
+    return until > Date.now() ? until : 0;
+  }
+
+  async pauseAutomation(requestedUntil = Date.now() + 5 * 60_000) {
+    return this.update(state => {
+      const current = state.automationPausedUntil ?? 0;
+      const until = current > Date.now() ? current : Math.min(requestedUntil, Date.now() + 5 * 60_000);
+      state.automationPausedUntil = until;
+      return until;
+    });
   }
 
   async threads() {
@@ -793,7 +853,7 @@ export class RalphRegistry {
 
   async register(
     conversationUrl: string,
-    options: { externalUpdate?: boolean; manual?: boolean; reactivate?: boolean; agentCreated?: boolean; title?: string; parentThreadId?: string } = {},
+    options: { externalUpdate?: boolean; manual?: boolean; reactivate?: boolean; agentCreated?: boolean; title?: string; parentThreadId?: string; activity?: "running" | "idle" | "blocked" } = {},
   ): Promise<"ignored" | "registered" | "active" | "reactivated"> {
     const conversation = parseConversationUrl(conversationUrl);
     const title = normalizeThreadTitle(options.title);
@@ -808,13 +868,28 @@ export class RalphRegistry {
         if (options.parentThreadId) existing.parentThreadId = options.parentThreadId;
         if (options.manual) existing.manuallyRegistered = true;
         if (options.agentCreated) existing.agentCreated = true;
-        if ((options.manual || options.agentCreated || options.reactivate) && existing.state === "complete") {
+        if ((options.manual && !options.activity) || options.agentCreated) existing.observedOnly = undefined;
+        if (options.activity && options.activity !== existing.activity) {
+          const now = new Date().toISOString();
+          if (options.activity !== "running") {
+            existing.attentionAt = existing.activity ? now : existing.lastCheckedAt ?? existing.registeredAt;
+          } else {
+            existing.settledAt = undefined;
+          }
+          existing.activity = options.activity;
+          existing.activityAt = now;
+        }
+        if (options.reactivate || (options.manual && !options.activity)) existing.settledAt = undefined;
+        if (((options.manual && !options.activity) || options.agentCreated || options.reactivate) && existing.state === "complete") {
           existing.state = "active";
           existing.lastError = undefined;
           existing.nextCheckAt = Date.now() + state.loopIntervalMs;
           return "reactivated" as const;
         }
         return "active" as const;
+      }
+      if (state.threads.length >= MAX_RALPH_THREADS) {
+        state.threads = state.threads.filter((thread) => !thread.settledAt);
       }
       if (state.threads.length >= MAX_RALPH_THREADS) throw new Error("RALPH thread registration limit reached.");
       state.threads.push({
@@ -824,8 +899,11 @@ export class RalphRegistry {
         ...(options.parentThreadId ? { parentThreadId: options.parentThreadId } : {}),
         ...(options.manual ? { manuallyRegistered: true } : {}),
         ...(options.agentCreated ? { agentCreated: true } : {}),
+        ...(options.activity && !options.agentCreated && !projectAllowed ? { observedOnly: true } : {}),
         ...(options.externalUpdate ? { externalRevision: randomUUID() } : {}),
         registeredAt: new Date().toISOString(),
+        ...(options.activity ? { activity: options.activity, activityAt: new Date().toISOString(),
+          ...(options.activity !== "running" ? { attentionAt: new Date().toISOString() } : {}) } : {}),
         nextCheckAt: Date.now() + state.loopIntervalMs,
         state: "active",
         mode: "normal",
@@ -841,10 +919,19 @@ export class RalphRegistry {
       .map((entry) => ({ ...entry }));
   }
 
+  async settle(threadId: string) {
+    return this.update((state) => {
+      const thread = state.threads.find((entry) => entry.threadId === threadId);
+      if (!thread || thread.activity === "running" || thread.activity === "blocked") return false;
+      thread.settledAt = new Date().toISOString();
+      return true;
+    });
+  }
+
   async due(now = Date.now()) {
     await this.queue;
     return this.state.threads
-      .filter((entry) => entry.state === "active" && entry.nextCheckAt <= now)
+      .filter((entry) => entry.state === "active" && !entry.settledAt && !entry.observedOnly && !entry.parentThreadId && entry.nextCheckAt <= now)
       .map((entry) => ({ ...entry }));
   }
 
@@ -854,7 +941,7 @@ export class RalphRegistry {
 
   async activeMode(threadId: string) {
     await this.queue;
-    const thread = this.state.threads.find((entry) => entry.threadId === threadId && entry.state === "active");
+    const thread = this.state.threads.find((entry) => entry.threadId === threadId && entry.state === "active" && !entry.settledAt);
     return thread?.mode;
   }
 
@@ -863,6 +950,8 @@ export class RalphRegistry {
       const thread = state.threads.find((entry) => entry.threadId === threadId);
       if (!thread) return "missing";
       if (thread.state === "complete") return "complete";
+      thread.observedOnly = undefined;
+      thread.settledAt = undefined;
       thread.nextCheckAt = Date.now();
       return "scheduled";
     });
@@ -873,6 +962,9 @@ export class RalphRegistry {
       const thread = state.threads.find((entry) => entry.threadId === threadId && entry.state === "active");
       if (!thread) return;
       thread.lastCheckedAt = new Date().toISOString();
+      if (thread.activity !== "running") thread.activityAt = thread.lastCheckedAt;
+      thread.activity = "running";
+      thread.settledAt = undefined;
       thread.lastError = undefined;
       thread.nextCheckAt = Date.now() + state.loopIntervalMs;
     });
@@ -910,7 +1002,9 @@ export class RalphRegistry {
       thread.mode = mode;
       thread.lastError = undefined;
       if (mode === "continuous") {
+        thread.observedOnly = undefined;
         thread.state = "active";
+        thread.settledAt = undefined;
         thread.nextCheckAt = Date.now() + state.loopIntervalMs;
       }
       return { ...thread };
@@ -923,6 +1017,8 @@ export class RalphRegistry {
       if (!thread) return false;
       thread.state = "complete";
       thread.lastCheckedAt = new Date().toISOString();
+      thread.attentionAt = thread.lastCheckedAt;
+      thread.activity = "idle";
       thread.lastError = undefined;
       return true;
     });
@@ -933,6 +1029,8 @@ export class RalphRegistry {
       const thread = state.threads.find((entry) => entry.threadId === threadId);
       if (!thread) return false;
       thread.state = "active";
+      thread.settledAt = undefined;
+      thread.observedOnly = undefined;
       thread.lastError = undefined;
       thread.nextCheckAt = Date.now() + state.loopIntervalMs;
       return true;
@@ -1037,9 +1135,9 @@ export function parseConversationUrl(value: string) {
   return {
     threadId,
     ...(projectId ? { projectId } : {}),
-    conversationUrl: projectId
+    conversationUrl: (projectId
       ? `https://chatgpt.com/g/${projectId}/c/${threadId}`
-      : `https://chatgpt.com/c/${threadId}`,
+      : `https://chatgpt.com/c/${threadId}`) + (url.searchParams.get("temporary-chat") === "true" ? "?temporary-chat=true" : ""),
   };
 }
 
@@ -1104,6 +1202,7 @@ export class RalphController {
   }
 
   async tick() {
+    if (this.options.commands.automationPausedUntil()) return;
     const due = await this.options.registry.due();
     for (const thread of due) {
       if (this.inFlight.has(thread.threadId)) continue;
@@ -1118,6 +1217,7 @@ export class RalphController {
 
   private async check(thread: z.infer<typeof ralphThreadSchema>) {
     try {
+      if (this.options.commands.automationPausedUntil()) return;
       if (this.options.commands.messageCooldownUntil() || await this.options.jobs?.blocksContinuation(thread.threadId)) {
         await this.options.registry.recordRunning(thread.threadId);
         return;
@@ -1284,10 +1384,11 @@ export class ThreadTabCleanupController {
   }
 
   async tick(now = Date.now()) {
+    if (this.options.commands.automationPausedUntil()) return;
     const retentionMs = this.options.retentionMs ?? COMPLETED_THREAD_TAB_RETENTION_MS;
     const threads = await this.options.registry.threads();
     for (const thread of threads) {
-      if (thread.state === "active") {
+      if (thread.state === "active" || !thread.parentThreadId) {
         this.closed.delete(thread.threadId);
         continue;
       }
@@ -1480,6 +1581,9 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
   const bodySchema = z.object({
     browserId: z.string().min(1).max(200),
     features: z.array(supportFeatureSchema).max(4),
+    conversationUnavailable: z.boolean().optional(),
+    automationPausedUntil: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    statusOnly: z.boolean().optional(),
     openThreads: z.array(z.string().max(2048).refine(value => {
       try { parseConversationUrl(value); return true; } catch { return false; }
     })).max(2000).optional(),
@@ -1496,9 +1600,16 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
     req.once("aborted", onDisconnect);
     res.once("close", onDisconnect);
     try {
+      if (parsed.data.conversationUnavailable) await commands.pauseAutomation(parsed.data.automationPausedUntil);
+      if (parsed.data.statusOnly) {
+        res.setHeader("X-Automation-Paused-Until", String(commands.automationPausedUntil()));
+        res.status(204).end();
+        return;
+      }
       const command = await commands.claim(parsed.data.browserId, parsed.data.features, CLAIM_WAIT_MS, abortController.signal, parsed.data.openThreads);
       if (abortController.signal.aborted) return;
       res.setHeader("Cache-Control", "no-store");
+      res.setHeader("X-Automation-Paused-Until", String(commands.automationPausedUntil()));
       if (!command) {
         res.status(204).end();
         return;
@@ -1524,6 +1635,8 @@ export function ralphRegistrationHandler(
     agentCreated: z.boolean().optional(),
     title: z.string().max(300).optional(),
     removed: z.boolean().optional(),
+    settled: z.boolean().optional(),
+    activity: z.enum(["running", "idle", "blocked"]).optional(),
   }).strict();
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
@@ -1533,6 +1646,12 @@ export function ralphRegistrationHandler(
       return;
     }
     try {
+      if (parsed.data.settled) {
+        const { threadId } = parseConversationUrl(parsed.data.conversationUrl);
+        const settled = await registry.settle(threadId);
+        res.json({ status: settled ? "settled" : "working" });
+        return;
+      }
       if (parsed.data.removed) {
         const { threadId } = parseConversationUrl(parsed.data.conversationUrl);
         await registry.remove(threadId);
@@ -1546,6 +1665,7 @@ export function ralphRegistrationHandler(
         externalUpdate: parsed.data.externalUpdate === true,
         agentCreated: parsed.data.agentCreated === true,
         title: parsed.data.title,
+        activity: parsed.data.activity,
       });
       res.setHeader("Cache-Control", "no-store");
       res.json({ status: registration === "ignored" ? "ignored" : "registered" });
@@ -1573,7 +1693,7 @@ export function ralphThreadsGetHandler(registry: RalphRegistry, extensionToken: 
       ...thread,
       waitingForTask: tasks.some((job) => job.parentThreadId === thread.threadId &&
         job.state === "pending"),
-    })), tasks, continuationEnabled });
+    })), tasks, continuationEnabled, automationPausedUntil: registry.automationPausedUntil() });
   };
 }
 
@@ -1906,7 +2026,7 @@ export function threadObservationHandler(
       }
       const conversation = parseConversationUrl(parsed.data.conversationUrl);
       const managed = (await registry.threads()).some((thread) =>
-        thread.threadId === conversation.threadId && thread.state === "active");
+        thread.threadId === conversation.threadId && thread.state === "active" && !thread.observedOnly && !thread.settledAt);
       if (!managed) {
         res.setHeader("Cache-Control", "no-store");
         res.json({ status: "ignored" });
@@ -1929,7 +2049,7 @@ function agentPrompt(message: string, jobId: string, resultPath: string) {
     message.trim(),
     "",
     "ROLE: ChatGPT worker. The specification above is your complete assignment. The parent handles planning and implementation.",
-    "Execute this bounded assignment yourself. Use terminal for specified commands and this server's browser_* tools for browser work. Change files only when the specification authorizes it. Submit a blocker if the specification or access is insufficient. Nested delegation and automatic continuation are disabled.",
+    "Execute this bounded assignment yourself. Use terminal for specified commands and this server's browser_* tools for browser work. Change files only when the specification authorizes it. Submit a blocker if the specification or access is insufficient. Do not delegate again. The service resumes interrupted work every 30 minutes until you publish the report.",
     `For browser work, save important evidence with browser_screenshot and jobId ${JSON.stringify(jobId)}. When recording is requested, start browser_recording before interacting, stop it before releasing the tab, and include the video path.`,
     "Inspect a fresh browser_snapshot before interacting and verify the observed result after each meaningful action. Never report an unperformed check as passed.",
     "Write the report with the tested workspace and revision, each check's expected and observed result, pass or fail, reproduction steps, evidence paths, and any blocker. An unsuccessful test or missing login is a reportable result.",
@@ -1951,13 +2071,12 @@ export async function startSubagentJob(job: SubagentJob, message: string,
   { commands, registry, jobs, preparer, launchBrowser }: AgentServices & { preparer: ThreadPreparationCoordinator }) {
   let deliveryUncertain = false;
   try {
-    const { subagentProjectUrl } = await registry.settings();
     await commands.ensureBrowser("threadMessaging", launchBrowser);
     deliveryUncertain = true;
     const result = await commands.execute({
-      feature: "threadMessaging", kind: "send_message", targetUrl: subagentProjectUrl ?? "https://chatgpt.com/",
+      feature: "threadMessaging", kind: "send_message", targetUrl: "https://chatgpt.com/", temporary: true,
       message: agentPrompt(message, job.jobId, job.resultPath),
-      ...(!subagentProjectUrl ? { connectorName: process.env.CHATGPT_WORKER_CONNECTOR_NAME ?? "Codex" } : {}),
+      connectorName: process.env.CHATGPT_WORKER_CONNECTOR_NAME ?? "Codex",
     });
     if (!result.ok) {
       deliveryUncertain = result.deliveryUncertain ?? true;
@@ -2076,7 +2195,6 @@ export class SubagentResultController {
   private readonly inFlight = new Set<string>();
   private readonly completedThreads = new Set<string>();
   private readonly inspectionAfter = new Map<string, number>();
-  private readonly idleSince = new Map<string, number>();
   private readonly timer: NodeJS.Timeout;
 
   constructor(
@@ -2085,7 +2203,6 @@ export class SubagentResultController {
     private readonly launchBrowser: () => Promise<void>,
     private readonly registry: RalphRegistry,
     checkEveryMs = 5_000,
-    private readonly idleGraceMs = 120_000,
   ) {
     this.timer = setInterval(() => void this.tick().catch((error: unknown) => console.error("[tasks] Report check failed:", error)), checkEveryMs);
     this.timer.unref();
@@ -2093,6 +2210,7 @@ export class SubagentResultController {
 
   async tick() {
     const now = Date.now();
+    const intervalMs = (await this.registry.settings()).loopIntervalSeconds * 1000;
     for (const job of await this.jobs.all()) {
       if (job.state !== "pending") {
         if (job.childThreadId && !this.completedThreads.has(job.childThreadId)) {
@@ -2102,14 +2220,14 @@ export class SubagentResultController {
         continue;
       }
       await this.jobs.collectReport(job.jobId).catch((error: unknown) => console.error("[tasks] Report read failed:", error));
-      if (job.preparationError || !job.childConversationUrl || this.commands.messageCooldownUntil()) continue;
-      if (this.inFlight.has(job.jobId) || (this.inspectionAfter.get(job.jobId) ?? Date.parse(job.createdAt) + this.idleGraceMs) > now) continue;
+      if ((await this.jobs.job(job.jobId))?.state !== "pending") continue;
+      if (job.preparationError || !job.childConversationUrl || this.commands.automationPausedUntil() || this.commands.messageCooldownUntil()) continue;
+      if (this.inFlight.has(job.jobId) || (this.inspectionAfter.get(job.jobId) ?? Date.parse(job.createdAt) + intervalMs) > now) continue;
       this.inFlight.add(job.jobId);
       void this.inspectUnreportedWorker(job.jobId, job.childConversationUrl).catch((error: unknown) => {
         console.error(`[tasks] worker_inspection_failed job=${job.jobId} error=${String(error)}`);
-        this.idleSince.delete(job.jobId);
       }).finally(() => {
-        this.inspectionAfter.set(job.jobId, Date.now() + 30_000);
+        this.inspectionAfter.set(job.jobId, Date.now() + intervalMs);
         this.inFlight.delete(job.jobId);
       });
     }
@@ -2124,27 +2242,16 @@ export class SubagentResultController {
     const inspection = await this.commands.execute({ feature: "threadMessaging", kind: "inspect_thread", conversationUrl });
     if (!inspection.ok) throw new Error(inspection.error);
     if (inspection.kind !== "inspect_thread") throw new Error("Unexpected worker inspection result.");
-    if (inspection.result.status !== "idle") {
-      this.idleSince.delete(jobId);
-      return;
-    }
-    const since = this.idleSince.get(jobId);
-    if (since === undefined) {
-      this.idleSince.set(jobId, Date.now());
-      return;
-    }
-    if (Date.now() - since < this.idleGraceMs) return;
+    if (inspection.result.status !== "idle") return;
     await this.jobs.collectReport(jobId);
     const current = await this.jobs.job(jobId);
     if (current?.state !== "pending") return;
-    await this.jobs.complete(jobId, `BLOCKED: worker stopped without publishing its report.
-
-The service observed this conversation idle for at least ${Math.round(this.idleGraceMs / 1_000)} seconds. No test outcome is confirmed.
-
-Worker: ${conversationUrl}
-
-Last observed response:
-${inspection.result.assistant?.text ?? "No final response."}`);
-    this.idleSince.delete(jobId);
+    const resumed = await this.commands.execute({
+      feature: "threadMessaging", kind: "send_message", targetUrl: conversationUrl,
+      message: `Resume your existing assignment from its current state. Do not repeat completed checks. If work remains, continue it. If you are finished or blocked, publish your complete report, including observed failures and blockers. Write it to ${JSON.stringify(current.resultPath + ".tmp")}, then rename it to ${JSON.stringify(current.resultPath)}. The report file is the completion signal.`,
+    });
+    if (!resumed.ok) throw new Error(resumed.error);
+    if (resumed.kind !== "send_message") throw new Error("Unexpected worker continuation result.");
+    if (current.childThreadId) await this.registry.recordContinuation(current.childThreadId);
   }
 }

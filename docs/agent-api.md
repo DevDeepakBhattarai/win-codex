@@ -1,6 +1,6 @@
 # Run a ChatGPT worker from a local agent
 
-Build and start the server. Enable **Agent thread messaging** and **Automation browser executor** in the Support extension. Sign in to ChatGPT in that browser. Attach the computer connector to the ChatGPT worker project if you use one.
+Build and start the server. Enable **Task and thread messaging** and **Automation browser executor** in the Support extension. Sign in to ChatGPT in that browser. The service starts temporary worker chats and attaches the configured worker plugin.
 
 Run one bounded assignment:
 

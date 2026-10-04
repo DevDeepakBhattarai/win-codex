@@ -6,11 +6,12 @@ const DEFAULT_SETTINGS = {
   ralph: false,
   threadMessaging: false,
 };
-const SUBAGENT_PROJECT_KEY = "subagentProjectUrl";
 const RALPH_MIN_WORKED_SECONDS_KEY = "ralphMinWorkedSeconds";
 const LEGACY_RALPH_MIN_WORKED_SECONDS = 19 * 60;
 const DEFAULT_RALPH_MIN_WORKED_SECONDS = 20 * 60;
-const DEFAULT_RALPH_LOOP_INTERVAL_SECONDS = 3 * 60;
+const DEFAULT_RALPH_LOOP_INTERVAL_SECONDS = 30 * 60;
+const sidePanel = new URLSearchParams(location.search).get("view") === "sidepanel";
+document.body.dataset.view = sidePanel ? "sidepanel" : "popup";
 
 function validateLoopbackEndpoint(value, pathname) {
   const endpoint = new URL(value);
@@ -98,10 +99,10 @@ for (const tab of document.querySelectorAll(".tab")) {
 
 const relativeTime = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
 const TIME_UNITS = [["day", 86_400], ["hour", 3_600], ["minute", 60], ["second", 1]];
-let threadFilter = "active";
 let loadedThreads = [];
 let loadedTasks = [];
 let currentConversationUrl;
+let currentWindowId;
 let continuationEnabled = false;
 
 function canonicalProjectId(value) {
@@ -120,15 +121,17 @@ function conversationUrl(value) {
   const match = url.pathname.match(/^(?:\/g\/([A-Za-z0-9_-]+))?\/c\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/?$/i);
   if (url.origin !== "https://chatgpt.com" || url.username || url.password || !match) return undefined;
   const threadId = match[2].toLowerCase();
-  return match[1]
+  return (match[1]
     ? `https://chatgpt.com/g/${canonicalProjectId(match[1])}/c/${threadId}`
-    : `https://chatgpt.com/c/${threadId}`;
+    : `https://chatgpt.com/c/${threadId}`) + (url.searchParams.get("temporary-chat") === "true" ? "?temporary-chat=true" : "");
 }
 
 async function loadCurrentThread() {
   const button = element("markCurrentThread");
   const status = element("currentThreadStatus");
   const [tab] = await extensionApi.tabs.query({ active: true, currentWindow: true });
+  currentWindowId = tab?.windowId;
+  element("openSidePanel").disabled = !Number.isInteger(currentWindowId);
   currentConversationUrl = conversationUrl(tab?.url);
   button.disabled = !currentConversationUrl;
   setNote(status, currentConversationUrl
@@ -176,12 +179,14 @@ async function openConversation(conversation) {
   } else {
     await extensionApi.tabs.create({ url: conversation, active: true });
   }
-  globalThis.close();
+  if (!sidePanel) globalThis.close();
 }
 function threadState(thread) {
   if (thread.waitingForTask) return "waiting for task";
+  if (thread.activity === "running") return "running";
+  if (thread.activity === "blocked") return "needs attention";
   if (thread.state === "complete") return "complete";
-  return thread.lastError ? "retrying" : "active";
+  return thread.lastError ? "retrying" : thread.activity === "idle" ? "finished" : "active";
 }
 
 function metaEntry(label, value) {
@@ -212,7 +217,7 @@ function renderThread(thread) {
   head.className = "thread-head";
   const title = Object.assign(document.createElement("span"), {
     className: "thread-id",
-    textContent: thread.title || "Waiting for title…",
+    textContent: thread.title || "ChatGPT thread",
   });
   if (!thread.title) title.dataset.placeholder = "true";
   head.append(title);
@@ -221,25 +226,23 @@ function renderThread(thread) {
   pill.dataset.state = state;
   const pillLabel = state === "retrying" || thread.waitingForTask
     ? state
-    : thread.mode === "continuous" && thread.state === "active" ? "continuous" : state;
+    : state === "active" && thread.mode === "continuous" ? "continuous" : state;
   pill.append(document.createElement("i"), pillLabel);
   head.append(pill);
 
   const meta = document.createElement("p");
   meta.className = "thread-meta";
-  meta.append(metaEntry("Registered", formatRelative(Date.parse(thread.registeredAt))));
+  meta.append(formatRelative(Date.parse(thread.attentionAt ?? thread.activityAt ?? thread.registeredAt)));
   if (thread.lastContinuationAt) {
     meta.append(metaEntry("Continued", formatRelative(Date.parse(thread.lastContinuationAt))));
   } else if (thread.lastCheckedAt) {
     meta.append(metaEntry("Checked", formatRelative(Date.parse(thread.lastCheckedAt))));
   }
   if (thread.parentThreadId) meta.append(metaEntry("Parent", thread.parentThreadId.slice(0, 8)));
-  if (thread.state === "active" && !thread.waitingForTask) meta.append(metaEntry("Next check", formatRelative(thread.nextCheckAt)));
+  if (thread.state === "active" && !thread.waitingForTask && !thread.observedOnly && thread.activity !== "idle") meta.append(metaEntry("Next check", formatRelative(thread.nextCheckAt)));
 
-  link.append(head, Object.assign(document.createElement("p"), {
-    className: "thread-url",
-    textContent: thread.conversationUrl,
-  }), meta);
+  link.title = thread.conversationUrl;
+  link.append(head, meta);
 
   if (thread.lastError) {
     link.append(Object.assign(document.createElement("p"), {
@@ -341,52 +344,49 @@ async function setThreadState(thread, button) {
   }
 }
 
-function renderEmptyState(kind) {
+function renderEmptyState() {
   const item = document.createElement("li");
   const empty = document.createElement("div");
   empty.className = "empty";
-  if (kind === "subagent") {
-    empty.append(
-      Object.assign(document.createElement("strong"), { textContent: threadFilter === "active" ? "No active workers" : "No completed workers" }),
-      threadFilter === "active"
-        ? "Automatically registered worker threads appear here while they are running."
-        : "Completed worker threads remain separated from your normal RALPH list.",
-    );
-  } else if (threadFilter === "active") {
-    empty.append(
-      Object.assign(document.createElement("strong"), { textContent: "No active threads" }),
-      "Completed threads remain available under Completed and can be marked active again.",
-    );
-  } else {
-    empty.append(
-      Object.assign(document.createElement("strong"), { textContent: "No completed threads" }),
-      "Threads you stop manually or RALPH finishes will appear here.",
-    );
-  }
+  empty.append(Object.assign(document.createElement("strong"), { textContent: "Nothing needs your attention" }),
+    "Finished threads appear here. Running threads and tasks stay below.");
   item.append(empty);
   return item;
 }
 
-function renderThreadList(list, threads, kind) {
+function renderThreadList(list, threads) {
   list.replaceChildren();
   if (threads.length === 0) {
-    list.append(renderEmptyState(kind));
+    list.append(renderEmptyState());
     return;
   }
-  const ordered = [...threads].sort((left, right) => Date.parse(right.registeredAt) - Date.parse(left.registeredAt));
+  const ordered = [...threads].sort((left, right) =>
+    Date.parse(right.attentionAt ?? right.lastCheckedAt ?? right.registeredAt) - Date.parse(left.attentionAt ?? left.lastCheckedAt ?? left.registeredAt));
   list.append(...ordered.map(renderThread));
 }
 
 function renderThreads() {
-  const regular = loadedThreads.filter((thread) => !thread.parentThreadId && thread.state === threadFilter);
-  renderThreadList(element("threadList"), regular, "regular");
+  const search = element("threadSearch").value.trim().toLowerCase();
+  const matches = item => !search || (item.title ?? "").toLowerCase().includes(search);
+  const childIds = new Set(loadedTasks.map(job => job.childThreadId));
+  const regular = loadedThreads.filter(thread => !thread.parentThreadId && !childIds.has(thread.threadId) && matches(thread));
+  const working = regular.filter(thread => !thread.settledAt && (thread.activity === "running" || thread.waitingForTask));
+  const ready = regular.filter(thread => !thread.settledAt && !working.includes(thread));
+  const settled = regular.filter(thread => thread.settledAt);
+  renderThreadList(element("threadList"), ready);
+  element("readyCount").textContent = String(ready.length);
+  element("workingSection").hidden = working.length === 0;
+  element("workingCount").textContent = String(working.length);
+  renderThreadList(element("workingList"), working);
+  element("settledSection").hidden = settled.length === 0;
+  element("settledCount").textContent = String(settled.length);
+  renderThreadList(element("settledList"), settled);
   const section = element("subagentThreadsSection");
-  section.hidden = loadedTasks.length === 0;
-  const tasks = loadedTasks.filter((job) => (job.state === "pending") === (threadFilter === "active"));
+  const tasks = loadedTasks.filter(job => job.state === "pending" && matches(job));
+  section.hidden = tasks.length === 0;
   element("subagentCount").textContent = String(tasks.length);
   const list = element("subagentThreadList");
   list.replaceChildren(...tasks.map(renderTask));
-  if (!tasks.length) list.append(renderEmptyState("subagent"));
 }
 
 function renderTask(job) {
@@ -405,11 +405,12 @@ function renderTask(job) {
   card.append(title, Object.assign(document.createElement("p"), { className: "thread-meta", textContent: label }));
   if (job.childConversationUrl) {
     const reviewUrl = Object.assign(document.createElement("a"), {
-      className: "thread-url",
+      className: "inspect-task",
       href: job.childConversationUrl,
       target: "_blank",
       rel: "noreferrer",
-      textContent: job.childConversationUrl,
+      textContent: "Inspect",
+      title: job.childConversationUrl,
     });
     reviewUrl.addEventListener("click", (event) => {
       if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
@@ -445,35 +446,34 @@ async function changeReview(job, action, button) {
   } finally { button.disabled = false; }
 }
 
-function selectThreadFilter(filter) {
-  threadFilter = filter;
-  for (const button of document.querySelectorAll("[data-thread-filter]")) {
-    button.setAttribute("aria-pressed", String(button.dataset.threadFilter === filter));
-  }
-  renderThreads();
-}
-
+let loadingThreads = false;
+let renderedSnapshot;
 async function loadThreads() {
+  if (loadingThreads) return;
+  loadingThreads = true;
   const button = element("refreshThreads");
   const status = element("threadsStatus");
   button.disabled = true;
   try {
-    const { threads, tasks = [], continuationEnabled: enabled } = await callServer(ralphThreadsEndpoint);
+    const { threads, tasks = [], continuationEnabled: enabled, automationPausedUntil = 0 } = await callServer(ralphThreadsEndpoint);
     continuationEnabled = enabled === true;
     for (const node of document.querySelectorAll("[data-legacy-continuation]")) node.hidden = !continuationEnabled;
     loadedThreads = threads;
     loadedTasks = tasks;
-    const active = threads.filter((thread) => !thread.agentCreated && thread.state === "active").length;
-    element("activeCount").textContent = String(active);
-    renderThreads();
-    setNote(status, "");
-    setConnection("online", "Connected");
+    const snapshot = JSON.stringify([threads, tasks, continuationEnabled]);
+    if (snapshot !== renderedSnapshot) {
+      renderThreads();
+      renderedSnapshot = snapshot;
+    }
+    const paused = automationPausedUntil > Date.now();
+    setNote(status, paused ? `ChatGPT could not load a conversation. Tasks stay queued. Automation resumes at ${new Date(automationPausedUntil).toLocaleTimeString()}.` : "");
+    setConnection(paused ? "paused" : "online", paused ? "Paused" : "Connected");
   } catch (error) {
-    element("threadList").replaceChildren();
     setNote(status, errorMessage(error, "Could not reach Local Codex."), "error");
     setConnection("offline", "Offline");
   } finally {
     button.disabled = false;
+    loadingThreads = false;
   }
 }
 
@@ -482,7 +482,6 @@ async function loadThreads() {
 async function loadSettings() {
   const settings = await extensionApi.storage.local.get({
     ...DEFAULT_SETTINGS,
-    [SUBAGENT_PROJECT_KEY]: "",
     [RALPH_MIN_WORKED_SECONDS_KEY]: DEFAULT_RALPH_MIN_WORKED_SECONDS,
   });
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
@@ -493,7 +492,7 @@ async function loadSettings() {
     await extensionApi.storage.local.set({ [RALPH_MIN_WORKED_SECONDS_KEY]: DEFAULT_RALPH_MIN_WORKED_SECONDS });
   }
   element(RALPH_MIN_WORKED_SECONDS_KEY).value = String(settings[RALPH_MIN_WORKED_SECONDS_KEY]);
-  await Promise.all([loadRalphProjects(), loadRalphSettings(settings[SUBAGENT_PROJECT_KEY])]);
+  await Promise.all([loadRalphProjects(), loadRalphSettings()]);
 }
 
 async function notifySettingsChanged() {
@@ -507,39 +506,6 @@ async function saveSettings() {
   }
   await extensionApi.storage.local.set(settings);
   await notifySettingsChanged();
-}
-
-function normalizeProjectUrl(value) {
-  const url = new URL(value.trim());
-  if (url.origin !== "https://chatgpt.com" || url.username || url.password ||
-      !/^\/g\/[A-Za-z0-9_-]+\/project\/?$/.test(url.pathname)) {
-    throw new Error("Use a ChatGPT project URL ending in /project.");
-  }
-  return `https://chatgpt.com${url.pathname.replace(/\/$/, "")}`;
-}
-
-async function saveSubagentProject() {
-  const button = element("saveSubagentProject");
-  const input = element(SUBAGENT_PROJECT_KEY);
-  const status = element("subagentProjectStatus");
-  button.disabled = true;
-  try {
-    const projectUrl = input.value.trim() ? normalizeProjectUrl(input.value) : null;
-    const settings = await callServer(ralphSettingsEndpoint, {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ subagentProjectUrl: projectUrl }),
-    });
-    input.value = settings.subagentProjectUrl ?? "";
-    await extensionApi.storage.local.remove?.(SUBAGENT_PROJECT_KEY);
-    setNote(status, settings.subagentProjectUrl
-      ? "Saved on the Local Codex server. New workers will spawn in this project."
-      : "No dedicated project configured. New workers will start at chatgpt.com.");
-  } catch (error) {
-    setNote(status, errorMessage(error, "Could not save the worker project."), "error");
-  } finally {
-    button.disabled = false;
-  }
 }
 
 async function saveRalphTime() {
@@ -561,29 +527,12 @@ async function saveRalphTime() {
   }
 }
 
-async function loadRalphSettings(legacySubagentProjectUrl = "") {
+async function loadRalphSettings() {
   const status = element("ralphLoopIntervalStatus");
-  const projectStatus = element("subagentProjectStatus");
   try {
-    let settings = await callServer(ralphSettingsEndpoint);
-    if (!settings.subagentProjectUrl && legacySubagentProjectUrl) {
-      const projectUrl = normalizeProjectUrl(legacySubagentProjectUrl);
-      settings = await callServer(ralphSettingsEndpoint, {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ subagentProjectUrl: projectUrl }),
-      });
-      await extensionApi.storage.local.remove?.(SUBAGENT_PROJECT_KEY);
-      setNote(projectStatus, "Migrated the saved Worker project to the Local Codex server.");
-    } else {
-      setNote(projectStatus, settings.subagentProjectUrl
-        ? "Stored on the Local Codex server. New workers spawn inside this project."
-        : "No dedicated project configured. New workers start at chatgpt.com.");
-    }
-    element(SUBAGENT_PROJECT_KEY).value = settings.subagentProjectUrl ?? "";
+    const settings = await callServer(ralphSettingsEndpoint);
     element("ralphLoopIntervalSeconds").value = String(settings.loopIntervalSeconds);
   } catch (error) {
-    element(SUBAGENT_PROJECT_KEY).value = legacySubagentProjectUrl || "";
     element("ralphLoopIntervalSeconds").value = String(DEFAULT_RALPH_LOOP_INTERVAL_SECONDS);
     setNote(status, errorMessage(error, "Could not load Local Codex support settings."), "error");
   }
@@ -655,13 +604,19 @@ async function saveRalphProjects() {
 for (const key of Object.keys(DEFAULT_SETTINGS)) {
   element(key).addEventListener("change", () => void saveSettings());
 }
-element("saveSubagentProject").addEventListener("click", () => void saveSubagentProject());
 element("saveRalphLoopInterval").addEventListener("click", () => void saveRalphLoopInterval());
 element("saveRalphTime").addEventListener("click", () => void saveRalphTime());
 element("saveRalphProjects").addEventListener("click", () => void saveRalphProjects());
 element("markCurrentThread").addEventListener("click", () => void markCurrentThread());
 element("refreshThreads").addEventListener("click", () => void loadThreads());
-for (const button of document.querySelectorAll("[data-thread-filter]")) {
-  button.addEventListener("click", () => selectThreadFilter(button.dataset.threadFilter));
-}
+element("threadSearch").addEventListener("input", renderThreads);
+element("openSidePanel").hidden = sidePanel || !extensionApi.sidePanel?.open;
+element("openSidePanel").addEventListener("click", () => {
+  // Start the call during the click so Chrome retains the user gesture.
+  void extensionApi.sidePanel.open({ windowId: currentWindowId })
+    .then(() => globalThis.close())
+    .catch(error => setNote(element("threadsStatus"), errorMessage(error, "Could not open the sidebar."), "error"));
+});
+const refreshTimer = setInterval(() => { if (!document.hidden) void loadThreads(); }, 3000);
+window.addEventListener("unload", () => clearInterval(refreshTimer), { once: true });
 void Promise.all([loadCurrentThread(), loadThreads()]);
