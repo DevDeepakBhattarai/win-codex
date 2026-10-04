@@ -626,7 +626,7 @@ const ralphThreadSchema = z.object({
   conversationUrl: z.string().url(),
   threadId: z.string(),
   title: z.string().optional(),
-  parentThreadId: z.string().uuid().optional(),
+  parentThreadId: z.union([z.uuid(), z.string().regex(/^api:[a-zA-Z0-9_-]{1,100}$/)]).optional(),
   manuallyRegistered: z.boolean().optional(),
   agentCreated: z.boolean().optional(),
   registeredAt: z.string(),

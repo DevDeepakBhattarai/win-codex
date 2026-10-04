@@ -167,6 +167,9 @@ try {
 	assert.equal((await reopened.job(restartJob.jobId)).state, "complete");
 	assert.equal((await reopened.job(restartJob.jobId)).preparationError, undefined);
 	assert.equal((await reopened.create({ threadId: "api:restart", requestId: "restart", promptHash: "hash" })).jobId, restartJob.jobId);
+	const restartedRegistry = await RalphRegistry.open(directory);
+	assert.ok((await restartedRegistry.threads()).some(thread => thread.parentThreadId === "api:local"),
+		"the service can reload worker registrations with local API parent sessions");
 	console.log("Agent API passed: one blocking request, file completion, retry deduplication, disconnect recovery, startup failure, capacity, evidence, CLI keepalive, and restart recovery.");
 } finally {
 	commands.close();
