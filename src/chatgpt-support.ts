@@ -251,7 +251,7 @@ export class SupportCommandBus {
   }
 
   async pauseAutomation(until?: number) {
-    if (this.pauseInFlight) return this.pauseInFlight;
+    while (this.pauseInFlight) await this.pauseInFlight;
     const operation = this.persistAutomationPause(until);
     this.pauseInFlight = operation;
     try { return await operation; } finally { if (this.pauseInFlight === operation) this.pauseInFlight = undefined; }

@@ -952,6 +952,11 @@ try {
     pauseNow += 180_001;
     await pauseHandler(request.req, request.res);
     assert.equal(Number(headers["X-Automation-Paused-Until"]), 0, "replaying an expired offline notice cannot start another pause");
+    const freshNotice = makeClaimRequest("fresh-notice-browser");
+    freshNotice.req.body = { browserId: "fresh-notice-browser", features: [], statusOnly: true,
+      conversationUnavailable: true, automationPausedUntil: pauseNow + 300_000 };
+    await Promise.all([pauseHandler(request.req, request.res), pauseHandler(freshNotice.req, freshNotice.res)]);
+    assert.equal(pauseBus.automationPausedUntil(), pauseNow + 300_000, "a concurrent expired notice cannot suppress a fresh failure");
   } finally {
     Date.now = realNow;
     pauseBus.close();
