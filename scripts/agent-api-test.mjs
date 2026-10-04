@@ -157,6 +157,38 @@ try {
 		env: { ...process.env, DATA_DIR: directory, THREAD_SYNC_PORT: String(server.address().port) },
 	});
 	assert.equal(JSON.parse(status.stdout).state, "complete");
+	// Callers without thread metadata share a workspace group, not a machine-wide group.
+	const workspaceThread = randomUUID();
+	const secondWorkspace = path.join(directory, "second-workspace");
+	await mkdir(secondWorkspace);
+	const defaultEnvironment = { ...process.env, DATA_DIR: directory, THREAD_SYNC_PORT: String(server.address().port) };
+	delete defaultEnvironment.CODEX_THREAD_ID;
+	delete defaultEnvironment.CODEX_SESSION_ID;
+	let firstWorkspaceJob;
+	for (const [cwd, threadId] of [[directory, workspaceThread], [directory, undefined], [secondWorkspace, undefined]]) {
+		const environment = { ...defaultEnvironment, ...(threadId ? { CODEX_THREAD_ID: threadId } : {}) };
+		const execution = promisify(execFile)(process.execPath, [cli, "run", "--prompt", "Test automatic caller grouping"], {
+			cwd, timeout: 30_000, env: environment,
+		});
+		const automaticSend = await claim();
+		sent(automaticSend);
+		const automaticJob = (await jobs.forParent(`api:${requests.at(-1).session}`)).find(item => item.state === "pending");
+		assert.ok(automaticJob);
+		await publish(automaticJob, "Automatic caller received its report");
+		assert.equal(JSON.parse((await execution).stdout).jobId, automaticJob.jobId);
+		if (threadId) assert.equal(automaticJob.parentThreadId, `api:${threadId}`);
+		else {
+			assert.match(automaticJob.parentThreadId, /^api:local-/);
+			if (!firstWorkspaceJob) firstWorkspaceJob = automaticJob;
+			else assert.notEqual(automaticJob.parentThreadId, firstWorkspaceJob.parentThreadId, "separate workspaces have separate capacity");
+		}
+		assert.ok(automaticJob.requestId, "the CLI supplies a retry ID without a flag");
+	}
+	const reusedWorkspace = await promisify(execFile)(process.execPath, [cli, "run", "--prompt", "Test automatic caller grouping", "--request-id", firstWorkspaceJob.requestId], {
+		cwd: directory, timeout: 30_000, env: defaultEnvironment,
+	});
+	assert.equal(JSON.parse(reusedWorkspace.stdout).jobId, firstWorkspaceJob.jobId, "recovery in the same workspace reuses its automatic group");
+	assert.equal(await commands.claim("extension", ["threadMessaging"], 0), undefined, "automatic recovery does not dispatch again");
 	assert.equal((await request("/not-a-job/wait")).status, 404);
 	assert.equal((await request(`/${jobId}/cancel`, {})).status, 404, "local callers have no cancel endpoint");
 

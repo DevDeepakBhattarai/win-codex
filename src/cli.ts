@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import { config } from "dotenv";
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 
@@ -32,7 +32,9 @@ async function main() {
 	if (command !== "run" && (values.prompt || values.file || values["request-id"])) throw new Error("Assignment options require run.");
 	const prompt = values.file ? await readFile(values.file, "utf8") : values.prompt;
 	if (command === "run" && !prompt?.trim()) throw new Error("run requires --prompt or --file.");
-	const session = values.session ?? process.env.CODEX_THREAD_ID ?? process.env.CODEX_SESSION_ID ?? "local";
+	const workspace = await realpath(process.cwd());
+	const session = values.session ?? process.env.CODEX_THREAD_ID ?? process.env.CODEX_SESSION_ID
+		?? `local-${createHash("sha256").update(process.platform === "win32" ? workspace.toLowerCase() : workspace).digest("hex").slice(0, 32)}`;
 	const dataDirectory = path.resolve(installationDirectory, process.env.DATA_DIR ?? ".data");
 	const token = (await readFile(path.join(dataDirectory, "support-extension-token"), "utf8")).trim();
 	const base = `http://127.0.0.1:${process.env.THREAD_SYNC_PORT ?? 6002}/agents`;
