@@ -21,6 +21,8 @@ The held response has HTTP status 200 and an `X-Job-Id` header. JSON whitespace 
 
 Each session has at most two pending assignments. Capacity returns 429. Malformed input returns 400. Unknown local jobs return 404. Sessions group jobs within one trusted local caller and are not separate authentication identities.
 
+The CLI supplies `session` from `--session`, `CODEX_THREAD_ID`, or `CODEX_SESSION_ID`, in that order. Without those values, it uses `local-` followed by a hash of the canonical current workspace directory. Windows directory names are case-insensitive for this hash. The CLI generates `requestId` unless `--request-id` is supplied. These identifiers require no conversation binding or callback to the caller.
+
 A job has `jobId`, `state`, `resultPath`, `createdAt`, and `parentThreadId`. New assignments have `specPath`. Local parents use `api:SESSION`. Confirmed startup adds `childThreadId` and `childConversationUrl`. Failed or uncertain startup sets `preparationError`. Interrupted startup remains reserved across restarts and is never resent automatically.
 
 `deliveryUncertain` is false when startup failed before dispatch or the executor confirmed that it did not send the task. A recovery wait returns that saved failure. Unknown delivery remains reserved, and recovery waits for a report or operator cancellation.

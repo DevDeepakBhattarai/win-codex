@@ -5,9 +5,9 @@ Build and start the server. Enable **Agent thread messaging** and **Automation b
 Run one bounded assignment:
 
 ```powershell
-	pnpm agent run --file spec.md --session parent-001 --request-id review-001
+	pnpm agent run --file spec.md
 ```
 
-Keep the command alive until it returns the worker report. Follow [the delegation workflow](delegation.md) for assignment and recovery steps. Use the CLI from Codex. The computer connector belongs to ChatGPT.
+Keep the command alive until it returns the worker report. Follow [the delegation workflow](delegation.md) for assignment and recovery steps. Caller grouping and request IDs are automatic. The caller needs terminal access to the local service, without a conversation binding or browser extension of its own.
 
 After a server update, restart the server and reload the generated Support and Browser Bridge extensions in `chrome://extensions`. Reload the ChatGPT page to replace an older content script.

@@ -22,7 +22,7 @@ graph TD
 
 ## What the server provides
 
-For a local parent agent, use `pnpm agent run --file spec.md --session PARENT_ID --request-id ASSIGNMENT_ID`. Keep the command alive until it returns the report. See [the delegation workflow](docs/delegation.md) and [the API reference](docs/agent-api-reference.md).
+For a local parent agent, use `pnpm agent run --file spec.md`. Keep the command alive until it returns the report. The CLI supplies caller grouping and a request ID. See [the delegation workflow](docs/delegation.md) and [the API reference](docs/agent-api-reference.md).
 
 ### Local computer tools
 
@@ -58,7 +58,7 @@ When `THREAD_SYNC_ENABLED` is not `false`, the server exposes:
 - `start_thread` creates a standalone conversation on explicit user request. It adds no task or callback.
 - `send_thread_message` sends an explicitly requested message to an existing conversation.
 
-Local agents delegate through [the blocking CLI or HTTP API](docs/agent-api.md). The request waits for the report. Include the revision and a unique request ID. Retries of the same request reuse its saved job. Each local session supports two pending assignments. The computer connector is for ChatGPT. Codex uses the local interface.
+Local agents delegate through [the blocking CLI or HTTP API](docs/agent-api.md). The request waits for the report. Include the revision in the specification. The CLI supplies a unique request ID, and retries with that ID reuse the saved job. Each caller group supports two pending assignments. The local caller requires no ChatGPT conversation binding.
 
 State, specifications, and reports live under `<DATA_DIR>/tasks`. Legacy reviews and subagents migrate on first open. The worker project uses the existing `subagentProjectUrl` setting. Cancellation and uncertain-delivery recovery remain operator actions in the Support extension.
 
@@ -321,4 +321,17 @@ pnpm thread-sync-test
 
 ## Agent instructions
 
-Repository agents follow [AGENTS.md](AGENTS.md) and [the delegation workflow](docs/delegation.md). Local parents call the blocking CLI and read the returned report. ChatGPT workers publish reports through a file rename. The computer connector is for ChatGPT and rejects clients that identify themselves as Codex.
+Repository agents follow [AGENTS.md](AGENTS.md) and [the delegation workflow](docs/delegation.md). Local parents call the blocking CLI and read the returned report. Workers publish reports through a file rename. Install the same delegation instructions in the shared agent files with `node scripts/install-agent-instructions.mjs`.
+
+## Connector configuration in Codex
+
+Codex supports a local setting for an individual connector in `~/.codex/config.toml`. This setting controls Codex without disconnecting the connector in ChatGPT. See the [OpenAI configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+
+For this installation, the connector ID is `asdk_app_6a87f9c260088191a43c50e76d4e03d7`:
+
+```toml
+	[apps.asdk_app_6a87f9c260088191a43c50e76d4e03d7]
+	enabled = false
+```
+
+An existing conversation may retain previously loaded tool metadata. Start a new Codex conversation after changing the setting. The MCP endpoint also rejects requests whose client metadata identifies Codex. Connector setup and browser extensions belong to the service and worker environment. Local CLI callers need neither a browser extension nor a conversation binding.
