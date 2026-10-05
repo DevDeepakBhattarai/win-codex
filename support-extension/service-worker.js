@@ -49,10 +49,10 @@ const CONVERSATION_UNAVAILABLE_MESSAGE = "local-codex-support/conversation-unava
 let pauseSync;
 let pauseSyncedAt = 0;
 
-async function syncAutomationPause(unavailable = false) {
+async function syncAutomationPause(unavailable = false, recoveryConversationUrl) {
   if (pauseSync) {
     await pauseSync;
-    if (!unavailable) return;
+    if (!unavailable && !recoveryConversationUrl) return;
   }
   const operation = (async () => {
     const stored = await extensionApi.storage.local.get("automationPausedUntil");
@@ -65,7 +65,8 @@ async function syncAutomationPause(unavailable = false) {
     const response = await fetch(claimEndpoint.href, {
       method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${config.extensionToken}` },
       body: JSON.stringify({ browserId: await getBrowserId(), features: [], statusOnly: true,
-        conversationUnavailable: unavailable || pending.automationPausePending === true, automationPausedUntil: until }),
+        conversationUnavailable: unavailable || pending.automationPausePending === true, automationPausedUntil: until,
+        ...(recoveryConversationUrl ? { recoveryConversationUrl } : {}) }),
       signal: AbortSignal.timeout(5000), redirect: "error",
     });
     if (!response.ok) throw new Error(`Automation pause synchronization returned ${response.status}.`);
@@ -79,9 +80,10 @@ async function syncAutomationPause(unavailable = false) {
       }
     }
     pauseSyncedAt = Date.now();
+    return response.headers.get("X-Recovery-Message-Pending") === "true";
   })();
   pauseSync = operation;
-  try { await operation; } finally { if (pauseSync === operation) pauseSync = null; }
+  try { return await operation; } finally { if (pauseSync === operation) pauseSync = null; }
 }
 
 async function waitForAutomationResume() {
@@ -539,6 +541,11 @@ async function waitForTabComplete(tabId, timeoutMs = 5 * 60_000) {
 
 async function sendAutomationMessage(tabId, command) {
   if (command.feature !== "voice") {
+    if (command.recovering && command.targetUrl && await syncAutomationPause(false, command.targetUrl)) {
+      const recovery = recoveringPages.get(tabId);
+      if (recovery) recovery.resume = false;
+      if (command.recoveryContinuation) return { ok: true, result: { status: "idle" } };
+    }
     await waitForAutomationResume();
     const currentUrl = (await extensionApi.tabs.get(tabId)).url;
     if (await isVoiceConversation(currentUrl)) {
@@ -935,7 +942,9 @@ async function reloadPageAfterFailure(tabId, targetUrl) {
 }
 
 async function recoverPage(tabId, resume = true) {
-  if (await isVoiceConversation((await extensionApi.tabs.get(tabId)).url)) return false;
+  const currentUrl = (await extensionApi.tabs.get(tabId)).url;
+  if (await syncAutomationPause(false, conversationUrl(currentUrl))) resume = false;
+  if (await isVoiceConversation(currentUrl)) return false;
   const existing = recoveringPages.get(tabId);
   if (existing) {
     if (!resume) {
@@ -957,7 +966,7 @@ async function recoverPageOnce(tabId, recovery) {
   const key = `pageRecovery:${tabId}`;
   const stored = await extensionApi.storage.local.get(key);
   let state = stored[key] ?? {};
-  if (state.rateLimitedUrl && !automationTargetMatches(targetUrl, state.rateLimitedUrl)) {
+  if (state.rateLimitedAt && (!state.rateLimitedUrl || !automationTargetMatches(targetUrl, state.rateLimitedUrl))) {
     state = {};
     await extensionApi.storage.local.set({ [key]: state });
   }
@@ -994,7 +1003,7 @@ async function recoverPageOnce(tabId, recovery) {
       await waitForAutomationResume();
     }
     // The empty page gets one visible Retry after the shared cooldown, never a reload of a temporary chat.
-    const retry = await sendAutomationMessageWithTimeout(tabId, { kind: "recover_page" });
+    const retry = await sendAutomationMessageWithTimeout(tabId, { kind: "recover_page", recovering: true, targetUrl });
     await extensionApi.storage.local.set({ [key]: { ...state, conversationUnavailableAt: undefined, conversationUnavailableUrl: undefined } });
     if (!retry?.ok || retry.result?.status !== "recovery_started") throw new Error("The conversation is still unavailable after the automation pause.");
     return false;
@@ -1061,7 +1070,7 @@ async function pollCommands(generation, voiceOnly = false) {
       if (!Number.isInteger(tab.id) || !conversationUrl(tab.url)) continue;
       const key = `pageRecovery:${tab.id}`;
       const saved = await extensionApi.storage.local.get(key);
-      if ((settings.automationExecutor && saved[key]?.conversationUnavailableAt) ||
+      if ((settings.errorRecovery && saved[key]?.conversationUnavailableAt) ||
           (settings.errorRecovery && saved[key]?.rateLimitedAt && Date.now() - saved[key].rateLimitedAt >= RATE_LIMIT_WAIT_MS)) {
         await recoverPage(tab.id).catch(() => undefined);
       }

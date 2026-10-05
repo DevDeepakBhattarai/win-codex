@@ -2262,6 +2262,7 @@ async function testRalphAutoRegistration(sync) {
           headers: { "content-type": "application/json" },
         });
       }
+      if (endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.commandClaimUrl) return new Response(null, { status: 204 });
       if (endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.commandResultUrl) {
         commandResults.push(JSON.parse(options.body));
         return new Response("", { status: 200 });
@@ -2629,6 +2630,7 @@ async function testWorkerNeverRedispatchesAfterLostResponse(sync) {
       } },
     },
     fetch: async (endpoint, options) => {
+      if (endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.commandClaimUrl) return new Response(null, { status: 204 });
       assert.equal(endpoint, generatedConfig.LOCAL_CODEX_THREAD_SYNC.commandResultUrl);
       postedResults.push(JSON.parse(options.body));
       return new Response("", { status: 200 });
@@ -2718,6 +2720,7 @@ async function testWorkerRecoversHungAutomation(sync) {
       } },
     },
     fetch: async (endpoint, options) => {
+      if (endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.commandClaimUrl) return new Response(null, { status: 204 });
       assert.equal(endpoint, generatedConfig.LOCAL_CODEX_THREAD_SYNC.commandResultUrl);
       postedResults.push(JSON.parse(options.body));
       return new Response("", { status: 200 });

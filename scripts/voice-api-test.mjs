@@ -51,6 +51,29 @@ try {
 	});
 	assert.equal(observerStatus.status, 204);
 	assert.equal(observerStatus.headers.get("X-Voice-Conversation-Url"), url, "Observer browsers receive the committed Voice binding through their ordinary support transport");
+	const newChatMessage = commands.execute({ feature: "threadMessaging", kind: "send_message", targetUrl: "https://chatgpt.com/", temporary: true, message: "Start a task" });
+	void newChatMessage.catch(() => {});
+	const unrelatedStatus = await fetch(base.replace("/voice", "/commands/claim"), {
+		method: "POST", headers, body: JSON.stringify({ browserId: "helium", features: [], statusOnly: true, recoveryConversationUrl: other }),
+	});
+	assert.equal(unrelatedStatus.status, 204, "An unrelated new-chat command cannot break recovery status for an existing chat");
+	assert.equal(unrelatedStatus.headers.get("X-Recovery-Message-Pending"), "false");
+	const newChatCommand = await commands.claim("chrome-messages", ["threadMessaging"], 1000);
+	commands.complete({ commandId: newChatCommand.id, browserId: "chrome-messages", kind: newChatCommand.kind, ok: true,
+		result: { status: "sent", conversationUrl: other } });
+	await newChatMessage;
+	const queuedMessage = commands.execute({ feature: "threadMessaging", kind: "send_message", targetUrl: other, message: "Continue" });
+	const pendingStatus = await fetch(base.replace("/voice", "/commands/claim"), {
+		method: "POST", headers, body: JSON.stringify({ browserId: "helium", features: [], statusOnly: true, recoveryConversationUrl: other }),
+	});
+	assert.equal(pendingStatus.status, 204);
+	assert.equal(pendingStatus.headers.get("X-Recovery-Message-Pending"), "true", "Observer recovery sees a queued message without claiming it");
+	assert.equal(await commands.claim("helium", [], 0, undefined, [other]), undefined);
+	const chromeMessage = await commands.claim("chrome-messages", ["threadMessaging"], 1000);
+	assert.equal(chromeMessage.kind, "send_message");
+	commands.complete({ commandId: chromeMessage.id, browserId: "chrome-messages", kind: chromeMessage.kind, ok: true,
+		result: { status: "sent", conversationUrl: other } });
+	await queuedMessage;
 	assert.equal((await request("GET")).headers.get("cache-control"), "no-store");
 	assert.equal((await registry.threads()).some(thread => thread.conversationUrl === url), false);
 	assert.equal(await registry.register(url, { manual: true, reactivate: true, activity: "running" }), "ignored");

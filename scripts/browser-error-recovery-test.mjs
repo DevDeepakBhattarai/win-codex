@@ -19,6 +19,8 @@ async function worker(settings = {}, serverVoiceUrl) {
   let navigateAfterStop = false;
   let stopGate;
   let stopError;
+  let pendingMessage = false;
+  let serviceOnline = true;
   const context = {
     URL, AbortSignal, AbortController, crypto: globalThis.crypto, Response, Error, console,
     Date: class extends Date { static now() { return clock; } },
@@ -48,14 +50,16 @@ async function worker(settings = {}, serverVoiceUrl) {
           }
           if (command.kind === "send_message") { health = "ok"; return { ok: true, result: { status: "sent" } }; }
           if (command.kind === "dismiss_rate_limit") { health = "ok"; return { ok: true, result: { status: "dismissed" } }; }
+          if (command.kind === "recover_page") { health = "ok"; return { ok: true, result: { status: "recovery_started" } }; }
           assert.fail(`Unexpected command ${command.kind}`);
         },
       },
     },
     async fetch(endpoint) {
       await new Promise(resolve => setImmediate(resolve));
+      if (!serviceOnline) throw new Error("Local service unavailable");
       return endpoint === config.ralphRegisterUrl ? new Response(JSON.stringify({ status: "ignored" })) : new Response(null, {
-        status: 204, headers: serverVoiceUrl ? { "X-Voice-Conversation-Url": serverVoiceUrl } : {},
+        status: 204, headers: { "X-Voice-Conversation-Url": serverVoiceUrl ?? "", "X-Recovery-Message-Pending": String(pendingMessage) },
       });
     },
   };
@@ -71,6 +75,8 @@ async function worker(settings = {}, serverVoiceUrl) {
     setHealth(value) { health = value; }, advance(ms) { clock += ms; },
     navigateAfterStop() { navigateAfterStop = true; },
     holdStop(gate) { stopGate = gate; }, failStop(error) { stopError = error; },
+    setServerVoice(value) { serverVoiceUrl = value; }, setPendingMessage(value) { pendingMessage = value; },
+    disconnect() { serviceOnline = false; },
   };
 }
 
@@ -101,6 +107,37 @@ const protectedFromChrome = await worker({}, url);
 await protectedFromChrome.notify();
 await protectedFromChrome.settle();
 assert.deepEqual(protectedFromChrome.calls, [], "Helium learns the server's Voice binding even when it never claimed a Voice command");
+
+const freshBinding = await worker();
+await freshBinding.context.syncAutomationPause();
+freshBinding.setServerVoice(url);
+await freshBinding.notify();
+await freshBinding.settle();
+assert.deepEqual(freshBinding.calls, [], "A Voice binding committed within the five-second pause cache window prevents observer recovery immediately");
+
+const queuedInChrome = await worker();
+queuedInChrome.setPendingMessage(true);
+await queuedInChrome.notify();
+await queuedInChrome.settle();
+assert.deepEqual(queuedInChrome.calls, ["page_health", "stop_thread"], "Helium stops the failure without adding a continuation when Chrome already has a queued message");
+
+const queuedDuringStop = await worker();
+let releaseQueuedStop;
+queuedDuringStop.holdStop(new Promise(resolve => { releaseQueuedStop = resolve; }));
+await queuedDuringStop.notify();
+await queuedDuringStop.settle();
+assert.equal(queuedDuringStop.calls.at(-1), "stop_thread");
+queuedDuringStop.setPendingMessage(true);
+releaseQueuedStop();
+await queuedDuringStop.settle();
+assert.equal(queuedDuringStop.calls.includes("send_message"), false, "A message queued in Chrome during Stop suppresses Helium's continuation");
+
+const unavailableService = await worker();
+await unavailableService.context.syncAutomationPause();
+unavailableService.disconnect();
+await unavailableService.notify();
+await unavailableService.settle();
+assert.deepEqual(unavailableService.calls, [], "Recovery cannot use cached protection when the current server status is unavailable");
 
 const pendingVoiceBinding = await worker({ voiceConversationUrl: url }, url.replace("11111111", "22222222"));
 await pendingVoiceBinding.notify();
@@ -142,4 +179,14 @@ await limited.settle();
 assert.deepEqual(limited.calls, ["page_health", "page_health", "dismiss_rate_limit", "page_health", "stop_thread", "send_message"],
   "An observer's normal cooldown poll dismisses the notice and resumes once in place after ten minutes");
 assert.equal(Object.keys(limited.storage["pageRecovery:7"]).length, 0);
+
+const legacyCooldown = await worker({ "pageRecovery:7": { rateLimitedAt: 1_800_000_000_000 - 60_000 } });
+legacyCooldown.setHealth("recoverable_error");
+await legacyCooldown.context.recoverPage(7);
+assert.deepEqual(legacyCooldown.calls, ["page_health", "stop_thread", "send_message"], "A legacy cooldown without a conversation association cannot block another chat");
+
+const emptyChat = await worker({ "pageRecovery:7": { conversationUnavailableAt: 1_800_000_000_000 - 300_001, conversationUnavailableUrl: url } });
+emptyChat.setHealth("conversation_unavailable");
+await emptyChat.context.pollCommands(vm.runInNewContext("pollGeneration", emptyChat.context));
+assert.deepEqual(emptyChat.calls, ["page_health", "recover_page"], "Helium retries its empty conversation in place after the shared cooldown");
 console.log("Browser error recovery tests passed.");

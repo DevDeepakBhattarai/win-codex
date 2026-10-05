@@ -170,7 +170,8 @@
       retry.click();
       return { status: "recovery_started" };
     }
-    if (command.kind === "send_message") return await sendMessage(command.message, command.connectorName, command.temporary, command.recovering === true);
+    if (command.kind === "send_message") return await sendMessage(command.message, command.connectorName, command.temporary,
+      command.recovering === true, command.recoveryContinuation === true);
     assertNoPageError();
     if (command.kind === "inspect_thread") {
       const url = conversationUrl();
@@ -389,7 +390,7 @@
     };
   }
 
-  async function sendMessage(message, connectorName, temporary = false, recovering = false) {
+  async function sendMessage(message, connectorName, temporary = false, recovering = false, preserveDraft = false) {
     let sendClicked = false;
     const recoveryUrl = recovering ? conversationUrl() : undefined;
     const checkPage = () => {
@@ -426,6 +427,9 @@
       const ready = await waitForComposer(SEND_READY_TIMEOUT_MS, recovering);
       if (!ready) throw new Error("ChatGPT composer did not become available.");
       checkPage();
+      if (preserveDraft && (ready.editor.value ?? ready.editor.textContent ?? "").trim()) {
+        return { status: "idle", conversationUrl: existingConversationUrl };
+      }
       insertMessage(ready.editor, message);
 
       if (connectorName) await attachConnector(ready, connectorName);
@@ -441,6 +445,9 @@
         return isActionableButton(button) ? { ...composer, button } : null;
       }, SEND_READY_TIMEOUT_MS, recovering);
       if (!current) throw new Error("ChatGPT send button did not become actionable.");
+      if (preserveDraft && (current.editor.value ?? current.editor.textContent ?? "").replace(/\s+/g, " ").trim() !== message.replace(/\s+/g, " ").trim()) {
+        return { status: "idle", conversationUrl: existingConversationUrl };
+      }
 
       const previousTurns = new Set(userTurns().map(userTurnId));
       sendClicked = true;
@@ -536,7 +543,7 @@
   function pageErrorNotice() {
     const notices = [...document.querySelectorAll('[role="alert"], [role="dialog"], [data-testid="toast"]')];
     return notices.find(element => element.getClientRects?.().length &&
-      /\b(?:error|failed|failure|interrupted|disconnected)\b|something went wrong|connection lost|timed out/i.test(element.textContent ?? ""));
+      /something went wrong|(?:error (?:generating|processing)|failure to (?:generate|process)) (?:a |the )?(?:response|message)|network error|stream (?:interrupted|disconnected|failed)|connection (?:lost|interrupted)|(?:request|response) timed out|message delivery failed/i.test(element.textContent ?? ""));
   }
 
   function isPageFailure(text) {

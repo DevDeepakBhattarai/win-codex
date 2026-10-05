@@ -94,6 +94,14 @@ try {
 	assert.equal(sent.result.conversationUrl, "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111?temporary-chat=true", "worker creation preserves temporary mode through Send and connector attachment");
 	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1);
 	assert.equal(await page.evaluate(() => globalThis.temporaryClicks), 2, "startup retries an ignored click without turning temporary mode off");
+	await page.evaluate(() => {
+		const alert = document.createElement("div");
+		alert.setAttribute("role", "alert");
+		alert.textContent = "File upload failed";
+		document.body.appendChild(alert);
+	});
+	assert.equal((await execute({ kind: "page_health" })).result.status, "ok", "An upload error cannot trigger response recovery or stop a healthy turn");
+	await page.evaluate(() => document.querySelector('[role="alert"]').remove());
 	assert.equal((await execute({ kind: "inspect_thread" })).result.status, "running");
 	phase = "stop and recovery";
 	const stopped = await execute({ kind: "stop_thread" });
@@ -109,6 +117,20 @@ try {
 		targetUrl: "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222", message: "Continue" });
 	assert.equal(wrongChatRecovery.ok, false, "Recovery dispatched to a different conversation is rejected in the page itself");
 	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1);
+	await page.evaluate(() => {
+		document.querySelector('[data-composer-markdown]').textContent = "My unsent note";
+		const alert = document.createElement("div");
+		alert.setAttribute("role", "alert");
+		alert.textContent = "Something went wrong";
+		document.body.appendChild(alert);
+	});
+	const preserveDraft = await execute({ kind: "send_message", recovering: true, recoveryContinuation: true,
+		targetUrl: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111?temporary-chat=true", message: "Continue" });
+	assert.equal(preserveDraft.ok, true, preserveDraft.error);
+	assert.equal(preserveDraft.result.status, "idle");
+	assert.equal(await page.locator('[data-composer-markdown]').innerText(), "My unsent note", "Automatic continuation preserves a user draft");
+	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1);
+	await page.evaluate(() => { document.querySelector('[data-composer-markdown]').textContent = ""; document.querySelector('[role="alert"]').remove(); });
 	await page.waitForFunction(() => globalThis.observedActivity.some(message => message.activity === "idle"));
 	assert.ok(await page.evaluate(() => globalThis.observedActivity.some(message => message.activity === "running")), "modern composer activity reaches the extension");
 	await page.evaluate(() => {

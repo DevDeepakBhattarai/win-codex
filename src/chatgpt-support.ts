@@ -268,6 +268,14 @@ export class SupportCommandBus {
     return this.registry?.voiceConversationUrl();
   }
 
+  hasPendingMessage(conversationUrl: string) {
+    const { threadId } = parseConversationUrl(conversationUrl);
+    return [...this.pending.values()].some(({ command }) => {
+      if (command.kind !== "send_message") return false;
+      try { return parseConversationUrl(command.targetUrl).threadId === threadId; } catch { return false; }
+    });
+  }
+
   async pauseAutomation(until?: number) {
     while (this.pauseInFlight) await this.pauseInFlight;
     const operation = this.persistAutomationPause(until);
@@ -1607,6 +1615,9 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
     conversationUnavailable: z.boolean().optional(),
     automationPausedUntil: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
     statusOnly: z.boolean().optional(),
+    recoveryConversationUrl: z.string().max(2048).refine(value => {
+      try { parseConversationUrl(value); return true; } catch { return false; }
+    }).optional(),
     openThreads: z.array(z.string().max(2048).refine(value => {
       try { parseConversationUrl(value); return true; } catch { return false; }
     })).max(2000).optional(),
@@ -1627,6 +1638,9 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
       if (parsed.data.statusOnly) {
         res.setHeader("X-Automation-Paused-Until", String(commands.automationPausedUntil()));
         res.setHeader("X-Voice-Conversation-Url", commands.voiceConversationUrl() ?? "");
+        if (parsed.data.recoveryConversationUrl) {
+          res.setHeader("X-Recovery-Message-Pending", String(commands.hasPendingMessage(parsed.data.recoveryConversationUrl)));
+        }
         res.status(204).end();
         return;
       }
