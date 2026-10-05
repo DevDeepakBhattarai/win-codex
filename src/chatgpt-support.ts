@@ -767,7 +767,7 @@ const ralphThreadSchema = z.object({
   settledAt: z.string().optional(),
   observedOnly: z.boolean().optional(),
   completionCheckEnabled: z.boolean().optional(),
-  checkRevision: z.number().int().nonnegative().optional(),
+  checkRevision: z.uuid().optional(),
   externalRevision: z.string().optional(),
   lastCheckedAt: z.string().optional(),
   lastContinuationAt: z.string().optional(),
@@ -985,7 +985,7 @@ export class RalphRegistry {
           if (thread.completionCheckEnabled !== undefined) {
             thread.completionCheckEnabled = undefined;
             thread.observedOnly = undefined;
-            thread.checkRevision = (thread.checkRevision ?? 0) + 1;
+            thread.checkRevision = randomUUID();
             thread.nextCheckAt = Date.now() + state.loopIntervalMs;
           }
           return true;
@@ -1020,24 +1020,24 @@ export class RalphRegistry {
           (existing.observedOnly || existing.completionCheckEnabled !== undefined);
         if (settingManaged && options.checkForCompletion !== undefined) {
           if (options.checkForCompletion && existing.observedOnly) existing.nextCheckAt = Date.now() + state.loopIntervalMs;
-          if (existing.completionCheckEnabled !== options.checkForCompletion) existing.checkRevision = (existing.checkRevision ?? 0) + 1;
+          if (existing.completionCheckEnabled !== options.checkForCompletion) existing.checkRevision = randomUUID();
           existing.completionCheckEnabled = options.checkForCompletion;
           existing.observedOnly = options.checkForCompletion ? undefined : true;
         }
         if (explicitlyMarked || options.agentCreated || projectAllowed) {
           if (existing.observedOnly) {
-            existing.checkRevision = (existing.checkRevision ?? 0) + 1;
+            existing.checkRevision = randomUUID();
             existing.nextCheckAt = Date.now() + state.loopIntervalMs;
           }
           existing.observedOnly = undefined;
           existing.completionCheckEnabled = undefined;
         }
         if (options.activity === "running" && options.reactivate) {
-          existing.checkRevision = (existing.checkRevision ?? 0) + 1;
+          existing.checkRevision = randomUUID();
           existing.nextCheckAt = Date.now() + state.loopIntervalMs;
         }
         if (options.activity && options.activity !== existing.activity) {
-          existing.checkRevision = (existing.checkRevision ?? 0) + 1;
+          existing.checkRevision = randomUUID();
           const now = new Date().toISOString();
           if (options.activity !== "running") {
             existing.attentionAt = existing.activity ? now : existing.lastCheckedAt ?? existing.registeredAt;
@@ -1065,6 +1065,7 @@ export class RalphRegistry {
       state.threads.push({
         conversationUrl: conversation.conversationUrl,
         threadId: conversation.threadId,
+        checkRevision: randomUUID(),
         ...(title ? { title } : {}),
         ...(options.parentThreadId ? { parentThreadId: options.parentThreadId } : {}),
         ...(options.manual ? { manuallyRegistered: true } : {}),
@@ -1113,10 +1114,10 @@ export class RalphRegistry {
     return this.state.threads.some(thread => thread.threadId === threadId && thread.state === "active" && !thread.settledAt);
   }
 
-  async isCheckCurrent(threadId: string, revision?: number) {
+  async isCheckCurrent(threadId: string, expected?: { checkRevision?: string }) {
     await this.queue;
     return this.state.threads.some(thread => thread.threadId === threadId && thread.state === "active" &&
-      !thread.settledAt && !thread.observedOnly && (revision === undefined || (thread.checkRevision ?? 0) === revision));
+      !thread.settledAt && !thread.observedOnly && (expected === undefined || thread.checkRevision === expected.checkRevision));
   }
 
   async scheduleNow(threadId: string): Promise<"scheduled" | "complete" | "missing"> {
@@ -1191,7 +1192,7 @@ export class RalphRegistry {
       thread.settledAt = undefined;
       thread.observedOnly = undefined;
       thread.completionCheckEnabled = undefined;
-      thread.checkRevision = (thread.checkRevision ?? 0) + 1;
+      thread.checkRevision = randomUUID();
       thread.lastError = undefined;
       thread.nextCheckAt = Date.now() + state.loopIntervalMs;
       return true;
@@ -1393,7 +1394,7 @@ export class RalphController {
       }, RALPH_BROWSER_INSPECTION_TIMEOUT_MS);
       if (!commandResult.ok) throw new Error(commandResult.error);
       if (commandResult.kind !== "inspect_thread") throw new Error("RALPH received the wrong support command result.");
-      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread.checkRevision ?? 0)) return;
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread)) return;
 
       const observedInspection = commandResult.result;
       const observedByExecutor = this.options.commands.browserHasFeature(commandResult.browserId, "ralph");
@@ -1407,7 +1408,7 @@ export class RalphController {
         return;
       }
 
-      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread.checkRevision ?? 0)) return;
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread)) return;
       if (await this.options.jobs?.blocksContinuation(thread.threadId)) {
         await this.options.registry.recordRunning(thread.threadId);
         return;
@@ -1416,7 +1417,7 @@ export class RalphController {
         ? observedInspection
         : await this.inspectExecutorBeforeContinuation(thread);
       if (!inspection) return;
-      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread.checkRevision ?? 0)) return;
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread)) return;
 
       const checkpoint = inspection.assistant.text.trim().match(/(?:^|\n)RALPH_STATUS: (CONTINUE|WAIT_CI|BLOCKED|COMPLETE)$/)?.[1];
       if (checkpoint === "COMPLETE" || checkpoint === "BLOCKED") {
@@ -1454,17 +1455,17 @@ export class RalphController {
         thread.conversationUrl,
         this.auditLog,
       );
-      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread.checkRevision ?? 0)) return;
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread)) return;
       if (decision.complete) {
         await this.options.registry.recordComplete(thread.threadId);
         return;
       }
-      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread.checkRevision ?? 0)) return;
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread)) return;
       if (await this.options.jobs?.blocksContinuation(thread.threadId)) {
         await this.options.registry.recordRunning(thread.threadId);
         return;
       }
-      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread.checkRevision ?? 0)) return;
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread)) return;
 
       const sendResult = await this.options.commands.execute({
         feature: "ralph",
@@ -1474,11 +1475,11 @@ export class RalphController {
       });
       if (!sendResult.ok) throw new Error(sendResult.error);
       if (sendResult.kind !== "send_message") throw new Error("RALPH received the wrong send-message result.");
-      if (await this.options.registry.isCheckCurrent(thread.threadId, thread.checkRevision ?? 0)) {
+      if (await this.options.registry.isCheckCurrent(thread.threadId, thread)) {
         await this.options.registry.recordContinuation(thread.threadId);
       }
     } catch (error) {
-      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread.checkRevision ?? 0)) return;
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread)) return;
       const message = error instanceof Error ? error.message : String(error);
       if (/timed out/i.test(message)) {
         await this.options.registry.recordLoading(thread.threadId);
@@ -1498,7 +1499,7 @@ export class RalphController {
     }, RALPH_BROWSER_INSPECTION_TIMEOUT_MS);
     if (!result.ok) throw new Error(result.error);
     if (result.kind !== "inspect_thread") throw new Error("RALPH received the wrong pre-send inspection result.");
-    if (!await this.options.registry.isCheckCurrent(thread.threadId, thread.checkRevision ?? 0)) return undefined;
+    if (!await this.options.registry.isCheckCurrent(thread.threadId, thread)) return undefined;
     if (result.result.title) await this.options.registry.recordTitle(thread.threadId, result.result.title);
     if (result.result.status === "loading") {
       await this.options.registry.recordLoading(thread.threadId);

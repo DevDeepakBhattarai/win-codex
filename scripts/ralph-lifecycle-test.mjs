@@ -94,11 +94,14 @@ try {
   await registry.recordComplete(threadId);
 
   for (const decision of ["CONTINUE", "COMPLETE"]) {
-    for (const change of ["running", "disabled"]) {
+    for (const change of ["running", "disabled", "reenrolled"]) {
       const raceDirectory = path.join(directory, `classifier-${decision}-${change}`);
       const raceRegistry = await RalphRegistry.open(raceDirectory);
       const raceCommands = new SupportCommandBus();
-      await raceRegistry.register(url, { manual: true, checkForCompletion: true, activity: "idle" });
+      const raceProject = "g-p-6a87fafd6d948191ab3338e485c07c39";
+      const raceUrl = change === "reenrolled" ? url.replace("/c/", `/g/${raceProject}/c/`) : url;
+      if (change === "reenrolled") await raceRegistry.setProjects([raceProject]);
+      await raceRegistry.register(raceUrl, { checkForCompletion: true, activity: "idle" });
       await raceRegistry.scheduleNow(threadId);
       const previousFetch = globalThis.fetch;
       let release;
@@ -115,19 +118,23 @@ try {
         model: "fixture-model", auditLogPath: path.join(raceDirectory, "audit.log"), checkEveryMs: 60_000 });
       try {
         await raceController.tick();
-        const inspect = await raceCommands.claim("chrome", ["ralph"], 1000, undefined, [url]);
+        const inspect = await raceCommands.claim("chrome", ["ralph"], 1000, undefined, [raceUrl]);
         assert.equal(inspect.kind, "inspect_thread");
         raceCommands.complete({ commandId: inspect.id, browserId: "chrome", kind: inspect.kind, ok: true,
           result: { status: "idle", workedSeconds: null, users: [{ id: "u1", text: "Finish the task" }],
             assistant: { id: "a1", synthetic: false, text: "Work remains" } } });
         await apiStarted;
-        await raceRegistry.register(url, { manual: true, checkForCompletion: change !== "disabled",
+        if (change === "reenrolled") {
+          await raceRegistry.setProjects([]);
+          assert.deepEqual(await raceRegistry.threads(), [], "project removal deletes its previous registration");
+        }
+        await raceRegistry.register(raceUrl, { checkForCompletion: change !== "disabled",
           ...(change === "running" ? { activity: "running", reactivate: true } : {}) });
         const changed = (await raceRegistry.threads())[0];
         release();
         const keepAlive = setTimeout(() => {}, 250);
         try {
-          assert.equal(await raceCommands.claim("chrome", ["ralph"], 150, undefined, [url]), undefined,
+          assert.equal(await raceCommands.claim("chrome", ["ralph"], 150, undefined, [raceUrl]), undefined,
             `${change} invalidates an in-flight ${decision} decision`);
         } finally { clearTimeout(keepAlive); }
         const after = (await raceRegistry.threads())[0];
