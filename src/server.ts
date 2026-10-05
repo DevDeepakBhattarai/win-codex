@@ -71,7 +71,6 @@ import {
   ralphThreadActiveHandler,
   ralphThreadCheckHandler,
   ralphThreadCompleteHandler,
-  ralphThreadModeHandler,
   ralphThreadsGetHandler,
   taskActionHandler,
   registerChatGptAgents,
@@ -85,6 +84,7 @@ import {
   supportCommandResultHandler,
 } from "./chatgpt-support.js";
 import { SubagentJobRegistry } from "./subagent-jobs.js";
+import { ScheduledTasks, createScheduleApi } from "./scheduled-tasks.js";
 import { createAgentApi } from "./agent-api.js";
 
 const PORT = Number(process.env.PORT ?? 6000);
@@ -2788,6 +2788,10 @@ const supportCommands = threadSync
 const threadPreparer = supportCommands && threadSync
   ? new ThreadPreparationCoordinator(supportCommands, threadSync.registry, launchChrome)
   : undefined;
+const scheduledTasks = threadSync ? await ScheduledTasks.open(DATA_DIR) : undefined;
+if (scheduledTasks && supportCommands && ralphRegistry && threadPreparer) {
+  scheduledTasks.start({ commands: supportCommands, registry: ralphRegistry, preparer: threadPreparer, launchBrowser: launchChrome });
+}
 const subagentResultController = supportCommands && subagentJobs && ralphRegistry
   ? new SubagentResultController(subagentJobs, supportCommands, launchChrome, ralphRegistry)
   : undefined;
@@ -2822,6 +2826,7 @@ const threadSyncHttpServer = threadSync
       const syncApp = express();
       syncApp.disable("x-powered-by");
       syncApp.use(express.json({ limit: "5mb" }));
+      if (scheduledTasks) syncApp.use("/chatgpt-support/schedules", createScheduleApi(scheduledTasks, threadSync.extensionToken));
       if (subagentJobs && supportCommands && ralphRegistry && threadPreparer) {
         syncApp.use("/agents", createAgentApi({ token: threadSync.extensionToken, jobs: subagentJobs,
           commands: supportCommands, registry: ralphRegistry, preparer: threadPreparer,
@@ -2854,8 +2859,6 @@ const threadSyncHttpServer = threadSync
           ralphThreadCompleteHandler(ralphRegistry, threadSync.extensionToken));
         syncApp.put("/chatgpt-support/ralph/threads/:threadId/active",
           ralphThreadActiveHandler(ralphRegistry, threadSync.extensionToken));
-        syncApp.put("/chatgpt-support/ralph/threads/:threadId/mode",
-          ralphThreadModeHandler(ralphRegistry, threadSync.extensionToken));
         if (ralphController) {
           syncApp.put("/chatgpt-support/ralph/threads/:threadId/check",
             ralphThreadCheckHandler(ralphRegistry, ralphController, threadSync.extensionToken));
@@ -2922,6 +2925,7 @@ async function shutdown(signal: string) {
   const browserClosed = browserService?.close();
   const mcpClosed = mcpHandler.close();
   ralphController?.close();
+  scheduledTasks?.close();
   threadTabCleanupController?.close();
   subagentResultController?.close();
   supportCommands?.close();

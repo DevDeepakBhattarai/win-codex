@@ -7,7 +7,7 @@ import vm from "node:vm";
 import { Client } from "@modelcontextprotocol/client";
 import { McpServer, InMemoryTransport } from "@modelcontextprotocol/server";
 import { THREAD_SYNC_AGENT_INSTRUCTION, THREAD_SYNC_WIDGET_URI, ThreadSyncRegistry, parseConversationUrl, prepareThreadSync, registerThreadSync, threadSyncBindHandler, threadSyncBindUrl } from "../dist/thread-sync.js";
-import { RalphController, RalphRegistry, SupportCommandBus, ThreadPreparationCoordinator, ThreadTabCleanupController, parseRalphProjectId, ralphRegistrationHandler, ralphSettingsGetHandler, ralphSettingsPutHandler, ralphThreadActiveHandler, ralphThreadCheckHandler, ralphThreadCompleteHandler, ralphThreadModeHandler, ralphThreadsGetHandler, registerChatGptAgents, supportCommandClaimHandler, threadObservationHandler } from "../dist/chatgpt-support.js";
+import { RalphController, RalphRegistry, SupportCommandBus, ThreadPreparationCoordinator, ThreadTabCleanupController, parseRalphProjectId, ralphRegistrationHandler, ralphSettingsGetHandler, ralphSettingsPutHandler, ralphThreadActiveHandler, ralphThreadCheckHandler, ralphThreadCompleteHandler, ralphThreadsGetHandler, registerChatGptAgents, supportCommandClaimHandler, threadObservationHandler } from "../dist/chatgpt-support.js";
 import { SubagentJobRegistry } from "../dist/subagent-jobs.js";
 
 const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "win-codex-thread-sync-test-"));
@@ -55,10 +55,10 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.8.5");
+  assert.equal(manifest.version, "1.9.0");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["alarms", "scripting", "sidePanel", "storage", "tabs", "webNavigation"]);
-  assert.equal(manifest.action.default_popup, "popup.html");
+  assert.equal(manifest.action.default_popup, undefined);
   assert.equal(manifest.content_security_policy.extension_pages,
     "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:*");
   for (const file of ["popup.html", "popup.js", "popup.css"]) {
@@ -495,28 +495,6 @@ try {
   await projectScopedRegistry.setProjects([]);
   assert.equal((await projectScopedRegistry.threads()).length, 2,
     "project allowlist changes retain AI-created sub-agents in RALPH");
-  const modeThreadHandler = ralphThreadModeHandler(projectScopedRegistry, sync.extensionToken);
-  const setThreadMode = (threadId, mode) => new Promise(resolve => {
-    const response = {
-      status(code) { response.code = code; return response; },
-      json(body) { resolve({ code: response.code ?? 200, body }); },
-      setHeader() {},
-    };
-    modeThreadHandler({
-      params: { threadId },
-      body: { mode },
-      get: name => (name === "authorization" ? `Bearer ${sync.extensionToken}` : undefined),
-    }, response);
-  });
-  await completeThread(parseConversationUrl(urlB).threadId);
-  const continuousMode = await setThreadMode(parseConversationUrl(urlB).threadId, "continuous");
-  assert.equal(continuousMode.body.thread.mode, "continuous");
-  assert.equal(continuousMode.body.thread.state, "active",
-    "enabling continuous mode reactivates a completed thread");
-  const normalMode = await setThreadMode(parseConversationUrl(urlB).threadId, "normal");
-  assert.equal(normalMode.body.thread.mode, "normal");
-  assert.equal(normalMode.body.thread.state, "active",
-    "stopping continuous mode returns to normal RALPH behavior without marking the thread complete");
   await completeThread(parseConversationUrl(urlA).threadId);
   await registerThread({ conversationUrl: urlA, manual: true });
   assert.equal(await projectScopedRegistry.isActive(parseConversationUrl(urlA).threadId), true,
@@ -1094,7 +1072,7 @@ try {
       "Do the task.",
     ].some((text) => transcript.includes(text))
       ? "COMPLETE"
-      : "Continue by resolving the remaining CI failure.";
+      : "CONTINUE";
     return new Response(JSON.stringify({
       output: [
         { type: "reasoning", encrypted_content: "opaque-test-reasoning" },
@@ -1181,7 +1159,7 @@ try {
     const continueCommand = await ralphCommands.claim("chrome-browser", ["ralph"], 1000);
     assert.equal(continueCommand.kind, "send_message");
     assert.equal(continueCommand.targetUrl, ralphUrl);
-    assert.equal(continueCommand.message, "Continue by resolving the remaining CI failure.");
+    assert.equal(continueCommand.message, "Continue the existing task from its current state. Do not repeat completed work.");
     assert.equal(apiRequest.model, "gpt-5.6-terra");
     assert.deepEqual(apiRequest.reasoning, { effort: "low" });
     assert.equal("max_output_tokens" in apiRequest, false,
@@ -1189,8 +1167,7 @@ try {
     const classifierInstruction = apiRequest.input[0].content[0].text;
     assert.doesNotMatch(classifierInstruction, /tool access expires after 25 minutes/);
     assert.match(classifierInstruction, /working agent is more capable than you/);
-    assert.match(classifierInstruction, /reply in English with one short sentence/);
-    assert.match(classifierInstruction, /names only the unfinished work stated or clearly implied by the transcript/);
+    assert.match(classifierInstruction, /reply with exactly CONTINUE/);
     assert.match(classifierInstruction, /Do not explain, add steps, or repeat completed work/);
     assert.match(JSON.stringify(apiRequest.input), /Fix the implementation end to end/);
     assert.match(JSON.stringify(apiRequest.input), /one CI failure remains/);
@@ -1202,7 +1179,7 @@ try {
       line.includes('"request_id":"req_ralph_success"') && line.includes('"http_status":200') &&
       line.includes('"input_tokens":123') && line.includes('"output_tokens":17') &&
       line.includes('"total_tokens":140') && line.includes('"action":"continue"') &&
-      line.includes("Continue by resolving the remaining CI failure.")),
+      line.includes("CONTINUE")),
       "the success audit log includes the exact OpenAI response body");
     assert.ok(ralphOpenAiLogs.every(line => !line.includes("test-key")),
       "RALPH OpenAI audit logs must not expose the API key");
@@ -1217,7 +1194,7 @@ try {
     assert.equal(persistedSuccessLogs[1].event, "request_succeeded");
     assert.equal(persistedSuccessLogs[1].request_id, "req_ralph_success");
     assert.equal(persistedSuccessLogs[1].total_tokens, 140);
-    assert.equal(persistedSuccessLogs[1].response_text, "Continue by resolving the remaining CI failure.");
+    assert.equal(persistedSuccessLogs[1].response_text, "CONTINUE");
     assert.equal("response" in persistedSuccessLogs[1], false,
       "the success audit record stores extracted response text instead of the opaque API payload");
     assert.ok(!JSON.stringify(persistedSuccessLogs).includes("opaque-test-reasoning"));
@@ -1251,10 +1228,10 @@ try {
       },
     });
     await new Promise(resolve => setTimeout(resolve, 20));
-    assert.equal(apiRequestCount, 1, "a settled turn at or below the 20-minute threshold must not spend classifier tokens");
+    assert.equal(apiRequestCount, 2, "an idle turn with unknown worked time still asks the completion classifier");
     assert.equal(await ralphCommands.claim("chrome-browser", ["ralph"], 0), undefined);
     assert.equal(await ralphControllerRegistry.isActive(parseConversationUrl(shortRalphUrl).threadId), false,
-      "a short settled turn is marked complete without classification");
+      "the classifier can complete a short settled turn");
 
     const staleObserverRalphUrl = `https://chatgpt.com/g/${projectId}/c/30303030-3030-4030-8030-303030303030`;
     await ralphControllerRegistry.register(staleObserverRalphUrl);
@@ -1297,75 +1274,6 @@ try {
       "RALPH must not send when the fresh Chrome inspection says the thread is running");
     await ralphControllerRegistry.recordComplete(parseConversationUrl(staleObserverRalphUrl).threadId);
 
-    const continuousRalphUrl = `https://chatgpt.com/g/${projectId}/c/66666666-6666-4666-8666-666666666666`;
-    await ralphControllerRegistry.register(continuousRalphUrl);
-    await ralphControllerRegistry.setMode(parseConversationUrl(continuousRalphUrl).threadId, "continuous");
-    await new Promise(resolve => setTimeout(resolve, 25));
-    await ralphController.tick();
-    const continuousInspectCommand = await ralphCommands.claim("chrome-browser", ["ralph"], 1000);
-    assert.equal(continuousInspectCommand.kind, "inspect_thread");
-    ralphCommands.complete({
-      commandId: continuousInspectCommand.id,
-      browserId: "chrome-browser",
-      kind: "inspect_thread",
-      ok: true,
-      result: {
-        status: "idle",
-        title: "Nightly optimizer - ChatGPT",
-        workedSeconds: null,
-        users: [{ id: "u-continuous", text: "Keep improving this overnight." }],
-        assistant: { synthetic: false, id: "a-continuous", text: "The current experiment is complete." },
-      },
-    });
-    const continuousCommand = await ralphCommands.claim("chrome-browser", ["ralph"], 1000);
-    assert.equal(continuousCommand.kind, "send_message");
-    assert.equal(continuousCommand.targetUrl, continuousRalphUrl);
-    assert.match(continuousCommand.message, /Continue the user-authorized continuous run/);
-    assert.match(continuousCommand.message, /You own all decisions about what to do next/);
-    assert.equal(apiRequestCount, 1, "continuous RALPH does not use the completion classifier");
-    ralphCommands.complete({
-      commandId: continuousCommand.id,
-      browserId: "chrome-browser",
-      kind: "send_message",
-      ok: true,
-      result: { status: "sent", conversationUrl: continuousRalphUrl },
-    });
-    await new Promise(resolve => setTimeout(resolve, 10));
-    const continuousThread = (await ralphControllerRegistry.threads())
-      .find(thread => thread.conversationUrl === continuousRalphUrl);
-    assert.equal(continuousThread.state, "active");
-    assert.equal(continuousThread.mode, "continuous");
-    assert.equal(continuousThread.title, "Nightly optimizer", "RALPH inspection refreshes the readable thread title");
-    await ralphControllerRegistry.recordComplete(parseConversationUrl(continuousRalphUrl).threadId);
-
-    const stoppedContinuousUrl = `https://chatgpt.com/g/${projectId}/c/88888888-8888-4888-8888-888888888888`;
-    await ralphControllerRegistry.register(stoppedContinuousUrl);
-    await ralphControllerRegistry.setMode(parseConversationUrl(stoppedContinuousUrl).threadId, "continuous");
-    await new Promise(resolve => setTimeout(resolve, 25));
-    await ralphController.tick();
-    const stoppedContinuousInspect = await ralphCommands.claim("chrome-browser", ["ralph"], 1000);
-    assert.equal(stoppedContinuousInspect.kind, "inspect_thread");
-    await ralphControllerRegistry.setMode(parseConversationUrl(stoppedContinuousUrl).threadId, "normal");
-    ralphCommands.complete({
-      commandId: stoppedContinuousInspect.id,
-      browserId: "chrome-browser",
-      kind: "inspect_thread",
-      ok: true,
-      result: {
-        status: "idle",
-        workedSeconds: null,
-        users: [{ id: "u-stopped-continuous", text: "Keep working until I stop continuous mode." }],
-        assistant: { synthetic: false, id: "a-stopped-continuous", text: "The current step is done." },
-      },
-    });
-    await new Promise(resolve => setTimeout(resolve, 20));
-    assert.equal(await ralphCommands.claim("chrome-browser", ["ralph"], 0), undefined,
-      "stopping continuous mode during inspection must prevent the stale continuous continuation");
-    assert.equal(apiRequestCount, 1,
-      "the fresh normal mode applies the worked-time gate before considering classification");
-    assert.equal(await ralphControllerRegistry.isActive(parseConversationUrl(stoppedContinuousUrl).threadId), false,
-      "the normal-mode classifier can complete the thread after continuous mode is stopped");
-
     const unknownRalphUrl = `https://chatgpt.com/g/${projectId}/c/44444444-4444-4444-8444-444444444444`;
     await ralphControllerRegistry.register(unknownRalphUrl);
     await new Promise(resolve => setTimeout(resolve, 25));
@@ -1385,7 +1293,7 @@ try {
       },
     });
     await new Promise(resolve => setTimeout(resolve, 20));
-    assert.equal(apiRequestCount, 1, "a settled turn with unavailable worked duration is marked complete without classification");
+    assert.equal(apiRequestCount, 3, "completion always depends on the classifier for ordinary idle turns");
     assert.equal(await ralphCommands.claim("chrome-browser", ["ralph"], 0), undefined);
 
     const failedRalphUrl = `https://chatgpt.com/g/${projectId}/c/55555555-5555-4555-8555-555555555555`;
@@ -1408,7 +1316,7 @@ try {
       },
     });
     await new Promise(resolve => setTimeout(resolve, 20));
-    assert.equal(apiRequestCount, 2);
+    assert.equal(apiRequestCount, 4);
     assert.ok(ralphOpenAiLogs.some(line => line.includes('"event":"request_failed"') &&
       line.includes('"request_id":"req_ralph_failure"') && line.includes('"http_status":429') &&
       line.includes('"duration_ms":') && line.includes("Rate limit reached for test")),
@@ -1442,7 +1350,7 @@ try {
     await new Promise(resolve => setTimeout(resolve, 20));
     const blankThread = (await ralphControllerRegistry.threads())
       .find(thread => thread.conversationUrl === blankRalphUrl);
-    assert.equal(apiRequestCount, 2, "RALPH must not classify a blank extracted transcript");
+    assert.equal(apiRequestCount, 4, "RALPH must not classify a blank extracted transcript");
     assert.equal(blankThread.state, "active", "a blank extracted transcript must not complete the thread");
     assert.match(blankThread.lastError, /could not extract every ChatGPT user message/);
   } finally {

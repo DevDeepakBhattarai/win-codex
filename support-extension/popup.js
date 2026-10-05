@@ -10,8 +10,7 @@ const RALPH_MIN_WORKED_SECONDS_KEY = "ralphMinWorkedSeconds";
 const LEGACY_RALPH_MIN_WORKED_SECONDS = 19 * 60;
 const DEFAULT_RALPH_MIN_WORKED_SECONDS = 20 * 60;
 const DEFAULT_RALPH_LOOP_INTERVAL_SECONDS = 30 * 60;
-const sidePanel = new URLSearchParams(location.search).get("view") === "sidepanel";
-document.body.dataset.view = sidePanel ? "sidepanel" : "popup";
+document.body.dataset.view = "sidepanel";
 
 function validateLoopbackEndpoint(value, pathname) {
   const endpoint = new URL(value);
@@ -26,6 +25,7 @@ const ralphProjectsEndpoint = validateLoopbackEndpoint(config?.ralphProjectsUrl,
 const ralphRegisterEndpoint = validateLoopbackEndpoint(config?.ralphRegisterUrl, "/chatgpt-support/ralph/register");
 const ralphSettingsEndpoint = validateLoopbackEndpoint(config?.ralphSettingsUrl, "/chatgpt-support/ralph/settings");
 const ralphThreadsEndpoint = validateLoopbackEndpoint(config?.ralphThreadsUrl, "/chatgpt-support/ralph/threads");
+const schedulesEndpoint = new URL("/chatgpt-support/schedules", ralphThreadsEndpoint);
 
 function element(id) {
   return document.getElementById(id);
@@ -75,6 +75,8 @@ function selectTab(tab) {
     element(other.dataset.panel).hidden = !selected;
   }
   tab.focus();
+  element("threadToolbar").hidden = !["panel-threads", "panel-settled"].includes(tab.dataset.panel);
+  if (tab.dataset.panel === "panel-schedules") void loadSchedules();
   if (tab.dataset.panel === "panel-settings" && !settingsLoaded) {
     settingsLoaded = true;
     void loadSettings().catch((error) => {
@@ -102,7 +104,6 @@ const TIME_UNITS = [["day", 86_400], ["hour", 3_600], ["minute", 60], ["second",
 let loadedThreads = [];
 let loadedTasks = [];
 let currentConversationUrl;
-let currentWindowId;
 let continuationEnabled = false;
 
 function canonicalProjectId(value) {
@@ -130,10 +131,9 @@ async function loadCurrentThread() {
   const button = element("markCurrentThread");
   const status = element("currentThreadStatus");
   const [tab] = await extensionApi.tabs.query({ active: true, currentWindow: true });
-  currentWindowId = tab?.windowId;
-  element("openSidePanel").disabled = !Number.isInteger(currentWindowId);
   currentConversationUrl = conversationUrl(tab?.url);
   button.disabled = !currentConversationUrl;
+  document.querySelector(".current-thread").hidden = !continuationEnabled || !currentConversationUrl;
   setNote(status, currentConversationUrl
     ? currentConversationUrl
     : "Open a saved ChatGPT thread in this tab.");
@@ -157,7 +157,7 @@ async function markCurrentThread() {
   } catch (error) {
     setNote(status, errorMessage(error, "Could not mark the current thread for RALPH."), "error");
   } finally {
-    button.textContent = "Mark for RALPH";
+    button.textContent = "Enable RALPH";
     button.disabled = !currentConversationUrl;
   }
 }
@@ -179,14 +179,13 @@ async function openConversation(conversation) {
   } else {
     await extensionApi.tabs.create({ url: conversation, active: true });
   }
-  if (!sidePanel) globalThis.close();
 }
 function threadState(thread) {
+  if (thread.state === "complete") return "complete";
   if (thread.waitingForTask) return "waiting for task";
   if (thread.activity === "running") return "running";
   if (thread.activity === "blocked") return "needs attention";
-  if (thread.state === "complete") return "complete";
-  return thread.lastError ? "retrying" : thread.activity === "idle" ? "finished" : "active";
+  return thread.lastError ? "retrying" : "active";
 }
 
 function metaEntry(label, value) {
@@ -224,10 +223,7 @@ function renderThread(thread) {
   const pill = document.createElement("span");
   pill.className = "pill";
   pill.dataset.state = state;
-  const pillLabel = state === "retrying" || thread.waitingForTask
-    ? state
-    : state === "active" && thread.mode === "continuous" ? "continuous" : state;
-  pill.append(document.createElement("i"), pillLabel);
+  pill.append(document.createElement("i"), state);
   head.append(pill);
 
   const meta = document.createElement("p");
@@ -252,7 +248,7 @@ function renderThread(thread) {
   }
 
   card.append(link);
-  if (thread.waitingForTask || !continuationEnabled) {
+  if (thread.state === "complete" || thread.waitingForTask || !continuationEnabled) {
     item.append(card);
     return item;
   }
@@ -267,20 +263,10 @@ function renderThread(thread) {
     checkButton.addEventListener("click", () => void checkThreadNow(thread, checkButton));
     actions.append(checkButton);
   }
-  const modeButton = document.createElement("button");
-  modeButton.className = "button button-ghost";
-  modeButton.type = "button";
-  modeButton.textContent = thread.mode === "continuous" ? "Stop continuous" : "Run continuously";
-  modeButton.title = thread.mode === "continuous"
-    ? "Return this thread to normal RALPH completion behavior"
-    : "Keep giving this thread new turns until you stop continuous mode";
-  modeButton.addEventListener("click", () => void setThreadMode(thread, modeButton));
-  actions.append(modeButton);
-
   const stateButton = document.createElement("button");
   stateButton.className = "button button-ghost";
   stateButton.type = "button";
-  stateButton.textContent = thread.state === "active" ? "Mark complete" : "Mark active";
+  stateButton.textContent = "Mark complete";
   stateButton.addEventListener("click", () => void setThreadState(thread, stateButton));
   actions.append(stateButton);
   card.append(actions);
@@ -309,47 +295,28 @@ async function checkThreadNow(thread, button) {
   }
 }
 
-async function setThreadMode(thread, button) {
-  const nextMode = thread.mode === "continuous" ? "normal" : "continuous";
-  button.disabled = true;
-  button.textContent = nextMode === "continuous" ? "Starting..." : "Stopping...";
-  try {
-    const endpoint = threadStateEndpoint(thread.threadId, "mode");
-    await callServer(endpoint, {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ mode: nextMode }),
-    });
-    await loadThreads();
-  } catch (error) {
-    button.disabled = false;
-    button.textContent = thread.mode === "continuous" ? "Stop continuous" : "Run continuously";
-    setNote(element("threadsStatus"), errorMessage(error, "Could not change the RALPH mode."), "error");
-  }
-}
-
 async function setThreadState(thread, button) {
-  const nextState = thread.state === "active" ? "complete" : "active";
+  const nextState = "complete";
   if (nextState === "complete" &&
       !globalThis.confirm(`Mark RALPH thread ${thread.threadId.slice(0, 8)} as complete? Local Codex will stop checking it.`)) return;
   button.disabled = true;
-  button.textContent = nextState === "active" ? "Activating..." : "Marking...";
+  button.textContent = "Marking...";
   try {
     await callServer(threadStateEndpoint(thread.threadId, nextState), { method: "PUT" });
     await loadThreads();
   } catch (error) {
     button.disabled = false;
-    button.textContent = nextState === "active" ? "Mark active" : "Mark complete";
+    button.textContent = "Mark complete";
     setNote(element("threadsStatus"), errorMessage(error, `Could not mark the RALPH thread ${nextState}.`), "error");
   }
 }
 
-function renderEmptyState() {
+function renderEmptyState(message = "No threads", description = "Completed threads appear in Settled.") {
   const item = document.createElement("li");
   const empty = document.createElement("div");
   empty.className = "empty";
-  empty.append(Object.assign(document.createElement("strong"), { textContent: "Nothing needs your attention" }),
-    "Finished threads appear here. Running threads and tasks stay below.");
+  empty.append(Object.assign(document.createElement("strong"), { textContent: message }),
+    description);
   item.append(empty);
   return item;
 }
@@ -370,20 +337,22 @@ function renderThreads() {
   const matches = item => !search || (item.title ?? "").toLowerCase().includes(search);
   const childIds = new Set(loadedTasks.map(job => job.childThreadId));
   const regular = loadedThreads.filter(thread => !thread.parentThreadId && !childIds.has(thread.threadId) && matches(thread));
-  const working = regular.filter(thread => !thread.settledAt && (thread.activity === "running" || thread.waitingForTask));
-  const ready = regular.filter(thread => !thread.settledAt && !working.includes(thread));
-  const settled = regular.filter(thread => thread.settledAt);
+  const active = regular.filter(thread => thread.state !== "complete");
+  const working = active.filter(thread => thread.activity === "running" || thread.waitingForTask);
+  const ready = active.filter(thread => !working.includes(thread));
+  const settled = regular.filter(thread => thread.state === "complete");
   renderThreadList(element("threadList"), ready);
-  element("readyCount").textContent = String(ready.length);
+  element("activeSection").hidden = ready.length === 0;
+  element("activeCount").textContent = String(ready.length);
   element("workingSection").hidden = working.length === 0;
   element("workingCount").textContent = String(working.length);
   renderThreadList(element("workingList"), working);
-  element("settledSection").hidden = settled.length === 0;
   element("settledCount").textContent = String(settled.length);
   renderThreadList(element("settledList"), settled);
   const section = element("subagentThreadsSection");
   const tasks = loadedTasks.filter(job => job.state === "pending" && matches(job));
   section.hidden = tasks.length === 0;
+  element("threadsEmpty").hidden = active.length > 0 || tasks.length > 0;
   element("subagentCount").textContent = String(tasks.length);
   const list = element("subagentThreadList");
   list.replaceChildren(...tasks.map(renderTask));
@@ -458,6 +427,7 @@ async function loadThreads() {
     const { threads, tasks = [], continuationEnabled: enabled, automationPausedUntil = 0 } = await callServer(ralphThreadsEndpoint);
     continuationEnabled = enabled === true;
     for (const node of document.querySelectorAll("[data-legacy-continuation]")) node.hidden = !continuationEnabled;
+    document.querySelector(".current-thread").hidden = !continuationEnabled || !currentConversationUrl;
     loadedThreads = threads;
     loadedTasks = tasks;
     const snapshot = JSON.stringify([threads, tasks, continuationEnabled]);
@@ -478,6 +448,101 @@ async function loadThreads() {
 }
 
 /* Settings */
+
+let loadingSchedules = false;
+let scheduleSnapshot;
+element("scheduleTimezone").textContent = `Your time zone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}.`;
+function updateRepeatFields() {
+  const enabled = element("scheduleRepeat").checked;
+  element("scheduleInterval").hidden = !enabled;
+  element("scheduleIntervalValue").disabled = !enabled;
+  element("scheduleIntervalUnit").disabled = !enabled;
+}
+element("scheduleRepeat").addEventListener("change", updateRepeatFields);
+
+async function loadSchedules() {
+  if (loadingSchedules) return;
+  loadingSchedules = true;
+  try {
+    const { tasks } = await callServer(schedulesEndpoint);
+    const snapshot = JSON.stringify(tasks);
+    if (snapshot === scheduleSnapshot) return;
+    const items = [...tasks].sort((a, b) => Date.parse(b.runAt) - Date.parse(a.runAt)).map(task => {
+      const item = document.createElement("li");
+      const card = Object.assign(document.createElement("div"), { className: "thread schedule" });
+      const prompt = Object.assign(document.createElement("p"), { className: "schedule-prompt", textContent: task.prompt });
+      const labels = { pending: "Scheduled", sending: "Starting", sent: "Started", failed: "Failed", missed: "Missed", cancelled: "Cancelled" };
+      card.append(Object.assign(document.createElement("p"), { className: "thread-meta",
+        textContent: `${labels[task.state] ?? task.state} · ${new Date(task.runAt).toLocaleString()}` }), prompt);
+      if (task.repeatIntervalSeconds) {
+        const seconds = task.repeatIntervalSeconds;
+        const unit = seconds % 86400 === 0 ? "day" : seconds % 3600 === 0 ? "hour" : "minute";
+        const amount = seconds / (unit === "day" ? 86400 : unit === "hour" ? 3600 : 60);
+        card.append(Object.assign(document.createElement("p"), { className: "thread-meta",
+          textContent: `Every ${amount} ${unit}${amount === 1 ? "" : "s"}${task.state === "pending" ? " · Next run shown above" : ""}` }));
+        if (task.lastRunAt) card.append(Object.assign(document.createElement("p"), { className: "thread-meta",
+          textContent: `Last run: ${task.lastRunState ? labels[task.lastRunState] : "Starting"} · ${new Date(task.lastRunAt).toLocaleString()}` }));
+      }
+      if (task.error) card.append(Object.assign(document.createElement("p"), { className: "thread-error", textContent: task.error }));
+      if (conversationUrl(task.conversationUrl)) {
+        const link = Object.assign(document.createElement("a"), { className: "inspect-task", textContent: "Open chat", href: task.conversationUrl });
+        link.addEventListener("click", event => { event.preventDefault(); void openConversation(task.conversationUrl); });
+        card.append(link);
+      }
+      const canCancel = task.state === "pending" || (task.state === "sending" && task.repeatIntervalSeconds);
+      if (task.state !== "sending" || canCancel) {
+        const button = Object.assign(document.createElement("button"), { className: "button button-ghost",
+          type: "button", textContent: canCancel ? task.repeatIntervalSeconds ? "Stop repeating" : "Cancel schedule" : "Remove" });
+        if (canCancel && task.repeatIntervalSeconds) button.title = "Cancel future runs. A prompt already being sent can finish delivery.";
+        button.addEventListener("click", () => {
+          button.disabled = true;
+          const endpoint = new URL(`${schedulesEndpoint.pathname}/${encodeURIComponent(task.id)}${canCancel ? "/cancel" : ""}`, schedulesEndpoint);
+          void callServer(endpoint, { method: canCancel ? "PUT" : "DELETE" })
+            .then(() => { setNote(element("scheduleStatus"), ""); return loadSchedules(); })
+            .catch(error => { button.disabled = false; setNote(element("scheduleStatus"), errorMessage(error, "Could not update the schedule."), "error"); });
+        });
+        const actions = Object.assign(document.createElement("div"), { className: "thread-actions" });
+        actions.append(button);
+        card.append(actions);
+      }
+      item.append(card);
+      return item;
+    });
+    element("scheduleList").replaceChildren(...(items.length ? items : [renderEmptyState("No scheduled tasks", "Add a prompt and a future date above.")]));
+    scheduleSnapshot = snapshot;
+  } catch (error) {
+    setNote(element("scheduleStatus"), errorMessage(error, "Could not load schedules."), "error");
+  } finally { loadingSchedules = false; }
+}
+
+element("scheduleForm").addEventListener("submit", event => {
+  event.preventDefault();
+  const date = new Date(element("scheduleAt").value);
+  if (!Number.isFinite(date.getTime()) || date.getTime() <= Date.now()) {
+    setNote(element("scheduleStatus"), "Choose a future date and time.", "error");
+    return;
+  }
+  const repeatIntervalSeconds = element("scheduleRepeat").checked
+    ? Number(element("scheduleIntervalValue").value) * Number(element("scheduleIntervalUnit").value) : undefined;
+  if (repeatIntervalSeconds !== undefined && (!Number.isInteger(Number(element("scheduleIntervalValue").value)) ||
+      repeatIntervalSeconds < 60 || repeatIntervalSeconds > 31_536_000)) {
+    setNote(element("scheduleStatus"), "Choose a whole-number interval between one minute and 365 days.", "error");
+    return;
+  }
+  const button = element("saveSchedule");
+  button.disabled = true;
+  void callServer(schedulesEndpoint, { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prompt: element("schedulePrompt").value, runAt: date.toISOString(), repeatIntervalSeconds }) })
+    .then(async () => {
+      element("scheduleForm").reset();
+      updateRepeatFields();
+      setNote(element("scheduleStatus"), "Task scheduled.");
+      await loadSchedules();
+    })
+    .catch(error => setNote(element("scheduleStatus"), errorMessage(error, "Could not save the schedule."), "error"))
+    .finally(() => { button.disabled = false; });
+});
+element("refreshSchedules").addEventListener("click", () => void loadSchedules());
 
 async function loadSettings() {
   const settings = await extensionApi.storage.local.get({
@@ -520,7 +585,7 @@ async function saveRalphTime() {
   button.disabled = true;
   try {
     await extensionApi.storage.local.set({ [RALPH_MIN_WORKED_SECONDS_KEY]: seconds });
-    setNote(status, `Saved ${seconds} second${seconds === 1 ? "" : "s"}. Only settled turns above this worked time are classified.`);
+    setNote(status, `Saved ${seconds} second${seconds === 1 ? "" : "s"}. Durations above this threshold appear in classifier metadata.`);
     await notifySettingsChanged();
   } finally {
     button.disabled = false;
@@ -610,13 +675,11 @@ element("saveRalphProjects").addEventListener("click", () => void saveRalphProje
 element("markCurrentThread").addEventListener("click", () => void markCurrentThread());
 element("refreshThreads").addEventListener("click", () => void loadThreads());
 element("threadSearch").addEventListener("input", renderThreads);
-element("openSidePanel").hidden = sidePanel || !extensionApi.sidePanel?.open;
-element("openSidePanel").addEventListener("click", () => {
-  // Start the call during the click so Chrome retains the user gesture.
-  void extensionApi.sidePanel.open({ windowId: currentWindowId })
-    .then(() => globalThis.close())
-    .catch(error => setNote(element("threadsStatus"), errorMessage(error, "Could not open the sidebar."), "error"));
-});
-const refreshTimer = setInterval(() => { if (!document.hidden) void loadThreads(); }, 3000);
+const refreshTimer = setInterval(() => {
+  if (document.hidden) return;
+  void loadCurrentThread();
+  void loadThreads();
+  if (!element("panel-schedules").hidden) void loadSchedules();
+}, 3000);
 window.addEventListener("unload", () => clearInterval(refreshTimer), { once: true });
 void Promise.all([loadCurrentThread(), loadThreads()]);

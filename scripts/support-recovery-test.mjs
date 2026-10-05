@@ -163,9 +163,9 @@ for (const temporary of [false, true]) {
     { ok: true, result: { status: "sent", conversationUrl: target } },
     { ok: true, result: { status: "running" } },
   ], Array.from({ length: 4 }, () => ({ ok: true, result: { status: "connection_interrupted" } })), [], temporary);
-  assert.equal(run.reloads, temporary ? 0 : 3, "temporary workers preserve their conversation, saved threads refresh three times");
-  assert.deepEqual(run.waits.filter(ms => ms === 30_000), [30_000, 30_000, 30_000]);
-  assert.equal(run.calls.filter(kind => kind === "resume_interrupted").length, 1, "one Stop-and-continue command follows three failed recovery checks");
+  assert.equal(run.reloads, 0, "stuck streams stop and continue in the same chat without reloads");
+  assert.deepEqual(run.waits.filter(ms => ms === 30_000), []);
+  assert.equal(run.calls.filter(kind => kind === "resume_interrupted").length, 1, "one Stop-and-continue command handles the failure");
   assert.equal(run.results[0].result.status, "running", "the original inspection observes the resumed turn");
 }
 {
@@ -178,11 +178,21 @@ for (const temporary of [false, true]) {
   assert.equal(run.reloads, 0);
 }
 {
-  const run = await runWorker(inspectCommand("stream-recovers"), [{ ok: true, result: { status: "running" } }], [
-    { ok: true, result: { status: "connection_interrupted" } }, { ok: true, result: { status: "ok" } },
-  ]);
-  assert.equal(run.reloads, 1);
-  assert.equal(run.calls.includes("resume_interrupted"), false, "a recovered stream keeps running without Stop or another message");
+  const run = await runWorker(inspectCommand("uncertain-recovery"), [new Error("Acknowledgement lost after recovery Send")],
+    [{ ok: true, result: { status: "connection_interrupted" } }]);
+  assert.equal(run.reloads, 0, "uncertain recovery preserves the existing conversation");
+  assert.equal(run.calls.filter(kind => kind === "resume_interrupted").length, 1, "uncertain recovery never resends immediately");
+  assert.equal(run.results[0].result.status, "loading");
+}
+
+for (const kind of ["connection_interrupted", "recoverable_error"]) {
+  const run = await runWorker({ ...sendCommand("recover-send"), targetUrl: url + "?temporary-chat=true" }, [
+    { ok: true, result: { status: "stopped", conversationUrl: url } },
+    { ok: true, result: { status: "sent", conversationUrl: url } },
+  ], [{ ok: true, result: { status: kind } }], [], true);
+  assert.deepEqual(run.calls, ["page_health", "stop_thread", "send_message"], "a pending message replaces recovery continuation without duplicate sends");
+  assert.equal(run.reloads, 0);
+  assert.equal(run.results[0].ok, true);
 }
 
 {
@@ -190,8 +200,8 @@ for (const temporary of [false, true]) {
     { ok: true, result: { status: "recoverable_error" } },
     { ok: true, result: { status: "recoverable_error" } },
   ]);
-  assert.equal(run.reloads, 1);
-  assert.equal(run.dispatches, 2, "each blocked page attempts its visible recovery action");
+  assert.equal(run.reloads, 0);
+  assert.equal(run.dispatches, 1, "failed recovery remains loading rather than complete without a second send");
   assert.equal(run.calls.includes("inspect_thread"), false, "a still-blocked page is never inspected as complete");
   assert.equal(run.results[0].result.status, "loading");
 }
@@ -304,7 +314,7 @@ for (const failure of [new Error("Timed out waiting for ChatGPT page automation.
     document, location: new URL(url), window: { addEventListener() {} },
     browser: { runtime: { async sendMessage() {}, onMessage: { addListener(value) { listener = value; } } } },
   });
-  for (const kind of ["inspect_thread", "stop_thread"]) {
+  for (const kind of ["inspect_thread"]) {
     const response = await new Promise(resolve => listener({
       type: "local-codex-support/automation-v1", command: { kind },
     }, {}, resolve));

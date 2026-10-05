@@ -119,7 +119,6 @@ try {
 
   const registry = await RalphRegistry.open(path.join(directory, "ralph"), 1);
   await registry.register(parent.conversationUrl, { agentCreated: true });
-  await registry.setMode(parent.threadId, "continuous");
   await registry.scheduleNow(parent.threadId);
   const waiting = await batchJobs.create(parent);
   const ralphBus = new SupportCommandBus();
@@ -128,7 +127,7 @@ try {
     await ralph.tick();
     await new Promise(resolve => setTimeout(resolve, 30));
     assert.equal(await ralphBus.claim("browser", ["ralph"], 0), undefined,
-      "a continuous parent waiting for children must not inspect, classify, or send");
+      "a parent waiting for children must not inspect, classify, or send");
   } finally { ralph.close(); ralphBus.close(); }
 
   const handlers = new Map();

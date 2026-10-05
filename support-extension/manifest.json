@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Local Codex Support",
-  "version": "1.8.5",
+  "version": "1.9.0",
   "description": "Runs bounded ChatGPT tasks, stores reports, and delivers completion to parent agents.",
   "permissions": ["alarms", "scripting", "sidePanel", "storage", "tabs", "webNavigation"],
   "side_panel": { "default_path": "popup.html?view=sidepanel" },
@@ -13,8 +13,7 @@
     "run_at": "document_start"
   }],
   "action": {
-    "default_title": "Local Codex Support",
-    "default_popup": "popup.html"
+    "default_title": "Open Local Codex sidebar"
   },
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:*"

@@ -238,10 +238,11 @@ assert.equal(clicks, 1, 'persisted cooldown survives a worker restart and permit
 assert.equal(results.at(-1).ok, true);
 health = 'recoverable_error';
 await inspect(false);
-assert.equal(reloads, 1, 'recognized timeout errors refresh the existing tab once');
+assert.equal(reloads, 0, 'failed Stop-and-continue recovery preserves the existing conversation');
+assert.equal(results.at(-1).result.status, 'loading', 'unconfirmed recovery cannot complete a thread');
 now += 120_000;
 await inspect(false);
-assert.equal(reloads, 2, 'a later inspection can retry recovery on the same tab');
+assert.equal(reloads, 0, 'a later inspection still preserves the same conversation');
 assert.equal(creations, 0);
 
 let listener;

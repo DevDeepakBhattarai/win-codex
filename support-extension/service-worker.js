@@ -1,10 +1,16 @@
-importScripts("config.js");
-
 const extensionApi = globalThis.browser ?? globalThis.chrome;
 if (!extensionApi?.runtime || !extensionApi?.tabs || !extensionApi?.scripting || !extensionApi?.storage) {
   throw new Error("Local Codex Support requires standard WebExtension runtime, tabs, scripting, and storage APIs.");
 }
 
+function configureSidePanel() {
+  void extensionApi.sidePanel?.setPanelBehavior({ openPanelOnActionClick: true }).catch(console.error);
+}
+configureSidePanel();
+extensionApi.runtime.onInstalled.addListener(configureSidePanel);
+extensionApi.runtime.onStartup.addListener(configureSidePanel);
+
+importScripts("config.js");
 const config = globalThis.LOCAL_CODEX_THREAD_SYNC;
 const bindEndpoint = validateLoopbackEndpoint(config?.bindUrl, "/thread-sync/bind");
 const claimEndpoint = validateLoopbackEndpoint(config?.commandClaimUrl, "/chatgpt-support/commands/claim");
@@ -692,13 +698,13 @@ async function executeCommandOnce(command, browserId) {
 
     if (!observing && command.kind !== "stop_thread") {
       try {
-        refreshed = await recoverPage(tabId) || refreshed;
+        refreshed = await recoverPage(tabId, command.kind !== "send_message") || refreshed;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (temporary || refreshed || /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(message)) throw error;
+        if (temporary || refreshed || /^CHATGPT_(?:RATE_LIMITED(?:_RETRYABLE)?|RECOVERY_FAILED):/.test(message)) throw error;
         await reloadPageAfterFailure(tabId, targetUrl);
         refreshed = true;
-        await recoverPage(tabId);
+        await recoverPage(tabId, command.kind !== "send_message");
       }
     }
 
@@ -715,7 +721,7 @@ async function executeCommandOnce(command, browserId) {
 
     const runPageCommand = async () => {
       deliveryUncertain = true;
-      const response = await sendAutomationMessageWithTimeout(tabId, command);
+      const response = await sendAutomationMessageWithTimeout(tabId, { ...command, recovering: refreshed });
       if (response?.ok) return response;
       deliveryUncertain = response?.retryable !== true;
       const error = new Error(response?.error || "ChatGPT page automation failed.");
@@ -829,15 +835,15 @@ async function reloadPageAfterFailure(tabId, targetUrl) {
   return tab;
 }
 
-function recoverPage(tabId) {
+function recoverPage(tabId, resume = true) {
   const existing = recoveringPages.get(tabId);
   if (existing) return existing;
-  const recovery = recoverPageOnce(tabId).finally(() => recoveringPages.delete(tabId));
+  const recovery = recoverPageOnce(tabId, resume).finally(() => recoveringPages.delete(tabId));
   recoveringPages.set(tabId, recovery);
   return recovery;
 }
 
-async function recoverPageOnce(tabId) {
+async function recoverPageOnce(tabId, resume) {
   await waitForAutomationResume();
   const key = `pageRecovery:${tabId}`;
   const stored = await extensionApi.storage.local.get(key);
@@ -861,23 +867,17 @@ async function recoverPageOnce(tabId) {
     if (!retry?.ok || retry.result?.status !== "recovery_started") throw new Error("The conversation is still unavailable after the automation pause.");
     return false;
   }
-  if (health.result?.status === "connection_interrupted") {
+  if (["connection_interrupted", "recoverable_error"].includes(health.result?.status)) {
     const targetUrl = (await extensionApi.tabs.get(tabId)).url;
     if (!conversationUrl(targetUrl)) throw new Error("Interrupted conversation is unavailable.");
-    const temporary = new URL(targetUrl).searchParams.get("temporary-chat") === "true";
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (!temporary) await reloadPageAfterFailure(tabId, targetUrl);
-      await sleep(30_000);
-      const current = await extensionApi.tabs.get(tabId);
-      if (!automationTargetMatches(current.url, targetUrl)) throw new Error("Recovery stopped because the tab navigated away.");
-      const observed = await sendAutomationMessageWithTimeout(tabId, { kind: "page_health" });
-      if (!observed?.ok) throw new Error(observed?.error || "Could not inspect recovery state.");
-      if (observed.result?.status !== "connection_interrupted") return true;
-    }
-    const resumed = await sendAutomationMessageWithTimeout(tabId, {
-      kind: "resume_interrupted", message: "Continue your existing assignment from its current state. Complete the remaining work and publish the required report. Do not repeat completed work.",
-    });
-    if (!resumed?.ok || !["sent", "idle"].includes(resumed.result?.status)) throw new Error(resumed?.error || "The interrupted turn could not resume.");
+    const current = await extensionApi.tabs.get(tabId);
+    if (!automationTargetMatches(current.url, targetUrl)) throw new Error("Recovery stopped because the tab navigated away.");
+    const resumed = await sendAutomationMessageWithTimeout(tabId, resume
+      ? { kind: "resume_interrupted", message: "Continue the existing task from its current state. Do not repeat completed work." }
+      : { kind: "stop_thread" }).catch(error => {
+        throw new Error(`CHATGPT_RECOVERY_FAILED: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    if (!resumed?.ok || !["sent", "stopped", "idle"].includes(resumed.result?.status)) throw new Error(`CHATGPT_RECOVERY_FAILED: ${resumed?.error || "The interrupted turn could not resume."}`);
     return true;
   }
   if (health.result?.status === "rate_limited") {
@@ -895,12 +895,6 @@ async function recoverPageOnce(tabId) {
     if (!after?.ok || after.result?.status !== "ok") {
       throw new Error("CHATGPT_RATE_LIMITED: The provider notice is still blocking the page.");
     }
-  } else if (health.result?.status === "recoverable_error") {
-    const retry = await sendAutomationMessageWithTimeout(tabId, { kind: "recover_page" });
-    if (!retry?.ok || retry.result?.status !== "recovery_started") {
-      throw new Error("ChatGPT page is still recovering. Waiting before checking again.");
-    }
-    return false;
   }
   if (state.rateLimitedAt || state.conversationUnavailableAt) await extensionApi.storage.local.set({ [key]: {} });
   return false;

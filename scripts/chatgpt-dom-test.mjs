@@ -4,6 +4,8 @@ import { chromium } from "playwright-core";
 
 // Captured ChatGPT markup, October 2026. Exercise the content script in a real DOM.
 const browser = await chromium.launch({ channel: "chrome", headless: true });
+let phase = "initial delivery";
+const timeout = setTimeout(() => { console.error(`ChatGPT DOM test timed out during ${phase}.`); void browser.close(); }, 120_000);
 try {
 	const page = await browser.newPage();
 	await page.route("https://chatgpt.com/**", route => route.fulfill({ contentType: "text/html", body: `<!doctype html>
@@ -93,6 +95,7 @@ try {
 	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1);
 	assert.equal(await page.evaluate(() => globalThis.temporaryClicks), 2, "startup retries an ignored click without turning temporary mode off");
 	assert.equal((await execute({ kind: "inspect_thread" })).result.status, "running");
+	phase = "stop and recovery";
 	const stopped = await execute({ kind: "stop_thread" });
 	assert.equal(stopped.ok, true, stopped.error);
 	assert.equal(stopped.result.status, "stopped");
@@ -123,10 +126,6 @@ try {
 		document.body.appendChild(status);
 	});
 	assert.equal((await execute({ kind: "page_health" })).result.status, "connection_interrupted", "the exact supplied recovery notice is detected");
-	const alreadyFinished = await execute({ kind: "resume_interrupted", message: "Continue the remaining assignment." });
-	assert.equal(alreadyFinished.ok, true, alreadyFinished.error);
-	assert.equal(alreadyFinished.result.status, "idle", "a turn that finishes before Stop receives no recovery continuation");
-	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1);
 	await page.evaluate(() => {
 		const status = document.querySelector('[role="status"]');
 		const button = document.querySelector('button[aria-label="Send"]');
@@ -142,14 +141,28 @@ try {
 	assert.equal(await page.evaluate(() => globalThis.sendClicks), 2);
 	assert.equal((await execute({ kind: "stop_thread" })).result.status, "stopped");
 	await page.evaluate(() => {
+		const alert = document.createElement("div");
+		alert.setAttribute("role", "alert");
+		alert.textContent = "Something went wrong";
+		document.body.appendChild(alert);
+		const button = document.querySelector('button[aria-label="Send"]');
+		button.onclick = () => { alert.remove(); globalThis.hostSend(); };
+	});
+	const idleRecovery = await execute({ kind: "resume_interrupted", message: "Continue the existing task." });
+	assert.equal(idleRecovery.ok, true, idleRecovery.error);
+	assert.equal(idleRecovery.result.status, "sent", "an error on an already idle turn still receives continuation");
+	assert.equal(await page.evaluate(() => globalThis.sendClicks), 3);
+	assert.equal((await execute({ kind: "stop_thread" })).result.status, "stopped");
+	await page.evaluate(() => {
 		history.pushState({}, "", "/");
 		document.querySelector("main").replaceChildren();
 		globalThis.hideUser = true;
 	});
+	phase = "hidden user delivery";
 	const hiddenUser = await execute({ kind: "send_message", message: "Run a new assignment whose user message stays hidden." });
 	assert.equal(hiddenUser.ok, true, hiddenUser.error);
 	assert.equal(hiddenUser.result.status, "sent");
-	assert.equal(await page.evaluate(() => globalThis.sendClicks), 3);
+	assert.equal(await page.evaluate(() => globalThis.sendClicks), 4);
 	assert.equal((await execute({ kind: "inspect_thread" })).result.status, "running");
 	assert.equal((await execute({ kind: "stop_thread" })).result.status, "stopped");
 	const hiddenIdle = await execute({ kind: "inspect_thread" });
@@ -178,6 +191,7 @@ try {
 	});
 	await page.waitForFunction(() => globalThis.observedActivity.some(message => message.type === "local-codex-support/conversation-unavailable-v1" && message.conversationUrl.endsWith("22222222-2222-4222-8222-222222222222")));
 
+	phase = "global pause";
 	await page.clock.install();
 	await page.evaluate(() => {
 		globalThis.pauseUntil = Date.now() + 300_000;
@@ -195,5 +209,6 @@ try {
 	assert.equal(await page.evaluate(() => globalThis.retryClicks), 1, "the same request resumes at five minutes without another command");
 	console.log("ChatGPT DOM passed: visible and hidden user delivery, app links, running detection, stop confirmation, and idle inspection.");
 } finally {
+	clearTimeout(timeout);
 	await browser.close();
 }
