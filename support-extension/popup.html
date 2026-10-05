@@ -9,7 +9,9 @@
 <body>
   <header class="masthead">
     <div class="brand">
-      <span class="brand-mark" aria-hidden="true">LC</span>
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/></svg>
+      </span>
       <span class="brand-text">
         <strong>Local Codex</strong>
         <small>Support extension</small>
@@ -20,33 +22,36 @@
     </span>
   </header>
 
+  <p id="threadsStatus" class="note status-banner" role="status" aria-live="polite"></p>
+
   <nav class="tabs" role="tablist" aria-label="Sections">
     <button id="tab-threads" class="tab" type="button" role="tab" data-panel="panel-threads"
-            aria-controls="panel-threads" aria-selected="true">
-      Threads
-    </button>
+            aria-controls="panel-threads" aria-selected="true">Threads</button>
     <button id="tab-settled" class="tab" type="button" role="tab" data-panel="panel-settled"
             aria-controls="panel-settled" aria-selected="false" tabindex="-1">Settled <span id="settledCount" class="section-count">0</span></button>
     <button id="tab-schedules" class="tab" type="button" role="tab" data-panel="panel-schedules"
             aria-controls="panel-schedules" aria-selected="false" tabindex="-1">Schedules</button>
     <button id="tab-settings" class="tab" type="button" role="tab" data-panel="panel-settings"
-            aria-controls="panel-settings" aria-selected="false" tabindex="-1">
-      Settings
-    </button>
+            aria-controls="panel-settings" aria-selected="false" tabindex="-1">Settings</button>
   </nav>
 
   <div id="threadToolbar" class="toolbar">
-    <input id="threadSearch" type="search" aria-label="Search threads" placeholder="Search threads">
-    <button id="refreshThreads" class="button button-ghost" type="button">Refresh</button>
+    <label class="search">
+      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+      <input id="threadSearch" type="search" aria-label="Search threads" placeholder="Search threads">
+    </label>
+    <button id="refreshThreads" class="button button-outline button-icon" type="button" aria-label="Refresh" title="Refresh">
+      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
+    </button>
   </div>
   <main>
     <section id="panel-threads" class="panel" role="tabpanel" aria-labelledby="tab-threads">
       <div class="current-thread" data-legacy-continuation hidden>
         <div><strong>Current thread</strong><p id="currentThreadStatus" class="note"></p></div>
-        <button id="markCurrentThread" class="button button-ghost" type="button" disabled>Enable RALPH</button>
+        <button id="markCurrentThread" class="button button-outline button-sm" type="button" disabled>Enable RALPH</button>
       </div>
       <details id="workingSection" class="thread-section" open hidden>
-        <summary>Working <span id="workingCount" class="section-count">0</span><i class="working-dot" aria-hidden="true"></i></summary>
+        <summary>Working <i class="working-dot" aria-hidden="true"></i><span id="workingCount" class="section-count">0</span></summary>
         <ul id="workingList" class="threads"></ul>
       </details>
       <details id="subagentThreadsSection" class="thread-section" open hidden>
@@ -57,7 +62,7 @@
         <summary>Active <span id="activeCount" class="section-count">0</span></summary>
         <ul id="threadList" class="threads"></ul>
       </details>
-      <p id="threadsEmpty" class="empty" hidden>No active threads.</p>
+      <p id="threadsEmpty" class="empty" hidden><strong>No active threads.</strong>Working chats and tasks appear here.</p>
     </section>
     <section id="panel-settled" class="panel" role="tabpanel" aria-labelledby="tab-settled" hidden>
       <p class="note panel-intro">Completed threads. Send a new message in a chat to start more work.</p>
@@ -65,25 +70,38 @@
     </section>
     <section id="panel-schedules" class="panel" role="tabpanel" aria-labelledby="tab-schedules" hidden>
       <form id="scheduleForm" class="card">
-        <h2>Schedule a task</h2>
-        <label class="field">Prompt<textarea id="schedulePrompt" rows="4" required maxlength="180000" placeholder="What should ChatGPT do?"></textarea></label>
+        <div class="card-header">
+          <h2>Schedule a task</h2>
+          <p class="note">Each run starts a new temporary ChatGPT chat. Keep the server running and Chrome's automation executor and task messaging enabled. Missed times are skipped.</p>
+        </div>
+        <label class="field">Prompt<textarea id="schedulePrompt" rows="3" required maxlength="180000" placeholder="What should ChatGPT do?"></textarea></label>
         <label class="field">Date and time<input id="scheduleAt" type="datetime-local" required></label>
-        <label class="repeat-toggle"><input id="scheduleRepeat" type="checkbox">Repeat</label>
+        <p id="scheduleTimezone" class="note field-hint"></p>
+        <label class="toggle repeat-toggle">
+          <span class="toggle-text">Repeat</span>
+          <span class="switch"><input id="scheduleRepeat" type="checkbox"><i aria-hidden="true"></i></span>
+        </label>
         <div id="scheduleInterval" class="interval-fields" hidden>
           <label class="field">Every<input id="scheduleIntervalValue" type="number" min="1" max="525600" step="1" value="1" disabled required></label>
           <label class="field">Unit<select id="scheduleIntervalUnit" aria-label="Unit" disabled><option value="60">Minutes</option><option value="3600">Hours</option><option value="86400">Days</option></select></label>
         </div>
-        <p id="scheduleTimezone" class="note"></p>
-        <p class="note">Each run starts a new temporary ChatGPT chat. Keep the server running and Chrome's automation executor and task messaging enabled. Missed times are skipped.</p>
-        <button id="saveSchedule" class="button" type="submit">Schedule task</button>
+        <button id="saveSchedule" class="button button-block" type="submit">Schedule task</button>
         <p id="scheduleStatus" class="note" role="status" aria-live="polite"></p>
       </form>
-      <div class="thread-section-head schedule-heading"><strong>Scheduled tasks</strong><button id="refreshSchedules" class="button button-ghost" type="button">Refresh</button></div>
+      <div class="list-heading">
+        <strong>Scheduled tasks</strong>
+        <button id="refreshSchedules" class="button button-ghost button-icon" type="button" aria-label="Refresh" title="Refresh">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
+        </button>
+      </div>
       <ul id="scheduleList" class="threads"></ul>
     </section>
     <section id="panel-settings" class="panel" role="tabpanel" aria-labelledby="tab-settings" hidden>
       <div class="card">
-        <h2>Features</h2>
+        <div class="card-header">
+          <h2>Features</h2>
+          <p class="note">Enable the automation executor and task messaging in the Chrome profile that runs ChatGPT workers.</p>
+        </div>
         <label class="toggle">
           <span class="toggle-text">Thread sync<small>Bind ChatGPT threads to Local Codex sessions.</small></span>
           <span class="switch"><input id="threadSync" type="checkbox"><i aria-hidden="true"></i></span>
@@ -100,25 +118,24 @@
           <span class="toggle-text">Task and thread messaging<small>Execute bounded specifications and deliver reports to parents.</small></span>
           <span class="switch"><input id="threadMessaging" type="checkbox"><i aria-hidden="true"></i></span>
         </label>
-        <p class="note">Enable the automation executor and task messaging in the Chrome profile that runs ChatGPT workers.</p>
       </div>
 
       <div class="card">
         <h2><label for="ralphLoopIntervalSeconds">RALPH check interval (seconds)</label></h2>
-        <input id="ralphLoopIntervalSeconds" type="number" min="120" max="86400" step="1" inputmode="numeric">
-        <div class="card-footer">
+        <div class="input-row">
+          <input id="ralphLoopIntervalSeconds" type="number" min="120" max="86400" step="1" inputmode="numeric">
           <button id="saveRalphLoopInterval" class="button" type="button">Save interval</button>
-          <p id="ralphLoopIntervalStatus" class="note">Default is 1800 seconds (30 minutes). Unfinished task workers resume at this interval. Reports are collected immediately.</p>
         </div>
+        <p id="ralphLoopIntervalStatus" class="note">Default is 1800 seconds (30 minutes). Unfinished task workers resume at this interval. Reports are collected immediately.</p>
       </div>
 
       <div class="card" data-legacy-continuation hidden>
         <h2><label for="ralphMinWorkedSeconds">RALPH worked-time metadata threshold (seconds)</label></h2>
-        <input id="ralphMinWorkedSeconds" type="number" min="0" max="86400" step="1" inputmode="numeric">
-        <div class="card-footer">
+        <div class="input-row">
+          <input id="ralphMinWorkedSeconds" type="number" min="0" max="86400" step="1" inputmode="numeric">
           <button id="saveRalphTime" class="button" type="button">Save threshold</button>
-          <p id="ralphTimeStatus" class="note">Default is 1200 seconds (20 minutes). Durations above this threshold appear in classifier metadata. Idle turns still receive an AI completion check.</p>
         </div>
+        <p id="ralphTimeStatus" class="note">Default is 1200 seconds (20 minutes). Durations above this threshold appear in classifier metadata. Idle turns still receive an AI completion check.</p>
       </div>
 
       <div class="card" data-legacy-continuation hidden>
@@ -126,13 +143,11 @@
         <textarea id="ralphProjects" rows="5" spellcheck="false" placeholder="One project URL or project ID per line"></textarea>
         <div class="card-footer">
           <button id="saveRalphProjects" class="button" type="button">Save projects</button>
-          <p id="ralphProjectsStatus" class="note">These projects are registered automatically. Manual registrations and workers are also retained.</p>
         </div>
+        <p id="ralphProjectsStatus" class="note">These projects are registered automatically. Manual registrations and workers are also retained.</p>
       </div>
     </section>
   </main>
-
-  <p id="threadsStatus" class="note status-footer" role="status" aria-live="polite"></p>
 
   <script src="config.js"></script>
   <script src="popup.js"></script>

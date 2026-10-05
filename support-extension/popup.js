@@ -223,12 +223,13 @@ function renderThread(thread) {
   const pill = document.createElement("span");
   pill.className = "pill";
   pill.dataset.state = state;
-  pill.append(document.createElement("i"), state);
+  pill.append(document.createElement("i"), state[0].toUpperCase() + state.slice(1));
   head.append(pill);
 
   const meta = document.createElement("p");
   meta.className = "thread-meta";
-  meta.append(formatRelative(Date.parse(thread.attentionAt ?? thread.activityAt ?? thread.registeredAt)));
+  const updatedAt = Date.parse(thread.attentionAt ?? thread.activityAt ?? thread.registeredAt);
+  meta.append(Object.assign(document.createElement("span"), { textContent: formatRelative(updatedAt), title: new Date(updatedAt).toLocaleString() }));
   if (thread.lastContinuationAt) {
     meta.append(metaEntry("Continued", formatRelative(Date.parse(thread.lastContinuationAt))));
   } else if (thread.lastCheckedAt) {
@@ -256,7 +257,7 @@ function renderThread(thread) {
   actions.className = "thread-actions";
   if (thread.state === "active" && !thread.waitingForTask) {
     const checkButton = document.createElement("button");
-    checkButton.className = "button";
+    checkButton.className = "button button-sm";
     checkButton.type = "button";
     checkButton.textContent = "Check now";
     checkButton.title = "Run the next RALPH check immediately";
@@ -264,7 +265,7 @@ function renderThread(thread) {
     actions.append(checkButton);
   }
   const stateButton = document.createElement("button");
-  stateButton.className = "button button-ghost";
+  stateButton.className = "button button-outline button-sm";
   stateButton.type = "button";
   stateButton.textContent = "Mark complete";
   stateButton.addEventListener("click", () => void setThreadState(thread, stateButton));
@@ -361,9 +362,9 @@ function renderThreads() {
 function renderTask(job) {
   const item = document.createElement("li");
   const card = Object.assign(document.createElement("div"), { className: "thread" });
-  const label = job.preparationError ? "Needs attention"
-    : job.state === "cancelled" ? "Cancelled"
-    : job.state === "complete" ? "Report available" : "Task in progress";
+  const [label, state] = job.preparationError ? ["Needs attention", "needs attention"]
+    : job.state === "cancelled" ? ["Cancelled", "complete"]
+    : job.state === "complete" ? ["Report available", "finished"] : ["Task in progress", "running"];
   const title = document.createElement(job.childConversationUrl ? "a" : "strong");
   title.className = "thread-id";
   title.textContent = job.title || "Worker startup";
@@ -371,10 +372,18 @@ function renderTask(job) {
     title.href = job.childConversationUrl;
     title.addEventListener("click", (event) => { event.preventDefault(); void openConversation(job.childConversationUrl); });
   }
-  card.append(title, Object.assign(document.createElement("p"), { className: "thread-meta", textContent: label }));
+  const pill = Object.assign(document.createElement("span"), { className: "pill" });
+  pill.dataset.state = state;
+  pill.append(document.createElement("i"), label);
+  const head = Object.assign(document.createElement("div"), { className: "thread-head" });
+  head.append(title, pill);
+  card.append(head);
+  const error = job.preparationError;
+  if (error) card.append(Object.assign(document.createElement("p"), { className: "thread-error", textContent: error }));
+  const actions = Object.assign(document.createElement("div"), { className: "thread-actions" });
   if (job.childConversationUrl) {
     const reviewUrl = Object.assign(document.createElement("a"), {
-      className: "inspect-task",
+      className: "inspect-task button button-outline button-sm",
       href: job.childConversationUrl,
       target: "_blank",
       rel: "noreferrer",
@@ -386,16 +395,15 @@ function renderTask(job) {
       event.preventDefault();
       void openConversation(job.childConversationUrl);
     });
-    card.append(reviewUrl);
+    actions.append(reviewUrl);
   }
-  const error = job.preparationError;
-  if (error) card.append(Object.assign(document.createElement("p"), { className: "thread-error", textContent: error }));
   if (job.state === "pending") {
     const action = "cancel";
-    const button = Object.assign(document.createElement("button"), { className: "button", type: "button", textContent: "Cancel task" });
+    const button = Object.assign(document.createElement("button"), { className: "button button-outline button-sm button-danger", type: "button", textContent: "Cancel task" });
     button.addEventListener("click", () => void changeReview(job, action, button));
-    card.append(button);
+    actions.append(button);
   }
+  if (actions.childElementCount) card.append(actions);
   item.append(card);
   return item;
 }
@@ -460,6 +468,8 @@ function updateRepeatFields() {
 }
 element("scheduleRepeat").addEventListener("change", updateRepeatFields);
 
+const formatDate = value => new Date(value).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+
 async function loadSchedules() {
   if (loadingSchedules) return;
   loadingSchedules = true;
@@ -472,8 +482,12 @@ async function loadSchedules() {
       const card = Object.assign(document.createElement("div"), { className: "thread schedule" });
       const prompt = Object.assign(document.createElement("p"), { className: "schedule-prompt", textContent: task.prompt });
       const labels = { pending: "Scheduled", sending: "Starting", sent: "Started", failed: "Failed", missed: "Missed", cancelled: "Cancelled" };
-      card.append(Object.assign(document.createElement("p"), { className: "thread-meta",
-        textContent: `${labels[task.state] ?? task.state} · ${new Date(task.runAt).toLocaleString()}` }), prompt);
+      const pill = Object.assign(document.createElement("span"), { className: "pill" });
+      pill.dataset.state = task.state;
+      pill.append(document.createElement("i"), labels[task.state] ?? task.state);
+      const head = Object.assign(document.createElement("div"), { className: "thread-head" });
+      head.append(pill, Object.assign(document.createElement("span"), { className: "schedule-time", textContent: formatDate(task.runAt) }));
+      card.append(head, prompt);
       if (task.repeatIntervalSeconds) {
         const seconds = task.repeatIntervalSeconds;
         const unit = seconds % 86400 === 0 ? "day" : seconds % 3600 === 0 ? "hour" : "minute";
@@ -481,17 +495,18 @@ async function loadSchedules() {
         card.append(Object.assign(document.createElement("p"), { className: "thread-meta",
           textContent: `Every ${amount} ${unit}${amount === 1 ? "" : "s"}${task.state === "pending" ? " · Next run shown above" : ""}` }));
         if (task.lastRunAt) card.append(Object.assign(document.createElement("p"), { className: "thread-meta",
-          textContent: `Last run: ${task.lastRunState ? labels[task.lastRunState] : "Starting"} · ${new Date(task.lastRunAt).toLocaleString()}` }));
+          textContent: `Last run: ${task.lastRunState ? labels[task.lastRunState] : "Starting"} · ${formatDate(task.lastRunAt)}` }));
       }
       if (task.error) card.append(Object.assign(document.createElement("p"), { className: "thread-error", textContent: task.error }));
+      const actions = Object.assign(document.createElement("div"), { className: "thread-actions" });
       if (conversationUrl(task.conversationUrl)) {
-        const link = Object.assign(document.createElement("a"), { className: "inspect-task", textContent: "Open chat", href: task.conversationUrl });
+        const link = Object.assign(document.createElement("a"), { className: "inspect-task button button-outline button-sm", textContent: "Open chat", href: task.conversationUrl });
         link.addEventListener("click", event => { event.preventDefault(); void openConversation(task.conversationUrl); });
-        card.append(link);
+        actions.append(link);
       }
       const canCancel = task.state === "pending" || (task.state === "sending" && task.repeatIntervalSeconds);
       if (task.state !== "sending" || canCancel) {
-        const button = Object.assign(document.createElement("button"), { className: "button button-ghost",
+        const button = Object.assign(document.createElement("button"), { className: `button button-sm ${canCancel ? "button-outline button-danger" : "button-ghost"}`,
           type: "button", textContent: canCancel ? task.repeatIntervalSeconds ? "Stop repeating" : "Cancel schedule" : "Remove" });
         if (canCancel && task.repeatIntervalSeconds) button.title = "Cancel future runs. A prompt already being sent can finish delivery.";
         button.addEventListener("click", () => {
@@ -501,10 +516,9 @@ async function loadSchedules() {
             .then(() => { setNote(element("scheduleStatus"), ""); return loadSchedules(); })
             .catch(error => { button.disabled = false; setNote(element("scheduleStatus"), errorMessage(error, "Could not update the schedule."), "error"); });
         });
-        const actions = Object.assign(document.createElement("div"), { className: "thread-actions" });
         actions.append(button);
-        card.append(actions);
       }
+      if (actions.childElementCount) card.append(actions);
       item.append(card);
       return item;
     });
