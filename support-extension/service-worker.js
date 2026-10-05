@@ -540,6 +540,7 @@ async function waitForTabComplete(tabId, timeoutMs = 5 * 60_000) {
 }
 
 async function sendAutomationMessage(tabId, command) {
+  const recovery = command.recovering ? recoveringPages.get(tabId) : undefined;
   if (command.feature !== "voice") {
     if (command.recovering && command.targetUrl && await syncAutomationPause(false, command.targetUrl)) {
       const recovery = recoveringPages.get(tabId);
@@ -553,6 +554,9 @@ async function sendAutomationMessage(tabId, command) {
     }
     if (command.recovering && command.targetUrl && !automationTargetMatches(currentUrl, command.targetUrl)) {
       throw new Error("Recovery stopped because the tab navigated away.");
+    }
+    if (recovery && !recovery.reservation) {
+      recovery.reservation = await recoveryReservation(recovery, { action: "acquire", ...(recovery.commandId ? { commandId: recovery.commandId } : {}) });
     }
   }
   // Establish the receiver before dispatching a side-effecting command. A lost response
@@ -575,7 +579,12 @@ async function sendAutomationMessage(tabId, command) {
     // cannot supersede a continuation that may already have clicked Send.
     recovery.continuationStarted = true;
   }
-  return await extensionApi.tabs.sendMessage(tabId, { type: AUTOMATION_MESSAGE, command });
+  if (recovery?.reservation && Date.now() >= recovery.reservation.expiresAt) throw new Error("Recovery reservation expired before delivery.");
+  if (recovery) recovery.deliveryUncertain = true;
+  const response = await extensionApi.tabs.sendMessage(tabId, { type: AUTOMATION_MESSAGE,
+    command: recovery?.reservation ? { ...command, recoveryExpiresAt: recovery.reservation.expiresAt } : command });
+  if (recovery) recovery.deliveryUncertain = false;
+  return response;
 }
 
 async function sendAutomationMessageWithTimeout(tabId, command) {
@@ -803,13 +812,13 @@ async function executeCommandOnce(command, browserId) {
 
     if (!observing && command.kind !== "stop_thread") {
       try {
-        refreshed = await recoverPage(tabId, command.kind !== "send_message") || refreshed;
+        refreshed = await recoverPage(tabId, command.kind !== "send_message", command.kind === "send_message" ? command.id : undefined) || refreshed;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (temporary || refreshed || /^CHATGPT_(?:RATE_LIMITED(?:_RETRYABLE)?|RECOVERY_FAILED):/.test(message)) throw error;
         await reloadPageAfterFailure(tabId, targetUrl);
         refreshed = true;
-        await recoverPage(tabId, command.kind !== "send_message");
+        await recoverPage(tabId, command.kind !== "send_message", command.kind === "send_message" ? command.id : undefined);
       }
     }
 
@@ -842,7 +851,7 @@ async function executeCommandOnce(command, browserId) {
       if (command.kind === "send_message" && error?.retryable !== true) throw error;
       await reloadPageAfterFailure(tabId, targetUrl);
       refreshed = true;
-      if (command.kind !== "stop_thread") await recoverPage(tabId);
+      if (command.kind !== "stop_thread") await recoverPage(tabId, command.kind !== "send_message", command.kind === "send_message" ? command.id : undefined);
       response = await runPageCommand();
     }
 
@@ -941,7 +950,23 @@ async function reloadPageAfterFailure(tabId, targetUrl) {
   return tab;
 }
 
-async function recoverPage(tabId, resume = true) {
+async function recoveryReservation(recovery, reservation) {
+  const response = await fetch(claimEndpoint.href, {
+    method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${config.extensionToken}` },
+    body: JSON.stringify({ browserId: await getBrowserId(), features: [], statusOnly: true,
+      recoveryConversationUrl: conversationUrl(recovery.targetUrl), recoveryReservation: reservation }),
+    signal: AbortSignal.timeout(5000), redirect: "error",
+  });
+  if (!response.ok) throw new Error("CHATGPT_RECOVERY_FAILED: Recovery reservation was unavailable. The chat was not resumed.");
+  if (reservation.action === "release") return;
+  const result = await response.json();
+  if (typeof result.id !== "string" || !Number.isSafeInteger(result.expiresAt) || result.expiresAt <= Date.now()) {
+    throw new Error("CHATGPT_RECOVERY_FAILED: Invalid recovery reservation.");
+  }
+  return result;
+}
+
+async function recoverPage(tabId, resume = true, commandId) {
   const currentUrl = (await extensionApi.tabs.get(tabId)).url;
   if (await syncAutomationPause(false, conversationUrl(currentUrl))) resume = false;
   if (await isVoiceConversation(currentUrl)) return false;
@@ -953,8 +978,14 @@ async function recoverPage(tabId, resume = true) {
     }
     return existing.promise;
   }
-  const recovery = { resume, continuationStarted: false, targetUrl: undefined, promise: undefined };
-  recovery.promise = recoverPageOnce(tabId, recovery).finally(() => recoveringPages.delete(tabId));
+  const recovery = { resume, commandId, continuationStarted: false, deliveryUncertain: false,
+    targetUrl: undefined, promise: undefined, reservation: undefined };
+  recovery.promise = recoverPageOnce(tabId, recovery).finally(async () => {
+    if (recovery.reservation && !recovery.deliveryUncertain) {
+      await recoveryReservation(recovery, { action: "release", id: recovery.reservation.id }).catch(() => undefined);
+    }
+    recoveringPages.delete(tabId);
+  });
   recoveringPages.set(tabId, recovery);
   return recovery.promise;
 }

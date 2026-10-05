@@ -81,6 +81,9 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
       } },
     },
     fetch: async (endpoint, options) => {
+      if (endpoint === config.commandClaimUrl && JSON.parse(options.body).recoveryReservation?.action === "acquire") {
+        return new Response(JSON.stringify({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", expiresAt: (globalPause ? clock : Date.now()) + 540_000 }));
+      }
       if (globalPause && endpoint === config.commandClaimUrl) {
         if (!serviceOnline) throw new Error("Local service unavailable");
         const request = JSON.parse(options.body);

@@ -38,9 +38,12 @@ export function createVoiceApi(input: { token: string; registry: RalphRegistry; 
 		if (!parsed.success) { res.status(400).json({ error: "Expected a saved regular ChatGPT conversation URL." }); return; }
 		if (busy) { res.status(409).json({ error: "A Voice operation is already in progress." }); return; }
 		busy = true;
+		let releaseProtection: (() => void) | undefined;
 		try {
 			const previous = input.registry.voiceConversationUrl();
 			const next = await input.registry.validateVoiceConversation(parsed.data.conversationUrl);
+			try { releaseProtection = input.commands.protectVoiceConfiguration(next.conversationUrl); }
+			catch (error) { res.status(409).json({ error: error instanceof Error ? error.message : String(error) }); return; }
 			if (previous && previous !== next.conversationUrl && (await execute("status", previous)).status !== "closed") {
 				res.status(409).json({ error: "End the current Voice call before changing its conversation." });
 				return;
@@ -51,7 +54,7 @@ export function createVoiceApi(input: { token: string; registry: RalphRegistry; 
 			res.json({ conversationUrl });
 		} catch (error) {
 			res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
-		} finally { busy = false; }
+		} finally { releaseProtection?.(); busy = false; }
 	});
 	router.post("/:action", async (req, res) => {
 		const parsed = z.enum(["status", "start", "stop"]).safeParse(req.params.action);

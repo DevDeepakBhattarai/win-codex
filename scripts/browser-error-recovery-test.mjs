@@ -55,9 +55,12 @@ async function worker(settings = {}, serverVoiceUrl) {
         },
       },
     },
-    async fetch(endpoint) {
+    async fetch(endpoint, options) {
       await new Promise(resolve => setImmediate(resolve));
       if (!serviceOnline) throw new Error("Local service unavailable");
+      const request = JSON.parse(options.body);
+      if (request.recoveryReservation?.action === "acquire") return pendingMessage ? new Response(null, { status: 409 }) :
+        new Response(JSON.stringify({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", expiresAt: clock + 540_000 }));
       return endpoint === config.ralphRegisterUrl ? new Response(JSON.stringify({ status: "ignored" })) : new Response(null, {
         status: 204, headers: { "X-Voice-Conversation-Url": serverVoiceUrl ?? "", "X-Recovery-Message-Pending": String(pendingMessage) },
       });
@@ -119,7 +122,7 @@ const queuedInChrome = await worker();
 queuedInChrome.setPendingMessage(true);
 await queuedInChrome.notify();
 await queuedInChrome.settle();
-assert.deepEqual(queuedInChrome.calls, ["page_health", "stop_thread"], "Helium stops the failure without adding a continuation when Chrome already has a queued message");
+assert.deepEqual(queuedInChrome.calls, ["page_health"], "Helium yields to a Chrome message rather than racing its delivery");
 
 const queuedDuringStop = await worker();
 let releaseQueuedStop;

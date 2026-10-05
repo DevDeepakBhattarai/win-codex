@@ -144,6 +144,7 @@
       return await controlVoice(command);
     }
     await waitForAutomationResume();
+    checkRecoveryDeadline(command.recoveryExpiresAt);
     if (command.recovering && command.targetUrl && conversationUrl() !== conversationUrl(new URL(command.targetUrl))) {
       throw new Error("Recovery stopped because the tab navigated away.");
     }
@@ -155,7 +156,7 @@
       if (button) button.click();
       return { status: button ? "dismissed" : "not_found" };
     }
-    if (command.kind === "stop_thread") return await stopThread(command.recovering ? command.targetUrl : undefined);
+    if (command.kind === "stop_thread") return await stopThread(command.recovering ? command.targetUrl : undefined, command.recoveryExpiresAt);
     if (command.kind === "resume_interrupted") {
       const failed = Boolean(connectionInterruptedNotice() || pageErrorNotice());
       const stopped = await stopThread();
@@ -171,7 +172,7 @@
       return { status: "recovery_started" };
     }
     if (command.kind === "send_message") return await sendMessage(command.message, command.connectorName, command.temporary,
-      command.recovering === true, command.recoveryContinuation === true);
+      command.recovering === true, command.recoveryContinuation === true, command.recoveryExpiresAt);
     assertNoPageError();
     if (command.kind === "inspect_thread") {
       const url = conversationUrl();
@@ -230,7 +231,13 @@
     throw new Error(`ChatGPT did not confirm Voice ${desired}. Check its call controls before retrying.`);
   }
 
-  async function stopThread(targetUrl) {
+  function checkRecoveryDeadline(expiresAt) {
+    if (expiresAt !== undefined && (!Number.isSafeInteger(expiresAt) || Date.now() >= expiresAt)) {
+      throw new Error("Recovery reservation expired before delivery.");
+    }
+  }
+
+  async function stopThread(targetUrl, expiresAt) {
     const ready = await waitForCancellationState(30_000);
     if (!ready) throw new Error("ChatGPT child state did not become ready for cancellation.");
 
@@ -239,6 +246,7 @@
     if (!currentUrl) throw new Error("ChatGPT cancellation is not on a saved conversation.");
     if (!ready.stopButton) return { status: "idle", conversationUrl: currentUrl };
 
+    checkRecoveryDeadline(expiresAt);
     ready.stopButton.click();
     const stopped = await waitForStableStop(30_000);
     if (!stopped) throw new Error("ChatGPT did not confirm that the child run stopped.");
@@ -390,10 +398,11 @@
     };
   }
 
-  async function sendMessage(message, connectorName, temporary = false, recovering = false, preserveDraft = false) {
+  async function sendMessage(message, connectorName, temporary = false, recovering = false, preserveDraft = false, expiresAt) {
     let sendClicked = false;
     const recoveryUrl = recovering ? conversationUrl() : undefined;
     const checkPage = () => {
+      if (!sendClicked) checkRecoveryDeadline(expiresAt);
       if (recovering && conversationUrl() !== recoveryUrl) throw new Error("Recovery stopped because the tab navigated away.");
       assertNoPageError(false, recovering);
     };
@@ -450,6 +459,7 @@
       }
 
       const previousTurns = new Set(userTurns().map(userTurnId));
+      checkRecoveryDeadline(expiresAt);
       sendClicked = true;
       current.button.click();
       await sleep(SEND_SETTLE_MS);

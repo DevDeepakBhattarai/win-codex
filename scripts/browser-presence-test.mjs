@@ -196,7 +196,11 @@ function worker() {
     },
     async fetch(endpoint, options) {
       if (endpoint === config.commandClaimUrl) {
-        presenceClaims.push(JSON.parse(options.body));
+        const request = JSON.parse(options.body);
+        presenceClaims.push(request);
+        if (request.recoveryReservation?.action === 'acquire') return new Response(JSON.stringify({
+          id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', expiresAt: now + 540_000,
+        }));
         return new Response(null, { status: 204 });
       }
       assert.equal(endpoint, config.commandResultUrl);

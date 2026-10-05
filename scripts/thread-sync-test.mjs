@@ -2934,6 +2934,11 @@ function configureAutomationContext(context) {
   vm.runInNewContext("pollGeneration += 1; pollController?.abort();", context);
   context.restartPolling = () => {};
   context.getSettings = async () => ({ threadSync: true, automationExecutor: true });
+  const fetch = context.fetch;
+  context.fetch = async (endpoint, options) => endpoint === context.LOCAL_CODEX_THREAD_SYNC.commandClaimUrl &&
+    JSON.parse(options.body).recoveryReservation?.action === "acquire"
+    ? new Response(JSON.stringify({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", expiresAt: Date.now() + 540_000 }))
+    : fetch(endpoint, options);
   const sendMessage = context.browser.tabs.sendMessage;
   context.browser.tabs.sendMessage = async (tabId, payload) => payload.command.kind === "page_health"
     ? { ok: true, result: { status: "ok" } }

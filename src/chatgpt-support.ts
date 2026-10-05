@@ -32,6 +32,7 @@ const TOOL_REQUEST_REPLAY_TTL_MS = 30 * 60 * 1000;
 const MAX_TOOL_REQUEST_REPLAYS = 1_000;
 const MESSAGE_COOLDOWN_MS = 10 * 60_000;
 const MESSAGE_SEND_SPACING_MS = 5_000;
+const RECOVERY_RESERVATION_MS = 9 * 60_000;
 
 type ToolRequestReplay = {
   expiresAt: number;
@@ -255,6 +256,8 @@ export class SupportCommandBus {
   private nextMessageClaimAt = 0;
   private messagePacingActive = false;
   private pauseInFlight?: Promise<number>;
+  private readonly recoveryReservations = new Map<string, { id: string; browserId: string; expiresAt: number }>();
+  private readonly voiceConfigurations = new Set<string>();
 
   messageCooldownUntil() {
     return this.cooldownUntil > Date.now() ? this.cooldownUntil : 0;
@@ -268,12 +271,56 @@ export class SupportCommandBus {
     return this.registry?.voiceConversationUrl();
   }
 
-  hasPendingMessage(conversationUrl: string) {
+  hasPendingMessage(conversationUrl: string, exceptCommandId?: string) {
     const { threadId } = parseConversationUrl(conversationUrl);
     return [...this.pending.values()].some(({ command }) => {
-      if (command.kind !== "send_message") return false;
+      if (command.kind !== "send_message" || command.id === exceptCommandId) return false;
       try { return parseConversationUrl(command.targetUrl).threadId === threadId; } catch { return false; }
     });
+  }
+
+  private recoveryReservation(threadId: string) {
+    const reservation = this.recoveryReservations.get(threadId);
+    if (reservation && reservation.expiresAt <= Date.now()) this.recoveryReservations.delete(threadId);
+    return this.recoveryReservations.get(threadId);
+  }
+
+  reserveRecovery(browserId: string, conversationUrl: string, commandId?: string) {
+    const { threadId } = parseConversationUrl(conversationUrl);
+    if (commandId) {
+      const pending = this.pending.get(commandId);
+      if (!pending || pending.claimedBy !== browserId || pending.command.kind !== "send_message" ||
+          parseConversationUrl(pending.command.targetUrl).threadId !== threadId) {
+        throw new Error("Recovery command does not belong to this browser and conversation.");
+      }
+    }
+    if (this.automationPausedUntil() || this.registry?.isVoiceConversation(conversationUrl) || this.voiceConfigurations.has(threadId) ||
+        this.recoveryReservation(threadId) || this.hasPendingMessage(conversationUrl, commandId)) {
+      throw new Error("Recovery conflicts with Voice, a pending message, or another browser's recovery.");
+    }
+    const reservation = { id: randomUUID(), browserId, expiresAt: Date.now() + RECOVERY_RESERVATION_MS };
+    this.recoveryReservations.set(threadId, reservation);
+    return reservation;
+  }
+
+  releaseRecovery(browserId: string, conversationUrl: string, id: string) {
+    const { threadId } = parseConversationUrl(conversationUrl);
+    const reservation = this.recoveryReservation(threadId);
+    if (reservation?.id === id && reservation.browserId === browserId) this.recoveryReservations.delete(threadId);
+  }
+
+  protectVoiceConfiguration(conversationUrl: string) {
+    const { threadId } = parseConversationUrl(conversationUrl);
+    const pendingAutomation = [...this.pending.values()].some(({ command }) => {
+      if (command.feature === "voice") return false;
+      const target = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
+      try { return parseConversationUrl(target).threadId === threadId; } catch { return false; }
+    });
+    if (this.recoveryReservation(threadId) || pendingAutomation) {
+      throw new Error("This conversation has recovery or thread automation in progress. Retry Voice configuration after it finishes.");
+    }
+    this.voiceConfigurations.add(threadId);
+    return () => { this.voiceConfigurations.delete(threadId); };
   }
 
   async pauseAutomation(until?: number) {
@@ -339,6 +386,10 @@ export class SupportCommandBus {
     }
     let targetThreadId: string | undefined;
     try { targetThreadId = parseConversationUrl(targetUrl).threadId; } catch { targetThreadId = undefined; }
+    if (command.feature !== "voice" && targetThreadId &&
+        (this.voiceConfigurations.has(targetThreadId) || (command.kind === "send_message" && this.recoveryReservation(targetThreadId)))) {
+      throw new Error("The conversation has Voice configuration or recovery in progress. The command was not sent. Retry after it finishes.");
+    }
     if (command.feature === "ralph" && targetThreadId && this.jobs?.blocksContinuationNow(targetThreadId)) {
       throw new Error("RALPH is paused for this task handoff.");
     }
@@ -353,6 +404,11 @@ export class SupportCommandBus {
     }
     const refreshRevision = this.registry ? await this.registry.externalRevision(targetUrl) : undefined;
     const fullCommand = supportCommandSchema.parse({ ...command, ...(refreshRevision ? { refreshRevision } : {}), id: randomUUID() });
+    if (command.feature !== "voice" && targetThreadId &&
+        (this.voiceConfigurations.has(targetThreadId) || this.registry?.isVoiceConversation(targetUrl) ||
+          (command.kind === "send_message" && this.recoveryReservation(targetThreadId)))) {
+      throw new Error("The conversation has Voice configuration or recovery in progress. The command was not sent. Retry after it finishes.");
+    }
     return new Promise<SupportCommandResult>((resolve, reject) => {
       const pending: PendingCommand = {
         command: fullCommand,
@@ -1618,6 +1674,10 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
     recoveryConversationUrl: z.string().max(2048).refine(value => {
       try { parseConversationUrl(value); return true; } catch { return false; }
     }).optional(),
+    recoveryReservation: z.discriminatedUnion("action", [
+      z.object({ action: z.literal("acquire"), commandId: z.string().uuid().optional() }).strict(),
+      z.object({ action: z.literal("release"), id: z.string().uuid() }).strict(),
+    ]).optional(),
     openThreads: z.array(z.string().max(2048).refine(value => {
       try { parseConversationUrl(value); return true; } catch { return false; }
     })).max(2000).optional(),
@@ -1629,6 +1689,10 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
       res.status(400).json({ error: "Invalid support command claim." });
       return;
     }
+    if (parsed.data.recoveryReservation && (!parsed.data.statusOnly || !parsed.data.recoveryConversationUrl)) {
+      res.status(400).json({ error: "A recovery reservation requires a status-only conversation request." });
+      return;
+    }
     const abortController = new AbortController();
     const onDisconnect = () => abortController.abort();
     req.once("aborted", onDisconnect);
@@ -1636,6 +1700,19 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
     try {
       if (parsed.data.conversationUnavailable) await commands.pauseAutomation(parsed.data.automationPausedUntil);
       if (parsed.data.statusOnly) {
+        if (parsed.data.recoveryReservation) {
+          const url = parsed.data.recoveryConversationUrl;
+          if (!url) { res.status(400).json({ error: "Recovery requires a conversation URL." }); return; }
+          const reservation = parsed.data.recoveryReservation;
+          if (reservation.action === "release") {
+            commands.releaseRecovery(parsed.data.browserId, url, reservation.id);
+            res.status(204).end();
+          } else {
+            try { res.json(commands.reserveRecovery(parsed.data.browserId, url, reservation.commandId)); }
+            catch (error) { res.status(409).json({ error: error instanceof Error ? error.message : String(error) }); }
+          }
+          return;
+        }
         res.setHeader("X-Automation-Paused-Until", String(commands.automationPausedUntil()));
         res.setHeader("X-Voice-Conversation-Url", commands.voiceConversationUrl() ?? "");
         if (parsed.data.recoveryConversationUrl) {

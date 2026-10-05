@@ -131,6 +131,11 @@ try {
 	assert.equal(await page.locator('[data-composer-markdown]').innerText(), "My unsent note", "Automatic continuation preserves a user draft");
 	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1);
 	await page.evaluate(() => { document.querySelector('[data-composer-markdown]').textContent = ""; document.querySelector('[role="alert"]').remove(); });
+	const expiredRecovery = await execute({ kind: "send_message", recovering: true, recoveryContinuation: true,
+		targetUrl: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111?temporary-chat=true", message: "Continue", recoveryExpiresAt: Date.now() + 300 });
+	assert.equal(expiredRecovery.ok, false);
+	assert.match(expiredRecovery.error, /reservation expired/);
+	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1, "A reservation that expires while the page waits cannot click Send");
 	await page.waitForFunction(() => globalThis.observedActivity.some(message => message.activity === "idle"));
 	assert.ok(await page.evaluate(() => globalThis.observedActivity.some(message => message.activity === "running")), "modern composer activity reaches the extension");
 	await page.evaluate(() => {
