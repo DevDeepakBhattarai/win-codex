@@ -294,7 +294,7 @@ export class SupportCommandBus {
         throw new Error("Recovery command does not belong to this browser and conversation.");
       }
     }
-    if (this.automationPausedUntil() || this.registry?.isVoiceConversation(conversationUrl) || this.voiceConfigurations.has(threadId) ||
+    if (this.pauseInFlight || this.automationPausedUntil() || this.registry?.isVoiceConversation(conversationUrl) || this.voiceConfigurations.has(threadId) ||
         this.recoveryReservation(threadId) || this.hasPendingMessage(conversationUrl, commandId)) {
       throw new Error("Recovery conflicts with Voice, a pending message, or another browser's recovery.");
     }

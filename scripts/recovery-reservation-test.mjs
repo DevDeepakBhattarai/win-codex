@@ -161,6 +161,20 @@ try {
   assert.throws(() => expired.bus.reserveRecovery("helium", url), /conflicts/, "A recovery action cannot acquire permission during the shared pause");
 } finally { await expired.close(); }
 
+const pausing = await fixture();
+const pause = pausing.bus.pauseAutomation(Date.now() + 150);
+try {
+  assert.throws(() => pausing.bus.reserveRecovery("helium", url), /conflicts/,
+    "A pause already being persisted must win over a new reservation");
+  await pause;
+  const message = pausing.bus.execute({ feature: "threadMessaging", kind: "send_message", targetUrl: url, message: "Continue after the pause" });
+  const command = await pausing.bus.claim("chrome", ["threadMessaging"], 1000);
+  assert.equal(command.kind, "send_message", "The waiting message remains claimable after the pause");
+  pausing.bus.complete({ commandId: command.id, browserId: "chrome", kind: command.kind, ok: true,
+    result: { status: "sent", conversationUrl: url } });
+  await message;
+} finally { await pause; await pausing.close(); }
+
 const expiryBus = new SupportCommandBus();
 try {
   mock.timers.enable({ apis: ["Date"], now: Date.now() });
