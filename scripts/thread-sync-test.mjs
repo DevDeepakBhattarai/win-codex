@@ -2279,7 +2279,7 @@ async function testRalphAutoRegistration(sync) {
 
   historyListener({ frameId: 0, url: urlA });
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(registrationBodies, [{ conversationUrl: urlA }],
+  assert.deepEqual(registrationBodies, [{ conversationUrl: urlA, manual: true, checkForCompletion: false }],
     "a ChatGPT SPA navigation into a project conversation registers it without thread sync");
 
   historyListener({ frameId: 0, url: urlA });
@@ -2289,7 +2289,8 @@ async function testRalphAutoRegistration(sync) {
 
   historyListener({ frameId: 0, url: "https://chatgpt.com/c/55555555-5555-4555-8555-555555555555" });
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(registrationBodies.length, 1, "normal non-project conversations are never offered to RALPH");
+  assert.equal(registrationBodies.length, 2, "ordinary route observations carry the disabled setting without enrolling checks");
+  assert.equal(registrationBodies.at(-1).checkForCompletion, false);
 
   const registrationsBeforeAgentSend = registrationBodies.length;
   await context.executeCommand({
@@ -2451,7 +2452,7 @@ async function testRalphWorkerReactivation(sync) {
   await new Promise(resolve => setImmediate(resolve));
   const registrationRequests = () => requests.filter(request =>
     request.endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.ralphRegisterUrl);
-  assert.deepEqual(JSON.parse(registrationRequests()[0].options.body), { conversationUrl: urlA });
+  assert.deepEqual(JSON.parse(registrationRequests()[0].options.body), { conversationUrl: urlA, manual: true, checkForCompletion: false });
 
   const reactivation = await new Promise(resolve => {
     runtimeListener({
@@ -2471,6 +2472,8 @@ async function testRalphWorkerReactivation(sync) {
     conversationUrl: urlA,
     reactivate: true,
     externalUpdate: true,
+    manual: true,
+    checkForCompletion: false,
   });
   updatedListener(7, { title: "RALPH - New chat" }, { url: urlA, title: "RALPH - New chat" });
   await new Promise(resolve => setImmediate(resolve));
@@ -2493,6 +2496,8 @@ async function testRalphWorkerReactivation(sync) {
   assert.deepEqual(JSON.parse(registrationRequests().at(-1).options.body), {
     conversationUrl: urlA,
     title: "RALPH - Persisted late title",
+    manual: true,
+    checkForCompletion: false,
   }, "a late page title observation is normalized and sent to the server");
 }
 
@@ -2933,7 +2938,7 @@ function configureAutomationContext(context) {
   // Stop the startup poller. These fixtures invoke commands directly.
   vm.runInNewContext("pollGeneration += 1; pollController?.abort();", context);
   context.restartPolling = () => {};
-  context.getSettings = async () => ({ threadSync: true, automationExecutor: true });
+  context.getSettings = async () => ({ threadSync: true, automationExecutor: true, ralph: false });
   const fetch = context.fetch;
   context.fetch = async (endpoint, options) => endpoint === context.LOCAL_CODEX_THREAD_SYNC.commandClaimUrl &&
     JSON.parse(options.body).recoveryReservation?.action === "acquire"

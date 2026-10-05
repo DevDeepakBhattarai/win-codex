@@ -351,13 +351,13 @@ export class SupportCommandBus {
     return until;
   }
 
-  cancelThreadChecks(threadId: string) {
+  cancelThreadChecks(threadId: string, ralphOnly = false) {
     for (const pending of this.pending.values()) {
       const command = pending.command;
       const url = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
-      if ((command.feature !== "ralph" && command.feature !== "threadPreparation") || parseConversationUrl(url).threadId !== threadId) continue;
+      if ((command.feature !== "ralph" && (ralphOnly || command.feature !== "threadPreparation")) || parseConversationUrl(url).threadId !== threadId) continue;
       this.removePending(command.id);
-      pending.reject(new Error("RALPH thread tab was closed."));
+      pending.reject(new Error(ralphOnly ? "RALPH check was superseded." : "RALPH thread tab was closed."));
     }
   }
 
@@ -766,6 +766,8 @@ const ralphThreadSchema = z.object({
   attentionAt: z.string().optional(),
   settledAt: z.string().optional(),
   observedOnly: z.boolean().optional(),
+  completionCheckEnabled: z.boolean().optional(),
+  checkRevision: z.number().int().nonnegative().optional(),
   externalRevision: z.string().optional(),
   lastCheckedAt: z.string().optional(),
   lastContinuationAt: z.string().optional(),
@@ -991,7 +993,7 @@ export class RalphRegistry {
   ): Promise<"ignored" | "registered" | "active" | "reactivated"> {
     const conversation = parseConversationUrl(conversationUrl);
     const title = normalizeThreadTitle(options.title);
-    const explicitlyMarked = options.manual && !options.activity && !options.checkForCompletion;
+    const explicitlyMarked = options.manual && !options.activity && options.checkForCompletion === undefined;
     return this.update((state) => {
       if (this.isVoiceConversation(conversation.conversationUrl)) return "ignored" as const;
       const projectAllowed = conversation.projectId && state.projects.includes(conversation.projectId);
@@ -1004,9 +1006,24 @@ export class RalphRegistry {
         if (options.parentThreadId) existing.parentThreadId = options.parentThreadId;
         if (options.manual) existing.manuallyRegistered = true;
         if (options.agentCreated) existing.agentCreated = true;
-        if (options.checkForCompletion && existing.observedOnly) existing.nextCheckAt = Date.now() + state.loopIntervalMs;
-        if (explicitlyMarked || options.checkForCompletion || options.agentCreated) existing.observedOnly = undefined;
+        const settingManaged = !projectAllowed && !existing.agentCreated && !existing.parentThreadId &&
+          (existing.observedOnly || existing.completionCheckEnabled !== undefined);
+        if (settingManaged && options.checkForCompletion !== undefined) {
+          if (options.checkForCompletion && existing.observedOnly) existing.nextCheckAt = Date.now() + state.loopIntervalMs;
+          if (existing.completionCheckEnabled !== options.checkForCompletion) existing.checkRevision = (existing.checkRevision ?? 0) + 1;
+          existing.completionCheckEnabled = options.checkForCompletion;
+          existing.observedOnly = options.checkForCompletion ? undefined : true;
+        }
+        if (explicitlyMarked || options.agentCreated) {
+          existing.observedOnly = undefined;
+          existing.completionCheckEnabled = undefined;
+        }
+        if (options.activity === "running" && options.reactivate) {
+          existing.checkRevision = (existing.checkRevision ?? 0) + 1;
+          existing.nextCheckAt = Date.now() + state.loopIntervalMs;
+        }
         if (options.activity && options.activity !== existing.activity) {
+          existing.checkRevision = (existing.checkRevision ?? 0) + 1;
           const now = new Date().toISOString();
           if (options.activity !== "running") {
             existing.attentionAt = existing.activity ? now : existing.lastCheckedAt ?? existing.registeredAt;
@@ -1038,7 +1055,9 @@ export class RalphRegistry {
         ...(options.parentThreadId ? { parentThreadId: options.parentThreadId } : {}),
         ...(options.manual ? { manuallyRegistered: true } : {}),
         ...(options.agentCreated ? { agentCreated: true } : {}),
-        ...(options.activity && !options.checkForCompletion && !options.agentCreated && !projectAllowed ? { observedOnly: true } : {}),
+        ...(!options.agentCreated && !options.parentThreadId && !projectAllowed && options.checkForCompletion !== undefined
+          ? { completionCheckEnabled: options.checkForCompletion, ...(options.checkForCompletion ? {} : { observedOnly: true }) }
+          : options.activity && !options.agentCreated && !projectAllowed ? { observedOnly: true } : {}),
         ...(options.externalUpdate ? { externalRevision: randomUUID() } : {}),
         registeredAt: new Date().toISOString(),
         ...(options.activity ? { activity: options.activity, activityAt: new Date().toISOString(),
@@ -1078,6 +1097,12 @@ export class RalphRegistry {
   async isActive(threadId: string) {
     await this.queue;
     return this.state.threads.some(thread => thread.threadId === threadId && thread.state === "active" && !thread.settledAt);
+  }
+
+  async isCheckCurrent(threadId: string, revision?: number) {
+    await this.queue;
+    return this.state.threads.some(thread => thread.threadId === threadId && thread.state === "active" &&
+      !thread.settledAt && !thread.observedOnly && (revision === undefined || (thread.checkRevision ?? 0) === revision));
   }
 
   async scheduleNow(threadId: string): Promise<"scheduled" | "complete" | "missing"> {
@@ -1151,6 +1176,8 @@ export class RalphRegistry {
       thread.state = "active";
       thread.settledAt = undefined;
       thread.observedOnly = undefined;
+      thread.completionCheckEnabled = undefined;
+      thread.checkRevision = (thread.checkRevision ?? 0) + 1;
       thread.lastError = undefined;
       thread.nextCheckAt = Date.now() + state.loopIntervalMs;
       return true;
@@ -1352,7 +1379,7 @@ export class RalphController {
       }, RALPH_BROWSER_INSPECTION_TIMEOUT_MS);
       if (!commandResult.ok) throw new Error(commandResult.error);
       if (commandResult.kind !== "inspect_thread") throw new Error("RALPH received the wrong support command result.");
-      if (!await this.options.registry.isActive(thread.threadId)) return;
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread.checkRevision ?? 0)) return;
 
       const observedInspection = commandResult.result;
       const observedByExecutor = this.options.commands.browserHasFeature(commandResult.browserId, "ralph");
@@ -1366,7 +1393,7 @@ export class RalphController {
         return;
       }
 
-      if (!await this.options.registry.isActive(thread.threadId)) return;
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread.checkRevision ?? 0)) return;
       if (await this.options.jobs?.blocksContinuation(thread.threadId)) {
         await this.options.registry.recordRunning(thread.threadId);
         return;
@@ -1375,7 +1402,7 @@ export class RalphController {
         ? observedInspection
         : await this.inspectExecutorBeforeContinuation(thread);
       if (!inspection) return;
-      if (!await this.options.registry.isActive(thread.threadId)) return;
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread.checkRevision ?? 0)) return;
 
       const checkpoint = inspection.assistant.text.trim().match(/(?:^|\n)RALPH_STATUS: (CONTINUE|WAIT_CI|BLOCKED|COMPLETE)$/)?.[1];
       if (checkpoint === "COMPLETE" || checkpoint === "BLOCKED") {
@@ -1413,16 +1440,17 @@ export class RalphController {
         thread.conversationUrl,
         this.auditLog,
       );
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread.checkRevision ?? 0)) return;
       if (decision.complete) {
         await this.options.registry.recordComplete(thread.threadId);
         return;
       }
-      if (!await this.options.registry.isActive(thread.threadId)) return;
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread.checkRevision ?? 0)) return;
       if (await this.options.jobs?.blocksContinuation(thread.threadId)) {
         await this.options.registry.recordRunning(thread.threadId);
         return;
       }
-      if (!await this.options.registry.isActive(thread.threadId)) return;
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread.checkRevision ?? 0)) return;
 
       const sendResult = await this.options.commands.execute({
         feature: "ralph",
@@ -1432,8 +1460,11 @@ export class RalphController {
       });
       if (!sendResult.ok) throw new Error(sendResult.error);
       if (sendResult.kind !== "send_message") throw new Error("RALPH received the wrong send-message result.");
-      await this.options.registry.recordContinuation(thread.threadId);
+      if (await this.options.registry.isCheckCurrent(thread.threadId, thread.checkRevision ?? 0)) {
+        await this.options.registry.recordContinuation(thread.threadId);
+      }
     } catch (error) {
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread.checkRevision ?? 0)) return;
       const message = error instanceof Error ? error.message : String(error);
       if (/timed out/i.test(message)) {
         await this.options.registry.recordLoading(thread.threadId);
@@ -1453,7 +1484,7 @@ export class RalphController {
     }, RALPH_BROWSER_INSPECTION_TIMEOUT_MS);
     if (!result.ok) throw new Error(result.error);
     if (result.kind !== "inspect_thread") throw new Error("RALPH received the wrong pre-send inspection result.");
-    if (!await this.options.registry.isActive(thread.threadId)) return undefined;
+    if (!await this.options.registry.isCheckCurrent(thread.threadId, thread.checkRevision ?? 0)) return undefined;
     if (result.result.title) await this.options.registry.recordTitle(thread.threadId, result.result.title);
     if (result.result.status === "loading") {
       await this.options.registry.recordLoading(thread.threadId);
@@ -1781,13 +1812,18 @@ export function ralphRegistrationHandler(
       }
       const registration = await registry.register(parsed.data.conversationUrl, {
         manual: parsed.data.manual === true,
-        checkForCompletion: parsed.data.checkForCompletion === true,
+        checkForCompletion: parsed.data.checkForCompletion,
         reactivate: parsed.data.reactivate === true,
         externalUpdate: parsed.data.externalUpdate === true,
         agentCreated: parsed.data.agentCreated === true,
         title: parsed.data.title,
         activity: parsed.data.activity,
       });
+      const { threadId } = parseConversationUrl(parsed.data.conversationUrl);
+      if (parsed.data.activity === "running" ||
+          (parsed.data.checkForCompletion === false && !await registry.isCheckCurrent(threadId))) {
+        commands?.cancelThreadChecks(threadId, true);
+      }
       res.setHeader("Cache-Control", "no-store");
       res.json({ status: registration === "ignored" ? "ignored" : "registered" });
     } catch (error) {

@@ -63,7 +63,24 @@ try {
   assert.equal((await registry.due(nextCheckAt))[0].threadId, threadId, "the idle chat becomes due on the timer");
   const promotedRegistry = await RalphRegistry.open(directory);
   assert.equal((await promotedRegistry.due(nextCheckAt))[0].threadId, threadId, "enabled completion checks survive restart");
+  const queuedContinuation = commands.execute({ feature: "ralph", kind: "send_message", targetUrl: url, message: "Continue" });
+  const optedOut = assert.rejects(queuedContinuation, /superseded/);
+  await new Promise(resolve => setImmediate(resolve));
+  await handler({ body: { conversationUrl: url, manual: true, checkForCompletion: false },
+    get: key => ({ authorization: `Bearer ${"x".repeat(32)}`, origin: `chrome-extension://${"a".repeat(32)}` })[key],
+  }, completionCheckResponse, error => { throw error; });
+  await optedOut;
+  assert.deepEqual(await registry.due(nextCheckAt), [], "turning checks off demotes a previously enrolled chat");
+  assert.deepEqual(await (await RalphRegistry.open(directory)).due(nextCheckAt), [], "the opt-out survives restart");
+  await registry.register(url, { manual: true, checkForCompletion: true, activity: "idle" });
   await registry.recordComplete(threadId);
+
+  const legacyMarkedRegistry = await RalphRegistry.open(path.join(directory, "legacy-marked"));
+  await legacyMarkedRegistry.register(url, { manual: true });
+  await legacyMarkedRegistry.register(url, { manual: true, checkForCompletion: true });
+  await legacyMarkedRegistry.register(url, { manual: true, checkForCompletion: false });
+  assert.equal((await legacyMarkedRegistry.due(Date.now() + 86400_000)).length, 1,
+    "the ordinary-chat setting does not remove a deliberate legacy RALPH mark");
   await registry.register(url, { manual: true, checkForCompletion: true, title: "Finished task" });
   assert.equal((await registry.threads())[0].state, "complete", "automatic title registration cannot restart a finished task");
   assert.deepEqual(await registry.due(Date.now() + 24 * 60 * 60_000), []);
@@ -74,6 +91,52 @@ try {
   assert.ok(resumedThread.nextCheckAt >= resumedAt + 1800_000, "the new turn receives a fresh thirty-minute timer");
   assert.deepEqual(await registry.due(resumedAt), [], "the old expired timer cannot immediately check new work");
   await registry.recordComplete(threadId);
+
+  for (const decision of ["CONTINUE", "COMPLETE"]) {
+    for (const change of ["running", "disabled"]) {
+      const raceDirectory = path.join(directory, `classifier-${decision}-${change}`);
+      const raceRegistry = await RalphRegistry.open(raceDirectory);
+      const raceCommands = new SupportCommandBus();
+      await raceRegistry.register(url, { manual: true, checkForCompletion: true, activity: "idle" });
+      await raceRegistry.scheduleNow(threadId);
+      const previousFetch = globalThis.fetch;
+      let release;
+      let started;
+      const gate = new Promise(resolve => { release = resolve; });
+      const apiStarted = new Promise(resolve => { started = resolve; });
+      globalThis.fetch = async () => {
+        started();
+        await gate;
+        return new Response(JSON.stringify({ output: [{ type: "message", content: [{ type: "output_text", text: decision }] }] }),
+          { headers: { "content-type": "application/json" } });
+      };
+      const raceController = new RalphController({ registry: raceRegistry, commands: raceCommands, apiKey: "fixture-key",
+        model: "fixture-model", auditLogPath: path.join(raceDirectory, "audit.log"), checkEveryMs: 60_000 });
+      try {
+        await raceController.tick();
+        const inspect = await raceCommands.claim("chrome", ["ralph"], 1000, undefined, [url]);
+        assert.equal(inspect.kind, "inspect_thread");
+        raceCommands.complete({ commandId: inspect.id, browserId: "chrome", kind: inspect.kind, ok: true,
+          result: { status: "idle", workedSeconds: null, users: [{ id: "u1", text: "Finish the task" }],
+            assistant: { id: "a1", synthetic: false, text: "Work remains" } } });
+        await apiStarted;
+        await raceRegistry.register(url, { manual: true, checkForCompletion: change !== "disabled",
+          ...(change === "running" ? { activity: "running", reactivate: true } : {}) });
+        const changed = (await raceRegistry.threads())[0];
+        release();
+        const keepAlive = setTimeout(() => {}, 250);
+        try {
+          assert.equal(await raceCommands.claim("chrome", ["ralph"], 150, undefined, [url]), undefined,
+            `${change} invalidates an in-flight ${decision} decision`);
+        } finally { clearTimeout(keepAlive); }
+        const after = (await raceRegistry.threads())[0];
+        assert.equal(after.state, "active", "an obsolete COMPLETE cannot settle newer work");
+        assert.equal(after.nextCheckAt, changed.nextCheckAt, "an obsolete check preserves the new timer");
+      } finally {
+        release(); raceController.close(); raceCommands.close(); globalThis.fetch = previousFetch;
+      }
+    }
+  }
 
   const legacyDirectory = path.join(directory, "legacy-settlement");
   await mkdir(legacyDirectory);
@@ -194,7 +257,8 @@ const context = {
     if (endpoint === config.commandResultUrl) results.push(JSON.parse(options.body));
     if (endpoint === config.ralphRegisterUrl) {
       if (offline) throw new Error("offline");
-      removals.push(JSON.parse(options.body));
+      const body = JSON.parse(options.body);
+      if (body.settled || body.removed) removals.push(body);
     }
     return new Response(null, { status: 204 });
   },
@@ -202,7 +266,7 @@ const context = {
 vm.runInNewContext(source, context);
 assert.deepEqual(panelBehaviors.map(value => value.openPanelOnActionClick), [true], "startup enables toolbar opening");
 await new Promise(resolve => setImmediate(resolve));
-context.getSettings = async () => ({ threadSync: false, automationExecutor: true });
+context.getSettings = async () => ({ threadSync: false, automationExecutor: true, ralph: false });
 const inspect = id => context.executeCommand({ id, feature: "ralph", kind: "inspect_thread", conversationUrl: url }, "existing");
 pageFailure = true;
 await inspect("timeout");
@@ -301,5 +365,5 @@ context.getSettings = async () => ({ threadSync: true, automationExecutor: false
 await context.reactivateRalphConversation({ conversationUrl: url, activity: "idle", completed: true }, {
   id: "a".repeat(32), frameId: 0, tab: { id: 11 },
 });
-assert.equal(completionRegistrations.at(-1).checkForCompletion, undefined, "disabling checks retains observation without new opt-in");
+assert.equal(completionRegistrations.at(-1).checkForCompletion, false, "disabling checks sends an explicit opt-out");
 console.log("RALPH lifecycle tests passed.");

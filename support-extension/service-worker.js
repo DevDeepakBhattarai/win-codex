@@ -316,7 +316,7 @@ async function registerRalphConversationOnce(value, { reactivate = false, extern
   if (await isVoiceConversation(currentUrl)) return;
   const settings = await getSettings();
   const currentTitle = normalizeThreadTitle(title);
-  if (!currentUrl || (!settings.ralph && !activity && !reactivate && !externalUpdate && !currentUrl.startsWith("https://chatgpt.com/g/") && !reportedRalphConversations.has(currentUrl)) ||
+  if (!currentUrl ||
       (!activity && !reactivate && !externalUpdate && !agentCreated && !currentTitle && reportedRalphConversations.has(currentUrl))) return;
   const response = await fetch(ralphRegisterEndpoint.href, {
     method: "POST",
@@ -328,7 +328,7 @@ async function registerRalphConversationOnce(value, { reactivate = false, extern
       ...(agentCreated ? { agentCreated: true } : {}),
       ...(currentTitle ? { title: currentTitle } : {}),
       ...(activity ? { activity, manual: true } : {}),
-      ...(settings.ralph ? { manual: true, checkForCompletion: true } : {}),
+      manual: true, checkForCompletion: settings.ralph,
     }),
     signal: AbortSignal.timeout(5000),
     redirect: "error",
@@ -1198,11 +1198,11 @@ async function scanExistingTabs() {
     if (Number.isInteger(tab.id)) {
       tasks.push(trackThreadTab(tab.id, tab.url));
       tasks.push(extensionApi.scripting.executeScript({ target: { tabId: tab.id }, files: ["content-script.js"] }));
+      tasks.push(registerRalphConversation(tab.url, { title: tab.title }));
     }
     if (tab.active && typeof tab.url === "string") {
       tasks.push(trackViewedThread(tab));
       tasks.push(observeConversation(tab.url));
-      tasks.push(registerRalphConversation(tab.url, { title: tab.title }));
     }
     return tasks;
   }));
