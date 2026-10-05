@@ -5,7 +5,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import express from "express";
-import { RalphRegistry, SupportCommandBus } from "../dist/chatgpt-support.js";
+import { RalphRegistry, SupportCommandBus, supportCommandClaimHandler } from "../dist/chatgpt-support.js";
 import { createVoiceApi } from "../dist/voice-api.js";
 
 const directory = await mkdtemp(path.join(os.tmpdir(), "voice-api-"));
@@ -14,6 +14,7 @@ const commands = new SupportCommandBus(undefined, undefined, undefined, undefine
 const app = express();
 app.use(express.json());
 app.use("/chatgpt-support/voice", createVoiceApi({ token: "test-token", registry, commands }));
+app.post("/chatgpt-support/commands/claim", supportCommandClaimHandler(commands, "test-token"));
 const server = await new Promise(resolve => { const listener = app.listen(0, "127.0.0.1", () => resolve(listener)); });
 const base = `http://127.0.0.1:${server.address().port}/chatgpt-support/voice`;
 const url = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
@@ -45,6 +46,11 @@ try {
 	assert.equal(registry.voiceConversationUrl(), undefined, "the server does not commit a new target before its browser probe completes");
 	complete(initialCommand, "closed");
 	assert.equal((await initial).status, 200);
+	const observerStatus = await fetch(base.replace("/voice", "/commands/claim"), {
+		method: "POST", headers, body: JSON.stringify({ browserId: "helium", features: [], statusOnly: true }),
+	});
+	assert.equal(observerStatus.status, 204);
+	assert.equal(observerStatus.headers.get("X-Voice-Conversation-Url"), url, "Observer browsers receive the committed Voice binding through their ordinary support transport");
 	assert.equal((await request("GET")).headers.get("cache-control"), "no-store");
 	assert.equal((await registry.threads()).some(thread => thread.conversationUrl === url), false);
 	assert.equal(await registry.register(url, { manual: true, reactivate: true, activity: "running" }), "ignored");

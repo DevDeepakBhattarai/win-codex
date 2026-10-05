@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.9.0";
+  const contentScriptVersion = "1.10.0";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -55,12 +55,12 @@
   const LEGACY_RALPH_MIN_WORKED_SECONDS = 19 * 60;
   const DEFAULT_RALPH_MIN_WORKED_SECONDS = 20 * 60;
 
-  function conversationUrl() {
-    const match = location.pathname.match(/^(?:\/g\/([A-Za-z0-9_-]+))?\/c\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/?$/i);
+  function conversationUrl(url = location) {
+    const match = url.pathname.match(/^(?:\/g\/([A-Za-z0-9_-]+))?\/c\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/?$/i);
     if (!match) return null;
     return (match[1]
       ? `https://chatgpt.com/g/${match[1]}/c/${match[2].toLowerCase()}`
-      : `https://chatgpt.com/c/${match[2].toLowerCase()}`) + (/[?&]temporary-chat=true(?:&|$)/.test(location.search) ? "?temporary-chat=true" : "");
+      : `https://chatgpt.com/c/${match[2].toLowerCase()}`) + (/[?&]temporary-chat=true(?:&|$)/.test(url.search) ? "?temporary-chat=true" : "");
   }
 
   function threadTitle() {
@@ -144,6 +144,9 @@
       return await controlVoice(command);
     }
     await waitForAutomationResume();
+    if (command.recovering && command.targetUrl && conversationUrl() !== conversationUrl(new URL(command.targetUrl))) {
+      throw new Error("Recovery stopped because the tab navigated away.");
+    }
     if (command.kind === "page_health") return pageHealth();
     if (command.kind === "dismiss_rate_limit") {
       const notice = rateLimitNotice();
@@ -152,7 +155,7 @@
       if (button) button.click();
       return { status: button ? "dismissed" : "not_found" };
     }
-    if (command.kind === "stop_thread") return await stopThread();
+    if (command.kind === "stop_thread") return await stopThread(command.recovering ? command.targetUrl : undefined);
     if (command.kind === "resume_interrupted") {
       const failed = Boolean(connectionInterruptedNotice() || pageErrorNotice());
       const stopped = await stopThread();
@@ -226,11 +229,12 @@
     throw new Error(`ChatGPT did not confirm Voice ${desired}. Check its call controls before retrying.`);
   }
 
-  async function stopThread() {
+  async function stopThread(targetUrl) {
     const ready = await waitForCancellationState(30_000);
     if (!ready) throw new Error("ChatGPT child state did not become ready for cancellation.");
 
     const currentUrl = conversationUrl();
+    if (targetUrl && currentUrl !== conversationUrl(new URL(targetUrl))) throw new Error("Recovery stopped because the tab navigated away.");
     if (!currentUrl) throw new Error("ChatGPT cancellation is not on a saved conversation.");
     if (!ready.stopButton) return { status: "idle", conversationUrl: currentUrl };
 
@@ -387,7 +391,11 @@
 
   async function sendMessage(message, connectorName, temporary = false, recovering = false) {
     let sendClicked = false;
-    const checkPage = () => assertNoPageError(false, recovering);
+    const recoveryUrl = recovering ? conversationUrl() : undefined;
+    const checkPage = () => {
+      if (recovering && conversationUrl() !== recoveryUrl) throw new Error("Recovery stopped because the tab navigated away.");
+      assertNoPageError(false, recovering);
+    };
     try {
       checkPage();
       if (typeof message !== "string" || !message.trim()) throw new Error("A non-empty ChatGPT message is required.");
@@ -656,11 +664,12 @@
       if (pauseUntil > Date.now()) return;
       const composer = getComposer()?.composer;
       if (!composer) return;
-      const interrupted = Boolean(connectionInterruptedNotice());
-      const action = interrupted || rateLimitNotice() || pageErrorNotice() ? "blocked"
+      const health = pageHealth().status;
+      const interrupted = health === "connection_interrupted";
+      const action = health !== "ok" ? "blocked"
         : isRunning() ? "running" : getSendButton(composer) && userTurns().length ? "idle" : null;
       if (!action) return;
-      const signature = `${action}:${interrupted}`;
+      const signature = `${action}:${health}`;
 
       if (currentUrl && signature !== previousComposerAction && !reporting) {
         reporting = true;
@@ -672,6 +681,7 @@
             title: threadTitle(),
             completed: action !== "running",
             interrupted,
+            pageHealth: health,
           });
           void Promise.resolve(delivery).then((result) => {
             if (result?.ok && observedConversationUrl === currentUrl) previousComposerAction = signature;

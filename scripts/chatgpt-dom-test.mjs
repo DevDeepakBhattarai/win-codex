@@ -105,6 +105,10 @@ try {
 	assert.equal(idle.result.users.at(-1).id, "new");
 	assert.equal(idle.result.users.at(-1).text, "Run the assigned check.\n\nPublish its complete report.");
 	assert.equal(idle.result.assistant.text, "Stopped after the assigned check.");
+	const wrongChatRecovery = await execute({ kind: "send_message", recovering: true,
+		targetUrl: "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222", message: "Continue" });
+	assert.equal(wrongChatRecovery.ok, false, "Recovery dispatched to a different conversation is rejected in the page itself");
+	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1);
 	await page.waitForFunction(() => globalThis.observedActivity.some(message => message.activity === "idle"));
 	assert.ok(await page.evaluate(() => globalThis.observedActivity.some(message => message.activity === "running")), "modern composer activity reaches the extension");
 	await page.evaluate(() => {
@@ -126,6 +130,7 @@ try {
 		document.body.appendChild(status);
 	});
 	assert.equal((await execute({ kind: "page_health" })).result.status, "connection_interrupted", "the exact supplied recovery notice is detected");
+	await page.waitForFunction(() => globalThis.observedActivity.some(message => message.pageHealth === "connection_interrupted"));
 	await page.evaluate(() => {
 		const status = document.querySelector('[role="status"]');
 		const button = document.querySelector('button[aria-label="Send"]');
@@ -148,6 +153,7 @@ try {
 		const button = document.querySelector('button[aria-label="Send"]');
 		button.onclick = () => { alert.remove(); globalThis.hostSend(); };
 	});
+	await page.waitForFunction(() => globalThis.observedActivity.some(message => message.pageHealth === "recoverable_error"));
 	const idleRecovery = await execute({ kind: "resume_interrupted", message: "Continue the existing task." });
 	assert.equal(idleRecovery.ok, true, idleRecovery.error);
 	assert.equal(idleRecovery.result.status, "sent", "an error on an already idle turn still receives continuation");

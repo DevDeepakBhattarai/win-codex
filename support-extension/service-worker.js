@@ -24,6 +24,7 @@ if (typeof config?.extensionToken !== "string" || config.extensionToken.length <
 const DEFAULT_SETTINGS = Object.freeze({
   threadSync: true,
   automationExecutor: false,
+  errorRecovery: true,
   ralph: false,
   threadMessaging: false,
 });
@@ -68,6 +69,8 @@ async function syncAutomationPause(unavailable = false) {
       signal: AbortSignal.timeout(5000), redirect: "error",
     });
     if (!response.ok) throw new Error(`Automation pause synchronization returned ${response.status}.`);
+    const voiceUrl = response.headers.get("X-Voice-Conversation-Url");
+    if (voiceUrl !== null) await extensionApi.storage.local.set({ serverVoiceConversationUrl: conversationUrl(voiceUrl) });
     const header = response.headers.get("X-Automation-Paused-Until");
     if (header !== null) {
       const until = Number(header);
@@ -264,6 +267,7 @@ async function getSettings() {
   return {
     threadSync: stored.threadSync !== false,
     automationExecutor: stored.automationExecutor === true,
+    errorRecovery: stored.errorRecovery !== false,
     ralph: stored.ralph === true,
     threadMessaging: stored.threadMessaging === true,
   };
@@ -478,6 +482,10 @@ async function reactivateRalphConversation(message, sender) {
   }
   const settings = await getSettings();
   const activity = ["running", "idle", "blocked"].includes(message.activity) ? message.activity : undefined;
+  if (settings.errorRecovery && (message.interrupted === true ||
+      ["connection_interrupted", "recoverable_error", "rate_limited"].includes(message.pageHealth))) {
+    void keepWorkerAliveUntil(recoverPage(sender.tab.id)).catch(error => console.warn("ChatGPT error recovery:", error));
+  }
   await registerRalphConversation(currentUrl, { reactivate: activity ? activity === "running" : message.completed !== true,
     externalUpdate: !settings.automationExecutor, activity, title: message.title });
   const tab = await extensionApi.tabs.get(sender.tab.id);
@@ -486,10 +494,6 @@ async function reactivateRalphConversation(message, sender) {
     await extensionApi.storage.local.set({ [`viewedCompletion:${currentUrl}`]: true });
   } else if (activity === "running") {
     await extensionApi.storage.local.remove(`viewedCompletion:${currentUrl}`);
-  }
-  if (message.interrupted === true && settings.automationExecutor && (settings.threadMessaging || settings.ralph) &&
-      (await getOwnedThreadTabs())[currentUrl] === sender.tab.id) {
-    void keepWorkerAliveUntil(recoverPage(sender.tab.id)).catch(error => console.warn("ChatGPT interruption recovery:", error));
   }
   return { ok: true };
 }
@@ -536,8 +540,12 @@ async function waitForTabComplete(tabId, timeoutMs = 5 * 60_000) {
 async function sendAutomationMessage(tabId, command) {
   if (command.feature !== "voice") {
     await waitForAutomationResume();
-    if (await isVoiceConversation((await extensionApi.tabs.get(tabId)).url)) {
+    const currentUrl = (await extensionApi.tabs.get(tabId)).url;
+    if (await isVoiceConversation(currentUrl)) {
       throw new Error("The dedicated Voice conversation is protected from page automation.");
+    }
+    if (command.recovering && command.targetUrl && !automationTargetMatches(currentUrl, command.targetUrl)) {
+      throw new Error("Recovery stopped because the tab navigated away.");
     }
   }
   // Establish the receiver before dispatching a side-effecting command. A lost response
@@ -550,6 +558,9 @@ async function sendAutomationMessage(tabId, command) {
   }
   if (command.recoveryContinuation) {
     const recovery = recoveringPages.get(tabId);
+    if (recovery?.targetUrl && !automationTargetMatches((await extensionApi.tabs.get(tabId)).url, recovery.targetUrl)) {
+      throw new Error("Recovery stopped because the tab navigated away.");
+    }
     if (!recovery?.resume || [...pendingMessages.values()].some(url => automationTargetMatches(url, recovery.targetUrl))) {
       return { ok: true, result: { status: "idle" } };
     }
@@ -643,10 +654,11 @@ function executeCommand(command, browserId) {
 }
 
 async function isVoiceConversation(value) {
-  const configured = (await extensionApi.storage.local.get("voiceConversationUrl")).voiceConversationUrl;
-  if (!configured || !value) return false;
+  const stored = await extensionApi.storage.local.get(["voiceConversationUrl", "serverVoiceConversationUrl"]);
+  if (!value) return false;
   const current = conversationUrl(value);
-  return current && current.split("/c/")[1]?.split("?")[0] === configured.split("/c/")[1]?.split("?")[0];
+  return Boolean(current && [stored.voiceConversationUrl, stored.serverVoiceConversationUrl].some(configured =>
+    configured && current.split("/c/")[1]?.split("?")[0] === configured.split("/c/")[1]?.split("?")[0]));
 }
 
 async function executeVoiceCommand(command, browserId) {
@@ -865,8 +877,9 @@ async function executeCommandOnce(command, browserId) {
     if (Number.isInteger(tabId) && /^CHATGPT_RATE_LIMITED(?:_RETRYABLE)?:/.test(errorMessage)) {
       const key = `pageRecovery:${tabId}`;
       const saved = await extensionApi.storage.local.get(key);
-      if (!saved[key]?.rateLimitedAt) {
-        await extensionApi.storage.local.set({ [key]: { ...saved[key], rateLimitedAt: Date.now() } });
+      const rateLimitedUrl = (await extensionApi.tabs.get(tabId)).url;
+      if (!saved[key]?.rateLimitedAt || (saved[key].rateLimitedUrl && !automationTargetMatches(rateLimitedUrl, saved[key].rateLimitedUrl))) {
+        await extensionApi.storage.local.set({ [key]: { ...saved[key], rateLimitedAt: Date.now(), rateLimitedUrl } });
       }
     }
     if (created && Number.isInteger(tabId) && createsNewThread) {
@@ -939,15 +952,40 @@ async function recoverPage(tabId, resume = true) {
 
 async function recoverPageOnce(tabId, recovery) {
   await waitForAutomationResume();
+  const targetUrl = (await extensionApi.tabs.get(tabId)).url;
+  recovery.targetUrl = targetUrl;
   const key = `pageRecovery:${tabId}`;
   const stored = await extensionApi.storage.local.get(key);
-  const state = stored[key] ?? {};
+  let state = stored[key] ?? {};
+  if (state.rateLimitedUrl && !automationTargetMatches(targetUrl, state.rateLimitedUrl)) {
+    state = {};
+    await extensionApi.storage.local.set({ [key]: state });
+  }
   const now = Date.now();
   if (state.rateLimitedAt && now - state.rateLimitedAt < RATE_LIMIT_WAIT_MS) {
     throw new Error("CHATGPT_RATE_LIMITED: Waiting ten minutes before dismissing the provider notice.");
   }
-  const health = await sendAutomationMessageWithTimeout(tabId, { kind: "page_health" });
+  let health = await sendAutomationMessageWithTimeout(tabId, { kind: "page_health" });
   if (!health?.ok) throw new Error(health?.error || "Could not inspect ChatGPT page health.");
+  let rateLimitDismissed = false;
+  if (health.result?.status === "rate_limited") {
+    if (!state.rateLimitedAt) {
+      await extensionApi.storage.local.set({ [key]: { ...state, rateLimitedAt: now, rateLimitedUrl: targetUrl } });
+      throw new Error("CHATGPT_RATE_LIMITED: Waiting ten minutes before dismissing the provider notice.");
+    }
+    const dismissal = await sendAutomationMessageWithTimeout(tabId, { kind: "dismiss_rate_limit", recovering: true, targetUrl });
+    await extensionApi.storage.local.set({ [key]: { ...state, rateLimitedAt: now, rateLimitedUrl: targetUrl } });
+    if (!dismissal?.ok || dismissal.result?.status !== "dismissed") {
+      throw new Error("CHATGPT_RATE_LIMITED: The provider notice could not be dismissed.");
+    }
+    await sleep(250);
+    health = await sendAutomationMessageWithTimeout(tabId, { kind: "page_health" });
+    if (!health?.ok || !["ok", "connection_interrupted", "recoverable_error"].includes(health.result?.status)) {
+      throw new Error("CHATGPT_RATE_LIMITED: The provider notice is still blocking the page.");
+    }
+    await extensionApi.storage.local.set({ [key]: {} });
+    rateLimitDismissed = true;
+  }
   if (health.result?.status === "conversation_unavailable") {
     const currentUrl = conversationUrl((await extensionApi.tabs.get(tabId)).url);
     if (!state.conversationUnavailableAt || state.conversationUnavailableUrl !== currentUrl) {
@@ -961,39 +999,22 @@ async function recoverPageOnce(tabId, recovery) {
     if (!retry?.ok || retry.result?.status !== "recovery_started") throw new Error("The conversation is still unavailable after the automation pause.");
     return false;
   }
-  if (["connection_interrupted", "recoverable_error"].includes(health.result?.status)) {
-    const targetUrl = (await extensionApi.tabs.get(tabId)).url;
+  if (rateLimitDismissed || ["connection_interrupted", "recoverable_error"].includes(health.result?.status)) {
     if (!conversationUrl(targetUrl)) throw new Error("Interrupted conversation is unavailable.");
     const current = await extensionApi.tabs.get(tabId);
     if (!automationTargetMatches(current.url, targetUrl)) throw new Error("Recovery stopped because the tab navigated away.");
     recovery.targetUrl = targetUrl;
-    const stopped = await sendAutomationMessageWithTimeout(tabId, { kind: "stop_thread" }).catch(error => {
+    const stopped = await sendAutomationMessageWithTimeout(tabId, { kind: "stop_thread", recovering: true, targetUrl }).catch(error => {
         throw new Error(`CHATGPT_RECOVERY_FAILED: ${error instanceof Error ? error.message : String(error)}`);
       });
     if (!stopped?.ok || !["stopped", "idle"].includes(stopped.result?.status)) throw new Error(`CHATGPT_RECOVERY_FAILED: ${stopped?.error || "The interrupted turn could not stop."}`);
     if (recovery.resume) {
-      const resumed = await sendAutomationMessageWithTimeout(tabId, { kind: "send_message", recovering: true,
+      const resumed = await sendAutomationMessageWithTimeout(tabId, { kind: "send_message", recovering: true, targetUrl,
         recoveryContinuation: true, message: "Continue the existing task from its current state. Do not repeat completed work." })
         .catch(error => { throw new Error(`CHATGPT_RECOVERY_FAILED: ${error instanceof Error ? error.message : String(error)}`); });
       if (!resumed?.ok || !["sent", "idle"].includes(resumed.result?.status)) throw new Error(`CHATGPT_RECOVERY_FAILED: ${resumed?.error || "The interrupted turn could not resume."}`);
     }
     return true;
-  }
-  if (health.result?.status === "rate_limited") {
-    if (!state.rateLimitedAt) {
-      await extensionApi.storage.local.set({ [key]: { ...state, rateLimitedAt: now } });
-      throw new Error("CHATGPT_RATE_LIMITED: Waiting ten minutes before dismissing the provider notice.");
-    }
-    const dismissal = await sendAutomationMessageWithTimeout(tabId, { kind: "dismiss_rate_limit" });
-    await extensionApi.storage.local.set({ [key]: { ...state, rateLimitedAt: now } });
-    if (!dismissal?.ok || dismissal.result?.status !== "dismissed") {
-      throw new Error("CHATGPT_RATE_LIMITED: The provider notice could not be dismissed.");
-    }
-    await sleep(250);
-    const after = await sendAutomationMessageWithTimeout(tabId, { kind: "page_health" });
-    if (!after?.ok || after.result?.status !== "ok") {
-      throw new Error("CHATGPT_RATE_LIMITED: The provider notice is still blocking the page.");
-    }
   }
   if (state.rateLimitedAt || state.conversationUnavailableAt) await extensionApi.storage.local.set({ [key]: {} });
   return false;
@@ -1012,7 +1033,7 @@ function enabledAutomationFeatures(settings) {
 async function syncPollingAlarm() {
   if (!extensionApi.alarms) return;
   const settings = await getSettings();
-  if (enabledAutomationFeatures(settings).length === 0) {
+  if (enabledAutomationFeatures(settings).length === 0 && !settings.errorRecovery) {
     await extensionApi.alarms.clear(SUPPORT_POLL_ALARM);
     return;
   }
@@ -1034,14 +1055,14 @@ async function pollCommands(generation, voiceOnly = false) {
     const settings = await getSettings();
     const features = voiceOnly ? (settings.automationExecutor && settings.threadMessaging ? ["voice"] : []) : enabledAutomationFeatures(settings);
     if (voiceOnly && features.length === 0) return;
-    const tabs = !voiceOnly && settings.threadSync ? await extensionApi.tabs.query({ url: "https://chatgpt.com/*" }) : [];
-    const openThreads = [...new Set(tabs.map(tab => conversationUrl(tab.url)).filter(Boolean))];
+    const tabs = !voiceOnly && (settings.threadSync || settings.errorRecovery) ? await extensionApi.tabs.query({ url: "https://chatgpt.com/*" }) : [];
+    const openThreads = settings.threadSync ? [...new Set(tabs.map(tab => conversationUrl(tab.url)).filter(Boolean))] : [];
     for (const tab of tabs) {
       if (!Number.isInteger(tab.id) || !conversationUrl(tab.url)) continue;
       const key = `pageRecovery:${tab.id}`;
       const saved = await extensionApi.storage.local.get(key);
-      if (settings.automationExecutor && (saved[key]?.conversationUnavailableAt ||
-          (saved[key]?.rateLimitedAt && Date.now() - saved[key].rateLimitedAt >= RATE_LIMIT_WAIT_MS))) {
+      if ((settings.automationExecutor && saved[key]?.conversationUnavailableAt) ||
+          (settings.errorRecovery && saved[key]?.rateLimitedAt && Date.now() - saved[key].rateLimitedAt >= RATE_LIMIT_WAIT_MS)) {
         await recoverPage(tab.id).catch(() => undefined);
       }
     }
@@ -1059,6 +1080,8 @@ async function pollCommands(generation, voiceOnly = false) {
         redirect: "error",
       });
       if (generation !== pollGeneration) return;
+      const voiceUrl = response.headers.get("X-Voice-Conversation-Url");
+      if (voiceUrl !== null) await extensionApi.storage.local.set({ serverVoiceConversationUrl: conversationUrl(voiceUrl) });
       const pausedUntil = Number(response.headers.get("X-Automation-Paused-Until"));
       if (Number.isSafeInteger(pausedUntil) && pausedUntil > Date.now()) {
         await extensionApi.storage.local.set({ automationPausedUntil: pausedUntil });

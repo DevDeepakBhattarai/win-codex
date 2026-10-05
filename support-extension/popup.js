@@ -3,6 +3,7 @@ const config = globalThis.LOCAL_CODEX_THREAD_SYNC;
 const DEFAULT_SETTINGS = {
   threadSync: true,
   automationExecutor: false,
+  errorRecovery: true,
   ralph: false,
   threadMessaging: false,
 };

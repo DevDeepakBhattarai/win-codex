@@ -264,6 +264,10 @@ export class SupportCommandBus {
     return this.registry?.automationPausedUntil() ?? 0;
   }
 
+  voiceConversationUrl() {
+    return this.registry?.voiceConversationUrl();
+  }
+
   async pauseAutomation(until?: number) {
     while (this.pauseInFlight) await this.pauseInFlight;
     const operation = this.persistAutomationPause(until);
@@ -1622,6 +1626,7 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
       if (parsed.data.conversationUnavailable) await commands.pauseAutomation(parsed.data.automationPausedUntil);
       if (parsed.data.statusOnly) {
         res.setHeader("X-Automation-Paused-Until", String(commands.automationPausedUntil()));
+        res.setHeader("X-Voice-Conversation-Url", commands.voiceConversationUrl() ?? "");
         res.status(204).end();
         return;
       }
@@ -1629,6 +1634,7 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
       if (abortController.signal.aborted) return;
       res.setHeader("Cache-Control", "no-store");
       res.setHeader("X-Automation-Paused-Until", String(commands.automationPausedUntil()));
+      res.setHeader("X-Voice-Conversation-Url", commands.voiceConversationUrl() ?? "");
       if (!command) {
         res.status(204).end();
         return;

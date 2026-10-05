@@ -4,6 +4,8 @@ Generate the private extension with `pnpm support:prepare`. Load `.data/support-
 
 Enable **Thread sync**, **Automation browser executor**, and **Task and thread messaging** in your automation profile. Thread sync can also run in an observer browser. Enable the executor and messaging in the browser that owns automated ChatGPT work.
 
+Keep **Recover interrupted chats** enabled in Helium and Chrome to resume failed turns in their existing tabs. This switch is enabled by default and does not require the executor, task messaging, Thread sync, or RALPH. Disable it in a browser if you want to handle that browser's errors yourself.
+
 Workers start in temporary chats and use the configured worker plugin. Their tabs close after the service collects the report.
 
 After an update, reload the generated extension in `chrome://extensions`. Reload saved ChatGPT pages after their work finishes. Keep temporary task chats open without refreshing. A running page can retain an older content script until the extension injects its current version.
@@ -22,7 +24,7 @@ Follow [the delegation workflow](../docs/delegation.md) for parent and worker pr
 
 Set **RALPH check interval** to change the default 1800-second worker recovery interval. The service resumes an idle worker until its report arrives. Marked manual-thread continuation uses the separate **RALPH automation** switch and server setting. Worker recovery needs no OpenAI API key. Ordinary RALPH completion decisions require `OPENAI_API_KEY`. The classifier returns `COMPLETE` or `CONTINUE`. Unfinished work receives a fixed continuation message, and explicit engineering checkpoints retain their existing behavior.
 
-When a managed chat displays a connection-interrupted notice or a response error, the extension clicks Stop, waits for the turn to stop, and sends a continuation in the same chat. An idle failed turn also receives a continuation. Temporary chats never reload during recovery. If a message is already queued, recovery sends that message once instead of adding another continuation. If recovery has already begun sending, the queued message fails before delivery to prevent a second prompt. Retry that message after the current turn stops.
+When an open chat displays a connection-interrupted notice or a response error, the extension clicks Stop, waits for the turn to stop, and sends a continuation in the same chat. Helium chats stay in Helium, and Chrome chats stay in Chrome. An idle failed turn also receives a continuation. Rate-limit notices wait ten minutes before dismissal and continuation. Temporary chats never reload during recovery. The configured Voice conversation does not receive text recovery. If a message is already queued, recovery sends that message once instead of adding another continuation. If recovery has already begun sending, the queued message fails before delivery to prevent a second prompt. Retry that message after the current turn stops.
 
 When an empty conversation displays **Could not load this ChatGPT conversation**, browser automation pauses globally for five minutes. Checks, recovery clicks, refreshes, sends, and automatic tab closure wait. Queued commands and task state stay intact. Local report collection continues. The pause deadline survives service and extension restarts. Automation resumes after the deadline and retries the visible page action. The sidebar displays the pause and resumption time.
 
