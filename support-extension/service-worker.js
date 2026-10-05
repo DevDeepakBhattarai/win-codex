@@ -25,7 +25,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   threadSync: true,
   automationExecutor: false,
   errorRecovery: true,
-  ralph: false,
+  ralph: true,
   threadMessaging: false,
 });
 const AUTOMATION_MESSAGE = "local-codex-support/automation-v1";
@@ -314,8 +314,9 @@ function registerRalphConversation(value, options = {}) {
 async function registerRalphConversationOnce(value, { reactivate = false, externalUpdate = false, agentCreated = false, title, activity } = {}) {
   const currentUrl = conversationUrl(value);
   if (await isVoiceConversation(currentUrl)) return;
+  const settings = await getSettings();
   const currentTitle = normalizeThreadTitle(title);
-  if (!currentUrl || (!activity && !reactivate && !externalUpdate && !currentUrl.startsWith("https://chatgpt.com/g/") && !reportedRalphConversations.has(currentUrl)) ||
+  if (!currentUrl || (!settings.ralph && !activity && !reactivate && !externalUpdate && !currentUrl.startsWith("https://chatgpt.com/g/") && !reportedRalphConversations.has(currentUrl)) ||
       (!activity && !reactivate && !externalUpdate && !agentCreated && !currentTitle && reportedRalphConversations.has(currentUrl))) return;
   const response = await fetch(ralphRegisterEndpoint.href, {
     method: "POST",
@@ -327,6 +328,7 @@ async function registerRalphConversationOnce(value, { reactivate = false, extern
       ...(agentCreated ? { agentCreated: true } : {}),
       ...(currentTitle ? { title: currentTitle } : {}),
       ...(activity ? { activity, manual: true } : {}),
+      ...(settings.ralph ? { manual: true, checkForCompletion: true } : {}),
     }),
     signal: AbortSignal.timeout(5000),
     redirect: "error",

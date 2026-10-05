@@ -6,6 +6,8 @@ Enable **Thread sync**, **Automation browser executor**, and **Task and thread m
 
 Keep **Recover interrupted chats** enabled in Helium and Chrome to resume failed turns in their existing tabs. This switch is enabled by default and does not require the executor, task messaging, Thread sync, or RALPH. Disable it in a browser if you want to handle that browser's errors yourself.
 
+Enable **Check unfinished chats** in Helium and Chrome to register ordinary chats for RALPH completion checks. Keep the executor enabled only in Chrome. The default interval is 1800 seconds, or 30 minutes. For an idle chat, the service sends all readable user messages and the final assistant response to the API classifier. A COMPLETE decision settles the chat. A CONTINUE decision sends a continuation in Chrome after Chrome confirms that the conversation is idle. Running and loading chats wait for another check. Delegated workers keep their report-based recovery, and the dedicated Voice chat is excluded. Stream-error recovery remains independent of this switch.
+
 Workers start in temporary chats and use the configured worker plugin. Their tabs close after the service collects the report.
 
 After an update, reload the generated extension in `chrome://extensions`. Reload saved ChatGPT pages after their work finishes. Keep temporary task chats open without refreshing. A running page can retain an older content script until the extension injects its current version.

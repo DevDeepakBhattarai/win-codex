@@ -115,7 +115,7 @@
           <span class="switch"><input id="errorRecovery" type="checkbox"><i aria-hidden="true"></i></span>
         </label>
         <label class="toggle" data-legacy-continuation hidden>
-          <span class="toggle-text">RALPH automation<small>Resume marked manual threads. Task recovery runs with task messaging.</small></span>
+          <span class="toggle-text">Check unfinished chats<small>Every 30 minutes, ask the API whether an idle chat has finished its task. Chrome sends a continuation when work remains.</small></span>
           <span class="switch"><input id="ralph" type="checkbox"><i aria-hidden="true"></i></span>
         </label>
         <label class="toggle">
@@ -130,7 +130,7 @@
           <input id="ralphLoopIntervalSeconds" type="number" min="120" max="86400" step="1" inputmode="numeric">
           <button id="saveRalphLoopInterval" class="button" type="button">Save interval</button>
         </div>
-        <p id="ralphLoopIntervalStatus" class="note">Default is 1800 seconds (30 minutes). Unfinished task workers resume at this interval. Reports are collected immediately.</p>
+        <p id="ralphLoopIntervalStatus" class="note">Default is 1800 seconds (30 minutes). Idle chats receive an API completion check. Worker recovery uses the same interval. Reports are collected immediately.</p>
       </div>
 
       <div class="card" data-legacy-continuation hidden>

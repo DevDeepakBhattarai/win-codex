@@ -4,7 +4,7 @@ const DEFAULT_SETTINGS = {
   threadSync: true,
   automationExecutor: false,
   errorRecovery: true,
-  ralph: false,
+  ralph: true,
   threadMessaging: false,
 };
 const RALPH_MIN_WORKED_SECONDS_KEY = "ralphMinWorkedSeconds";

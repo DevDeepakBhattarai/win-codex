@@ -987,10 +987,11 @@ export class RalphRegistry {
 
   async register(
     conversationUrl: string,
-    options: { externalUpdate?: boolean; manual?: boolean; reactivate?: boolean; agentCreated?: boolean; title?: string; parentThreadId?: string; activity?: "running" | "idle" | "blocked" } = {},
+    options: { externalUpdate?: boolean; manual?: boolean; checkForCompletion?: boolean; reactivate?: boolean; agentCreated?: boolean; title?: string; parentThreadId?: string; activity?: "running" | "idle" | "blocked" } = {},
   ): Promise<"ignored" | "registered" | "active" | "reactivated"> {
     const conversation = parseConversationUrl(conversationUrl);
     const title = normalizeThreadTitle(options.title);
+    const explicitlyMarked = options.manual && !options.activity && !options.checkForCompletion;
     return this.update((state) => {
       if (this.isVoiceConversation(conversation.conversationUrl)) return "ignored" as const;
       const projectAllowed = conversation.projectId && state.projects.includes(conversation.projectId);
@@ -1003,7 +1004,8 @@ export class RalphRegistry {
         if (options.parentThreadId) existing.parentThreadId = options.parentThreadId;
         if (options.manual) existing.manuallyRegistered = true;
         if (options.agentCreated) existing.agentCreated = true;
-        if ((options.manual && !options.activity) || options.agentCreated) existing.observedOnly = undefined;
+        if (options.checkForCompletion && existing.observedOnly) existing.nextCheckAt = Date.now() + state.loopIntervalMs;
+        if (explicitlyMarked || options.checkForCompletion || options.agentCreated) existing.observedOnly = undefined;
         if (options.activity && options.activity !== existing.activity) {
           const now = new Date().toISOString();
           if (options.activity !== "running") {
@@ -1011,12 +1013,13 @@ export class RalphRegistry {
           } else {
             existing.state = "active";
             existing.settledAt = undefined;
+            existing.nextCheckAt = Date.now() + state.loopIntervalMs;
           }
           existing.activity = options.activity;
           existing.activityAt = now;
         }
-        if (options.reactivate || (options.manual && !options.activity)) existing.settledAt = undefined;
-        if (((options.manual && !options.activity) || options.agentCreated || options.reactivate) && existing.state === "complete") {
+        if (options.reactivate || explicitlyMarked) existing.settledAt = undefined;
+        if ((explicitlyMarked || options.agentCreated || options.reactivate) && existing.state === "complete") {
           existing.state = "active";
           existing.lastError = undefined;
           existing.nextCheckAt = Date.now() + state.loopIntervalMs;
@@ -1035,7 +1038,7 @@ export class RalphRegistry {
         ...(options.parentThreadId ? { parentThreadId: options.parentThreadId } : {}),
         ...(options.manual ? { manuallyRegistered: true } : {}),
         ...(options.agentCreated ? { agentCreated: true } : {}),
-        ...(options.activity && !options.agentCreated && !projectAllowed ? { observedOnly: true } : {}),
+        ...(options.activity && !options.checkForCompletion && !options.agentCreated && !projectAllowed ? { observedOnly: true } : {}),
         ...(options.externalUpdate ? { externalRevision: randomUUID() } : {}),
         registeredAt: new Date().toISOString(),
         ...(options.activity ? { activity: options.activity, activityAt: new Date().toISOString(),
@@ -1746,6 +1749,7 @@ export function ralphRegistrationHandler(
   const bodySchema = z.object({
     conversationUrl: z.string().max(2048),
     manual: z.boolean().optional(),
+    checkForCompletion: z.boolean().optional(),
     reactivate: z.boolean().optional(),
     externalUpdate: z.boolean().optional(),
     agentCreated: z.boolean().optional(),
@@ -1777,6 +1781,7 @@ export function ralphRegistrationHandler(
       }
       const registration = await registry.register(parsed.data.conversationUrl, {
         manual: parsed.data.manual === true,
+        checkForCompletion: parsed.data.checkForCompletion === true,
         reactivate: parsed.data.reactivate === true,
         externalUpdate: parsed.data.externalUpdate === true,
         agentCreated: parsed.data.agentCreated === true,
