@@ -151,8 +151,9 @@
     }
     if (command.kind === "stop_thread") return await stopThread();
     if (command.kind === "resume_interrupted") {
+      const failed = Boolean(connectionInterruptedNotice() || pageErrorNotice());
       const stopped = await stopThread();
-      if (stopped.status === "idle") return stopped;
+      if (stopped.status === "idle" && !failed) return stopped;
       return await sendMessage(command.message, undefined, false, true);
     }
     if (command.kind === "recover_page") {
@@ -163,7 +164,7 @@
       retry.click();
       return { status: "recovery_started" };
     }
-    if (command.kind === "send_message") return await sendMessage(command.message, command.connectorName, command.temporary);
+    if (command.kind === "send_message") return await sendMessage(command.message, command.connectorName, command.temporary, command.recovering === true);
     assertNoPageError();
     if (command.kind === "inspect_thread") {
       const url = conversationUrl();
@@ -492,6 +493,7 @@
     if (conversationUnavailableNotice()) throw new Error("CHATGPT_CONVERSATION_UNAVAILABLE: Could not load this ChatGPT conversation.");
     if (allowRateLimit && rateLimitNotice()) return;
     assertNotRateLimited();
+    if (allowInterrupted) return;
     if (!allowInterrupted && connectionInterruptedNotice()) throw new Error("CHATGPT_CONNECTION_INTERRUPTED: Waiting for the complete answer.");
     const notice = pageErrorNotice();
     if (notice) throw new Error(`CHATGPT_PAGE_ERROR: ${(notice.textContent ?? "").trim().slice(0, 500)}`);

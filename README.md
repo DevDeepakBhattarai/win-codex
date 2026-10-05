@@ -198,7 +198,7 @@ This writes `.data/support-extension` with the local support endpoint and privat
 
 Load `.data/support-extension` as an unpacked extension. Do not load the source `support-extension` directory.
 
-The popup configures these browser responsibilities:
+The sidebar configures these browser responsibilities:
 
 - Thread sync. This can be enabled in more than one compatible browser because binding is idempotent.
 - Automation browser executor. Enable this only in the Chrome automation profile. It opens or reuses persistent thread tabs for active registered conversations.

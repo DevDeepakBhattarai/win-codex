@@ -4,43 +4,62 @@ import { chromium } from "playwright-core";
 
 const browser = await chromium.launch({ channel: "chrome", headless: true });
 try {
-  const page = await browser.newPage({ viewport: { width: 560, height: 900 } });
+  const page = await browser.newPage({ viewport: { width: 380, height: 700 }, timezoneId: "Asia/Katmandu" });
   const errors = [];
   page.on("pageerror", error => errors.push(error.message));
+  const url = id => `https://chatgpt.com/c/${id}`;
   const parentId = "11111111-1111-4111-8111-111111111111";
   const reviewId = "22222222-2222-4222-8222-222222222222";
-  const parentUrl = `https://chatgpt.com/c/${parentId}`;
-  const reviewUrl = `https://chatgpt.com/c/${reviewId}`;
-  const thread = { threadId: parentId, conversationUrl: parentUrl, title: "Implement feature", state: "active", mode: "continuous", waitingForTask: true, registeredAt: new Date().toISOString(), nextCheckAt: Date.now() + 1800_000 };
-  const task = { jobId: reviewId, childThreadId: reviewId, childConversationUrl: reviewUrl + "?temporary-chat=true", parentThreadId: parentId, title: "Independent PR task", resultPath: "D:\\workspace\\task.md", state: "pending" };
-  const ready = { ...thread, threadId: "33333333-3333-4333-8333-333333333333", conversationUrl: "https://chatgpt.com/c/33333333-3333-4333-8333-333333333333", title: "Recent completion", waitingForTask: false, activity: "idle", attentionAt: "2026-10-04T02:00:00Z" };
-  const older = { ...ready, threadId: "44444444-4444-4444-8444-444444444444", title: "Earlier completion", attentionAt: "2026-10-04T01:00:00Z", agentCreated: true };
-  const settled = { ...ready, threadId: "55555555-5555-4555-8555-555555555555", title: "Old closed tab", settledAt: "2026-10-03T12:00:00Z" };
+  const baseThread = { registeredAt: new Date().toISOString(), nextCheckAt: Date.now() + 1800_000 };
+  const parent = { ...baseThread, threadId: parentId, conversationUrl: url(parentId), title: "Implement feature", state: "active", waitingForTask: true };
+  const active = { ...baseThread, threadId: "33333333-3333-4333-8333-333333333333", conversationUrl: url("33333333-3333-4333-8333-333333333333"), title: "Check remaining work", state: "active", activity: "idle" };
+  const legacyActive = { ...active, threadId: "44444444-4444-4444-8444-444444444444", title: "Legacy active with settlement", settledAt: new Date().toISOString() };
+  const complete = Array.from({ length: 24 }, (_, index) => ({ ...baseThread,
+    threadId: `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`,
+    conversationUrl: url(`00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`),
+    title: `Completed task ${index}`, state: "complete", activity: "idle", lastCheckedAt: new Date(Date.now() - index * 60_000).toISOString(),
+  }));
+  const task = { jobId: reviewId, childThreadId: reviewId, childConversationUrl: url(reviewId) + "?temporary-chat=true", parentThreadId: parentId, title: "Independent review", state: "pending" };
   let settingsRequests = 0;
   let cancelled = false;
   let automationPausedUntil = 0;
+  let schedules = [];
+  let scheduleRequests = 0;
   await page.addInitScript(() => {
     globalThis.closedViews = 0;
-    globalThis.openedPanels = [];
+    globalThis.openedChats = [];
     globalThis.close = () => { globalThis.closedViews += 1; };
     globalThis.chrome = {
       storage: { local: { async get(defaults) { return defaults; }, async set() {}, async remove() {} } },
       runtime: { async sendMessage() {} },
-      sidePanel: { async open(options) { globalThis.openedPanels.push(options); } },
-      tabs: { async query() { return [{ id: 7, windowId: 3, url: "https://example.com" }]; }, async create() {}, async update() {} },
+      tabs: { async query() { return [{ id: 7, windowId: 3, url: "https://example.com" }]; },
+        async create(options) { globalThis.openedChats.push(options.url); }, async update() {} },
     };
   });
   await page.route("http://127.0.0.1:19999/**", async route => {
     const pathname = new URL(route.request().url()).pathname;
     let data;
-    if (pathname === "/chatgpt-support/ralph/threads") data = { threads: [older, thread, ready, settled, { ...thread, threadId: reviewId, activity: "running", waitingForTask: false }], tasks: [task], automationPausedUntil };
+    if (pathname === "/chatgpt-support/ralph/threads") data = { threads: [parent, active, legacyActive, ...complete], tasks: [task], continuationEnabled: true, automationPausedUntil };
     else if (pathname === "/chatgpt-support/ralph/settings") { settingsRequests += 1; data = { loopIntervalSeconds: 1800 }; }
     else if (pathname === "/chatgpt-support/ralph/projects") data = { projects: [] };
-    else if (pathname === `/chatgpt-support/tasks/${reviewId}`) {
+    else if (pathname === "/chatgpt-support/schedules") {
+      if (route.request().method() === "POST") {
+        scheduleRequests++;
+        const input = route.request().postDataJSON();
+        schedules.push({ ...input, id: "99999999-9999-4999-8999-999999999999", state: "pending" });
+        data = { task: schedules.at(-1) };
+      } else data = { tasks: schedules };
+    } else if (pathname.endsWith("/cancel") && pathname.startsWith("/chatgpt-support/schedules/")) {
+      schedules[0].state = "cancelled";
+      data = { task: schedules[0] };
+    } else if (pathname.startsWith("/chatgpt-support/schedules/") && route.request().method() === "DELETE") {
+      schedules = []; data = { status: "removed" };
+    } else if (pathname === `/chatgpt-support/tasks/${reviewId}`) {
       assert.equal(route.request().postDataJSON().action, "cancel");
       cancelled = true;
       task.state = "cancelled";
-      thread.waitingForTask = false;
+      parent.waitingForTask = false;
+      parent.activity = "running";
       data = { status: "accepted" };
     }
     if (data) { await route.fulfill({ json: data }); return; }
@@ -53,67 +72,95 @@ try {
     if (!["popup.html", "popup.js", "popup.css"].includes(file)) { await route.abort(); return; }
     await route.fulfill({ contentType: file.endsWith("html") ? "text/html" : file.endsWith("css") ? "text/css" : "text/javascript", body: await readFile(`support-extension/${file}`, "utf8") });
   });
-  await page.goto("http://127.0.0.1:19999/popup.html");
-  await page.locator("#readyCount").getByText("2", { exact: true }).waitFor();
-  assert.deepEqual(await page.locator("#threadList .thread-id").allTextContents(), ["Recent completion", "Earlier completion"]);
-  assert.equal(await page.locator("#workingSection").getAttribute("open"), null, "running work is collapsed by default");
+  await page.goto("http://127.0.0.1:19999/popup.html?view=sidepanel");
+  await page.locator("#activeCount").getByText("2", { exact: true }).waitFor();
+  assert.deepEqual(await page.locator("#threadList .thread-id").allTextContents(), ["Check remaining work", "Legacy active with settlement"]);
+  assert.equal(await page.locator("#workingSection").getAttribute("open"), "", "working chats are visible on opening the sidebar");
   assert.equal(await page.locator("#workingCount").textContent(), "1");
-  assert.equal(await page.locator("#settledCount").textContent(), "1");
-  await page.locator("#workingSection summary").click();
-  await page.locator("#subagentThreadsSection summary").click();
-  await page.getByText("waiting for task", { exact: true }).waitFor();
-  assert.equal(await page.getByRole("button", { name: "Check now", exact: true }).count(), 0);
-  assert.equal(settingsRequests, 0, "opening the thread view does not fetch settings");
-  const reviewLink = page.locator('#subagentThreadList a.inspect-task');
-  assert.equal(await reviewLink.textContent(), "Inspect");
-  assert.equal(await reviewLink.getAttribute("href"), task.childConversationUrl, "worker inspection preserves temporary chat mode");
-  assert.equal(await page.getByText(task.resultPath, { exact: true }).count(), 0,
-    "RALPH does not substitute the local result file for worker navigation");
-  await mkdir(".data", { recursive: true });
-  await page.screenshot({ path: ".data/worker-popup.png", fullPage: true });
-  await page.getByRole("button", { name: "Sidebar", exact: true }).click();
-  assert.deepEqual(await page.evaluate(() => globalThis.openedPanels), [{ windowId: 3 }]);
-  assert.equal(await page.evaluate(() => globalThis.closedViews), 1);
-  await page.getByRole("tab", { name: "Settings", exact: true }).click();
-  await page.locator("#ralphLoopIntervalSeconds").waitFor({ state: "visible" });
-  assert.equal(await page.locator("#ralphLoopIntervalSeconds").inputValue(), "1800");
-  assert.equal(settingsRequests, 1);
-  await page.getByRole("tab", { name: "Tasks and threads", exact: true }).click();
-  await page.getByRole("tab", { name: "Settings", exact: true }).click();
-  assert.equal(settingsRequests, 1, "switching tabs reuses loaded settings");
-  await page.getByRole("tab", { name: "Tasks and threads", exact: true }).click();
+  assert.equal(await page.locator("#settledCount").textContent(), "24");
+  assert.equal(await page.locator("#panel-threads").getByText("Completed task 0", { exact: true }).count(), 0, "completed chats cannot crowd active work");
+  assert.equal(await page.getByRole("button", { name: "Run continuously", exact: true }).count(), 0);
+  assert.equal(await page.getByRole("button", { name: "Sidebar", exact: true }).count(), 0);
+  assert.equal(settingsRequests, 0);
+  assert.equal(await page.locator('#subagentThreadList a.inspect-task').getAttribute("href"), task.childConversationUrl);
+  await page.getByRole("link", { name: "Inspect", exact: true }).click();
+  assert.deepEqual(await page.evaluate(() => globalThis.openedChats), [task.childConversationUrl]);
+  assert.equal(await page.evaluate(() => globalThis.closedViews), 0);
+  await page.getByRole("tab", { name: /Settled/ }).click();
+  assert.equal(await page.getByRole("button", { name: "Mark active", exact: true }).count(), 0, "settled cards offer no contradictory active action");
+  await page.locator("#settledList .thread-id").last().scrollIntoViewIfNeeded();
+  assert.equal(await page.locator("#settledList .thread-id").last().isVisible(), true, "long completed lists remain scrollable");
+  assert.ok(await page.locator("main").evaluate(node => node.scrollTop > 0));
+  await page.getByRole("searchbox", { name: "Search threads" }).fill("Completed task 23");
+  assert.equal(await page.locator("#settledList .thread-id").count(), 1);
+  await page.getByRole("searchbox", { name: "Search threads" }).fill("");
+  await page.getByRole("tab", { name: "Threads", exact: true }).click();
   page.once("dialog", dialog => dialog.accept());
   await page.getByRole("button", { name: "Cancel task", exact: true }).click();
   await page.locator("#subagentThreadsSection").waitFor({ state: "hidden" });
-  assert.equal(await page.getByRole("button", { name: "Run continuously", exact: true }).count(), 0);
   assert.equal(cancelled, true);
-  await page.goto("http://127.0.0.1:19999/popup.html?view=sidepanel");
-  await page.locator("#threadList .thread-id").first().waitFor();
-  assert.equal(await page.locator("#openSidePanel").isVisible(), false);
-  await page.getByRole("link", { name: /Recent completion/ }).click();
-  assert.equal(await page.evaluate(() => globalThis.closedViews), 0, "the sidebar remains open during inspection");
-  thread.activity = "running";
-  ready.settledAt = new Date().toISOString();
-  await page.locator("#readyCount").getByText("1", { exact: true }).waitFor();
-  assert.equal(await page.locator("#threadList .thread-id").textContent(), "Earlier completion", "the sidebar updates without Refresh");
-  await page.getByRole("searchbox", { name: "Search threads" }).fill("Implement");
-  await page.locator("#workingSection summary").click();
-  await page.getByText("running", { exact: true }).waitFor();
-  await page.getByRole("searchbox", { name: "Search threads" }).fill("");
+  await page.getByRole("tab", { name: "Settings", exact: true }).click();
+  await page.waitForFunction(() => document.getElementById("ralphLoopIntervalSeconds").value === "1800");
+  assert.equal(settingsRequests, 1);
+  await page.getByRole("tab", { name: "Threads", exact: true }).click();
+  await page.getByRole("tab", { name: "Settings", exact: true }).click();
+  assert.equal(settingsRequests, 1, "settings remain lazy and cached");
+  await page.getByRole("tab", { name: "Schedules", exact: true }).click();
+  assert.match(await page.locator("#scheduleTimezone").textContent(), /Asia\/(?:Katmandu|Kathmandu)/);
+  await page.getByLabel("Prompt", { exact: true }).fill("Run my scheduled check");
+  const localTime = await page.evaluate(() => {
+    const date = new Date(Date.now() + 3600_000);
+    return new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+  });
+  await page.getByLabel("Date and time", { exact: true }).fill(localTime);
+  const expectedUtc = await page.evaluate(() => new Date(document.getElementById("scheduleAt").value).toISOString());
+  await page.getByRole("button", { name: "Schedule task", exact: true }).click();
+  await page.locator("#scheduleList").getByText("Run my scheduled check", { exact: true }).waitFor();
+  assert.equal(schedules[0].runAt, expectedUtc, "the local time converts to the selected instant");
+  assert.equal(scheduleRequests, 1);
+  await page.getByRole("button", { name: "Cancel schedule", exact: true }).click();
+  await page.locator("#scheduleList").getByText(/Cancelled/).waitFor();
+  await page.getByRole("button", { name: "Remove", exact: true }).click();
+  await page.locator("#scheduleList .empty").waitFor();
+  await page.getByLabel("Prompt", { exact: true }).fill("Do not run in the past");
+  await page.getByLabel("Date and time", { exact: true }).fill("2000-01-01T12:00");
+  await page.getByRole("button", { name: "Schedule task", exact: true }).click();
+  await page.getByText("Choose a future date and time.", { exact: true }).waitFor();
+  assert.equal(scheduleRequests, 1, "invalid past schedules never reach the API");
+  for (const [amount, unit, seconds, cadence] of [[1, "60", 60, "Every 1 minute"], [1, "3600", 3600, "Every 1 hour"], [7, "60", 420, "Every 7 minutes"]]) {
+    await page.getByLabel("Prompt", { exact: true }).fill("Recurring check");
+    await page.getByLabel("Date and time", { exact: true }).fill(localTime);
+    await page.getByLabel("Repeat", { exact: true }).check();
+    await page.getByLabel("Every", { exact: true }).fill(String(amount));
+    await page.getByLabel("Unit", { exact: true }).selectOption(unit);
+    await page.getByRole("button", { name: "Schedule task", exact: true }).click();
+    await page.locator("#scheduleList").getByText(cadence, { exact: false }).waitFor();
+    assert.equal(schedules[0].repeatIntervalSeconds, seconds, "repeat interval reaches the server in seconds");
+    assert.equal(await page.locator("#scheduleInterval").isVisible(), false, "successful save resets repeat controls");
+    schedules[0].state = "sending";
+    await page.getByRole("button", { name: "Refresh", exact: true }).last().click();
+    await page.locator("#scheduleList").getByText(/^Starting/).waitFor();
+    await page.getByRole("button", { name: "Stop repeating", exact: true }).click();
+    await page.locator("#scheduleList").getByText(/Cancelled/).waitFor();
+    await page.getByRole("button", { name: "Remove", exact: true }).click();
+    await page.locator("#scheduleList .empty").waitFor();
+  }
+  assert.equal(scheduleRequests, 4);
+  await page.getByRole("tab", { name: "Threads", exact: true }).click();
+  active.state = "complete";
+  await page.locator("#activeCount").getByText("1", { exact: true }).waitFor();
+  assert.equal(await page.locator("#threadList .thread-id").textContent(), "Legacy active with settlement", "completion moves a chat without Refresh");
   automationPausedUntil = Date.now() + 300_000;
   await page.locator("#refreshThreads").click();
   await page.locator('#connection[data-state="paused"]').waitFor();
-  assert.equal(await page.locator("#connectionLabel").textContent(), "Paused");
-  assert.match(await page.locator("#threadsStatus").textContent(), /Tasks stay queued.*resumes at/);
-  await page.setViewportSize({ width: 320, height: 900 });
-  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, "the pause indicator fits the narrow sidebar");
-  await page.screenshot({ path: ".data/global-pause-sidebar.png", fullPage: true });
-  automationPausedUntil = 0;
-  await page.locator("#refreshThreads").click();
-  await page.locator('#connection[data-state="online"]').waitFor();
-  assert.equal(await page.locator("#connectionLabel").textContent(), "Connected");
+  await page.setViewportSize({ width: 320, height: 600 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+  await mkdir(".data", { recursive: true });
   await page.screenshot({ path: ".data/thread-sidebar.png", fullPage: true });
+  await page.getByRole("tab", { name: "Schedules", exact: true }).click();
+  await page.getByLabel("Repeat", { exact: true }).check();
+  await page.screenshot({ path: ".data/schedule-sidebar.png", fullPage: true });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
   assert.deepEqual(errors, []);
-  console.log("Support UI passed: completion ordering, collapsed work, separate tasks, settlement, live updates, search, popup/sidebar navigation, and lazy settings. API responses were fixtures.");
+  console.log("Support UI passed: active and settled separation, scrolling, working tasks, live completion, temporary chat inspection, one-time and minute/hour/custom repeat schedules, cancellation during delivery, timezone conversion, narrow sidebar, and lazy settings. API responses were fixtures.");
 } finally { await browser.close(); }

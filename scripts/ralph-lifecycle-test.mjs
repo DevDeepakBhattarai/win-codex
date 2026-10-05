@@ -40,11 +40,22 @@ try {
   await registry.register(url, { manual: true, activity: "idle" });
   assert.equal(await registry.settle(threadId), true);
   const settled = (await (await RalphRegistry.open(directory)).threads())[0];
+  assert.equal(settled.state, "complete", "a settled chat cannot remain active");
   assert.ok(settled.settledAt, "settlement survives restart without deleting the conversation");
   assert.deepEqual(await registry.due(Date.now() + 24 * 60 * 60_000), []);
   await registry.register(url, { manual: true, activity: "running", reactivate: true });
   assert.equal((await registry.threads())[0].settledAt, undefined, "new work returns a settled thread to the active list");
   assert.deepEqual(await registry.due(Date.now() + 24 * 60 * 60_000), [], "observed manual threads never receive unsolicited continuation");
+
+  const legacyDirectory = path.join(directory, "legacy-settlement");
+  await mkdir(legacyDirectory);
+  await writeFile(path.join(legacyDirectory, "ralph.json"), JSON.stringify({
+    version: 2, projects: [], threads: [{ conversationUrl: url, threadId, state: "active", activity: "idle",
+      manuallyRegistered: true, registeredAt: new Date().toISOString(), nextCheckAt: 0, settledAt: new Date().toISOString() }],
+  }));
+  const migratedRegistry = await RalphRegistry.open(legacyDirectory);
+  assert.equal((await migratedRegistry.threads())[0].state, "complete", "legacy settled history cannot restart unsolicited work");
+  assert.deepEqual(await migratedRegistry.due(), []);
 
   const capacityDirectory = path.join(directory, "capacity");
   await mkdir(capacityDirectory);
@@ -67,8 +78,8 @@ try {
   assert.equal(await capacityRegistry.register(url, { agentCreated: true, parentThreadId: "api:new" }), "registered",
     "settled history cannot exhaust registration capacity");
   const remaining = await capacityRegistry.threads();
-  assert.equal(remaining.length, 3);
-  assert.ok(remaining.some(thread => thread.threadId === retained[0].threadId), "unviewed manual completions retain their place");
+  assert.equal(remaining.length, 2);
+  assert.ok(!remaining.some(thread => thread.threadId === retained[0].threadId), "completed history can be pruned when registration reaches capacity");
   assert.ok(remaining.some(thread => thread.threadId === retained[1].threadId), "running workers retain their registration");
 
   const startupCommands = new SupportCommandBus(undefined, undefined, undefined, async () => {
@@ -101,6 +112,7 @@ try {
 }
 
 const source = await readFile("support-extension/service-worker.js", "utf8");
+const panelBehaviors = [];
 const config = { extensionToken: "x".repeat(32) };
 for (const [key, route] of Object.entries({ bindUrl: "/thread-sync/bind", commandClaimUrl: "/chatgpt-support/commands/claim",
   commandResultUrl: "/chatgpt-support/commands/result", threadObserveUrl: "/chatgpt-support/threads/observe",
@@ -121,6 +133,7 @@ const context = {
   URL, AbortSignal, AbortController, crypto: globalThis.crypto, Response, console, setTimeout, clearTimeout,
   importScripts() {}, LOCAL_CODEX_THREAD_SYNC: config,
   browser: {
+    sidePanel: { async setPanelBehavior(options) { panelBehaviors.push(options); } },
     runtime: { id: "a".repeat(32), onMessage: { addListener() {} }, onInstalled: { addListener() {} }, onStartup: { addListener() {} } },
     storage: { local: {
       async get(query) { return typeof query === "string" ? { [query]: storage[query] } : { ...query, threadSync: false, ...storage }; },
@@ -159,6 +172,7 @@ const context = {
   },
 };
 vm.runInNewContext(source, context);
+assert.deepEqual(panelBehaviors.map(value => value.openPanelOnActionClick), [true], "startup enables toolbar opening");
 await new Promise(resolve => setImmediate(resolve));
 context.getSettings = async () => ({ threadSync: false, automationExecutor: true });
 const inspect = id => context.executeCommand({ id, feature: "ralph", kind: "inspect_thread", conversationUrl: url }, "existing");
@@ -236,4 +250,7 @@ offline = false;
 await context.reportClosedThreadTabs();
 assert.deepEqual(removals.at(-1), { conversationUrl: url, settled: true }, "monitoring retries settlement after the server returns");
 assert.equal(storage[`viewedCompletion:${url}`], undefined);
+const beforeInvalidConfig = panelBehaviors.length;
+assert.throws(() => vm.runInNewContext(source, { ...context, LOCAL_CODEX_THREAD_SYNC: { ...config, bindUrl: "https://example.com/" } }), /endpoint must/);
+assert.equal(panelBehaviors.length, beforeInvalidConfig + 1, "toolbar opening config runs even when automation config is invalid");
 console.log("RALPH lifecycle tests passed.");

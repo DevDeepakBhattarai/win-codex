@@ -28,7 +28,6 @@ const RALPH_PREPARE_TIMEOUT_MS = 3 * 60 * 1000;
 const THREAD_PREPARATION_HOLD_MS = 2 * 60 * 1000;
 const COMPLETED_THREAD_TAB_RETENTION_MS = 0;
 const THREAD_TAB_CLEANUP_TICK_MS = 5 * 1000;
-const MAX_CONTINUATION_CHARS = 500;
 const TOOL_REQUEST_REPLAY_TTL_MS = 30 * 60 * 1000;
 const MAX_TOOL_REQUEST_REPLAYS = 1_000;
 const MESSAGE_COOLDOWN_MS = 10 * 60_000;
@@ -62,7 +61,6 @@ function replayToolRequest(replayKey: string, createResult: () => Promise<CallTo
 }
 
 export const SUBAGENT_AGENT_INSTRUCTION = "For reviews, browser work, application testing, or bounded independent assignments in a large task, use the blocking local CLI with a specification file. Keep planning, implementation, diagnosis, reproduction, and evidence collection in the parent unless the user assigns them to a worker. Keep the parent turn active until the command returns and read the complete report. Assigned workers execute their specification themselves and publish their report through the supplied temporary file and rename.";
-const CONTINUOUS_RALPH_INSTRUCTION = "Continue the user-authorized continuous run toward the existing goal. You own all decisions about what to do next. Read the conversation and current state, use completed task reports as evidence, choose useful unfinished work, and verify the result. If progress depends on a pending task, user input, or a message cooldown, state the blocker and end this turn. Do not poll. Continuous RALPH will wake the thread again while the user keeps continuous mode enabled.";
 
 export const supportFeatureSchema = z.enum(["ralph", "threadMessaging", "threadPreparation", "threadLifecycle"]);
 export type SupportFeature = z.infer<typeof supportFeatureSchema>;
@@ -677,7 +675,6 @@ const ralphThreadSchema = z.object({
   attentionAt: z.string().optional(),
   settledAt: z.string().optional(),
   observedOnly: z.boolean().optional(),
-  mode: z.enum(["normal", "continuous"]).default("normal"),
   externalRevision: z.string().optional(),
   lastCheckedAt: z.string().optional(),
   lastContinuationAt: z.string().optional(),
@@ -742,6 +739,15 @@ export class RalphRegistry {
       if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
     }
     for (const thread of state.threads) {
+      if (thread.settledAt && thread.state === "active") {
+        if (thread.activity === "running" || thread.activity === "blocked") thread.settledAt = undefined;
+        else thread.state = "complete";
+        migrated = true;
+      }
+      if (thread.state === "complete" && !thread.settledAt) {
+        thread.settledAt = thread.lastCheckedAt ?? thread.registeredAt;
+        migrated = true;
+      }
       const title = normalizeThreadTitle(thread.title);
       if (title === thread.title) continue;
       migrated = true;
@@ -874,6 +880,7 @@ export class RalphRegistry {
           if (options.activity !== "running") {
             existing.attentionAt = existing.activity ? now : existing.lastCheckedAt ?? existing.registeredAt;
           } else {
+            existing.state = "active";
             existing.settledAt = undefined;
           }
           existing.activity = options.activity;
@@ -906,7 +913,6 @@ export class RalphRegistry {
           ...(options.activity !== "running" ? { attentionAt: new Date().toISOString() } : {}) } : {}),
         nextCheckAt: Date.now() + state.loopIntervalMs,
         state: "active",
-        mode: "normal",
       });
       return "registered" as const;
     });
@@ -923,6 +929,8 @@ export class RalphRegistry {
     return this.update((state) => {
       const thread = state.threads.find((entry) => entry.threadId === threadId);
       if (!thread || thread.activity === "running" || thread.activity === "blocked") return false;
+      if (!thread.observedOnly && thread.state === "active") return false;
+      thread.state = "complete";
       thread.settledAt = new Date().toISOString();
       return true;
     });
@@ -936,13 +944,8 @@ export class RalphRegistry {
   }
 
   async isActive(threadId: string) {
-    return (await this.activeMode(threadId)) !== undefined;
-  }
-
-  async activeMode(threadId: string) {
     await this.queue;
-    const thread = this.state.threads.find((entry) => entry.threadId === threadId && entry.state === "active" && !entry.settledAt);
-    return thread?.mode;
+    return this.state.threads.some(thread => thread.threadId === threadId && thread.state === "active" && !thread.settledAt);
   }
 
   async scheduleNow(threadId: string): Promise<"scheduled" | "complete" | "missing"> {
@@ -995,22 +998,6 @@ export class RalphRegistry {
     });
   }
 
-  async setMode(threadId: string, mode: "normal" | "continuous") {
-    return this.update((state) => {
-      const thread = state.threads.find((entry) => entry.threadId === threadId);
-      if (!thread) return undefined;
-      thread.mode = mode;
-      thread.lastError = undefined;
-      if (mode === "continuous") {
-        thread.observedOnly = undefined;
-        thread.state = "active";
-        thread.settledAt = undefined;
-        thread.nextCheckAt = Date.now() + state.loopIntervalMs;
-      }
-      return { ...thread };
-    });
-  }
-
   async recordComplete(threadId: string) {
     return this.update((state) => {
       const thread = state.threads.find((entry) => entry.threadId === threadId);
@@ -1019,6 +1006,7 @@ export class RalphRegistry {
       thread.lastCheckedAt = new Date().toISOString();
       thread.attentionAt = thread.lastCheckedAt;
       thread.activity = "idle";
+      thread.settledAt = thread.lastCheckedAt;
       thread.lastError = undefined;
       return true;
     });
@@ -1061,6 +1049,9 @@ export class RalphRegistry {
       const now = new Date().toISOString();
       thread.lastCheckedAt = now;
       thread.lastContinuationAt = now;
+      thread.activity = "running";
+      thread.activityAt = now;
+      thread.settledAt = undefined;
       if (fingerprint) thread.resumedFingerprint = fingerprint;
       thread.lastError = undefined;
       thread.nextCheckAt = Date.now() + state.loopIntervalMs;
@@ -1243,8 +1234,7 @@ export class RalphController {
         return;
       }
 
-      const currentMode = await this.options.registry.activeMode(thread.threadId);
-      if (currentMode === undefined) return;
+      if (!await this.options.registry.isActive(thread.threadId)) return;
       if (await this.options.jobs?.blocksContinuation(thread.threadId)) {
         await this.options.registry.recordRunning(thread.threadId);
         return;
@@ -1253,7 +1243,7 @@ export class RalphController {
         ? observedInspection
         : await this.inspectExecutorBeforeContinuation(thread);
       if (!inspection) return;
-      if (await this.options.registry.activeMode(thread.threadId) !== currentMode) return;
+      if (!await this.options.registry.isActive(thread.threadId)) return;
 
       const checkpoint = inspection.assistant.text.trim().match(/(?:^|\n)RALPH_STATUS: (CONTINUE|WAIT_CI|BLOCKED|COMPLETE)$/)?.[1];
       if (checkpoint === "COMPLETE" || checkpoint === "BLOCKED") {
@@ -1278,30 +1268,12 @@ export class RalphController {
         await this.options.registry.recordContinuation(thread.threadId, fingerprint);
         return;
       }
-      if (currentMode === "continuous") {
-        const sendResult = await this.options.commands.execute({
-          feature: "ralph",
-          kind: "send_message",
-          targetUrl: thread.conversationUrl,
-          message: CONTINUOUS_RALPH_INSTRUCTION,
-        });
-        if (!sendResult.ok) throw new Error(sendResult.error);
-        if (sendResult.kind !== "send_message") throw new Error("RALPH received the wrong send-message result.");
-        await this.options.registry.recordContinuation(thread.threadId);
-        return;
-      }
-
       if (inspection.users.length === 0 || inspection.users.some((message) => !message.text.trim())) {
         throw new Error("RALPH could not extract every ChatGPT user message.");
       }
       if (!inspection.assistant.text.trim()) {
         throw new Error("RALPH could not extract the final ChatGPT assistant message.");
       }
-      if (inspection.workedSeconds === null) {
-        await this.options.registry.recordComplete(thread.threadId);
-        return;
-      }
-
       const decision = await decideRalphContinuation(
         inspection,
         this.options.apiKey,
@@ -1313,23 +1285,18 @@ export class RalphController {
         await this.options.registry.recordComplete(thread.threadId);
         return;
       }
-      const modeBeforeSend = await this.options.registry.activeMode(thread.threadId);
-      if (modeBeforeSend === undefined) return;
-      const continuation = modeBeforeSend === "continuous"
-        ? CONTINUOUS_RALPH_INSTRUCTION
-        : decision.instruction;
-      if (await this.options.registry.activeMode(thread.threadId) !== modeBeforeSend) return;
+      if (!await this.options.registry.isActive(thread.threadId)) return;
       if (await this.options.jobs?.blocksContinuation(thread.threadId)) {
         await this.options.registry.recordRunning(thread.threadId);
         return;
       }
-      if (await this.options.registry.activeMode(thread.threadId) !== modeBeforeSend) return;
+      if (!await this.options.registry.isActive(thread.threadId)) return;
 
       const sendResult = await this.options.commands.execute({
         feature: "ralph",
         kind: "send_message",
         targetUrl: thread.conversationUrl,
-        message: continuation,
+        message: "Continue the existing task from its current state. Do not repeat completed work.",
       });
       if (!sendResult.ok) throw new Error(sendResult.error);
       if (sendResult.kind !== "send_message") throw new Error("RALPH received the wrong send-message result.");
@@ -1459,7 +1426,7 @@ async function decideRalphContinuation(
     "An idle turn may be finished or waiting for input. Judge the transcript without assuming a fixed tool-access time limit.",
     "The working agent is more capable than you and already has the full conversation, so do not plan or choose how it should work.",
     "Based only on all user messages and the final assistant message below, reply with exactly COMPLETE if the request is finished.",
-    "If work remains, reply in English with one short sentence that tells the agent to continue and names only the unfinished work stated or clearly implied by the transcript.",
+    "If work remains, reply with exactly CONTINUE. Do not write a continuation prompt. The working agent decides what to do next.",
     "Do not explain, add steps, or repeat completed work.",
   ].join(" ");
   const requestBody = {
@@ -1505,9 +1472,8 @@ async function decideRalphContinuation(
     responseBody = await response.json();
     const text = extractResponsesText(responseBody).trim();
     if (!text) throw new Error("OpenAI RALPH decision returned no text.");
-    const decision = /^COMPLETE\.?$/i.test(text)
-      ? { complete: true as const }
-      : { complete: false as const, instruction: compactContinuation(text) };
+    if (!/^(?:COMPLETE|CONTINUE)\.?$/i.test(text)) throw new Error("OpenAI RALPH decision must be COMPLETE or CONTINUE.");
+    const decision = { complete: /^COMPLETE\.?$/i.test(text) };
     await auditLog.write("request_succeeded", {
       thread: conversationUrl,
       model,
@@ -1553,15 +1519,7 @@ function extractResponsesText(value: unknown) {
   return parts.join("\n");
 }
 
-function compactContinuation(value: string) {
-  const normalized = value.replace(/\s+/g, " ").replace(/^['"]|['"]$/g, "").trim();
-  if (!normalized) throw new Error("OpenAI RALPH decision returned an empty continuation instruction.");
-  return normalized.length <= MAX_CONTINUATION_CHARS
-    ? normalized
-    : `${normalized.slice(0, MAX_CONTINUATION_CHARS - 1).trimEnd()}â€¦`;
-}
-
-function authenticateSupportExtension(req: Request, res: Response, extensionToken: string) {
+export function authenticateSupportExtension(req: Request, res: Response, extensionToken: string) {
   const authorization = req.get("authorization");
   const candidate = Buffer.from(authorization?.startsWith("Bearer ") ? authorization.slice(7) : "");
   const expected = Buffer.from(extensionToken);
@@ -1762,26 +1720,6 @@ export function ralphThreadActiveHandler(registry: RalphRegistry, extensionToken
     }
     res.setHeader("Cache-Control", "no-store");
     res.json({ threadId: parsed.data, state: "active" });
-  };
-}
-
-export function ralphThreadModeHandler(registry: RalphRegistry, extensionToken: string): RequestHandler {
-  const bodySchema = z.object({ mode: z.enum(["normal", "continuous"]) }).strict();
-  return async (req, res) => {
-    if (!authenticateSupportExtension(req, res, extensionToken)) return;
-    const threadId = z.string().uuid().safeParse(req.params.threadId);
-    const body = bodySchema.safeParse(req.body);
-    if (!threadId.success || !body.success) {
-      res.status(400).json({ error: "Invalid RALPH thread mode request." });
-      return;
-    }
-    const thread = await registry.setMode(threadId.data, body.data.mode);
-    if (!thread) {
-      res.status(404).json({ error: "RALPH thread not found." });
-      return;
-    }
-    res.setHeader("Cache-Control", "no-store");
-    res.json({ thread });
   };
 }
 
