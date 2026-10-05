@@ -2279,7 +2279,7 @@ async function testRalphAutoRegistration(sync) {
 
   historyListener({ frameId: 0, url: urlA });
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(registrationBodies, [{ conversationUrl: urlA, manual: true, checkForCompletion: false }],
+  assert.deepEqual(registrationBodies, [{ conversationUrl: urlA, checkForCompletion: false }],
     "a ChatGPT SPA navigation into a project conversation registers it without thread sync");
 
   historyListener({ frameId: 0, url: urlA });
@@ -2452,7 +2452,7 @@ async function testRalphWorkerReactivation(sync) {
   await new Promise(resolve => setImmediate(resolve));
   const registrationRequests = () => requests.filter(request =>
     request.endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.ralphRegisterUrl);
-  assert.deepEqual(JSON.parse(registrationRequests()[0].options.body), { conversationUrl: urlA, manual: true, checkForCompletion: false });
+  assert.deepEqual(JSON.parse(registrationRequests()[0].options.body), { conversationUrl: urlA, checkForCompletion: false });
 
   const reactivation = await new Promise(resolve => {
     runtimeListener({
@@ -2472,7 +2472,6 @@ async function testRalphWorkerReactivation(sync) {
     conversationUrl: urlA,
     reactivate: true,
     externalUpdate: true,
-    manual: true,
     checkForCompletion: false,
   });
   updatedListener(7, { title: "RALPH - New chat" }, { url: urlA, title: "RALPH - New chat" });
@@ -2496,7 +2495,6 @@ async function testRalphWorkerReactivation(sync) {
   assert.deepEqual(JSON.parse(registrationRequests().at(-1).options.body), {
     conversationUrl: urlA,
     title: "RALPH - Persisted late title",
-    manual: true,
     checkForCompletion: false,
   }, "a late page title observation is normalized and sent to the server");
 }

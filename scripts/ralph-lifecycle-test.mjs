@@ -81,6 +81,7 @@ try {
   await legacyMarkedRegistry.register(url, { manual: true, checkForCompletion: false });
   assert.equal((await legacyMarkedRegistry.due(Date.now() + 86400_000)).length, 1,
     "the ordinary-chat setting does not remove a deliberate legacy RALPH mark");
+
   await registry.register(url, { manual: true, checkForCompletion: true, title: "Finished task" });
   assert.equal((await registry.threads())[0].state, "complete", "automatic title registration cannot restart a finished task");
   assert.deepEqual(await registry.due(Date.now() + 24 * 60 * 60_000), []);
@@ -366,4 +367,28 @@ await context.reactivateRalphConversation({ conversationUrl: url, activity: "idl
   id: "a".repeat(32), frameId: 0, tab: { id: 11 },
 });
 assert.equal(completionRegistrations.at(-1).checkForCompletion, false, "disabling checks sends an explicit opt-out");
+assert.equal(completionRegistrations.at(-1).manual, undefined, "automatic observations cannot create a manual mark");
+const projectDirectory = await mkdtemp(path.join(os.tmpdir(), "ralph-project-toggle-"));
+try {
+  const projectRegistry = await RalphRegistry.open(projectDirectory);
+  const projectId = "g-p-6a87fafd6d948191ab3338e485c07c39";
+  const projectUrl = url.replace("/c/", `/g/${projectId}/c/`);
+  await context.registerRalphConversation(projectUrl, { title: "Observed project task" });
+  await projectRegistry.register(projectUrl, completionRegistrations.at(-1));
+  await projectRegistry.setProjects([projectId]);
+  await context.registerRalphConversation(projectUrl, { title: "Observed project task" });
+  await projectRegistry.register(projectUrl, completionRegistrations.at(-1));
+  assert.equal((await projectRegistry.due(Date.now() + 86400_000)).length, 1,
+    "adding a project enrolls its observed chat while ordinary checks are off");
+  assert.equal((await projectRegistry.threads())[0].manuallyRegistered, undefined,
+    "automatic project enrollment cannot create a deliberate manual mark");
+  await projectRegistry.setProjects([]);
+  assert.deepEqual(await projectRegistry.threads(), [], "removing a project removes its automatic registrations");
+  context.getSettings = async () => ({ threadSync: true, automationExecutor: false, ralph: true });
+  await context.registerRalphConversation(url, { title: "Ordinary task" });
+  await projectRegistry.register(url, completionRegistrations.at(-1));
+  await projectRegistry.setProjects([projectId]);
+  assert.equal((await projectRegistry.due(Date.now() + 86400_000)).length, 1,
+    "changing project scope preserves ordinary setting-enrolled chats");
+} finally { await rm(projectDirectory, { recursive: true, force: true }); }
 console.log("RALPH lifecycle tests passed.");

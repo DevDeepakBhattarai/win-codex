@@ -981,7 +981,16 @@ export class RalphRegistry {
       state.threads = state.threads.filter((thread) => {
         if (thread.manuallyRegistered || thread.agentCreated) return true;
         const projectId = parseConversationUrl(thread.conversationUrl).projectId;
-        return projectId !== undefined && allowed.has(projectId);
+        if (projectId !== undefined && allowed.has(projectId)) {
+          if (thread.completionCheckEnabled !== undefined) {
+            thread.completionCheckEnabled = undefined;
+            thread.observedOnly = undefined;
+            thread.checkRevision = (thread.checkRevision ?? 0) + 1;
+            thread.nextCheckAt = Date.now() + state.loopIntervalMs;
+          }
+          return true;
+        }
+        return thread.completionCheckEnabled !== undefined && (projectId === undefined || thread.completionCheckEnabled);
       });
       return [...projects];
     });
@@ -998,7 +1007,8 @@ export class RalphRegistry {
       if (this.isVoiceConversation(conversation.conversationUrl)) return "ignored" as const;
       const projectAllowed = conversation.projectId && state.projects.includes(conversation.projectId);
       const existing = state.threads.find((entry) => entry.threadId === conversation.threadId);
-      if (!options.manual && !options.agentCreated && !projectAllowed && !existing?.manuallyRegistered && !existing?.agentCreated) return "ignored" as const;
+      if (!options.manual && options.checkForCompletion === undefined && !options.agentCreated && !projectAllowed &&
+          !existing?.manuallyRegistered && !existing?.agentCreated) return "ignored" as const;
       if (existing) {
         if (options.externalUpdate) existing.externalRevision = randomUUID();
         if (existing.conversationUrl !== conversation.conversationUrl) existing.conversationUrl = conversation.conversationUrl;
@@ -1014,7 +1024,11 @@ export class RalphRegistry {
           existing.completionCheckEnabled = options.checkForCompletion;
           existing.observedOnly = options.checkForCompletion ? undefined : true;
         }
-        if (explicitlyMarked || options.agentCreated) {
+        if (explicitlyMarked || options.agentCreated || projectAllowed) {
+          if (existing.observedOnly) {
+            existing.checkRevision = (existing.checkRevision ?? 0) + 1;
+            existing.nextCheckAt = Date.now() + state.loopIntervalMs;
+          }
           existing.observedOnly = undefined;
           existing.completionCheckEnabled = undefined;
         }
