@@ -18,6 +18,7 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
   const results = [];
   let dispatches = 0;
   let reloads = 0;
+  let removals = 0;
   const calls = [];
   const deliveredMessages = [];
   let releaseRecovery;
@@ -49,6 +50,7 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
         create: async () => ({ id: 11 }),
         get: async () => ({ id: 11, status: "complete", url: tabUrl }),
         reload: async () => { reloads += 1; },
+        update: async () => {},
         sendMessage: async (_tabId, payload) => {
           calls.push(payload.command.kind);
           if (payload.command.kind === "send_message") deliveredMessages.push(payload.command.message);
@@ -66,7 +68,7 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
           if (response instanceof Error) throw response;
           return response;
         },
-        remove: async () => {},
+        remove: async () => { removals += 1; },
       },
       webNavigation: { onHistoryStateUpdated: { addListener() {} }, onCommitted: { addListener() {} } },
       scripting: { executeScript: async () => { const failure = activeInjectionFailures.shift(); if (failure) throw failure; } },
@@ -101,7 +103,8 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
   const execution = context.executeCommand(command, "browser-a");
   releaseRecovery();
   await Promise.all([background, execution]);
-  return { results, dispatches, reloads, calls, deliveredMessages, waits, dispatchTimes, storage,
+  return { results, dispatches, reloads, removals, calls, deliveredMessages, waits, dispatchTimes, storage,
+    closeThread() { return context.closeOwnedThreadTab(url); },
     advanceTime(ms) { clock += ms; },
     setServiceOnline(online) { serviceOnline = online; },
     syncPause() { return context.syncAutomationPause(); },
@@ -111,6 +114,27 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
         { id: "a".repeat(32), frameId: 0, tab: { id: 11 }, url: nextUrl }, resolve));
     },
   };
+}
+
+for (const kind of ["voice_start", "voice_stop"]) {
+  const run = await runWorker({ id: kind, feature: "voice", kind, targetUrl: url }, [
+    { ok: true, result: { status: kind === "voice_start" ? "active" : "closed", conversationUrl: url } },
+  ], [], [], false, "restart");
+  assert.equal(run.results[0].ok, true);
+  assert.equal(run.reloads, 0, "Voice controls never refresh the conversation");
+  assert.deepEqual(run.calls, [kind], "Voice bypasses page recovery and the worker automation pause");
+  assert.equal(run.dispatchTimes[0], 1_800_000_000_000);
+  run.storage.automationThreadTabsV1 = { [url]: 11 };
+  assert.equal((await run.closeThread()).status, "not_owned", "worker cleanup cannot close the dedicated Voice tab");
+  assert.equal(run.removals, 0);
+}
+{
+  const run = await runWorker({ id: "voice-failed-stop", feature: "voice", kind: "voice_stop", targetUrl: url }, [
+    { ok: false, error: "End Voice unavailable" },
+  ]);
+  assert.equal(run.results[0].ok, false);
+  assert.equal(run.reloads, 0, "a failed Voice stop does not reload or replay the call");
+  assert.equal(run.removals, 0, "a failed stop preserves the tab for recovery");
 }
 
 function inspectCommand(id) {

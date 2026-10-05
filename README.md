@@ -24,6 +24,8 @@ graph TD
 
 For a local parent agent, use `pnpm agent run --file spec.md`. Keep the command alive until it returns the report. The CLI supplies caller grouping and a request ID. See [the delegation workflow](docs/delegation.md) and [the API reference](docs/agent-api-reference.md).
 
+To control Voice in a dedicated chatgpt.com conversation, follow [the browser Voice setup](docs/browser-voice-controls.md). The local CLI can configure the saved chat, inspect its call controls, start Voice, and end the call.
+
 ### Local computer tools
 
 The core MCP server always exposes these tools:

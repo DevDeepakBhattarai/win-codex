@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.8.4";
+  const contentScriptVersion = "1.9.0";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -140,6 +140,9 @@
   });
 
   async function runAutomation(command) {
+    if (["voice_status", "voice_start", "voice_stop"].includes(command.kind) && command.feature === "voice") {
+      return await controlVoice(command);
+    }
     await waitForAutomationResume();
     if (command.kind === "page_health") return pageHealth();
     if (command.kind === "dismiss_rate_limit") {
@@ -173,6 +176,54 @@
       return result;
     }
     throw new Error("Unsupported ChatGPT support command.");
+  }
+
+  function visibleVoiceButton(label) {
+    return [...document.querySelectorAll(`button[aria-label="${label}"]`)].find(button =>
+      button.getClientRects().length && getComputedStyle(button).visibility !== "hidden");
+  }
+
+  function voiceState() {
+    const start = visibleVoiceButton("Start Voice");
+    const end = visibleVoiceButton("End Voice");
+    if (end && !start) return "active";
+    if (isActionableButton(start) && !end) return "closed";
+    return "unavailable";
+  }
+
+  async function controlVoice(command) {
+    const targetUrl = command.targetUrl;
+    const assertTarget = () => {
+      if (!targetUrl || conversationUrl() !== targetUrl || new URL(targetUrl).searchParams.get("temporary-chat") === "true") {
+        throw new Error("Voice control is no longer on the configured regular conversation.");
+      }
+    };
+    assertTarget();
+    if (command.kind === "voice_status") return { status: voiceState(), conversationUrl: targetUrl };
+    const desired = command.kind === "voice_start" ? "active" : "closed";
+    const deadline = Date.now() + 30_000;
+    let button;
+    while (Date.now() < deadline) {
+      assertTarget();
+      if (voiceState() === desired) return { status: desired, conversationUrl: targetUrl };
+      button = visibleVoiceButton(command.kind === "voice_start" ? "Start Voice" : "End Voice");
+      if (isActionableButton(button)) break;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    if (!isActionableButton(button)) throw new Error("ChatGPT Voice control is unavailable. Check login, Voice access, and microphone permission.");
+    button.click();
+    let stableSince = 0;
+    while (Date.now() < deadline) {
+      assertTarget();
+      if (voiceState() === desired) {
+        if (!stableSince) stableSince = Date.now();
+        if (Date.now() - stableSince >= 500) return { status: desired, conversationUrl: targetUrl };
+      } else {
+        stableSince = 0;
+      }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    throw new Error(`ChatGPT did not confirm Voice ${desired}. Check its call controls before retrying.`);
   }
 
   async function stopThread() {

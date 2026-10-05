@@ -62,7 +62,7 @@ function replayToolRequest(replayKey: string, createResult: () => Promise<CallTo
 
 export const SUBAGENT_AGENT_INSTRUCTION = "For reviews, browser work, application testing, or bounded independent assignments in a large task, use the blocking local CLI with a specification file. Keep planning, implementation, diagnosis, reproduction, and evidence collection in the parent unless the user assigns them to a worker. Keep the parent turn active until the command returns and read the complete report. Assigned workers execute their specification themselves and publish their report through the supplied temporary file and rename.";
 
-export const supportFeatureSchema = z.enum(["ralph", "threadMessaging", "threadPreparation", "threadLifecycle"]);
+export const supportFeatureSchema = z.enum(["ralph", "threadMessaging", "threadPreparation", "threadLifecycle", "voice"]);
 export type SupportFeature = z.infer<typeof supportFeatureSchema>;
 
 const threadMessageSchema = z.object({
@@ -100,6 +100,12 @@ const stopThreadResultSchema = z.object({
 });
 
 const supportCommandSchema = z.union([
+  z.object({
+    id: z.string(),
+    feature: z.literal("voice"),
+    kind: z.enum(["voice_status", "voice_start", "voice_stop"]),
+    targetUrl: z.string().url(),
+  }),
   z.object({
     id: z.string(),
     refreshRevision: z.string().optional(),
@@ -156,6 +162,16 @@ const commandResultSchema = z.union([
   z.object({
     commandId: z.string(),
     browserId: z.string(),
+    kind: z.enum(["voice_status", "voice_start", "voice_stop"]),
+    ok: z.literal(true),
+    result: z.object({
+      status: z.enum(["closed", "active", "unavailable"]),
+      conversationUrl: z.string().url(),
+    }),
+  }),
+  z.object({
+    commandId: z.string(),
+    browserId: z.string(),
     kind: z.literal("inspect_thread"),
     ok: z.literal(true),
     result: threadInspectionSchema,
@@ -197,7 +213,7 @@ const commandResultSchema = z.union([
   z.object({
     commandId: z.string(),
     browserId: z.string(),
-    kind: z.union([z.literal("inspect_thread"), z.literal("prepare_thread"), z.literal("close_thread"), z.literal("send_message"), z.literal("stop_thread")]),
+    kind: z.enum(["inspect_thread", "prepare_thread", "close_thread", "send_message", "stop_thread", "voice_status", "voice_start", "voice_stop"]),
     ok: z.literal(false),
     error: z.string().min(1).max(2_000),
     deliveryUncertain: z.boolean().optional(),
@@ -244,6 +260,10 @@ export class SupportCommandBus {
     return this.cooldownUntil > Date.now() ? this.cooldownUntil : 0;
   }
 
+  voiceConversationUrl() {
+    return this.registry?.voiceConversationUrl();
+  }
+
   automationPausedUntil() {
     return this.registry?.automationPausedUntil() ?? 0;
   }
@@ -262,6 +282,7 @@ export class SupportCommandBus {
     const extension = until - Math.max(Date.now(), previous);
     if (extension > 0) {
       for (const pending of this.pending.values()) {
+        if (pending.command.feature === "voice") continue;
         pending.deadline += extension;
         clearTimeout(pending.timeout);
         pending.timeout = setTimeout(() => {
@@ -301,16 +322,19 @@ export class SupportCommandBus {
     options: { allowBrowserLaunch?: boolean } = {},
   ) {
     const allowBrowserLaunch = options.allowBrowserLaunch !== false;
-    while (this.automationPausedUntil()) {
+    while (command.feature !== "voice" && this.automationPausedUntil()) {
       await new Promise<void>(resolve => setTimeout(resolve, Math.min(1000, this.automationPausedUntil() - Date.now())));
     }
     const targetUrl = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
+    if (command.feature !== "voice" && this.registry?.isVoiceConversation(targetUrl)) {
+      throw new Error("The dedicated Voice conversation is protected from thread automation.");
+    }
     let targetThreadId: string | undefined;
     try { targetThreadId = parseConversationUrl(targetUrl).threadId; } catch { targetThreadId = undefined; }
     if (command.feature === "ralph" && targetThreadId && this.jobs?.blocksContinuationNow(targetThreadId)) {
       throw new Error("RALPH is paused for this task handoff.");
     }
-    if (allowBrowserLaunch && (command.kind === "send_message" || command.kind === "stop_thread" || command.kind === "prepare_thread") && this.launchBrowser) {
+    if (allowBrowserLaunch && (command.feature === "voice" || command.kind === "send_message" || command.kind === "stop_thread" || command.kind === "prepare_thread") && this.launchBrowser) {
       await this.ensureBrowser(command.feature, this.launchBrowser);
     }
     if (allowBrowserLaunch && command.kind === "inspect_thread" && this.launchBrowser) {
@@ -627,6 +651,9 @@ export class SupportCommandBus {
   }
 
   private canClaim(command: SupportCommand) {
+    if (command.feature === "voice") return true;
+    const target = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
+    if (this.registry?.isVoiceConversation(target)) return false;
     if (this.automationPausedUntil()) return false;
     if (command.kind !== "send_message") return true;
     if (this.messageCooldownUntil()) return false;
@@ -699,6 +726,7 @@ const ralphStoreSchema = z.object({
   loopIntervalMs: z.number().int().positive().max(MAX_RALPH_INTERVAL_SECONDS * 1000).default(DEFAULT_RALPH_CHECK_INTERVAL_MS),
   subagentProjectUrl: z.string().url().optional(),
   automationPausedUntil: z.number().int().nonnegative().optional(),
+  voiceConversationUrl: z.string().url().optional(),
 });
 type RalphStore = z.infer<typeof ralphStoreSchema>;
 const ralphLoopIntervalSecondsSchema = z.number().int()
@@ -799,6 +827,32 @@ export class RalphRegistry {
     return this.state.threads.map((entry) => ({ ...entry }));
   }
 
+  voiceConversationUrl() {
+    return this.state.voiceConversationUrl;
+  }
+
+  isVoiceConversation(value: string) {
+    const configured = this.state.voiceConversationUrl;
+    if (!configured) return false;
+    try { return parseConversationUrl(value).threadId === parseConversationUrl(configured).threadId; }
+    catch { return false; }
+  }
+
+  async setVoiceConversation(value: string) {
+    const conversation = parseConversationUrl(value);
+    if (conversation.projectId || new URL(value).searchParams.get("temporary-chat") === "true") {
+      throw new Error("Voice requires a regular saved ChatGPT conversation outside a project.");
+    }
+    return this.update(state => {
+      if (state.threads.some(thread => thread.threadId === conversation.threadId && thread.parentThreadId)) {
+        throw new Error("A delegated worker cannot be used as the Voice conversation.");
+      }
+      state.voiceConversationUrl = conversation.conversationUrl;
+      state.threads = state.threads.filter(thread => thread.threadId !== conversation.threadId);
+      return conversation.conversationUrl;
+    });
+  }
+
   async externalRevision(conversationUrl: string) {
     let threadId: string;
     try { threadId = parseConversationUrl(conversationUrl).threadId; }
@@ -864,6 +918,7 @@ export class RalphRegistry {
     const conversation = parseConversationUrl(conversationUrl);
     const title = normalizeThreadTitle(options.title);
     return this.update((state) => {
+      if (this.isVoiceConversation(conversation.conversationUrl)) return "ignored" as const;
       const projectAllowed = conversation.projectId && state.projects.includes(conversation.projectId);
       const existing = state.threads.find((entry) => entry.threadId === conversation.threadId);
       if (!options.manual && !options.agentCreated && !projectAllowed && !existing?.manuallyRegistered && !existing?.agentCreated) return "ignored" as const;
@@ -1538,7 +1593,7 @@ export function authenticateSupportExtension(req: Request, res: Response, extens
 export function supportCommandClaimHandler(commands: SupportCommandBus, extensionToken: string): RequestHandler {
   const bodySchema = z.object({
     browserId: z.string().min(1).max(200),
-    features: z.array(supportFeatureSchema).max(4),
+    features: z.array(supportFeatureSchema).max(5),
     conversationUnavailable: z.boolean().optional(),
     automationPausedUntil: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
     statusOnly: z.boolean().optional(),
@@ -1567,6 +1622,7 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
       const command = await commands.claim(parsed.data.browserId, parsed.data.features, CLAIM_WAIT_MS, abortController.signal, parsed.data.openThreads);
       if (abortController.signal.aborted) return;
       res.setHeader("Cache-Control", "no-store");
+      res.setHeader("X-Voice-Conversation-Url", commands.voiceConversationUrl() ?? "");
       res.setHeader("X-Automation-Paused-Until", String(commands.automationPausedUntil()));
       if (!command) {
         res.status(204).end();

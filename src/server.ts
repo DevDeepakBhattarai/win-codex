@@ -86,6 +86,7 @@ import {
 import { SubagentJobRegistry } from "./subagent-jobs.js";
 import { ScheduledTasks, createScheduleApi } from "./scheduled-tasks.js";
 import { createAgentApi } from "./agent-api.js";
+import { createVoiceApi } from "./voice-api.js";
 
 const PORT = Number(process.env.PORT ?? 6000);
 const HOST = process.env.HOST ?? "localhost";
@@ -2826,6 +2827,9 @@ const threadSyncHttpServer = threadSync
       const syncApp = express();
       syncApp.disable("x-powered-by");
       syncApp.use(express.json({ limit: "5mb" }));
+      if (supportCommands && ralphRegistry) {
+        syncApp.use("/chatgpt-support/voice", createVoiceApi({ token: threadSync.extensionToken, registry: ralphRegistry, commands: supportCommands }));
+      }
       if (scheduledTasks) syncApp.use("/chatgpt-support/schedules", createScheduleApi(scheduledTasks, threadSync.extensionToken));
       if (subagentJobs && supportCommands && ralphRegistry && threadPreparer) {
         syncApp.use("/agents", createAgentApi({ token: threadSync.extensionToken, jobs: subagentJobs,

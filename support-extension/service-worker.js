@@ -37,6 +37,7 @@ const SUPPORT_POLL_ALARM = "local-codex-support/poll";
 const SUPPORT_POLL_PERIOD_MINUTES = 1;
 let pollGeneration = 0;
 let pollController = null;
+let voicePollController = null;
 const reportedRalphConversations = new Set();
 const observingConversations = new Map();
 const observedAt = new Map();
@@ -93,6 +94,7 @@ async function conversationUnavailable(message, sender) {
   if (sender.id !== extensionApi.runtime.id || sender.frameId !== 0 || !Number.isInteger(sender.tab?.id)) return { ok: false };
   const tab = await extensionApi.tabs.get(sender.tab.id);
   const url = conversationUrl(tab.url);
+  if (await isVoiceConversation(url)) return { ok: true };
   if (!url || url !== conversationUrl(message.conversationUrl) || new URL(sender.url).origin !== "https://chatgpt.com") return { ok: false };
   const key = `pageRecovery:${tab.id}`;
   const saved = await extensionApi.storage.local.get(key);
@@ -305,6 +307,7 @@ function registerRalphConversation(value, options = {}) {
 
 async function registerRalphConversationOnce(value, { reactivate = false, externalUpdate = false, agentCreated = false, title, activity } = {}) {
   const currentUrl = conversationUrl(value);
+  if (await isVoiceConversation(currentUrl)) return;
   const currentTitle = normalizeThreadTitle(title);
   if (!currentUrl || (!activity && !reactivate && !externalUpdate && !currentUrl.startsWith("https://chatgpt.com/g/") && !reportedRalphConversations.has(currentUrl)) ||
       (!activity && !reactivate && !externalUpdate && !agentCreated && !currentTitle && reportedRalphConversations.has(currentUrl))) return;
@@ -403,6 +406,7 @@ async function acquireAutomationTab(targetUrl, createsNewThread) {
 async function closeOwnedThreadTab(value) {
   const currentUrl = conversationUrl(value);
   if (!currentUrl) throw new Error("Thread cleanup requires a saved ChatGPT conversation URL.");
+  if (await isVoiceConversation(currentUrl)) return { status: "not_owned", conversationUrl: currentUrl };
   const owned = await getOwnedThreadTabs();
   const tabId = owned[currentUrl];
   if (!Number.isInteger(tabId)) return { status: "not_owned", conversationUrl: currentUrl };
@@ -530,7 +534,7 @@ async function waitForTabComplete(tabId, timeoutMs = 5 * 60_000) {
 }
 
 async function sendAutomationMessage(tabId, command) {
-  await waitForAutomationResume();
+  if (command.feature !== "voice") await waitForAutomationResume();
   // Establish the receiver before dispatching a side-effecting command. A lost response
   // does not prove that the page failed to send the message.
   try {
@@ -552,16 +556,16 @@ async function sendAutomationMessage(tabId, command) {
 }
 
 async function sendAutomationMessageWithTimeout(tabId, command) {
-  await waitForAutomationResume();
+  if (command.feature !== "voice") await waitForAutomationResume();
   let timeout;
   try {
     return await Promise.race([
       sendAutomationMessage(tabId, command),
       new Promise((_, reject) => {
-        const timeoutMs = command.kind === "inspect_thread" ? 30_000 : command.kind === "page_health" ? 15_000 : AUTOMATION_RESPONSE_TIMEOUT_MS;
+        const timeoutMs = command.feature === "voice" ? 45_000 : command.kind === "inspect_thread" ? 30_000 : command.kind === "page_health" ? 15_000 : AUTOMATION_RESPONSE_TIMEOUT_MS;
         const expire = async () => {
           const { automationPausedUntil = 0 } = await extensionApi.storage.local.get("automationPausedUntil");
-          if (automationPausedUntil > Date.now()) timeout = setTimeout(expire, automationPausedUntil - Date.now() + timeoutMs);
+          if (command.feature !== "voice" && automationPausedUntil > Date.now()) timeout = setTimeout(expire, automationPausedUntil - Date.now() + timeoutMs);
           else reject(new Error("Timed out waiting for ChatGPT page automation."));
         };
         timeout = setTimeout(expire, timeoutMs);
@@ -607,6 +611,12 @@ let executionTail = Promise.resolve();
 function executeCommand(command, browserId) {
   const existing = executingCommands.get(command.id);
   if (existing) return existing;
+  if (command.feature === "voice") {
+    const operation = keepWorkerAliveUntil(executeVoiceCommand(command, browserId))
+      .finally(() => executingCommands.delete(command.id));
+    executingCommands.set(command.id, operation);
+    return operation;
+  }
   let recoveryConflict = false;
   if (command.kind === "send_message" && typeof command.targetUrl === "string") {
     pendingMessages.set(command.id, command.targetUrl);
@@ -627,11 +637,53 @@ function executeCommand(command, browserId) {
   return operation;
 }
 
+async function isVoiceConversation(value) {
+  const configured = (await extensionApi.storage.local.get("voiceConversationUrl")).voiceConversationUrl;
+  if (!configured || !value) return false;
+  const current = conversationUrl(value);
+  return current && current.split("/c/")[1]?.split("?")[0] === configured.split("/c/")[1]?.split("?")[0];
+}
+
+async function executeVoiceCommand(command, browserId) {
+  try {
+    const targetUrl = conversationUrl(command.targetUrl);
+    if (!targetUrl || targetUrl.includes("/g/") || new URL(targetUrl).searchParams.get("temporary-chat") === "true") {
+      throw new Error("Voice requires a regular saved ChatGPT conversation.");
+    }
+    await extensionApi.storage.local.set({ voiceConversationUrl: targetUrl });
+    const matches = (await extensionApi.tabs.query({ url: "https://chatgpt.com/*" })).filter(tab => automationTargetMatches(tab.url, targetUrl));
+    if (matches.length > 1) throw new Error("The Voice conversation is open in multiple tabs. Close the duplicate before controlling its call.");
+    let acquired = matches[0] ? { tab: matches[0] } : null;
+    if (!acquired && command.kind === "voice_start") {
+      const tabs = await extensionApi.tabs.query({ windowType: "normal" });
+      const windowId = tabs.find(tab => Number.isInteger(tab.windowId) && !tab.incognito)?.windowId;
+      if (!Number.isInteger(windowId)) throw new Error("Open a Chrome window before starting Voice.");
+      acquired = { tab: await extensionApi.tabs.create({ windowId, url: targetUrl, active: true }) };
+    }
+    let result;
+    if (!acquired) {
+      result = { status: "closed", conversationUrl: targetUrl };
+    } else {
+      const tab = await waitForTabComplete(acquired.tab.id, 30_000);
+      if (!automationTargetMatches(tab.url, targetUrl)) throw new Error("Voice tab navigated away from the configured conversation.");
+      if (command.kind === "voice_start") await extensionApi.tabs.update(tab.id, { active: true });
+      const response = await sendAutomationMessageWithTimeout(tab.id, command);
+      if (!response?.ok) throw new Error(response?.error || "ChatGPT Voice control failed.");
+      result = response.result;
+    }
+    await postResult({ commandId: command.id, browserId, kind: command.kind, ok: true, result });
+  } catch (error) {
+    await postResult({ commandId: command.id, browserId, kind: command.kind, ok: false,
+      error: error instanceof Error ? error.message : String(error) }).catch(() => undefined);
+  }
+}
+
 async function executeCommandOnce(command, browserId) {
   await waitForAutomationResume();
   let targetUrl;
   try {
     targetUrl = await commandTargetUrl(command);
+    if (await isVoiceConversation(targetUrl)) throw new Error("The dedicated Voice conversation is protected from thread automation.");
   } catch (error) {
     await postResult({
       commandId: command.id,
@@ -857,7 +909,8 @@ async function reloadPageAfterFailure(tabId, targetUrl) {
   return tab;
 }
 
-function recoverPage(tabId, resume = true) {
+async function recoverPage(tabId, resume = true) {
+  if (await isVoiceConversation((await extensionApi.tabs.get(tabId)).url)) return false;
   const existing = recoveringPages.get(tabId);
   if (existing) {
     if (!resume) {
@@ -955,20 +1008,21 @@ async function syncPollingAlarm() {
   extensionApi.alarms.create(SUPPORT_POLL_ALARM, { periodInMinutes: SUPPORT_POLL_PERIOD_MINUTES });
 }
 
-async function pollCommands(generation) {
-  const browserId = await getBrowserId();
+async function pollCommands(generation, voiceOnly = false) {
+  const browserId = (await getBrowserId()) + (voiceOnly ? ":voice" : "");
   while (generation === pollGeneration) {
-    await waitForAutomationResume();
+    if (!voiceOnly) await waitForAutomationResume();
     if (generation !== pollGeneration) return;
     try {
-      await reportClosedThreadTabs();
+      if (!voiceOnly) await reportClosedThreadTabs();
     } catch {
       await sleep(1000);
       continue;
     }
     const settings = await getSettings();
-    const features = enabledAutomationFeatures(settings);
-    const tabs = settings.threadSync ? await extensionApi.tabs.query({ url: "https://chatgpt.com/*" }) : [];
+    const features = voiceOnly ? (settings.automationExecutor && settings.threadMessaging ? ["voice"] : []) : enabledAutomationFeatures(settings);
+    if (voiceOnly && features.length === 0) return;
+    const tabs = !voiceOnly && settings.threadSync ? await extensionApi.tabs.query({ url: "https://chatgpt.com/*" }) : [];
     const openThreads = [...new Set(tabs.map(tab => conversationUrl(tab.url)).filter(Boolean))];
     for (const tab of tabs) {
       if (!Number.isInteger(tab.id) || !conversationUrl(tab.url)) continue;
@@ -982,7 +1036,8 @@ async function pollCommands(generation) {
     const idleObserver = features.length === 0 && openThreads.length === 0;
 
     const controller = new AbortController();
-    pollController = controller;
+    if (voiceOnly) voicePollController = controller;
+    else pollController = controller;
     try {
       const response = await fetch(claimEndpoint.href, {
         method: "POST",
@@ -992,6 +1047,8 @@ async function pollCommands(generation) {
         redirect: "error",
       });
       if (generation !== pollGeneration) return;
+      const voiceUrl = response.headers.get("X-Voice-Conversation-Url");
+      if (voiceUrl !== null) await extensionApi.storage.local.set({ voiceConversationUrl: voiceUrl || null });
       const pausedUntil = Number(response.headers.get("X-Automation-Paused-Until"));
       if (Number.isSafeInteger(pausedUntil) && pausedUntil > Date.now()) {
         await extensionApi.storage.local.set({ automationPausedUntil: pausedUntil });
@@ -1009,6 +1066,7 @@ async function pollCommands(generation) {
       await sleep(1000);
     } finally {
       if (pollController === controller) pollController = null;
+      if (voicePollController === controller) voicePollController = null;
     }
   }
 }
@@ -1016,8 +1074,10 @@ async function pollCommands(generation) {
 function restartPolling() {
   pollGeneration += 1;
   pollController?.abort();
+  voicePollController?.abort();
   const generation = pollGeneration;
   void pollCommands(generation);
+  void pollCommands(generation, true);
 }
 
 function sleep(ms) {
