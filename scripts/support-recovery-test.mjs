@@ -14,11 +14,16 @@ const config = {
   extensionToken: "x".repeat(32),
 };
 
-async function runWorker(command, responses, healthResponses = [], injectionFailures = [], temporary = false, globalPause = false) {
+async function runWorker(command, responses, healthResponses = [], injectionFailures = [], temporary = false, globalPause = false, recoveryPhase) {
   const results = [];
   let dispatches = 0;
   let reloads = 0;
   const calls = [];
+  const deliveredMessages = [];
+  let releaseRecovery;
+  let recoveryEntered;
+  const recoveryGate = new Promise(resolve => { releaseRecovery = resolve; });
+  const recoveryStarted = new Promise(resolve => { recoveryEntered = resolve; });
   const waits = [];
   let tabUrl = url + (temporary ? "?temporary-chat=true" : "");
   let activeInjectionFailures = [];
@@ -46,7 +51,12 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
         reload: async () => { reloads += 1; },
         sendMessage: async (_tabId, payload) => {
           calls.push(payload.command.kind);
+          if (payload.command.kind === "send_message") deliveredMessages.push(payload.command.message);
           dispatchTimes.push(clock);
+          if (recoveryPhase && payload.command.kind === (recoveryPhase === "stopping" ? "stop_thread" : "send_message")) {
+            recoveryEntered();
+            await recoveryGate;
+          }
           if (payload.command.kind === "page_health") {
             const response = healthResponses.shift();
             if (response instanceof Error) throw response;
@@ -86,8 +96,12 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
   context.restartPolling = () => {};
   context.sleep = async ms => { waits.push(ms); if (globalPause) clock += ms; };
   context.getSettings = async () => ({ threadSync: true, automationExecutor: true });
-  await context.executeCommand(command, "browser-a");
-  return { results, dispatches, reloads, calls, waits, dispatchTimes, storage,
+  const background = recoveryPhase ? context.recoverPage(11) : undefined;
+  if (background) await recoveryStarted;
+  const execution = context.executeCommand(command, "browser-a");
+  releaseRecovery();
+  await Promise.all([background, execution]);
+  return { results, dispatches, reloads, calls, deliveredMessages, waits, dispatchTimes, storage,
     advanceTime(ms) { clock += ms; },
     setServiceOnline(online) { serviceOnline = online; },
     syncPause() { return context.syncAutomationPause(); },
@@ -160,28 +174,30 @@ for (const kind of ["inspect_thread", "prepare_thread"]) {
 for (const temporary of [false, true]) {
   const target = url + (temporary ? "?temporary-chat=true" : "");
   const run = await runWorker({ ...inspectCommand("stuck-stream"), conversationUrl: target }, [
+    { ok: true, result: { status: "stopped", conversationUrl: target } },
     { ok: true, result: { status: "sent", conversationUrl: target } },
     { ok: true, result: { status: "running" } },
   ], Array.from({ length: 4 }, () => ({ ok: true, result: { status: "connection_interrupted" } })), [], temporary);
   assert.equal(run.reloads, 0, "stuck streams stop and continue in the same chat without reloads");
   assert.deepEqual(run.waits.filter(ms => ms === 30_000), []);
-  assert.equal(run.calls.filter(kind => kind === "resume_interrupted").length, 1, "one Stop-and-continue command handles the failure");
+  assert.deepEqual(run.calls, ["page_health", "stop_thread", "send_message", "inspect_thread"], "Stop is confirmed before one continuation");
   assert.equal(run.results[0].result.status, "running", "the original inspection observes the resumed turn");
 }
 {
   const temporaryUrl = url + "?temporary-chat=true";
   const run = await runWorker({ ...inspectCommand("finishes-during-recovery"), conversationUrl: temporaryUrl }, [
     { ok: true, result: { status: "idle", conversationUrl: temporaryUrl } },
+    { ok: true, result: { status: "sent", conversationUrl: temporaryUrl } },
     { ok: true, result: { status: "idle" } },
   ], Array.from({ length: 4 }, () => ({ ok: true, result: { status: "connection_interrupted" } })), [], true);
   assert.equal(run.results[0].result.status, "idle", "an already-finished recovery result reaches the original inspection");
   assert.equal(run.reloads, 0);
 }
 {
-  const run = await runWorker(inspectCommand("uncertain-recovery"), [new Error("Acknowledgement lost after recovery Send")],
+  const run = await runWorker(inspectCommand("uncertain-recovery"), [{ ok: true, result: { status: "stopped" } }, new Error("Acknowledgement lost after recovery Send")],
     [{ ok: true, result: { status: "connection_interrupted" } }]);
   assert.equal(run.reloads, 0, "uncertain recovery preserves the existing conversation");
-  assert.equal(run.calls.filter(kind => kind === "resume_interrupted").length, 1, "uncertain recovery never resends immediately");
+  assert.equal(run.calls.filter(kind => kind === "send_message").length, 1, "uncertain recovery never resends immediately");
   assert.equal(run.results[0].result.status, "loading");
 }
 
@@ -193,6 +209,25 @@ for (const kind of ["connection_interrupted", "recoverable_error"]) {
   assert.deepEqual(run.calls, ["page_health", "stop_thread", "send_message"], "a pending message replaces recovery continuation without duplicate sends");
   assert.equal(run.reloads, 0);
   assert.equal(run.results[0].ok, true);
+}
+
+{
+  const run = await runWorker({ ...sendCommand("queued-during-stop"), targetUrl: url + "?temporary-chat=true" }, [
+    { ok: true, result: { status: "stopped" } }, { ok: true, result: { status: "sent", conversationUrl: url } },
+  ], [{ ok: true, result: { status: "connection_interrupted" } }], [], true, false, "stopping");
+  assert.equal(run.calls.filter(kind => kind === "stop_thread").length, 1);
+  assert.equal(run.reloads, 0);
+  assert.deepEqual(run.deliveredMessages, ["Continue"], "a queued message supersedes background continuation while Stop is in flight");
+  assert.equal(run.results[0].ok, true);
+}
+{
+  const run = await runWorker({ ...sendCommand("queued-after-recovery-send"), targetUrl: url + "?temporary-chat=true" }, [
+    { ok: true, result: { status: "stopped" } }, { ok: true, result: { status: "sent", conversationUrl: url } },
+  ], [{ ok: true, result: { status: "connection_interrupted" } }], [], true, false, "sending");
+  assert.deepEqual(run.deliveredMessages, ["Continue the existing task from its current state. Do not repeat completed work."], "an irreversible recovery send never receives a second queued prompt");
+  assert.equal(run.results[0].ok, false);
+  assert.equal(run.results[0].deliveryUncertain, false, "the original queued message definitely was not dispatched");
+  assert.match(run.results[0].error, /queued message was not sent/);
 }
 
 {

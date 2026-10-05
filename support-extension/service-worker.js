@@ -539,6 +539,15 @@ async function sendAutomationMessage(tabId, command) {
     if (command.kind === "send_message" && error instanceof Error) error.retryable = true;
     throw error;
   }
+  if (command.recoveryContinuation) {
+    const recovery = recoveringPages.get(tabId);
+    if (!recovery?.resume || [...pendingMessages.values()].some(url => automationTargetMatches(url, recovery.targetUrl))) {
+      return { ok: true, result: { status: "idle" } };
+    }
+    // No await between claiming this delivery and dispatch. A later queued message
+    // cannot supersede a continuation that may already have clicked Send.
+    recovery.continuationStarted = true;
+  }
   return await extensionApi.tabs.sendMessage(tabId, { type: AUTOMATION_MESSAGE, command });
 }
 
@@ -592,14 +601,27 @@ async function commandTargetUrl(command) {
 }
 
 const executingCommands = new Map();
+const pendingMessages = new Map();
 let executionTail = Promise.resolve();
 
 function executeCommand(command, browserId) {
   const existing = executingCommands.get(command.id);
   if (existing) return existing;
+  let recoveryConflict = false;
+  if (command.kind === "send_message" && typeof command.targetUrl === "string") {
+    pendingMessages.set(command.id, command.targetUrl);
+    for (const recovery of recoveringPages.values()) {
+      if (!recovery.targetUrl || !automationTargetMatches(command.targetUrl, recovery.targetUrl)) continue;
+      recoveryConflict ||= recovery.continuationStarted;
+      recovery.resume = false;
+    }
+  }
   const operation = executionTail.catch(() => undefined)
-    .then(() => keepWorkerAliveUntil(executeCommandOnce(command, browserId)))
-    .finally(() => executingCommands.delete(command.id));
+    .then(() => recoveryConflict
+      ? postResult({ commandId: command.id, browserId, kind: command.kind, ok: false, deliveryUncertain: false,
+        error: "CHATGPT_RECOVERY_FAILED: A recovery continuation is already being delivered. The queued message was not sent. Retry after the current turn stops." })
+      : keepWorkerAliveUntil(executeCommandOnce(command, browserId)))
+    .finally(() => { executingCommands.delete(command.id); pendingMessages.delete(command.id); });
   executingCommands.set(command.id, operation);
   executionTail = operation;
   return operation;
@@ -837,13 +859,20 @@ async function reloadPageAfterFailure(tabId, targetUrl) {
 
 function recoverPage(tabId, resume = true) {
   const existing = recoveringPages.get(tabId);
-  if (existing) return existing;
-  const recovery = recoverPageOnce(tabId, resume).finally(() => recoveringPages.delete(tabId));
+  if (existing) {
+    if (!resume) {
+      if (existing.continuationStarted) throw new Error("CHATGPT_RECOVERY_FAILED: A recovery continuation is already being delivered. The queued message was not sent.");
+      existing.resume = false;
+    }
+    return existing.promise;
+  }
+  const recovery = { resume, continuationStarted: false, targetUrl: undefined, promise: undefined };
+  recovery.promise = recoverPageOnce(tabId, recovery).finally(() => recoveringPages.delete(tabId));
   recoveringPages.set(tabId, recovery);
-  return recovery;
+  return recovery.promise;
 }
 
-async function recoverPageOnce(tabId, resume) {
+async function recoverPageOnce(tabId, recovery) {
   await waitForAutomationResume();
   const key = `pageRecovery:${tabId}`;
   const stored = await extensionApi.storage.local.get(key);
@@ -872,12 +901,17 @@ async function recoverPageOnce(tabId, resume) {
     if (!conversationUrl(targetUrl)) throw new Error("Interrupted conversation is unavailable.");
     const current = await extensionApi.tabs.get(tabId);
     if (!automationTargetMatches(current.url, targetUrl)) throw new Error("Recovery stopped because the tab navigated away.");
-    const resumed = await sendAutomationMessageWithTimeout(tabId, resume
-      ? { kind: "resume_interrupted", message: "Continue the existing task from its current state. Do not repeat completed work." }
-      : { kind: "stop_thread" }).catch(error => {
+    recovery.targetUrl = targetUrl;
+    const stopped = await sendAutomationMessageWithTimeout(tabId, { kind: "stop_thread" }).catch(error => {
         throw new Error(`CHATGPT_RECOVERY_FAILED: ${error instanceof Error ? error.message : String(error)}`);
       });
-    if (!resumed?.ok || !["sent", "stopped", "idle"].includes(resumed.result?.status)) throw new Error(`CHATGPT_RECOVERY_FAILED: ${resumed?.error || "The interrupted turn could not resume."}`);
+    if (!stopped?.ok || !["stopped", "idle"].includes(stopped.result?.status)) throw new Error(`CHATGPT_RECOVERY_FAILED: ${stopped?.error || "The interrupted turn could not stop."}`);
+    if (recovery.resume) {
+      const resumed = await sendAutomationMessageWithTimeout(tabId, { kind: "send_message", recovering: true,
+        recoveryContinuation: true, message: "Continue the existing task from its current state. Do not repeat completed work." })
+        .catch(error => { throw new Error(`CHATGPT_RECOVERY_FAILED: ${error instanceof Error ? error.message : String(error)}`); });
+      if (!resumed?.ok || !["sent", "idle"].includes(resumed.result?.status)) throw new Error(`CHATGPT_RECOVERY_FAILED: ${resumed?.error || "The interrupted turn could not resume."}`);
+    }
     return true;
   }
   if (health.result?.status === "rate_limited") {
