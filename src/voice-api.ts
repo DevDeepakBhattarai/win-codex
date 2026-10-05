@@ -40,11 +40,12 @@ export function createVoiceApi(input: { token: string; registry: RalphRegistry; 
 		busy = true;
 		try {
 			const previous = input.registry.voiceConversationUrl();
-			const next = parseConversationUrl(parsed.data.conversationUrl);
+			const next = await input.registry.validateVoiceConversation(parsed.data.conversationUrl);
 			if (previous && previous !== next.conversationUrl && (await execute("status", previous)).status !== "closed") {
 				res.status(409).json({ error: "End the current Voice call before changing its conversation." });
 				return;
 			}
+			await execute("status", next.conversationUrl);
 			const conversationUrl = await input.registry.setVoiceConversation(parsed.data.conversationUrl);
 			input.commands.cancelThreadChecks(next.threadId);
 			res.json({ conversationUrl });

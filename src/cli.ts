@@ -37,7 +37,7 @@ async function main() {
 			method: jobId === "configure" ? "PUT" : "POST",
 			headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
 			body: JSON.stringify(jobId === "configure" ? { conversationUrl: voiceUrl } : {}),
-			signal: AbortSignal.timeout(100_000),
+			signal: AbortSignal.timeout(jobId === "configure" ? 210_000 : 110_000),
 		});
 		const body: unknown = await response.json();
 		console.log(JSON.stringify(body, null, 2));

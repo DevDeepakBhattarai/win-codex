@@ -37,7 +37,14 @@ try {
 	await registry.register(other, { agentCreated: true, parentThreadId: "api:test" });
 	assert.equal((await request("PUT", "", { conversationUrl: other })).status, 400);
 	await registry.register(url, { manual: true });
-	assert.equal((await request("PUT", "", { conversationUrl: url })).status, 200);
+	const initial = request("PUT", "", { conversationUrl: url });
+	const initialCommand = await claim();
+	assert.ok(initialCommand, "configuration requires an extension acknowledgment before succeeding");
+	assert.equal(initialCommand.kind, "voice_status");
+	assert.equal(initialCommand.targetUrl, url);
+	assert.equal(registry.voiceConversationUrl(), undefined, "the server does not commit a new target before its browser probe completes");
+	complete(initialCommand, "closed");
+	assert.equal((await initial).status, 200);
 	assert.equal((await request("GET")).headers.get("cache-control"), "no-store");
 	assert.equal((await registry.threads()).some(thread => thread.conversationUrl === url), false);
 	assert.equal(await registry.register(url, { manual: true, reactivate: true, activity: "running" }), "ignored");
@@ -70,12 +77,28 @@ try {
 	complete(await claim(), "active");
 	assert.equal((await change).status, 409, "changing chats cannot abandon an active call");
 	assert.equal(registry.voiceConversationUrl(), url);
+	const replacement = "https://chatgpt.com/c/33333333-3333-4333-8333-333333333333";
+	const duplicate = request("PUT", "", { conversationUrl: replacement });
+	complete(await claim(), "closed");
+	const duplicateProbe = await claim();
+	assert.equal(duplicateProbe.targetUrl, replacement, "configuration probes its new target before committing it");
+	commands.complete({ commandId: duplicateProbe.id, browserId: "voice-browser", kind: duplicateProbe.kind,
+		ok: false, error: "The Voice conversation is open in multiple tabs." });
+	assert.equal((await duplicate).status, 400);
+	assert.equal(registry.voiceConversationUrl(), url, "duplicate tabs cannot replace the existing configuration");
+	const rebound = request("PUT", "", { conversationUrl: replacement });
+	complete(await claim(), "closed");
+	const replacementProbe = await claim();
+	assert.equal(registry.voiceConversationUrl(), url);
+	complete(replacementProbe, "closed");
+	assert.equal((await rebound).status, 200);
+	assert.equal(registry.voiceConversationUrl(), replacement);
 	await writeFile(path.join(directory, "support-extension-token"), "test-token");
 	const cli = promisify(execFile)(process.execPath, ["dist/cli.js", "voice", "status"], {
 		env: { ...process.env, DATA_DIR: directory, THREAD_SYNC_PORT: String(server.address().port) }, timeout: 5000,
 	});
 	complete(await commands.claim("voice-browser", ["voice"], 4000), "closed");
-	assert.deepEqual(JSON.parse((await cli).stdout), { status: "closed", conversationUrl: url }, "the CLI uses the authenticated local Voice API");
+	assert.deepEqual(JSON.parse((await cli).stdout), { status: "closed", conversationUrl: replacement }, "the CLI uses the authenticated local Voice API");
 	console.log("Voice API passed: authentication, persisted protection, duplicate wakes, pause bypass, failed start, stop, and active-call rebinding rejection.");
 } finally {
 	commands.close();

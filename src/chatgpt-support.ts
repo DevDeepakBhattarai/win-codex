@@ -260,10 +260,6 @@ export class SupportCommandBus {
     return this.cooldownUntil > Date.now() ? this.cooldownUntil : 0;
   }
 
-  voiceConversationUrl() {
-    return this.registry?.voiceConversationUrl();
-  }
-
   automationPausedUntil() {
     return this.registry?.automationPausedUntil() ?? 0;
   }
@@ -838,15 +834,25 @@ export class RalphRegistry {
     catch { return false; }
   }
 
-  async setVoiceConversation(value: string) {
+  private voiceConversationCandidate(value: string) {
     const conversation = parseConversationUrl(value);
     if (conversation.projectId || new URL(value).searchParams.get("temporary-chat") === "true") {
       throw new Error("Voice requires a regular saved ChatGPT conversation outside a project.");
     }
+    if (this.state.threads.some(thread => thread.threadId === conversation.threadId && thread.parentThreadId)) {
+      throw new Error("A delegated worker cannot be used as the Voice conversation.");
+    }
+    return conversation;
+  }
+
+  async validateVoiceConversation(value: string) {
+    await this.queue;
+    return this.voiceConversationCandidate(value);
+  }
+
+  async setVoiceConversation(value: string) {
     return this.update(state => {
-      if (state.threads.some(thread => thread.threadId === conversation.threadId && thread.parentThreadId)) {
-        throw new Error("A delegated worker cannot be used as the Voice conversation.");
-      }
+      const conversation = this.voiceConversationCandidate(value);
       state.voiceConversationUrl = conversation.conversationUrl;
       state.threads = state.threads.filter(thread => thread.threadId !== conversation.threadId);
       return conversation.conversationUrl;
@@ -1622,7 +1628,6 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
       const command = await commands.claim(parsed.data.browserId, parsed.data.features, CLAIM_WAIT_MS, abortController.signal, parsed.data.openThreads);
       if (abortController.signal.aborted) return;
       res.setHeader("Cache-Control", "no-store");
-      res.setHeader("X-Voice-Conversation-Url", commands.voiceConversationUrl() ?? "");
       res.setHeader("X-Automation-Paused-Until", String(commands.automationPausedUntil()));
       if (!command) {
         res.status(204).end();

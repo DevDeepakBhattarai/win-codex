@@ -14,8 +14,9 @@ const config = {
   extensionToken: "x".repeat(32),
 };
 
-async function runWorker(command, responses, healthResponses = [], injectionFailures = [], temporary = false, globalPause = false, recoveryPhase) {
+async function runWorker(command, responses, healthResponses = [], injectionFailures = [], temporary = false, globalPause = false, recoveryPhase, duplicateTabs = false) {
   const results = [];
+  const protectionAtResult = [];
   let dispatches = 0;
   let reloads = 0;
   let removals = 0;
@@ -32,6 +33,7 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
   let sharedPauseUntil = globalPause === "restart" ? clock + 300_000 : 0;
   let serviceOnline = true;
   const storage = globalPause === "restart" ? { automationPausedUntil: sharedPauseUntil } : {};
+  if (duplicateTabs) storage.voiceConversationUrl = url.replace("11111111", "22222222");
   if (globalPause === "stale") storage["pageRecovery:11"] = { conversationUnavailableAt: clock - 300_001, conversationUnavailableUrl: tabUrl };
   let messageListener;
   const dispatchTimes = [];
@@ -46,7 +48,8 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
         onMessage: { addListener(listener) { messageListener = listener; } }, onInstalled: { addListener() {} }, onStartup: { addListener() {} },
       },
       tabs: {
-        onUpdated: { addListener() {} }, query: async () => [{ id: 11, status: "complete", url: tabUrl }],
+        onUpdated: { addListener() {} }, query: async () => [{ id: 11, status: "complete", url: tabUrl },
+          ...(duplicateTabs ? [{ id: 12, status: "complete", url: tabUrl }] : [])],
         create: async () => ({ id: 11 }),
         get: async () => ({ id: 11, status: "complete", url: tabUrl }),
         reload: async () => { reloads += 1; },
@@ -87,6 +90,7 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
         return new Response(null, { status: 204, headers: { "X-Automation-Paused-Until": String(sharedPauseUntil > clock ? sharedPauseUntil : 0) } });
       }
       if (endpoint !== config.commandResultUrl) return new Response(null, { status: 204 });
+      protectionAtResult.push(storage.voiceConversationUrl);
       results.push(JSON.parse(options.body));
       return new Response("", { status: 200 });
     },
@@ -101,9 +105,10 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
   const background = recoveryPhase ? context.recoverPage(11) : undefined;
   if (background) await recoveryStarted;
   const execution = context.executeCommand(command, "browser-a");
+  if (command.feature === "voice" && background) await execution;
   releaseRecovery();
   await Promise.all([background, execution]);
-  return { results, dispatches, reloads, removals, calls, deliveredMessages, waits, dispatchTimes, storage,
+  return { results, protectionAtResult, dispatches, reloads, removals, calls, deliveredMessages, waits, dispatchTimes, storage,
     closeThread() { return context.closeOwnedThreadTab(url); },
     advanceTime(ms) { clock += ms; },
     setServiceOnline(online) { serviceOnline = online; },
@@ -114,6 +119,25 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
         { id: "a".repeat(32), frameId: 0, tab: { id: 11 }, url: nextUrl }, resolve));
     },
   };
+}
+
+{
+  const run = await runWorker({ id: "voice-pending-recovery", feature: "voice", kind: "voice_status", targetUrl: url }, [
+    { ok: true, result: { status: "closed", conversationUrl: url } },
+    { ok: true, result: { status: "stopped", conversationUrl: url } },
+    { ok: true, result: { status: "sent", conversationUrl: url } },
+  ], [{ ok: true, result: { status: "connection_interrupted" } }], [], false, false, "stopping");
+  assert.equal(run.results[0].ok, true);
+  assert.equal(run.protectionAtResult[0], url, "the extension protects the target before acknowledging its status probe");
+  assert.deepEqual(run.calls, ["page_health", "stop_thread", "voice_status"], "protecting Voice prevents an already pending recovery from resuming the text turn");
+}
+
+{
+  const run = await runWorker({ id: "voice-duplicate-config", feature: "voice", kind: "voice_status", targetUrl: url }, [], [], [], false, false, undefined, true);
+  assert.equal(run.results[0].ok, false);
+  assert.match(run.results[0].error, /multiple tabs/);
+  assert.equal(run.storage.voiceConversationUrl, url.replace("11111111", "22222222"), "a rejected new target keeps the previous chat protected");
+  assert.equal(run.dispatches, 0);
 }
 
 for (const kind of ["voice_start", "voice_stop"]) {

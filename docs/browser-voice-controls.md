@@ -22,7 +22,7 @@ Configure the chat with its saved URL:
 	pnpm agent voice configure https://chatgpt.com/c/YOUR_CONVERSATION_ID
 ```
 
-The command returns the configured URL. The service saves that URL in `ralph.json` and excludes the chat from continuation and worker cleanup. Temporary chats and delegated worker chats cannot be configured.
+The command checks the new target through the connected extension before it saves the URL. The extension records its protection before it acknowledges that check. The service then saves the URL in `ralph.json` and excludes the chat from continuation and worker cleanup. Temporary chats, delegated worker chats, and duplicate tabs cannot be configured.
 
 ## Start and end a call
 
