@@ -19,6 +19,7 @@ async function worker(settings = {}, serverVoiceUrl) {
   let navigateAfterStop = false;
   let stopGate;
   let stopError;
+  let stopStatus = "stopped";
   let pendingMessage = false;
   let serviceOnline = true;
   const context = {
@@ -46,7 +47,7 @@ async function worker(settings = {}, serverVoiceUrl) {
             if (stopGate) await stopGate;
             if (stopError) return { ok: false, error: stopError };
             if (navigateAfterStop) currentUrl = url.replace("11111111", "22222222");
-            return { ok: true, result: { status: "stopped" } };
+            return { ok: true, result: { status: stopStatus } };
           }
           if (command.kind === "send_message") { health = "ok"; return { ok: true, result: { status: "sent" } }; }
           if (command.kind === "dismiss_rate_limit") { health = "ok"; return { ok: true, result: { status: "dismissed" } }; }
@@ -77,7 +78,7 @@ async function worker(settings = {}, serverVoiceUrl) {
     async settle() { for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve)); },
     setHealth(value) { health = value; }, advance(ms) { clock += ms; },
     navigateAfterStop() { navigateAfterStop = true; },
-    holdStop(gate) { stopGate = gate; }, failStop(error) { stopError = error; },
+    holdStop(gate) { stopGate = gate; }, failStop(error) { stopError = error; }, setStopStatus(value) { stopStatus = value; },
     setServerVoice(value) { serverVoiceUrl = value; }, setPendingMessage(value) { pendingMessage = value; },
     disconnect() { serviceOnline = false; },
   };
@@ -95,6 +96,13 @@ for (const automationExecutor of [false, true]) {
   await run.settle();
   assert.deepEqual(run.calls, ["page_health", "stop_thread", "send_message"], "Page errors recover in the browser that reports them, including user-owned Chrome tabs");
 }
+const selfStopped = await worker();
+selfStopped.setHealth("recoverable_error");
+selfStopped.setStopStatus("idle");
+await selfStopped.notify({ interrupted: false, pageHealth: "recoverable_error" });
+await selfStopped.settle();
+assert.deepEqual(selfStopped.calls, ["page_health", "stop_thread", "send_message"],
+  "A failed turn that already stopped still receives the continuation after the idle state is confirmed");
 
 const disabled = await worker({ errorRecovery: false, automationExecutor: true, threadMessaging: true });
 await disabled.notify();

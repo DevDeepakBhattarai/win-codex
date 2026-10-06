@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.10.0";
+  const contentScriptVersion = "1.11.0";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -571,7 +571,8 @@
     if (conversationUnavailableNotice()) return { status: "conversation_unavailable" };
     if (rateLimitNotice()) return { status: "rate_limited" };
     if (connectionInterruptedNotice()) return { status: "connection_interrupted" };
-    return { status: pageErrorNotice() ? "recoverable_error" : "ok" };
+    if (pageErrorNotice() || inlineAssistantFailureNotice()) return { status: "recoverable_error" };
+    return { status: "ok" };
   }
 
   function connectionInterruptedNotice() {
@@ -583,6 +584,25 @@
     const notices = [...document.querySelectorAll('[role="alert"], [role="dialog"], [data-testid="toast"]')];
     return notices.find(element => element.getClientRects?.().length &&
       /something went wrong|(?:error (?:generating|processing)|failure to (?:generate|process)) (?:a |the )?(?:response|message)|network error|stream (?:interrupted|disconnected|failed)|connection (?:lost|interrupted)|(?:request|response) timed out|message delivery failed/i.test(element.textContent ?? ""));
+  }
+
+  function inlineAssistantFailureNotice() {
+    const turns = [...document.querySelectorAll("section[data-turn]")];
+    if (turns.length) {
+      const lastUserIndex = turns.findLastIndex(turn => turn.dataset.turn === "user");
+      if (lastUserIndex < 0) return null;
+      const assistantTurn = turns.slice(lastUserIndex + 1).filter(turn => turn.dataset.turn === "assistant").at(-1);
+      if (!assistantTurn) return null;
+      const finalMessage = [...assistantTurn.querySelectorAll('[data-message-author-role="assistant"]')].at(-1) ??
+        [...assistantTurn.querySelectorAll('[data-markdown-text-tone="primary"]')].at(-1);
+      const failureText = finalMessage?.textContent ?? assistantTurn.textContent ?? "";
+      return isPageFailure(failureText) ? (finalMessage ?? assistantTurn) : null;
+    }
+
+    const lastUserTurn = userTurns().at(-1);
+    const lastTurn = lastUserTurn?.closest?.("[data-turn-key]") ?? [...document.querySelectorAll("[data-turn-key]")].at(-1);
+    const finalMessage = lastTurn && [...lastTurn.querySelectorAll('[data-markdown-text-tone="primary"]')].at(-1);
+    return finalMessage && isPageFailure(finalMessage.textContent ?? "") ? finalMessage : null;
   }
 
   function isPageFailure(text) {

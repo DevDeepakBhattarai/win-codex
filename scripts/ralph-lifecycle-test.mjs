@@ -121,7 +121,7 @@ try {
         const inspect = await raceCommands.claim("chrome", ["ralph"], 1000, undefined, [raceUrl]);
         assert.equal(inspect.kind, "inspect_thread");
         raceCommands.complete({ commandId: inspect.id, browserId: "chrome", kind: inspect.kind, ok: true,
-          result: { status: "idle", workedSeconds: null, users: [{ id: "u1", text: "Finish the task" }],
+          result: { status: "idle", workedSeconds: 20 * 60 + 1, users: [{ id: "u1", text: "Finish the task" }],
             assistant: { id: "a1", synthetic: false, text: "Work remains" } } });
         await apiStarted;
         if (change === "reenrolled") {
