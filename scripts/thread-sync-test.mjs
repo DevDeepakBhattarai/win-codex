@@ -55,7 +55,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.10.0");
+  assert.equal(manifest.version, "1.11.0");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["alarms", "scripting", "sidePanel", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, undefined);
@@ -102,7 +102,7 @@ try {
     "thread sending does not use acknowledgement or DOM-stability heuristics");
   assert.match(preparedContentScript, /const SEND_SETTLE_MS = 5_000;/,
     "thread sending uses the fixed five-second settle requested for typing and sending");
-  assert.match(preparedContentScript, /contentScriptVersion = "1\.8\.4"/,
+  assert.match(preparedContentScript, /contentScriptVersion = "1\.8\.5"/,
     "extension reloads can replace a stale page script with the current content-script version");
   assert.equal(parseRalphProjectId(namedProjectHome), projectId);
   assert.equal(parseRalphProjectId(urlA), projectId);
@@ -1228,10 +1228,10 @@ try {
       },
     });
     await new Promise(resolve => setTimeout(resolve, 20));
-    assert.equal(apiRequestCount, 2, "an idle turn with unknown worked time still asks the completion classifier");
+    assert.equal(apiRequestCount, 1, "a final response at or below the worked-time threshold skips the completion classifier");
     assert.equal(await ralphCommands.claim("chrome-browser", ["ralph"], 0), undefined);
     assert.equal(await ralphControllerRegistry.isActive(parseConversationUrl(shortRalphUrl).threadId), false,
-      "the classifier can complete a short settled turn");
+      "a short settled turn completes without a classifier call");
 
     const staleObserverRalphUrl = `https://chatgpt.com/g/${projectId}/c/30303030-3030-4030-8030-303030303030`;
     await ralphControllerRegistry.register(staleObserverRalphUrl);
@@ -1293,7 +1293,7 @@ try {
       },
     });
     await new Promise(resolve => setTimeout(resolve, 20));
-    assert.equal(apiRequestCount, 3, "completion always depends on the classifier for ordinary idle turns");
+    assert.equal(apiRequestCount, 1, "an idle final response without worked-time eligibility skips the classifier");
     assert.equal(await ralphCommands.claim("chrome-browser", ["ralph"], 0), undefined);
 
     const failedRalphUrl = `https://chatgpt.com/g/${projectId}/c/55555555-5555-4555-8555-555555555555`;
@@ -1316,7 +1316,7 @@ try {
       },
     });
     await new Promise(resolve => setTimeout(resolve, 20));
-    assert.equal(apiRequestCount, 4);
+    assert.equal(apiRequestCount, 2);
     assert.ok(ralphOpenAiLogs.some(line => line.includes('"event":"request_failed"') &&
       line.includes('"request_id":"req_ralph_failure"') && line.includes('"http_status":429') &&
       line.includes('"duration_ms":') && line.includes("Rate limit reached for test")),
@@ -1350,7 +1350,7 @@ try {
     await new Promise(resolve => setTimeout(resolve, 20));
     const blankThread = (await ralphControllerRegistry.threads())
       .find(thread => thread.conversationUrl === blankRalphUrl);
-    assert.equal(apiRequestCount, 4, "RALPH must not classify a blank extracted transcript");
+    assert.equal(apiRequestCount, 2, "RALPH must not classify a blank extracted transcript");
     assert.equal(blankThread.state, "active", "a blank extracted transcript must not complete the thread");
     assert.match(blankThread.lastError, /could not extract every ChatGPT user message/);
   } finally {

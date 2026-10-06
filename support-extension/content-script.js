@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.8.4";
+  const contentScriptVersion = "1.8.5";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -151,7 +151,7 @@
     }
     if (command.kind === "stop_thread") return await stopThread();
     if (command.kind === "resume_interrupted") {
-      const failed = Boolean(connectionInterruptedNotice() || pageErrorNotice());
+      const failed = Boolean(connectionInterruptedNotice() || pageErrorNotice() || inlineAssistantFailureNotice());
       const stopped = await stopThread();
       if (stopped.status === "idle" && !failed) return stopped;
       return await sendMessage(command.message, undefined, false, true);
@@ -466,7 +466,8 @@
     if (conversationUnavailableNotice()) return { status: "conversation_unavailable" };
     if (rateLimitNotice()) return { status: "rate_limited" };
     if (connectionInterruptedNotice()) return { status: "connection_interrupted" };
-    return { status: pageErrorNotice() ? "recoverable_error" : "ok" };
+    if (pageErrorNotice() || inlineAssistantFailureNotice()) return { status: "recoverable_error" };
+    return { status: "ok" };
   }
 
   function connectionInterruptedNotice() {
@@ -477,7 +478,26 @@
   function pageErrorNotice() {
     const notices = [...document.querySelectorAll('[role="alert"], [role="dialog"], [data-testid="toast"]')];
     return notices.find(element => element.getClientRects?.().length &&
-      /\b(?:error|failed|failure|interrupted|disconnected)\b|something went wrong|connection lost|timed out/i.test(element.textContent ?? ""));
+      /something went wrong|(?:error (?:generating|processing)|failure to (?:generate|process)) (?:a |the )?(?:response|message)|network error|stream (?:interrupted|disconnected|failed)|connection (?:lost|interrupted)|(?:request|response) timed out|message delivery failed/i.test(element.textContent ?? ""));
+  }
+
+  function inlineAssistantFailureNotice() {
+    const turns = [...document.querySelectorAll("section[data-turn]")];
+    if (turns.length) {
+      const lastUserIndex = turns.findLastIndex(turn => turn.dataset.turn === "user");
+      if (lastUserIndex < 0) return null;
+      const assistantTurn = turns.slice(lastUserIndex + 1).filter(turn => turn.dataset.turn === "assistant").at(-1);
+      if (!assistantTurn) return null;
+      const finalMessage = [...assistantTurn.querySelectorAll('[data-message-author-role="assistant"]')].at(-1) ??
+        [...assistantTurn.querySelectorAll('[data-markdown-text-tone="primary"]')].at(-1);
+      const failureText = finalMessage?.textContent ?? assistantTurn.textContent ?? "";
+      return isPageFailure(failureText) ? (finalMessage ?? assistantTurn) : null;
+    }
+
+    const lastUserTurn = userTurns().at(-1);
+    const lastTurn = lastUserTurn?.closest?.("[data-turn-key]") ?? [...document.querySelectorAll("[data-turn-key]")].at(-1);
+    const finalMessage = lastTurn && [...lastTurn.querySelectorAll('[data-markdown-text-tone="primary"]')].at(-1);
+    return finalMessage && isPageFailure(finalMessage.textContent ?? "") ? finalMessage : null;
   }
 
   function isPageFailure(text) {
@@ -605,11 +625,12 @@
       if (pauseUntil > Date.now()) return;
       const composer = getComposer()?.composer;
       if (!composer) return;
-      const interrupted = Boolean(connectionInterruptedNotice());
-      const action = interrupted || rateLimitNotice() || pageErrorNotice() ? "blocked"
+      const health = pageHealth().status;
+      const interrupted = health === "connection_interrupted";
+      const action = health !== "ok" ? "blocked"
         : isRunning() ? "running" : getSendButton(composer) && userTurns().length ? "idle" : null;
       if (!action) return;
-      const signature = `${action}:${interrupted}`;
+      const signature = `${action}:${health}`;
 
       if (currentUrl && signature !== previousComposerAction && !reporting) {
         reporting = true;
@@ -621,6 +642,7 @@
             title: threadTitle(),
             completed: action !== "running",
             interrupted,
+            pageHealth: health,
           });
           void Promise.resolve(delivery).then((result) => {
             if (result?.ok && observedConversationUrl === currentUrl) previousComposerAction = signature;

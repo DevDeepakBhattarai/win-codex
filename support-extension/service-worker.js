@@ -483,7 +483,8 @@ async function reactivateRalphConversation(message, sender) {
   } else if (activity === "running") {
     await extensionApi.storage.local.remove(`viewedCompletion:${currentUrl}`);
   }
-  if (message.interrupted === true && settings.automationExecutor && (settings.threadMessaging || settings.ralph) &&
+  if ((message.interrupted === true || ["connection_interrupted", "recoverable_error", "rate_limited"].includes(message.pageHealth)) &&
+      settings.automationExecutor && (settings.threadMessaging || settings.ralph) &&
       (await getOwnedThreadTabs())[currentUrl] === sender.tab.id) {
     void keepWorkerAliveUntil(recoverPage(sender.tab.id)).catch(error => console.warn("ChatGPT interruption recovery:", error));
   }

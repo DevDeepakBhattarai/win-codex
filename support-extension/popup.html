@@ -135,7 +135,7 @@
           <input id="ralphMinWorkedSeconds" type="number" min="0" max="86400" step="1" inputmode="numeric">
           <button id="saveRalphTime" class="button" type="button">Save threshold</button>
         </div>
-        <p id="ralphTimeStatus" class="note">Default is 1200 seconds (20 minutes). Durations above this threshold appear in classifier metadata. Idle turns still receive an AI completion check.</p>
+        <p id="ralphTimeStatus" class="note">Default is 1200 seconds (20 minutes). Only final responses strictly above this threshold use the completion classifier. Stopped turns without a final response resume directly.</p>
       </div>
 
       <div class="card" data-legacy-continuation hidden>

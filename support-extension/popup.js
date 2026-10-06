@@ -599,7 +599,7 @@ async function saveRalphTime() {
   button.disabled = true;
   try {
     await extensionApi.storage.local.set({ [RALPH_MIN_WORKED_SECONDS_KEY]: seconds });
-    setNote(status, `Saved ${seconds} second${seconds === 1 ? "" : "s"}. Durations above this threshold appear in classifier metadata.`);
+    setNote(status, `Saved ${seconds} second${seconds === 1 ? "" : "s"}. Only final responses above this threshold use the completion classifier.`);
     await notifySettingsChanged();
   } finally {
     button.disabled = false;

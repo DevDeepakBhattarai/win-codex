@@ -1268,22 +1268,28 @@ export class RalphController {
         await this.options.registry.recordContinuation(thread.threadId, fingerprint);
         return;
       }
-      if (inspection.users.length === 0 || inspection.users.some((message) => !message.text.trim())) {
-        throw new Error("RALPH could not extract every ChatGPT user message.");
-      }
-      if (!inspection.assistant.text.trim()) {
-        throw new Error("RALPH could not extract the final ChatGPT assistant message.");
-      }
-      const decision = await decideRalphContinuation(
-        inspection,
-        this.options.apiKey,
-        this.options.model,
-        thread.conversationUrl,
-        this.auditLog,
-      );
-      if (decision.complete) {
-        await this.options.registry.recordComplete(thread.threadId);
-        return;
+      if (!inspection.assistant.synthetic) {
+        if (inspection.workedSeconds === null) {
+          await this.options.registry.recordComplete(thread.threadId);
+          return;
+        }
+        if (inspection.users.length === 0 || inspection.users.some((message) => !message.text.trim())) {
+          throw new Error("RALPH could not extract every ChatGPT user message.");
+        }
+        if (!inspection.assistant.text.trim()) {
+          throw new Error("RALPH could not extract the final ChatGPT assistant message.");
+        }
+        const decision = await decideRalphContinuation(
+          inspection,
+          this.options.apiKey,
+          this.options.model,
+          thread.conversationUrl,
+          this.auditLog,
+        );
+        if (decision.complete) {
+          await this.options.registry.recordComplete(thread.threadId);
+          return;
+        }
       }
       if (!await this.options.registry.isActive(thread.threadId)) return;
       if (await this.options.jobs?.blocksContinuation(thread.threadId)) {
