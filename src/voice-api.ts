@@ -17,18 +17,20 @@ export function createVoiceApi(input: { token: string; registry: RalphRegistry; 
 		next();
 	});
 
-	const execute = async (action: "status" | "start" | "stop", targetUrl: string) => {
+	const execute = async (action: "status" | "start" | "stop" | "mute" | "unmute" | "toggle_mute", targetUrl: string) => {
 		const result = await input.commands.execute({ feature: "voice", kind: `voice_${action}`, targetUrl }, action === "status" ? 5_000 : 90_000);
 		if (!result.ok) throw new Error(result.error);
-		if ((result.kind !== "voice_status" && result.kind !== "voice_start" && result.kind !== "voice_stop") || result.kind !== `voice_${action}`) {
+		if ((result.kind !== "voice_status" && result.kind !== "voice_start" && result.kind !== "voice_stop" && result.kind !== "voice_mute" && result.kind !== "voice_unmute" && result.kind !== "voice_toggle_mute") || result.kind !== `voice_${action}`) {
 			throw new Error("Voice received the wrong support command result.");
 		}
 		if (parseConversationUrl(result.result.conversationUrl).conversationUrl !== targetUrl) {
 			throw new Error("Voice command returned a different conversation.");
 		}
-		if (action !== "status" && result.result.status !== (action === "start" ? "active" : "closed")) {
+		if (action !== "status" && result.result.status !== (action === "stop" ? "closed" : "active")) {
 			throw new Error("ChatGPT did not confirm the requested Voice state.");
 		}
+		if ((action === "mute" && result.result.muted !== true) || (action === "unmute" && result.result.muted !== false)
+			|| (action === "toggle_mute" && typeof result.result.muted !== "boolean")) throw new Error("ChatGPT did not confirm the requested microphone state.");
 		return result.result;
 	};
 
@@ -57,8 +59,8 @@ export function createVoiceApi(input: { token: string; registry: RalphRegistry; 
 		} finally { releaseProtection?.(); busy = false; }
 	});
 	router.post("/:action", async (req, res) => {
-		const parsed = z.enum(["status", "start", "stop"]).safeParse(req.params.action);
-		if (!parsed.success) { res.status(400).json({ error: "Expected status, start, or stop." }); return; }
+		const parsed = z.enum(["status", "start", "stop", "mute", "unmute", "toggle_mute"]).safeParse(req.params.action);
+		if (!parsed.success) { res.status(400).json({ error: "Unknown Voice action." }); return; }
 		if (!z.object({}).strict().safeParse(req.body ?? {}).success) { res.status(400).json({ error: "Voice actions do not accept a request body." }); return; }
 		const targetUrl = input.registry.voiceConversationUrl();
 		if (!targetUrl) { res.status(409).json({ error: "Configure the Voice conversation first." }); return; }

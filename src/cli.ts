@@ -21,14 +21,14 @@ async function main() {
 	} });
 	const [command, jobId, voiceUrl] = positionals;
 	if (values.help || !command) {
-		console.log('win-codex-agent run --file spec.md [--session ID] [--request-id ID]\nwin-codex-agent wait JOB_ID\nwin-codex-agent status JOB_ID\nwin-codex-agent list [--session ID]\nwin-codex-agent voice configure CONVERSATION_URL\nwin-codex-agent voice status|start|stop');
+		console.log('win-codex-agent run --file spec.md [--session ID] [--request-id ID]\nwin-codex-agent wait JOB_ID\nwin-codex-agent status JOB_ID\nwin-codex-agent list [--session ID]\nwin-codex-agent voice configure CONVERSATION_URL\nwin-codex-agent voice status|start|stop|mute|unmute|toggle_mute');
 		return;
 	}
 	if (!["run", "wait", "status", "list", "voice"].includes(command)) throw new Error(`Unknown command: ${command}`);
 	if (command === "voice") {
 		if (Object.keys(values).length) throw new Error("Voice commands do not accept assignment options.");
-		if (!["configure", "status", "start", "stop"].includes(jobId ?? "") || positionals.length !== (jobId === "configure" ? 3 : 2)) {
-			throw new Error("Use voice configure CONVERSATION_URL, voice status, voice start, or voice stop.");
+		if (!["configure", "status", "start", "stop", "mute", "unmute", "toggle_mute"].includes(jobId ?? "") || positionals.length !== (jobId === "configure" ? 3 : 2)) {
+			throw new Error("Use voice configure CONVERSATION_URL, voice status, voice start, voice stop, voice mute, voice unmute, or voice toggle_mute.");
 		}
 		const dataDirectory = path.resolve(installationDirectory, process.env.DATA_DIR ?? ".data");
 		const token = (await readFile(path.join(dataDirectory, "support-extension-token"), "utf8")).trim();

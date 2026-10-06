@@ -24,13 +24,13 @@ const request = (method, suffix = "", body, extra = {}) => fetch(base + suffix, 
 	method, headers: { ...headers, ...extra }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(5000),
 });
 const claim = () => commands.claim("voice-browser", ["voice"], 1000);
-const complete = (command, status, conversationUrl = command.targetUrl) => commands.complete({
-	commandId: command.id, browserId: "voice-browser", kind: command.kind, ok: true, result: { status, conversationUrl },
+const complete = (command, status, conversationUrl = command.targetUrl, muted) => commands.complete({
+	commandId: command.id, browserId: "voice-browser", kind: command.kind, ok: true, result: { status, conversationUrl, ...(muted === undefined ? {} : { muted }) },
 });
 try {
 	assert.equal((await request("GET", "", undefined, { authorization: "Bearer wrong" })).status, 401);
 	assert.equal((await request("POST", "/start", {}, { origin: "https://chatgpt.com" })).status, 401);
-	assert.equal((await request("POST", "/mute", {})).status, 400);
+	assert.equal((await request("POST", "/pause", {})).status, 400);
 	assert.equal((await request("POST", "/start", { targetUrl: other })).status, 400);
 	assert.equal((await request("POST", "/start", {})).status, 409);
 	assert.equal((await request("PUT", "", { conversationUrl: url + "?temporary-chat=true" })).status, 400);
@@ -96,6 +96,18 @@ try {
 	assert.equal(stopCommand.kind, "voice_stop", "end-call requests bypass the worker pause");
 	complete(stopCommand, "closed");
 	assert.deepEqual(await (await stop).json(), { status: "closed", conversationUrl: url });
+	for (const [action, muted] of [["mute", true], ["unmute", false], ["toggle_mute", true]]) {
+		const pending = request("POST", "/" + action, {});
+		const command = await claim();
+		assert.equal(command.kind, "voice_" + action);
+		complete(command, "active", url, muted);
+		assert.equal((await (await pending).json()).muted, muted);
+	}
+	for (const [action, status, muted] of [["mute", "active", false], ["unmute", "active", true], ["toggle_mute", "active", null], ["mute", "closed", true]]) {
+		const pending = request("POST", "/" + action, {});
+		complete(await claim(), status, url, muted);
+		assert.equal((await pending).status, 503, "An unconfirmed microphone change cannot succeed");
+	}
 	const unavailable = request("POST", "/stop", {});
 	complete(await claim(), "unavailable");
 	assert.equal((await unavailable).status, 503, "unavailable controls cannot confirm a successful stop");

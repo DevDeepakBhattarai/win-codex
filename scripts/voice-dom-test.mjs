@@ -34,6 +34,13 @@ try {
 					start.setAttribute("aria-label", "Start Voice");
 					document.body.appendChild(start);
 				};
+				const mic = document.createElement("button");
+				mic.setAttribute("aria-label", "Turn off microphone");
+				mic.onclick = () => {
+					if (globalThis.ignoreMic) return;
+					mic.setAttribute("aria-label", mic.getAttribute("aria-label") === "Turn off microphone" ? "Turn on microphone" : "Turn off microphone");
+				};
+				document.body.appendChild(mic);
 				document.body.appendChild(end);
 			}, 1000);
 		};
@@ -57,12 +64,21 @@ try {
 	await page.clock.runFor(500);
 	assert.equal(await result(), null, "a newly loaded chat waits for its Voice control instead of failing during hydration");
 	await page.clock.runFor(2500);
-	assert.deepEqual(await result(), { ok: true, result: { status: "active", conversationUrl: url } });
+	assert.deepEqual(await result(), { ok: true, result: { status: "active", muted: false, conversationUrl: url } });
 	await begin("voice_start");
 	await page.clock.runFor(100);
 	assert.equal((await result()).result.status, "active");
 	assert.equal(await page.evaluate(() => globalThis.startClicks), 1, "another wake cannot toggle an active call off");
-	await page.evaluate(() => { globalThis.ignoreEnd = true; });
+	for (const [kind, expected] of [["voice_toggle_mute", true], ["voice_mute", true], ["voice_unmute", false], ["voice_unmute", false], ["voice_toggle_mute", true], ["voice_toggle_mute", false]]) {
+		await begin(kind);
+		await page.clock.runFor(500);
+		assert.deepEqual(await result(), { ok: true, result: { status: "active", muted: expected, conversationUrl: url } });
+	}
+	await page.evaluate(() => { globalThis.ignoreMic = true; });
+	await begin("voice_mute");
+	await page.clock.runFor(5100);
+	assert.equal((await result()).ok, false, "an ignored microphone click cannot report success");
+	await page.evaluate(() => { globalThis.ignoreMic = false; globalThis.ignoreEnd = true; });
 	await begin("voice_stop");
 	await page.clock.runFor(30_100);
 	assert.equal((await result()).ok, false, "a failed end click cannot report the call closed");
@@ -71,6 +87,9 @@ try {
 	await begin("voice_stop");
 	await page.clock.runFor(1000);
 	assert.equal((await result()).result.status, "closed", "ending Voice works during the automation pause");
+	await begin("voice_toggle_mute");
+	await page.clock.runFor(100);
+	assert.equal((await result()).ok, false, "a microphone toggle must never start a closed call");
 	assert.equal(await page.evaluate(() => globalThis.textStopClicks), 0, "Voice stop never cancels a text generation");
 	await begin("voice_stop");
 	await page.clock.runFor(100);
