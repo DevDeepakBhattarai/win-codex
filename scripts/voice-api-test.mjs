@@ -128,6 +128,16 @@ try {
 	});
 	complete(await commands.claim("voice-browser", ["voice"], 4000), "closed");
 	assert.deepEqual(JSON.parse((await cli).stdout), { status: "closed", conversationUrl: replacement }, "the CLI uses the authenticated local Voice API");
+	const unansweredStatus = fetch(base + "/status", {
+		method: "POST", headers, body: "{}", signal: AbortSignal.timeout(8000),
+	});
+	assert.equal((await claim()).kind, "voice_status");
+	assert.equal((await unansweredStatus).status, 503, "an unacknowledged status check must expire so it cannot hold the Voice operation lock");
+	const stopAfterTimeout = request("POST", "/stop", {});
+	const recoveredStop = await claim();
+	assert.equal(recoveredStop.kind, "voice_stop", "End Voice remains available after a status timeout");
+	complete(recoveredStop, "closed");
+	assert.equal((await stopAfterTimeout).status, 200);
 	console.log("Voice API passed: authentication, persisted protection, duplicate wakes, pause bypass, failed start, stop, and active-call rebinding rejection.");
 } finally {
 	commands.close();

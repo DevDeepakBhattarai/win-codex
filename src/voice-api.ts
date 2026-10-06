@@ -18,7 +18,7 @@ export function createVoiceApi(input: { token: string; registry: RalphRegistry; 
 	});
 
 	const execute = async (action: "status" | "start" | "stop", targetUrl: string) => {
-		const result = await input.commands.execute({ feature: "voice", kind: `voice_${action}`, targetUrl }, 90_000);
+		const result = await input.commands.execute({ feature: "voice", kind: `voice_${action}`, targetUrl }, action === "status" ? 5_000 : 90_000);
 		if (!result.ok) throw new Error(result.error);
 		if ((result.kind !== "voice_status" && result.kind !== "voice_start" && result.kind !== "voice_stop") || result.kind !== `voice_${action}`) {
 			throw new Error("Voice received the wrong support command result.");
