@@ -140,7 +140,7 @@
   });
 
   async function runAutomation(command) {
-    if (["voice_status", "voice_start", "voice_stop", "voice_mute", "voice_unmute", "voice_toggle_mute"].includes(command.kind) && command.feature === "voice") {
+    if (["voice_status", "voice_start", "voice_stop"].includes(command.kind) && command.feature === "voice") {
       return await controlVoice(command);
     }
     await waitForAutomationResume();
@@ -196,12 +196,6 @@
     return "unavailable";
   }
 
-  function voiceMuted() {
-    const mute = visibleVoiceButton("Turn off microphone");
-    const unmute = visibleVoiceButton("Turn on microphone");
-    return unmute && !mute ? true : mute && !unmute ? false : null;
-  }
-
   async function controlVoice(command) {
     const targetUrl = command.targetUrl;
     const assertTarget = () => {
@@ -210,36 +204,13 @@
       }
     };
     assertTarget();
-    const result = () => ({ status: voiceState(), muted: voiceState() === "active" ? voiceMuted() : null, conversationUrl: targetUrl });
-    if (command.kind === "voice_status") return result();
-    if (["voice_mute", "voice_unmute", "voice_toggle_mute"].includes(command.kind)) {
-      if (voiceState() !== "active") throw new Error("Start Voice before changing its microphone.");
-      const current = voiceMuted();
-      if (current === null) throw new Error("ChatGPT microphone controls are unavailable.");
-      const desired = command.kind === "voice_toggle_mute" ? !current : command.kind === "voice_mute";
-      if (current === desired) return result();
-      const button = visibleVoiceButton(desired ? "Turn off microphone" : "Turn on microphone");
-      if (!isActionableButton(button)) throw new Error("ChatGPT microphone control is unavailable.");
-      button.click();
-      const deadline = Date.now() + 5000;
-      let stableSince = 0;
-      while (Date.now() < deadline) {
-        assertTarget();
-        if (voiceState() !== "active") throw new Error("Voice ended before its microphone change was confirmed.");
-        if (voiceMuted() === desired) {
-          if (!stableSince) stableSince = Date.now();
-          if (Date.now() - stableSince >= 200) return result();
-        } else stableSince = 0;
-        await new Promise(resolve => setTimeout(resolve, 50));
-      }
-      throw new Error("ChatGPT did not confirm the requested microphone state.");
-    }
+    if (command.kind === "voice_status") return { status: voiceState(), conversationUrl: targetUrl };
     const desired = command.kind === "voice_start" ? "active" : "closed";
     const deadline = Date.now() + 30_000;
     let button;
     while (Date.now() < deadline) {
       assertTarget();
-      if (voiceState() === desired) return result();
+      if (voiceState() === desired) return { status: desired, conversationUrl: targetUrl };
       button = visibleVoiceButton(command.kind === "voice_start" ? "Start Voice" : "End Voice");
       if (isActionableButton(button)) break;
       await new Promise(resolve => setTimeout(resolve, 100));
@@ -251,7 +222,7 @@
       assertTarget();
       if (voiceState() === desired) {
         if (!stableSince) stableSince = Date.now();
-        if (Date.now() - stableSince >= 500) return result();
+        if (Date.now() - stableSince >= 500) return { status: desired, conversationUrl: targetUrl };
       } else {
         stableSince = 0;
       }

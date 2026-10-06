@@ -1,6 +1,6 @@
 # Control ChatGPT Voice from the local service
 
-Use these commands to start and end Voice in a dedicated saved chat on chatgpt.com. This first step provides the control path for the Jarvis listener. Wake detection, task announcements, and Super App controls come later.
+Use these commands to start and end Voice in a dedicated saved chat on chatgpt.com. Super App's wake listener and the agent's `chatgpt_voice` tool use the same configured conversation.
 
 ## Prepare the service and extension
 
@@ -43,6 +43,14 @@ Run:
 The page has 30 seconds to confirm a state change. If a click fails, the command returns an error. Inspect the call controls before retrying. A failed stop never triggers a page refresh or closes the tab automatically.
 
 If the conversation is open in multiple tabs, close the duplicate before controlling Voice. To change the configured chat, end its current call first. The service checks that the previous chat is closed before replacing its URL.
+
+## Let the agent end its call
+
+Refresh the computer connector's tools in ChatGPT after updating the service. Attach the connector to the configured Voice chat. Ask the agent to disconnect, and have it call `chatgpt_voice` with `action: "stop"`. Use `action: "status"` to inspect the call or `action: "start"` to start it through the browser.
+
+After disconnecting, say "Jarvis" or "Chat" with Super App listening enabled to reconnect. You can also click **Start Voice** in Super App. The disconnected ChatGPT call cannot hear your request.
+
+To ask the agent to stay quiet while it works, give it that instruction during the call. This instruction leaves the microphone connected. Super App has no local mute command or DJI double-press microphone shortcut.
 
 ## Check failures
 

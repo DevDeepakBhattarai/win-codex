@@ -18,7 +18,7 @@ async function fixture() {
   const app = express();
   app.use(express.json());
   app.post("/chatgpt-support/commands/claim", supportCommandClaimHandler(bus, token));
-  app.use("/chatgpt-support/voice", createVoiceApi({ token, registry, commands: bus }));
+  app.use("/chatgpt-support/voice", createVoiceApi({ token, registry, commands: bus }).router);
   const server = await new Promise(resolve => { const listener = app.listen(0, "127.0.0.1", () => resolve(listener)); });
   const base = `http://127.0.0.1:${server.address().port}`;
   const config = { extensionToken: token };

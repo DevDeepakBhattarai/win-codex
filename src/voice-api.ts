@@ -1,6 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { Router } from "express";
 import { z } from "zod";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { parseConversationUrl, type RalphRegistry, type SupportCommandBus } from "./chatgpt-support.js";
 
 export function createVoiceApi(input: { token: string; registry: RalphRegistry; commands: SupportCommandBus }) {
@@ -17,20 +18,18 @@ export function createVoiceApi(input: { token: string; registry: RalphRegistry; 
 		next();
 	});
 
-	const execute = async (action: "status" | "start" | "stop" | "mute" | "unmute" | "toggle_mute", targetUrl: string) => {
+	const execute = async (action: "status" | "start" | "stop", targetUrl: string) => {
 		const result = await input.commands.execute({ feature: "voice", kind: `voice_${action}`, targetUrl }, action === "status" ? 5_000 : 90_000);
 		if (!result.ok) throw new Error(result.error);
-		if ((result.kind !== "voice_status" && result.kind !== "voice_start" && result.kind !== "voice_stop" && result.kind !== "voice_mute" && result.kind !== "voice_unmute" && result.kind !== "voice_toggle_mute") || result.kind !== `voice_${action}`) {
+		if ((result.kind !== "voice_status" && result.kind !== "voice_start" && result.kind !== "voice_stop") || result.kind !== `voice_${action}`) {
 			throw new Error("Voice received the wrong support command result.");
 		}
 		if (parseConversationUrl(result.result.conversationUrl).conversationUrl !== targetUrl) {
 			throw new Error("Voice command returned a different conversation.");
 		}
-		if (action !== "status" && result.result.status !== (action === "stop" ? "closed" : "active")) {
+		if (action !== "status" && result.result.status !== (action === "start" ? "active" : "closed")) {
 			throw new Error("ChatGPT did not confirm the requested Voice state.");
 		}
-		if ((action === "mute" && result.result.muted !== true) || (action === "unmute" && result.result.muted !== false)
-			|| (action === "toggle_mute" && typeof result.result.muted !== "boolean")) throw new Error("ChatGPT did not confirm the requested microphone state.");
 		return result.result;
 	};
 
@@ -58,17 +57,35 @@ export function createVoiceApi(input: { token: string; registry: RalphRegistry; 
 			res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
 		} finally { releaseProtection?.(); busy = false; }
 	});
-	router.post("/:action", async (req, res) => {
-		const parsed = z.enum(["status", "start", "stop", "mute", "unmute", "toggle_mute"]).safeParse(req.params.action);
-		if (!parsed.success) { res.status(400).json({ error: "Unknown Voice action." }); return; }
-		if (!z.object({}).strict().safeParse(req.body ?? {}).success) { res.status(400).json({ error: "Voice actions do not accept a request body." }); return; }
+	const control = async (action: "status" | "start" | "stop") => {
 		const targetUrl = input.registry.voiceConversationUrl();
-		if (!targetUrl) { res.status(409).json({ error: "Configure the Voice conversation first." }); return; }
-		if (busy) { res.status(409).json({ error: "A Voice operation is already in progress." }); return; }
+		if (!targetUrl) return { ok: false, status: 409, error: "Configure the Voice conversation first." } as const;
+		if (busy) return { ok: false, status: 409, error: "A Voice operation is already in progress." } as const;
 		busy = true;
-		try { res.json(await execute(parsed.data, targetUrl)); }
-		catch (error) { res.status(503).json({ error: error instanceof Error ? error.message : String(error) }); }
+		try { return { ok: true, result: await execute(action, targetUrl) } as const; }
+		catch (error) { return { ok: false, status: 503, error: error instanceof Error ? error.message : String(error) } as const; }
 		finally { busy = false; }
+	};
+	router.post("/:action", async (req, res) => {
+		const parsed = z.enum(["status", "start", "stop"]).safeParse(req.params.action);
+		if (!parsed.success) { res.status(400).json({ error: "Expected status, start, or stop." }); return; }
+		if (!z.object({}).strict().safeParse(req.body ?? {}).success) { res.status(400).json({ error: "Voice actions do not accept a request body." }); return; }
+		const result = await control(parsed.data);
+		if (result.ok) res.json(result.result);
+		else res.status(result.status).json({ error: result.error });
 	});
-	return router;
+	return { router, control };
+}
+
+export function registerVoiceTool(server: McpServer, voice: ReturnType<typeof createVoiceApi>) {
+	server.registerTool("chatgpt_voice", {
+		title: "Control ChatGPT Voice call",
+		description: "Control this computer's configured ChatGPT Voice conversation. Use start when the user asks to connect, stop when they ask to disconnect or end the call, and status to inspect it. Start and stop succeed only after the browser confirms the call state. Ending a call disconnects its microphone. This tool does not mute or unmute. A disconnected call cannot hear a reconnect request; the user can say the local Jarvis or Chat wake word or use Start Voice in Super App to reconnect.",
+		inputSchema: { action: z.enum(["status", "start", "stop"]) },
+		annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+	}, async ({ action }) => {
+		const result = await voice.control(action);
+		if (!result.ok) return { isError: true, content: [{ type: "text", text: result.error }] };
+		return { content: [{ type: "text", text: JSON.stringify(result.result) }], structuredContent: result.result };
+	});
 }

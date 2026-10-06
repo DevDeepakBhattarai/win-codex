@@ -5,15 +5,25 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import express from "express";
+import { Client } from "@modelcontextprotocol/client";
+import { McpServer, InMemoryTransport } from "@modelcontextprotocol/server";
 import { RalphRegistry, SupportCommandBus, supportCommandClaimHandler } from "../dist/chatgpt-support.js";
-import { createVoiceApi } from "../dist/voice-api.js";
+import { createVoiceApi, registerVoiceTool } from "../dist/voice-api.js";
 
 const directory = await mkdtemp(path.join(os.tmpdir(), "voice-api-"));
 const registry = await RalphRegistry.open(directory);
 const commands = new SupportCommandBus(undefined, undefined, undefined, undefined, registry);
 const app = express();
 app.use(express.json());
-app.use("/chatgpt-support/voice", createVoiceApi({ token: "test-token", registry, commands }));
+const voice = createVoiceApi({ token: "test-token", registry, commands });
+app.use("/chatgpt-support/voice", voice.router);
+const mcp = new McpServer({ name: "voice-test", version: "1" });
+registerVoiceTool(mcp, voice);
+const client = new Client({ name: "voice-test", version: "1" });
+const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+await mcp.connect(serverTransport);
+await client.connect(clientTransport);
+const callTool = action => client.callTool({ name: "chatgpt_voice", arguments: { action } });
 app.post("/chatgpt-support/commands/claim", supportCommandClaimHandler(commands, "test-token"));
 const server = await new Promise(resolve => { const listener = app.listen(0, "127.0.0.1", () => resolve(listener)); });
 const base = `http://127.0.0.1:${server.address().port}/chatgpt-support/voice`;
@@ -24,10 +34,16 @@ const request = (method, suffix = "", body, extra = {}) => fetch(base + suffix, 
 	method, headers: { ...headers, ...extra }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(5000),
 });
 const claim = () => commands.claim("voice-browser", ["voice"], 1000);
-const complete = (command, status, conversationUrl = command.targetUrl, muted) => commands.complete({
-	commandId: command.id, browserId: "voice-browser", kind: command.kind, ok: true, result: { status, conversationUrl, ...(muted === undefined ? {} : { muted }) },
+const complete = (command, status, conversationUrl = command.targetUrl) => commands.complete({
+	commandId: command.id, browserId: "voice-browser", kind: command.kind, ok: true, result: { status, conversationUrl },
 });
 try {
+	assert.equal((await callTool("start")).isError, true, "An agent cannot start an unconfigured call");
+	for (const action of ["mute", "unmute", "toggle_mute"]) {
+		assert.equal((await request("POST", "/" + action, {})).status, 400, "Removed microphone actions are rejected");
+		const rejected = await callTool(action);
+		assert.equal(rejected.isError, true, "The agent tool rejects microphone actions");
+	}
 	assert.equal((await request("GET", "", undefined, { authorization: "Bearer wrong" })).status, 401);
 	assert.equal((await request("POST", "/start", {}, { origin: "https://chatgpt.com" })).status, 401);
 	assert.equal((await request("POST", "/pause", {})).status, 400);
@@ -85,6 +101,7 @@ try {
 	const start = request("POST", "/start", {});
 	const startCommand = await claim();
 	assert.equal(startCommand.kind, "voice_start", "Voice can start while worker automation is paused");
+	assert.equal((await callTool("stop")).isError, true, "The MCP tool shares the local API operation lock");
 	assert.equal((await request("POST", "/start", {})).status, 409, "duplicate wake requests do not start a second concurrent operation");
 	commands.complete({ commandId: startCommand.id, browserId: "voice-browser", kind: startCommand.kind,
 		ok: false, error: "Microphone permission denied" });
@@ -96,18 +113,23 @@ try {
 	assert.equal(stopCommand.kind, "voice_stop", "end-call requests bypass the worker pause");
 	complete(stopCommand, "closed");
 	assert.deepEqual(await (await stop).json(), { status: "closed", conversationUrl: url });
-	for (const [action, muted] of [["mute", true], ["unmute", false], ["toggle_mute", true]]) {
-		const pending = request("POST", "/" + action, {});
-		const command = await claim();
-		assert.equal(command.kind, "voice_" + action);
-		complete(command, "active", url, muted);
-		assert.equal((await (await pending).json()).muted, muted);
-	}
-	for (const [action, status, muted] of [["mute", "active", false], ["unmute", "active", true], ["toggle_mute", "active", null], ["mute", "closed", true]]) {
-		const pending = request("POST", "/" + action, {});
-		complete(await claim(), status, url, muted);
-		assert.equal((await pending).status, 503, "An unconfirmed microphone change cannot succeed");
-	}
+	const agentStart = callTool("start");
+	const agentStartCommand = await claim();
+	assert.equal(agentStartCommand.kind, "voice_start");
+	assert.equal(agentStartCommand.targetUrl, url);
+	assert.equal((await request("PUT", "", { conversationUrl: other })).status, 409, "Agent operations protect the configured target from rebinding");
+	complete(agentStartCommand, "active");
+	assert.deepEqual((await agentStart).structuredContent, { status: "active", conversationUrl: url });
+	const agentStop = callTool("stop");
+	complete(await claim(), "active");
+	assert.equal((await agentStop).isError, true, "An agent cannot claim it disconnected without browser confirmation");
+	const agentWrongChat = callTool("status");
+	complete(await claim(), "closed", other);
+	assert.equal((await agentWrongChat).isError, true, "An agent cannot inspect a different chat");
+	const agentDisconnect = callTool("stop");
+	assert.equal((await request("POST", "/start", {})).status, 409, "The local API shares the MCP operation lock");
+	complete(await claim(), "closed");
+	assert.deepEqual((await agentDisconnect).structuredContent, { status: "closed", conversationUrl: url });
 	const unavailable = request("POST", "/stop", {});
 	complete(await claim(), "unavailable");
 	assert.equal((await unavailable).status, 503, "unavailable controls cannot confirm a successful stop");
@@ -150,8 +172,10 @@ try {
 	assert.equal(recoveredStop.kind, "voice_stop", "End Voice remains available after a status timeout");
 	complete(recoveredStop, "closed");
 	assert.equal((await stopAfterTimeout).status, 200);
-	console.log("Voice API passed: authentication, persisted protection, duplicate wakes, pause bypass, failed start, stop, and active-call rebinding rejection.");
+	console.log("Voice API and MCP tool passed: authentication, configured call control, removed microphone actions, shared operation lock, browser confirmation, and timeout recovery.");
 } finally {
+	await client.close();
+	await mcp.close();
 	commands.close();
 	await new Promise(resolve => server.close(resolve));
 	await rm(directory, { recursive: true, force: true });

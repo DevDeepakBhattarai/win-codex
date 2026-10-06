@@ -697,8 +697,7 @@ async function executeVoiceCommand(command, browserId) {
     }
     let result;
     if (!acquired) {
-      if (!["voice_status", "voice_stop"].includes(command.kind)) throw new Error("Start Voice before changing its microphone.");
-      result = { status: "closed", muted: null, conversationUrl: targetUrl };
+      result = { status: "closed", conversationUrl: targetUrl };
     } else {
       const tab = await waitForTabComplete(acquired.tab.id, 30_000);
       if (!automationTargetMatches(tab.url, targetUrl)) throw new Error("Voice tab navigated away from the configured conversation.");
