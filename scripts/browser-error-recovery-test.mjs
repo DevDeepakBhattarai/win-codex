@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 
-const source = await readFile("support-extension/service-worker.js", "utf8");
+const source = await readFile(process.env.SUPPORT_SERVICE_WORKER ?? "support-extension/service-worker.js", "utf8");
 const url = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
 const config = { extensionToken: "x".repeat(40) };
 for (const [key, route] of Object.entries({ bindUrl: "/thread-sync/bind", commandClaimUrl: "/chatgpt-support/commands/claim",
@@ -10,7 +10,7 @@ for (const [key, route] of Object.entries({ bindUrl: "/thread-sync/bind", comman
   ralphRegisterUrl: "/chatgpt-support/ralph/register" })) config[key] = `http://127.0.0.1:6002${route}`;
 
 async function worker(settings = {}, serverVoiceUrl) {
-  const storage = { threadSync: false, automationExecutor: false, ralph: false, threadMessaging: false, ...settings };
+  const storage = { threadSync: false, automationExecutor: false, ralph: false, threadMessaging: false, ...settings, errorRecovery: false };
   const calls = [];
   let listener;
   let clock = 1_800_000_000_000;
@@ -70,6 +70,7 @@ async function worker(settings = {}, serverVoiceUrl) {
   vm.runInNewContext(source, context);
   await new Promise(resolve => setImmediate(resolve));
   vm.runInNewContext("pollGeneration += 1; pollController?.abort(); voicePollController?.abort();", context);
+  storage.errorRecovery = settings.errorRecovery ?? true;
   context.sleep = async () => {};
   const notify = message => new Promise(resolve => listener({ type: "local-codex-support/ralph-reactivate-v1",
     conversationUrl: url, activity: "blocked", interrupted: true, ...message },
@@ -108,6 +109,28 @@ const disabled = await worker({ errorRecovery: false, automationExecutor: true, 
 await disabled.notify();
 await disabled.settle();
 assert.deepEqual(disabled.calls, [], "The local error recovery toggle disables unsolicited recovery");
+
+const missedNotice = await worker();
+await missedNotice.context.pollCommands(vm.runInNewContext("pollGeneration", missedNotice.context));
+assert.deepEqual(missedNotice.calls, ["page_health", "stop_thread", "send_message"],
+  "periodic scanning recovers a notice even when no content-script event arrives");
+missedNotice.setHealth("recoverable_error");
+await missedNotice.context.pollCommands(vm.runInNewContext("pollGeneration", missedNotice.context));
+assert.equal(missedNotice.calls.length, 3, "periodic health checks wait three minutes before another scan");
+missedNotice.advance(180_000);
+await missedNotice.context.pollCommands(vm.runInNewContext("pollGeneration", missedNotice.context));
+assert.deepEqual(missedNotice.calls.slice(3), ["page_health", "stop_thread", "send_message"],
+  "the next three-minute scan recovers a later failure without another event");
+
+const retryStop = await worker();
+retryStop.failStop("Stop did not finish");
+await retryStop.context.pollCommands(vm.runInNewContext("pollGeneration", retryStop.context));
+assert.deepEqual(retryStop.calls, ["page_health", "stop_thread"]);
+retryStop.failStop(undefined);
+retryStop.advance(180_000);
+await retryStop.context.pollCommands(vm.runInNewContext("pollGeneration", retryStop.context));
+assert.deepEqual(retryStop.calls.slice(2), ["page_health", "stop_thread", "send_message"],
+  "a failed recovery is retried on the next scan rather than being forgotten");
 
 const protectedChat = await worker({ voiceConversationUrl: url });
 await protectedChat.notify();
