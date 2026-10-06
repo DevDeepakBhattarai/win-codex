@@ -13,6 +13,8 @@ try {
 	await page.goto(url);
 	await page.clock.install();
 	await page.evaluate(() => {
+		globalThis.__localCodexSupportInstalled = { version: "1.11.0" };
+		globalThis.voiceListener = (_message, _sender, reply) => reply({ ok: false, error: "The stale page handler is still active." });
 		globalThis.chrome = { runtime: { sendMessage: async () => ({ ok: true }), onMessage: { addListener(listener) { globalThis.voiceListener = listener; } } },
 			storage: { local: { get: async () => ({ automationPausedUntil: Date.now() + 300_000 }) } } };
 		globalThis.startClicks = 0;
@@ -47,6 +49,7 @@ try {
 	const result = () => page.evaluate(() => globalThis.voiceResult);
 	await begin("voice_status");
 	await page.clock.runFor(100);
+	assert.equal((await result()).ok, true, "injecting the updated extension replaces the previously installed page handler");
 	assert.equal((await result()).result.status, "closed");
 	await page.evaluate(() => {
 		const start = document.querySelector('button[aria-label="Start Voice"]');

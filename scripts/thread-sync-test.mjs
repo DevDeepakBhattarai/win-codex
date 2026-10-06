@@ -55,7 +55,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.15.0");
+  assert.equal(manifest.version, "1.16.0");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["alarms", "scripting", "sidePanel", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, undefined);
@@ -102,7 +102,7 @@ try {
     "thread sending does not use acknowledgement or DOM-stability heuristics");
   assert.match(preparedContentScript, /const SEND_SETTLE_MS = 5_000;/,
     "thread sending uses the fixed five-second settle requested for typing and sending");
-  assert.match(preparedContentScript, /contentScriptVersion = "1\.11\.0"/,
+  assert.match(preparedContentScript, /contentScriptVersion = "1\.12\.0"/,
     "extension reloads can replace a stale page script with the current content-script version");
   assert.equal(parseRalphProjectId(namedProjectHome), projectId);
   assert.equal(parseRalphProjectId(urlA), projectId);
