@@ -55,7 +55,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.11.0");
+  assert.equal(manifest.version, "1.16.0");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["alarms", "scripting", "sidePanel", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, undefined);
@@ -102,7 +102,7 @@ try {
     "thread sending does not use acknowledgement or DOM-stability heuristics");
   assert.match(preparedContentScript, /const SEND_SETTLE_MS = 5_000;/,
     "thread sending uses the fixed five-second settle requested for typing and sending");
-  assert.match(preparedContentScript, /contentScriptVersion = "1\.8\.5"/,
+  assert.match(preparedContentScript, /contentScriptVersion = "1\.12\.0"/,
     "extension reloads can replace a stale page script with the current content-script version");
   assert.equal(parseRalphProjectId(namedProjectHome), projectId);
   assert.equal(parseRalphProjectId(urlA), projectId);
@@ -2262,6 +2262,7 @@ async function testRalphAutoRegistration(sync) {
           headers: { "content-type": "application/json" },
         });
       }
+      if (endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.commandClaimUrl) return new Response(null, { status: 204 });
       if (endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.commandResultUrl) {
         commandResults.push(JSON.parse(options.body));
         return new Response("", { status: 200 });
@@ -2278,7 +2279,7 @@ async function testRalphAutoRegistration(sync) {
 
   historyListener({ frameId: 0, url: urlA });
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(registrationBodies, [{ conversationUrl: urlA }],
+  assert.deepEqual(registrationBodies, [{ conversationUrl: urlA, checkForCompletion: false }],
     "a ChatGPT SPA navigation into a project conversation registers it without thread sync");
 
   historyListener({ frameId: 0, url: urlA });
@@ -2288,7 +2289,8 @@ async function testRalphAutoRegistration(sync) {
 
   historyListener({ frameId: 0, url: "https://chatgpt.com/c/55555555-5555-4555-8555-555555555555" });
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(registrationBodies.length, 1, "normal non-project conversations are never offered to RALPH");
+  assert.equal(registrationBodies.length, 2, "ordinary route observations carry the disabled setting without enrolling checks");
+  assert.equal(registrationBodies.at(-1).checkForCompletion, false);
 
   const registrationsBeforeAgentSend = registrationBodies.length;
   await context.executeCommand({
@@ -2390,7 +2392,7 @@ async function testRalphWorkerReactivation(sync) {
   const generatedConfig = {};
   vm.runInNewContext(await readFile(path.join(sync.extensionDirectory, "config.js"), "utf8"), generatedConfig);
   const extensionId = "a".repeat(32);
-  const storage = {};
+  const storage = { ralph: false };
   const requests = [];
   let runtimeListener;
   let updatedListener;
@@ -2450,7 +2452,7 @@ async function testRalphWorkerReactivation(sync) {
   await new Promise(resolve => setImmediate(resolve));
   const registrationRequests = () => requests.filter(request =>
     request.endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.ralphRegisterUrl);
-  assert.deepEqual(JSON.parse(registrationRequests()[0].options.body), { conversationUrl: urlA });
+  assert.deepEqual(JSON.parse(registrationRequests()[0].options.body), { conversationUrl: urlA, checkForCompletion: false });
 
   const reactivation = await new Promise(resolve => {
     runtimeListener({
@@ -2470,6 +2472,7 @@ async function testRalphWorkerReactivation(sync) {
     conversationUrl: urlA,
     reactivate: true,
     externalUpdate: true,
+    checkForCompletion: false,
   });
   updatedListener(7, { title: "RALPH - New chat" }, { url: urlA, title: "RALPH - New chat" });
   await new Promise(resolve => setImmediate(resolve));
@@ -2492,6 +2495,7 @@ async function testRalphWorkerReactivation(sync) {
   assert.deepEqual(JSON.parse(registrationRequests().at(-1).options.body), {
     conversationUrl: urlA,
     title: "RALPH - Persisted late title",
+    checkForCompletion: false,
   }, "a late page title observation is normalized and sent to the server");
 }
 
@@ -2629,6 +2633,7 @@ async function testWorkerNeverRedispatchesAfterLostResponse(sync) {
       } },
     },
     fetch: async (endpoint, options) => {
+      if (endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.commandClaimUrl) return new Response(null, { status: 204 });
       assert.equal(endpoint, generatedConfig.LOCAL_CODEX_THREAD_SYNC.commandResultUrl);
       postedResults.push(JSON.parse(options.body));
       return new Response("", { status: 200 });
@@ -2718,6 +2723,7 @@ async function testWorkerRecoversHungAutomation(sync) {
       } },
     },
     fetch: async (endpoint, options) => {
+      if (endpoint === generatedConfig.LOCAL_CODEX_THREAD_SYNC.commandClaimUrl) return new Response(null, { status: 204 });
       assert.equal(endpoint, generatedConfig.LOCAL_CODEX_THREAD_SYNC.commandResultUrl);
       postedResults.push(JSON.parse(options.body));
       return new Response("", { status: 200 });
@@ -2930,7 +2936,12 @@ function configureAutomationContext(context) {
   // Stop the startup poller. These fixtures invoke commands directly.
   vm.runInNewContext("pollGeneration += 1; pollController?.abort();", context);
   context.restartPolling = () => {};
-  context.getSettings = async () => ({ threadSync: true, automationExecutor: true });
+  context.getSettings = async () => ({ threadSync: true, automationExecutor: true, ralph: false });
+  const fetch = context.fetch;
+  context.fetch = async (endpoint, options) => endpoint === context.LOCAL_CODEX_THREAD_SYNC.commandClaimUrl &&
+    JSON.parse(options.body).recoveryReservation?.action === "acquire"
+    ? new Response(JSON.stringify({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", expiresAt: Date.now() + 540_000 }))
+    : fetch(endpoint, options);
   const sendMessage = context.browser.tabs.sendMessage;
   context.browser.tabs.sendMessage = async (tabId, payload) => payload.command.kind === "page_health"
     ? { ok: true, result: { status: "ok" } }

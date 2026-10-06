@@ -19,12 +19,31 @@ async function main() {
 		prompt: { type: "string" }, file: { type: "string" }, session: { type: "string" },
 		"request-id": { type: "string" }, help: { type: "boolean" },
 	} });
-	const [command, jobId] = positionals;
+	const [command, jobId, voiceUrl] = positionals;
 	if (values.help || !command) {
-		console.log('win-codex-agent run --file spec.md [--session ID] [--request-id ID]\nwin-codex-agent wait JOB_ID\nwin-codex-agent status JOB_ID\nwin-codex-agent list [--session ID]');
+		console.log('win-codex-agent run --file spec.md [--session ID] [--request-id ID]\nwin-codex-agent wait JOB_ID\nwin-codex-agent status JOB_ID\nwin-codex-agent list [--session ID]\nwin-codex-agent voice configure CONVERSATION_URL\nwin-codex-agent voice status|start|stop');
 		return;
 	}
-	if (!["run", "wait", "status", "list"].includes(command)) throw new Error(`Unknown command: ${command}`);
+	if (!["run", "wait", "status", "list", "voice"].includes(command)) throw new Error(`Unknown command: ${command}`);
+	if (command === "voice") {
+		if (Object.keys(values).length) throw new Error("Voice commands do not accept assignment options.");
+		if (!["configure", "status", "start", "stop"].includes(jobId ?? "") || positionals.length !== (jobId === "configure" ? 3 : 2)) {
+			throw new Error("Use voice configure CONVERSATION_URL, voice status, voice start, or voice stop.");
+		}
+		const dataDirectory = path.resolve(installationDirectory, process.env.DATA_DIR ?? ".data");
+		const token = (await readFile(path.join(dataDirectory, "support-extension-token"), "utf8")).trim();
+		const base = `http://127.0.0.1:${process.env.THREAD_SYNC_PORT ?? 6002}/chatgpt-support/voice`;
+		const response = await fetch(jobId === "configure" ? base : `${base}/${jobId}`, {
+			method: jobId === "configure" ? "PUT" : "POST",
+			headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+			body: JSON.stringify(jobId === "configure" ? { conversationUrl: voiceUrl } : {}),
+			signal: AbortSignal.timeout(jobId === "configure" ? 210_000 : 110_000),
+		});
+		const body: unknown = await response.json();
+		console.log(JSON.stringify(body, null, 2));
+		if (!response.ok) process.exitCode = 1;
+		return;
+	}
 	const needsId = command === "wait" || command === "status";
 	if (positionals.length !== (needsId ? 2 : 1)) throw new Error("Unexpected or missing positional argument.");
 	if (needsId && !z.uuid().safeParse(jobId).success) throw new Error("A job UUID is required.");

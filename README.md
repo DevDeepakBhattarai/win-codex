@@ -24,6 +24,8 @@ graph TD
 
 For a local parent agent, use `pnpm agent run --file spec.md`. Keep the command alive until it returns the report. The CLI supplies caller grouping and a request ID. See [the delegation workflow](docs/delegation.md) and [the API reference](docs/agent-api-reference.md).
 
+To control Voice in a dedicated chatgpt.com conversation, follow [the browser Voice setup](docs/browser-voice-controls.md). The local CLI can configure the saved chat, inspect its call controls, start Voice, and end the call.
+
 ### Local computer tools
 
 The core MCP server always exposes these tools:
@@ -202,6 +204,7 @@ The sidebar configures these browser responsibilities:
 
 - Thread sync. This can be enabled in more than one compatible browser because binding is idempotent.
 - Automation browser executor. Enable this only in the Chrome automation profile. It opens or reuses persistent thread tabs for active registered conversations.
+- Recover interrupted chats. Enabled by default in each browser. Helium and Chrome recover errors in their own open tabs without enabling RALPH.
 - RALPH automation for marked manual threads, visible when the server enables it.
 - Agent thread messaging. Normally enable this in only one browser.
 
@@ -221,7 +224,7 @@ The service checks unfinished workers every 30 minutes without classifier calls.
 
 `RALPH_ENABLED` defaults to true and controls continuation of marked manual threads. Worker recovery uses task messaging and needs no classifier API key. The default interval is 1800 seconds. Observing an ordinary manual conversation updates its sidebar status without enabling continuation.
 
-The extension detects the visible "Connection interrupted. Waiting for the complete answer" notice. For saved, managed threads, it refreshes up to three times, 30 seconds apart. For temporary task chats, it checks at the same interval without refreshing because a refresh discards the conversation. If the notice persists after all three checks, it stops the stuck turn and sends one continuation message. A turn that finishes before Stop receives no recovery message.
+The extension detects visible stream interruptions, retry errors, and rate-limit notices in each browser. With **Recover interrupted chats** enabled, it stops the affected turn and sends one continuation in the same tab. This includes user-opened Helium and Chrome chats. A rate limit waits ten minutes before dismissal and continuation. Recovery preserves temporary chats, protects the dedicated Voice chat, and stops if the tab navigates to another conversation. Error recovery does not start a RALPH loop.
 
 ## Windows startup
 

@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.8.5";
+  const contentScriptVersion = "1.12.0";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -55,12 +55,12 @@
   const LEGACY_RALPH_MIN_WORKED_SECONDS = 19 * 60;
   const DEFAULT_RALPH_MIN_WORKED_SECONDS = 20 * 60;
 
-  function conversationUrl() {
-    const match = location.pathname.match(/^(?:\/g\/([A-Za-z0-9_-]+))?\/c\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/?$/i);
+  function conversationUrl(url = location) {
+    const match = url.pathname.match(/^(?:\/g\/([A-Za-z0-9_-]+))?\/c\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/?$/i);
     if (!match) return null;
     return (match[1]
       ? `https://chatgpt.com/g/${match[1]}/c/${match[2].toLowerCase()}`
-      : `https://chatgpt.com/c/${match[2].toLowerCase()}`) + (/[?&]temporary-chat=true(?:&|$)/.test(location.search) ? "?temporary-chat=true" : "");
+      : `https://chatgpt.com/c/${match[2].toLowerCase()}`) + (/[?&]temporary-chat=true(?:&|$)/.test(url.search) ? "?temporary-chat=true" : "");
   }
 
   function threadTitle() {
@@ -140,7 +140,14 @@
   });
 
   async function runAutomation(command) {
+    if (["voice_status", "voice_start", "voice_stop"].includes(command.kind) && command.feature === "voice") {
+      return await controlVoice(command);
+    }
     await waitForAutomationResume();
+    checkRecoveryDeadline(command.recoveryExpiresAt);
+    if (command.recovering && command.targetUrl && conversationUrl() !== conversationUrl(new URL(command.targetUrl))) {
+      throw new Error("Recovery stopped because the tab navigated away.");
+    }
     if (command.kind === "page_health") return pageHealth();
     if (command.kind === "dismiss_rate_limit") {
       const notice = rateLimitNotice();
@@ -149,7 +156,7 @@
       if (button) button.click();
       return { status: button ? "dismissed" : "not_found" };
     }
-    if (command.kind === "stop_thread") return await stopThread();
+    if (command.kind === "stop_thread") return await stopThread(command.recovering ? command.targetUrl : undefined, command.recoveryExpiresAt);
     if (command.kind === "resume_interrupted") {
       const failed = Boolean(connectionInterruptedNotice() || pageErrorNotice() || inlineAssistantFailureNotice());
       const stopped = await stopThread();
@@ -164,7 +171,8 @@
       retry.click();
       return { status: "recovery_started" };
     }
-    if (command.kind === "send_message") return await sendMessage(command.message, command.connectorName, command.temporary, command.recovering === true);
+    if (command.kind === "send_message") return await sendMessage(command.message, command.connectorName, command.temporary,
+      command.recovering === true, command.recoveryContinuation === true, command.recoveryExpiresAt);
     assertNoPageError();
     if (command.kind === "inspect_thread") {
       const url = conversationUrl();
@@ -175,14 +183,70 @@
     throw new Error("Unsupported ChatGPT support command.");
   }
 
-  async function stopThread() {
+  function visibleVoiceButton(label) {
+    return [...document.querySelectorAll(`button[aria-label="${label}"]`)].find(button =>
+      button.getClientRects().length && getComputedStyle(button).visibility !== "hidden");
+  }
+
+  function voiceState() {
+    const start = visibleVoiceButton("Start Voice");
+    const end = visibleVoiceButton("End Voice");
+    if (end && !start) return "active";
+    if (isActionableButton(start) && !end) return "closed";
+    return "unavailable";
+  }
+
+  async function controlVoice(command) {
+    const targetUrl = command.targetUrl;
+    const assertTarget = () => {
+      if (!targetUrl || conversationUrl() !== targetUrl || new URL(targetUrl).searchParams.get("temporary-chat") === "true") {
+        throw new Error("Voice control is no longer on the configured regular conversation.");
+      }
+    };
+    assertTarget();
+    if (command.kind === "voice_status") return { status: voiceState(), conversationUrl: targetUrl };
+    const desired = command.kind === "voice_start" ? "active" : "closed";
+    const deadline = Date.now() + 30_000;
+    let button;
+    while (Date.now() < deadline) {
+      assertTarget();
+      if (voiceState() === desired) return { status: desired, conversationUrl: targetUrl };
+      button = visibleVoiceButton(command.kind === "voice_start" ? "Start Voice" : "End Voice");
+      if (isActionableButton(button)) break;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    if (!isActionableButton(button)) throw new Error("ChatGPT Voice control is unavailable. Check login, Voice access, and microphone permission.");
+    button.click();
+    let stableSince = 0;
+    while (Date.now() < deadline) {
+      assertTarget();
+      if (voiceState() === desired) {
+        if (!stableSince) stableSince = Date.now();
+        if (Date.now() - stableSince >= 500) return { status: desired, conversationUrl: targetUrl };
+      } else {
+        stableSince = 0;
+      }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    throw new Error(`ChatGPT did not confirm Voice ${desired}. Check its call controls before retrying.`);
+  }
+
+  function checkRecoveryDeadline(expiresAt) {
+    if (expiresAt !== undefined && (!Number.isSafeInteger(expiresAt) || Date.now() >= expiresAt)) {
+      throw new Error("Recovery reservation expired before delivery.");
+    }
+  }
+
+  async function stopThread(targetUrl, expiresAt) {
     const ready = await waitForCancellationState(30_000);
     if (!ready) throw new Error("ChatGPT child state did not become ready for cancellation.");
 
     const currentUrl = conversationUrl();
+    if (targetUrl && currentUrl !== conversationUrl(new URL(targetUrl))) throw new Error("Recovery stopped because the tab navigated away.");
     if (!currentUrl) throw new Error("ChatGPT cancellation is not on a saved conversation.");
     if (!ready.stopButton) return { status: "idle", conversationUrl: currentUrl };
 
+    checkRecoveryDeadline(expiresAt);
     ready.stopButton.click();
     const stopped = await waitForStableStop(30_000);
     if (!stopped) throw new Error("ChatGPT did not confirm that the child run stopped.");
@@ -334,9 +398,14 @@
     };
   }
 
-  async function sendMessage(message, connectorName, temporary = false, recovering = false) {
+  async function sendMessage(message, connectorName, temporary = false, recovering = false, preserveDraft = false, expiresAt) {
     let sendClicked = false;
-    const checkPage = () => assertNoPageError(false, recovering);
+    const recoveryUrl = recovering ? conversationUrl() : undefined;
+    const checkPage = () => {
+      if (!sendClicked) checkRecoveryDeadline(expiresAt);
+      if (recovering && conversationUrl() !== recoveryUrl) throw new Error("Recovery stopped because the tab navigated away.");
+      assertNoPageError(false, recovering);
+    };
     try {
       checkPage();
       if (typeof message !== "string" || !message.trim()) throw new Error("A non-empty ChatGPT message is required.");
@@ -367,6 +436,9 @@
       const ready = await waitForComposer(SEND_READY_TIMEOUT_MS, recovering);
       if (!ready) throw new Error("ChatGPT composer did not become available.");
       checkPage();
+      if (preserveDraft && (ready.editor.value ?? ready.editor.textContent ?? "").trim()) {
+        return { status: "idle", conversationUrl: existingConversationUrl };
+      }
       insertMessage(ready.editor, message);
 
       if (connectorName) await attachConnector(ready, connectorName);
@@ -382,8 +454,12 @@
         return isActionableButton(button) ? { ...composer, button } : null;
       }, SEND_READY_TIMEOUT_MS, recovering);
       if (!current) throw new Error("ChatGPT send button did not become actionable.");
+      if (preserveDraft && (current.editor.value ?? current.editor.textContent ?? "").replace(/\s+/g, " ").trim() !== message.replace(/\s+/g, " ").trim()) {
+        return { status: "idle", conversationUrl: existingConversationUrl };
+      }
 
       const previousTurns = new Set(userTurns().map(userTurnId));
+      checkRecoveryDeadline(expiresAt);
       sendClicked = true;
       current.button.click();
       await sleep(SEND_SETTLE_MS);

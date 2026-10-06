@@ -86,6 +86,7 @@ import {
 import { SubagentJobRegistry } from "./subagent-jobs.js";
 import { ScheduledTasks, createScheduleApi } from "./scheduled-tasks.js";
 import { createAgentApi } from "./agent-api.js";
+import { createVoiceApi, registerVoiceTool } from "./voice-api.js";
 
 const PORT = Number(process.env.PORT ?? 6000);
 const HOST = process.env.HOST ?? "localhost";
@@ -1634,6 +1635,7 @@ function createMcpServer(ownerId: string) {
   }, instructions.length > 0 ? { instructions: instructions.join("\n") } : {});
 
   if (threadSync) registerThreadSync(server, threadSync, ownerId);
+  if (voiceApi) registerVoiceTool(server, voiceApi);
   if (threadSync && supportCommands && ralphRegistry && subagentJobs && threadPreparer) {
     registerChatGptAgents(
       server,
@@ -2788,6 +2790,9 @@ const supportCommands = threadSync
 const threadPreparer = supportCommands && threadSync
   ? new ThreadPreparationCoordinator(supportCommands, threadSync.registry, launchChrome)
   : undefined;
+const voiceApi = threadSync && ralphRegistry && supportCommands
+  ? createVoiceApi({ token: threadSync.extensionToken, registry: ralphRegistry, commands: supportCommands })
+  : undefined;
 const scheduledTasks = threadSync ? await ScheduledTasks.open(DATA_DIR) : undefined;
 if (scheduledTasks && supportCommands && ralphRegistry && threadPreparer) {
   scheduledTasks.start({ commands: supportCommands, registry: ralphRegistry, preparer: threadPreparer, launchBrowser: launchChrome });
@@ -2826,6 +2831,7 @@ const threadSyncHttpServer = threadSync
       const syncApp = express();
       syncApp.disable("x-powered-by");
       syncApp.use(express.json({ limit: "5mb" }));
+      if (voiceApi) syncApp.use("/chatgpt-support/voice", voiceApi.router);
       if (scheduledTasks) syncApp.use("/chatgpt-support/schedules", createScheduleApi(scheduledTasks, threadSync.extensionToken));
       if (subagentJobs && supportCommands && ralphRegistry && threadPreparer) {
         syncApp.use("/agents", createAgentApi({ token: threadSync.extensionToken, jobs: subagentJobs,

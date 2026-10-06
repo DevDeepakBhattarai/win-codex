@@ -3,7 +3,8 @@ const config = globalThis.LOCAL_CODEX_THREAD_SYNC;
 const DEFAULT_SETTINGS = {
   threadSync: true,
   automationExecutor: false,
-  ralph: false,
+  errorRecovery: true,
+  ralph: true,
   threadMessaging: false,
 };
 const RALPH_MIN_WORKED_SECONDS_KEY = "ralphMinWorkedSeconds";

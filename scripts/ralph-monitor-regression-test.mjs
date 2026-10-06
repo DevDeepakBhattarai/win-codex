@@ -1,4 +1,4 @@
-﻿import assert from "node:assert/strict";
+import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -84,7 +84,7 @@ async function testInlineStreamFailureDetection() {
     "a terminal error from an older assistant turn must not stop a newer run before its assistant output appears");
 }
 
-async function testIdleCompletionGate() {
+async function testIdleCompletionClassification() {
   const directory = await mkdtemp(path.join(os.tmpdir(), "ralph-monitor-regression-"));
   const registry = await RalphRegistry.open(directory, 1);
   const commands = new SupportCommandBus();
@@ -92,7 +92,8 @@ async function testIdleCompletionGate() {
   let apiCalls = 0;
   globalThis.fetch = async () => {
     apiCalls += 1;
-    throw new Error("The classifier must not run for a settled turn below the worked-time gate.");
+    return new Response(JSON.stringify({ output: [{ content: [{ type: "output_text", text: "CONTINUE" }] }] }),
+      { headers: { "content-type": "application/json" } });
   };
   const controller = new RalphController({ registry, commands, apiKey: "fixture-key", model: "fixture-model",
     auditLogPath: path.join(directory, "audit.log"), checkEveryMs: 60_000 });
@@ -107,11 +108,16 @@ async function testIdleCompletionGate() {
     commands.complete({ commandId: inspect.id, browserId: "chrome", kind: inspect.kind, ok: true, result: {
       status: "idle", workedSeconds: null,
       users: [{ id: "u1", text: "Finish the task." }],
-      assistant: { id: "a1", synthetic: false, text: "Done." },
+      assistant: { id: "a1", synthetic: false, text: "I stopped before finishing the task." },
     } });
     await new Promise(resolve => setTimeout(resolve, 25));
-    assert.equal(apiCalls, 0, "a final response at or below 20 minutes must not spend a completion-classifier call");
-    assert.equal(await registry.isActive(threadId), false, "the short settled turn is complete");
+    assert.equal(apiCalls, 1, "every real final response must reach the classifier even without a worked-time label");
+    const send = await commands.claim("chrome", ["ralph"], 1000, undefined, [url]);
+    assert.equal(send.kind, "send_message", "an unfinished idle turn receives a continuation");
+    assert.equal(send.message, "Continue");
+    commands.complete({ commandId: send.id, browserId: "chrome", kind: send.kind, ok: true,
+      result: { status: "sent", conversationUrl: url } });
+    assert.equal(await registry.isActive(threadId), true, "unfinished work stays monitored");
   } finally {
     controller.close();
     commands.close();
@@ -143,7 +149,7 @@ async function testMissingFinalResponseContinues() {
     } });
     const send = await commands.claim("chrome", ["ralph"], 1000, undefined, [url]);
     assert.equal(send.kind, "send_message");
-    assert.equal(send.message, "Continue the existing task from its current state. Do not repeat completed work.");
+    assert.equal(send.message, "Continue");
     assert.equal(apiCalls, 0, "a stopped turn without a final response continues without calling the classifier");
     commands.complete({ commandId: send.id, browserId: "chrome", kind: send.kind, ok: true,
       result: { status: "sent", conversationUrl: url } });
@@ -157,7 +163,7 @@ async function testMissingFinalResponseContinues() {
 }
 
 if (!caseName || caseName === "inline") await testInlineStreamFailureDetection();
-if (!caseName || caseName === "idle") await testIdleCompletionGate();
+if (!caseName || caseName === "idle") await testIdleCompletionClassification();
 if (!caseName || caseName === "synthetic") await testMissingFinalResponseContinues();
 
 async function testPageErrorRecoveryDispatch() {
@@ -201,7 +207,11 @@ async function testPageErrorRecoveryDispatch() {
         },
       },
     },
-    async fetch(endpoint) {
+    async fetch(endpoint, options) {
+      const request = JSON.parse(options.body);
+      if (request.recoveryReservation?.action === "acquire") {
+        return new Response(JSON.stringify({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", expiresAt: Date.now() + 540_000 }));
+      }
       if (endpoint === config.ralphRegisterUrl) {
         return new Response(JSON.stringify({ status: "registered" }), { status: 200, headers: { "content-type": "application/json" } });
       }

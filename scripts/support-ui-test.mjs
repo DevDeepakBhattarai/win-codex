@@ -102,6 +102,7 @@ try {
   await page.getByRole("tab", { name: "Settings", exact: true }).click();
   await page.waitForFunction(() => document.getElementById("ralphLoopIntervalSeconds").value === "1800");
   assert.equal(settingsRequests, 1);
+  assert.equal(await page.getByLabel("Recover interrupted chats").isChecked(), true, "In-place error recovery is enabled independently of the executor and RALPH toggles");
   await page.getByRole("tab", { name: "Threads", exact: true }).click();
   await page.getByRole("tab", { name: "Settings", exact: true }).click();
   assert.equal(settingsRequests, 1, "settings remain lazy and cached");

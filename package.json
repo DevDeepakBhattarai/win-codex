@@ -12,6 +12,7 @@
         "dev": "tsx src/server.ts",
         "agent": "node dist/cli.js",
         "agent-api-test": "pnpm build && node scripts/agent-api-test.mjs",
+        "voice-test": "pnpm build && node scripts/voice-api-test.mjs && node scripts/voice-dom-test.mjs",
         "build": "tsc -p tsconfig.build.json",
         "start": "node dist/server.js",
         "type": "tsc --noEmit",
@@ -24,7 +25,7 @@
         "support-ui-test": "node scripts/support-ui-test.mjs",
         "support-action-test": "pnpm build && node scripts/support-action-test.mjs",
         "scheduled-tasks-test": "pnpm build && node scripts/scheduled-tasks-test.mjs",
-        "thread-sync-test": "pnpm build && node scripts/browser-launch-test.mjs && node scripts/thread-sync-test.mjs && node scripts/subagent-limits-test.mjs && node scripts/task-test.mjs && node scripts/support-ui-test.mjs && node scripts/chatgpt-dom-test.mjs && node scripts/browser-presence-test.mjs && node scripts/support-recovery-test.mjs && node scripts/ralph-monitor-regression-test.mjs && node scripts/ralph-lifecycle-test.mjs && node scripts/scheduled-tasks-test.mjs",
+        "thread-sync-test": "pnpm build && node scripts/browser-launch-test.mjs && node scripts/thread-sync-test.mjs && node scripts/subagent-limits-test.mjs && node scripts/task-test.mjs && node scripts/support-ui-test.mjs && node scripts/chatgpt-dom-test.mjs && node scripts/browser-presence-test.mjs && node scripts/browser-error-recovery-test.mjs && node scripts/recovery-reservation-test.mjs && node scripts/support-recovery-test.mjs && node scripts/ralph-monitor-regression-test.mjs && node scripts/ralph-lifecycle-test.mjs && node scripts/scheduled-tasks-test.mjs",
         "support:prepare": "pnpm build && node scripts/prepare-support-extension.mjs",
         "thread-sync:prepare": "pnpm support:prepare"
     },

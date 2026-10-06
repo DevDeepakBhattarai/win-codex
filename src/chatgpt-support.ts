@@ -32,6 +32,7 @@ const TOOL_REQUEST_REPLAY_TTL_MS = 30 * 60 * 1000;
 const MAX_TOOL_REQUEST_REPLAYS = 1_000;
 const MESSAGE_COOLDOWN_MS = 10 * 60_000;
 const MESSAGE_SEND_SPACING_MS = 5_000;
+const RECOVERY_RESERVATION_MS = 9 * 60_000;
 
 type ToolRequestReplay = {
   expiresAt: number;
@@ -62,7 +63,7 @@ function replayToolRequest(replayKey: string, createResult: () => Promise<CallTo
 
 export const SUBAGENT_AGENT_INSTRUCTION = "For reviews, browser work, application testing, or bounded independent assignments in a large task, use the blocking local CLI with a specification file. Keep planning, implementation, diagnosis, reproduction, and evidence collection in the parent unless the user assigns them to a worker. Keep the parent turn active until the command returns and read the complete report. Assigned workers execute their specification themselves and publish their report through the supplied temporary file and rename.";
 
-export const supportFeatureSchema = z.enum(["ralph", "threadMessaging", "threadPreparation", "threadLifecycle"]);
+export const supportFeatureSchema = z.enum(["ralph", "threadMessaging", "threadPreparation", "threadLifecycle", "voice"]);
 export type SupportFeature = z.infer<typeof supportFeatureSchema>;
 
 const threadMessageSchema = z.object({
@@ -100,6 +101,12 @@ const stopThreadResultSchema = z.object({
 });
 
 const supportCommandSchema = z.union([
+  z.object({
+    id: z.string(),
+    feature: z.literal("voice"),
+    kind: z.enum(["voice_status", "voice_start", "voice_stop"]),
+    targetUrl: z.string().url(),
+  }),
   z.object({
     id: z.string(),
     refreshRevision: z.string().optional(),
@@ -156,6 +163,16 @@ const commandResultSchema = z.union([
   z.object({
     commandId: z.string(),
     browserId: z.string(),
+    kind: z.enum(["voice_status", "voice_start", "voice_stop"]),
+    ok: z.literal(true),
+    result: z.object({
+      status: z.enum(["closed", "active", "unavailable"]),
+      conversationUrl: z.string().url(),
+    }),
+  }),
+  z.object({
+    commandId: z.string(),
+    browserId: z.string(),
     kind: z.literal("inspect_thread"),
     ok: z.literal(true),
     result: threadInspectionSchema,
@@ -197,7 +214,7 @@ const commandResultSchema = z.union([
   z.object({
     commandId: z.string(),
     browserId: z.string(),
-    kind: z.union([z.literal("inspect_thread"), z.literal("prepare_thread"), z.literal("close_thread"), z.literal("send_message"), z.literal("stop_thread")]),
+    kind: z.enum(["inspect_thread", "prepare_thread", "close_thread", "send_message", "stop_thread", "voice_status", "voice_start", "voice_stop"]),
     ok: z.literal(false),
     error: z.string().min(1).max(2_000),
     deliveryUncertain: z.boolean().optional(),
@@ -239,6 +256,8 @@ export class SupportCommandBus {
   private nextMessageClaimAt = 0;
   private messagePacingActive = false;
   private pauseInFlight?: Promise<number>;
+  private readonly recoveryReservations = new Map<string, { id: string; browserId: string; expiresAt: number }>();
+  private readonly voiceConfigurations = new Set<string>();
 
   messageCooldownUntil() {
     return this.cooldownUntil > Date.now() ? this.cooldownUntil : 0;
@@ -246,6 +265,62 @@ export class SupportCommandBus {
 
   automationPausedUntil() {
     return this.registry?.automationPausedUntil() ?? 0;
+  }
+
+  voiceConversationUrl() {
+    return this.registry?.voiceConversationUrl();
+  }
+
+  hasPendingMessage(conversationUrl: string, exceptCommandId?: string) {
+    const { threadId } = parseConversationUrl(conversationUrl);
+    return [...this.pending.values()].some(({ command }) => {
+      if (command.kind !== "send_message" || command.id === exceptCommandId) return false;
+      try { return parseConversationUrl(command.targetUrl).threadId === threadId; } catch { return false; }
+    });
+  }
+
+  private recoveryReservation(threadId: string) {
+    const reservation = this.recoveryReservations.get(threadId);
+    if (reservation && reservation.expiresAt <= Date.now()) this.recoveryReservations.delete(threadId);
+    return this.recoveryReservations.get(threadId);
+  }
+
+  reserveRecovery(browserId: string, conversationUrl: string, commandId?: string) {
+    const { threadId } = parseConversationUrl(conversationUrl);
+    if (commandId) {
+      const pending = this.pending.get(commandId);
+      if (!pending || pending.claimedBy !== browserId || pending.command.kind !== "send_message" ||
+          parseConversationUrl(pending.command.targetUrl).threadId !== threadId) {
+        throw new Error("Recovery command does not belong to this browser and conversation.");
+      }
+    }
+    if (this.pauseInFlight || this.automationPausedUntil() || this.registry?.isVoiceConversation(conversationUrl) || this.voiceConfigurations.has(threadId) ||
+        this.recoveryReservation(threadId) || this.hasPendingMessage(conversationUrl, commandId)) {
+      throw new Error("Recovery conflicts with Voice, a pending message, or another browser's recovery.");
+    }
+    const reservation = { id: randomUUID(), browserId, expiresAt: Date.now() + RECOVERY_RESERVATION_MS };
+    this.recoveryReservations.set(threadId, reservation);
+    return reservation;
+  }
+
+  releaseRecovery(browserId: string, conversationUrl: string, id: string) {
+    const { threadId } = parseConversationUrl(conversationUrl);
+    const reservation = this.recoveryReservation(threadId);
+    if (reservation?.id === id && reservation.browserId === browserId) this.recoveryReservations.delete(threadId);
+  }
+
+  protectVoiceConfiguration(conversationUrl: string) {
+    const { threadId } = parseConversationUrl(conversationUrl);
+    const pendingAutomation = [...this.pending.values()].some(({ command }) => {
+      if (command.feature === "voice") return false;
+      const target = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
+      try { return parseConversationUrl(target).threadId === threadId; } catch { return false; }
+    });
+    if (this.recoveryReservation(threadId) || pendingAutomation) {
+      throw new Error("This conversation has recovery or thread automation in progress. Retry Voice configuration after it finishes.");
+    }
+    this.voiceConfigurations.add(threadId);
+    return () => { this.voiceConfigurations.delete(threadId); };
   }
 
   async pauseAutomation(until?: number) {
@@ -262,6 +337,7 @@ export class SupportCommandBus {
     const extension = until - Math.max(Date.now(), previous);
     if (extension > 0) {
       for (const pending of this.pending.values()) {
+        if (pending.command.feature === "voice") continue;
         pending.deadline += extension;
         clearTimeout(pending.timeout);
         pending.timeout = setTimeout(() => {
@@ -275,13 +351,13 @@ export class SupportCommandBus {
     return until;
   }
 
-  cancelThreadChecks(threadId: string) {
+  cancelThreadChecks(threadId: string, ralphOnly = false) {
     for (const pending of this.pending.values()) {
       const command = pending.command;
       const url = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
-      if ((command.feature !== "ralph" && command.feature !== "threadPreparation") || parseConversationUrl(url).threadId !== threadId) continue;
+      if ((command.feature !== "ralph" && (ralphOnly || command.feature !== "threadPreparation")) || parseConversationUrl(url).threadId !== threadId) continue;
       this.removePending(command.id);
-      pending.reject(new Error("RALPH thread tab was closed."));
+      pending.reject(new Error(ralphOnly ? "RALPH check was superseded." : "RALPH thread tab was closed."));
     }
   }
 
@@ -301,16 +377,23 @@ export class SupportCommandBus {
     options: { allowBrowserLaunch?: boolean } = {},
   ) {
     const allowBrowserLaunch = options.allowBrowserLaunch !== false;
-    while (this.automationPausedUntil()) {
+    while (command.feature !== "voice" && this.automationPausedUntil()) {
       await new Promise<void>(resolve => setTimeout(resolve, Math.min(1000, this.automationPausedUntil() - Date.now())));
     }
     const targetUrl = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
+    if (command.feature !== "voice" && this.registry?.isVoiceConversation(targetUrl)) {
+      throw new Error("The dedicated Voice conversation is protected from thread automation.");
+    }
     let targetThreadId: string | undefined;
     try { targetThreadId = parseConversationUrl(targetUrl).threadId; } catch { targetThreadId = undefined; }
+    if (command.feature !== "voice" && targetThreadId &&
+        (this.voiceConfigurations.has(targetThreadId) || (command.kind === "send_message" && this.recoveryReservation(targetThreadId)))) {
+      throw new Error("The conversation has Voice configuration or recovery in progress. The command was not sent. Retry after it finishes.");
+    }
     if (command.feature === "ralph" && targetThreadId && this.jobs?.blocksContinuationNow(targetThreadId)) {
       throw new Error("RALPH is paused for this task handoff.");
     }
-    if (allowBrowserLaunch && (command.kind === "send_message" || command.kind === "stop_thread" || command.kind === "prepare_thread") && this.launchBrowser) {
+    if (allowBrowserLaunch && (command.feature === "voice" || command.kind === "send_message" || command.kind === "stop_thread" || command.kind === "prepare_thread") && this.launchBrowser) {
       await this.ensureBrowser(command.feature, this.launchBrowser);
     }
     if (allowBrowserLaunch && command.kind === "inspect_thread" && this.launchBrowser) {
@@ -321,6 +404,11 @@ export class SupportCommandBus {
     }
     const refreshRevision = this.registry ? await this.registry.externalRevision(targetUrl) : undefined;
     const fullCommand = supportCommandSchema.parse({ ...command, ...(refreshRevision ? { refreshRevision } : {}), id: randomUUID() });
+    if (command.feature !== "voice" && targetThreadId &&
+        (this.voiceConfigurations.has(targetThreadId) || this.registry?.isVoiceConversation(targetUrl) ||
+          (command.kind === "send_message" && this.recoveryReservation(targetThreadId)))) {
+      throw new Error("The conversation has Voice configuration or recovery in progress. The command was not sent. Retry after it finishes.");
+    }
     return new Promise<SupportCommandResult>((resolve, reject) => {
       const pending: PendingCommand = {
         command: fullCommand,
@@ -627,6 +715,9 @@ export class SupportCommandBus {
   }
 
   private canClaim(command: SupportCommand) {
+    if (command.feature === "voice") return true;
+    const target = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
+    if (this.registry?.isVoiceConversation(target)) return false;
     if (this.automationPausedUntil()) return false;
     if (command.kind !== "send_message") return true;
     if (this.messageCooldownUntil()) return false;
@@ -675,6 +766,8 @@ const ralphThreadSchema = z.object({
   attentionAt: z.string().optional(),
   settledAt: z.string().optional(),
   observedOnly: z.boolean().optional(),
+  completionCheckEnabled: z.boolean().optional(),
+  checkRevision: z.uuid().optional(),
   externalRevision: z.string().optional(),
   lastCheckedAt: z.string().optional(),
   lastContinuationAt: z.string().optional(),
@@ -699,6 +792,7 @@ const ralphStoreSchema = z.object({
   loopIntervalMs: z.number().int().positive().max(MAX_RALPH_INTERVAL_SECONDS * 1000).default(DEFAULT_RALPH_CHECK_INTERVAL_MS),
   subagentProjectUrl: z.string().url().optional(),
   automationPausedUntil: z.number().int().nonnegative().optional(),
+  voiceConversationUrl: z.string().url().optional(),
 });
 type RalphStore = z.infer<typeof ralphStoreSchema>;
 const ralphLoopIntervalSecondsSchema = z.number().int()
@@ -799,6 +893,42 @@ export class RalphRegistry {
     return this.state.threads.map((entry) => ({ ...entry }));
   }
 
+  voiceConversationUrl() {
+    return this.state.voiceConversationUrl;
+  }
+
+  isVoiceConversation(value: string) {
+    const configured = this.state.voiceConversationUrl;
+    if (!configured) return false;
+    try { return parseConversationUrl(value).threadId === parseConversationUrl(configured).threadId; }
+    catch { return false; }
+  }
+
+  private voiceConversationCandidate(value: string) {
+    const conversation = parseConversationUrl(value);
+    if (conversation.projectId || new URL(value).searchParams.get("temporary-chat") === "true") {
+      throw new Error("Voice requires a regular saved ChatGPT conversation outside a project.");
+    }
+    if (this.state.threads.some(thread => thread.threadId === conversation.threadId && thread.parentThreadId)) {
+      throw new Error("A delegated worker cannot be used as the Voice conversation.");
+    }
+    return conversation;
+  }
+
+  async validateVoiceConversation(value: string) {
+    await this.queue;
+    return this.voiceConversationCandidate(value);
+  }
+
+  async setVoiceConversation(value: string) {
+    return this.update(state => {
+      const conversation = this.voiceConversationCandidate(value);
+      state.voiceConversationUrl = conversation.conversationUrl;
+      state.threads = state.threads.filter(thread => thread.threadId !== conversation.threadId);
+      return conversation.conversationUrl;
+    });
+  }
+
   async externalRevision(conversationUrl: string) {
     let threadId: string;
     try { threadId = parseConversationUrl(conversationUrl).threadId; }
@@ -851,7 +981,16 @@ export class RalphRegistry {
       state.threads = state.threads.filter((thread) => {
         if (thread.manuallyRegistered || thread.agentCreated) return true;
         const projectId = parseConversationUrl(thread.conversationUrl).projectId;
-        return projectId !== undefined && allowed.has(projectId);
+        if (projectId !== undefined && allowed.has(projectId)) {
+          if (thread.completionCheckEnabled !== undefined) {
+            thread.completionCheckEnabled = undefined;
+            thread.observedOnly = undefined;
+            thread.checkRevision = randomUUID();
+            thread.nextCheckAt = Date.now() + state.loopIntervalMs;
+          }
+          return true;
+        }
+        return thread.completionCheckEnabled !== undefined && (projectId === undefined || thread.completionCheckEnabled);
       });
       return [...projects];
     });
@@ -859,14 +998,17 @@ export class RalphRegistry {
 
   async register(
     conversationUrl: string,
-    options: { externalUpdate?: boolean; manual?: boolean; reactivate?: boolean; agentCreated?: boolean; title?: string; parentThreadId?: string; activity?: "running" | "idle" | "blocked" } = {},
+    options: { externalUpdate?: boolean; manual?: boolean; checkForCompletion?: boolean; reactivate?: boolean; agentCreated?: boolean; title?: string; parentThreadId?: string; activity?: "running" | "idle" | "blocked" } = {},
   ): Promise<"ignored" | "registered" | "active" | "reactivated"> {
     const conversation = parseConversationUrl(conversationUrl);
     const title = normalizeThreadTitle(options.title);
+    const explicitlyMarked = options.manual && !options.activity && options.checkForCompletion === undefined;
     return this.update((state) => {
+      if (this.isVoiceConversation(conversation.conversationUrl)) return "ignored" as const;
       const projectAllowed = conversation.projectId && state.projects.includes(conversation.projectId);
       const existing = state.threads.find((entry) => entry.threadId === conversation.threadId);
-      if (!options.manual && !options.agentCreated && !projectAllowed && !existing?.manuallyRegistered && !existing?.agentCreated) return "ignored" as const;
+      if (!options.manual && options.checkForCompletion === undefined && !options.agentCreated && !projectAllowed &&
+          !existing?.manuallyRegistered && !existing?.agentCreated) return "ignored" as const;
       if (existing) {
         if (options.externalUpdate) existing.externalRevision = randomUUID();
         if (existing.conversationUrl !== conversation.conversationUrl) existing.conversationUrl = conversation.conversationUrl;
@@ -874,20 +1016,41 @@ export class RalphRegistry {
         if (options.parentThreadId) existing.parentThreadId = options.parentThreadId;
         if (options.manual) existing.manuallyRegistered = true;
         if (options.agentCreated) existing.agentCreated = true;
-        if ((options.manual && !options.activity) || options.agentCreated) existing.observedOnly = undefined;
+        const settingManaged = !projectAllowed && !existing.agentCreated && !existing.parentThreadId &&
+          (existing.observedOnly || existing.completionCheckEnabled !== undefined);
+        if (settingManaged && options.checkForCompletion !== undefined) {
+          if (options.checkForCompletion && existing.observedOnly) existing.nextCheckAt = Date.now() + state.loopIntervalMs;
+          if (existing.completionCheckEnabled !== options.checkForCompletion) existing.checkRevision = randomUUID();
+          existing.completionCheckEnabled = options.checkForCompletion;
+          existing.observedOnly = options.checkForCompletion ? undefined : true;
+        }
+        if (explicitlyMarked || options.agentCreated || projectAllowed) {
+          if (existing.observedOnly) {
+            existing.checkRevision = randomUUID();
+            existing.nextCheckAt = Date.now() + state.loopIntervalMs;
+          }
+          existing.observedOnly = undefined;
+          existing.completionCheckEnabled = undefined;
+        }
+        if (options.activity === "running" && options.reactivate) {
+          existing.checkRevision = randomUUID();
+          existing.nextCheckAt = Date.now() + state.loopIntervalMs;
+        }
         if (options.activity && options.activity !== existing.activity) {
+          existing.checkRevision = randomUUID();
           const now = new Date().toISOString();
           if (options.activity !== "running") {
             existing.attentionAt = existing.activity ? now : existing.lastCheckedAt ?? existing.registeredAt;
           } else {
             existing.state = "active";
             existing.settledAt = undefined;
+            existing.nextCheckAt = Date.now() + state.loopIntervalMs;
           }
           existing.activity = options.activity;
           existing.activityAt = now;
         }
-        if (options.reactivate || (options.manual && !options.activity)) existing.settledAt = undefined;
-        if (((options.manual && !options.activity) || options.agentCreated || options.reactivate) && existing.state === "complete") {
+        if (options.reactivate || explicitlyMarked) existing.settledAt = undefined;
+        if ((explicitlyMarked || options.agentCreated || options.reactivate) && existing.state === "complete") {
           existing.state = "active";
           existing.lastError = undefined;
           existing.nextCheckAt = Date.now() + state.loopIntervalMs;
@@ -902,11 +1065,14 @@ export class RalphRegistry {
       state.threads.push({
         conversationUrl: conversation.conversationUrl,
         threadId: conversation.threadId,
+        checkRevision: randomUUID(),
         ...(title ? { title } : {}),
         ...(options.parentThreadId ? { parentThreadId: options.parentThreadId } : {}),
         ...(options.manual ? { manuallyRegistered: true } : {}),
         ...(options.agentCreated ? { agentCreated: true } : {}),
-        ...(options.activity && !options.agentCreated && !projectAllowed ? { observedOnly: true } : {}),
+        ...(!options.agentCreated && !options.parentThreadId && !projectAllowed && options.checkForCompletion !== undefined
+          ? { completionCheckEnabled: options.checkForCompletion, ...(options.checkForCompletion ? {} : { observedOnly: true }) }
+          : options.activity && !options.agentCreated && !projectAllowed ? { observedOnly: true } : {}),
         ...(options.externalUpdate ? { externalRevision: randomUUID() } : {}),
         registeredAt: new Date().toISOString(),
         ...(options.activity ? { activity: options.activity, activityAt: new Date().toISOString(),
@@ -946,6 +1112,12 @@ export class RalphRegistry {
   async isActive(threadId: string) {
     await this.queue;
     return this.state.threads.some(thread => thread.threadId === threadId && thread.state === "active" && !thread.settledAt);
+  }
+
+  async isCheckCurrent(threadId: string, expected?: { checkRevision?: string }) {
+    await this.queue;
+    return this.state.threads.some(thread => thread.threadId === threadId && thread.state === "active" &&
+      !thread.settledAt && !thread.observedOnly && (expected === undefined || thread.checkRevision === expected.checkRevision));
   }
 
   async scheduleNow(threadId: string): Promise<"scheduled" | "complete" | "missing"> {
@@ -1019,6 +1191,8 @@ export class RalphRegistry {
       thread.state = "active";
       thread.settledAt = undefined;
       thread.observedOnly = undefined;
+      thread.completionCheckEnabled = undefined;
+      thread.checkRevision = randomUUID();
       thread.lastError = undefined;
       thread.nextCheckAt = Date.now() + state.loopIntervalMs;
       return true;
@@ -1220,7 +1394,7 @@ export class RalphController {
       }, RALPH_BROWSER_INSPECTION_TIMEOUT_MS);
       if (!commandResult.ok) throw new Error(commandResult.error);
       if (commandResult.kind !== "inspect_thread") throw new Error("RALPH received the wrong support command result.");
-      if (!await this.options.registry.isActive(thread.threadId)) return;
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread)) return;
 
       const observedInspection = commandResult.result;
       const observedByExecutor = this.options.commands.browserHasFeature(commandResult.browserId, "ralph");
@@ -1234,7 +1408,7 @@ export class RalphController {
         return;
       }
 
-      if (!await this.options.registry.isActive(thread.threadId)) return;
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread)) return;
       if (await this.options.jobs?.blocksContinuation(thread.threadId)) {
         await this.options.registry.recordRunning(thread.threadId);
         return;
@@ -1243,7 +1417,7 @@ export class RalphController {
         ? observedInspection
         : await this.inspectExecutorBeforeContinuation(thread);
       if (!inspection) return;
-      if (!await this.options.registry.isActive(thread.threadId)) return;
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread)) return;
 
       const checkpoint = inspection.assistant.text.trim().match(/(?:^|\n)RALPH_STATUS: (CONTINUE|WAIT_CI|BLOCKED|COMPLETE)$/)?.[1];
       if (checkpoint === "COMPLETE" || checkpoint === "BLOCKED") {
@@ -1286,17 +1460,18 @@ export class RalphController {
           thread.conversationUrl,
           this.auditLog,
         );
+        if (!await this.options.registry.isCheckCurrent(thread.threadId, thread)) return;
         if (decision.complete) {
           await this.options.registry.recordComplete(thread.threadId);
           return;
         }
       }
-      if (!await this.options.registry.isActive(thread.threadId)) return;
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread)) return;
       if (await this.options.jobs?.blocksContinuation(thread.threadId)) {
         await this.options.registry.recordRunning(thread.threadId);
         return;
       }
-      if (!await this.options.registry.isActive(thread.threadId)) return;
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread)) return;
 
       const sendResult = await this.options.commands.execute({
         feature: "ralph",
@@ -1306,8 +1481,11 @@ export class RalphController {
       });
       if (!sendResult.ok) throw new Error(sendResult.error);
       if (sendResult.kind !== "send_message") throw new Error("RALPH received the wrong send-message result.");
-      await this.options.registry.recordContinuation(thread.threadId);
+      if (await this.options.registry.isCheckCurrent(thread.threadId, thread)) {
+        await this.options.registry.recordContinuation(thread.threadId);
+      }
     } catch (error) {
+      if (!await this.options.registry.isCheckCurrent(thread.threadId, thread)) return;
       const message = error instanceof Error ? error.message : String(error);
       if (/timed out/i.test(message)) {
         await this.options.registry.recordLoading(thread.threadId);
@@ -1327,7 +1505,7 @@ export class RalphController {
     }, RALPH_BROWSER_INSPECTION_TIMEOUT_MS);
     if (!result.ok) throw new Error(result.error);
     if (result.kind !== "inspect_thread") throw new Error("RALPH received the wrong pre-send inspection result.");
-    if (!await this.options.registry.isActive(thread.threadId)) return undefined;
+    if (!await this.options.registry.isCheckCurrent(thread.threadId, thread)) return undefined;
     if (result.result.title) await this.options.registry.recordTitle(thread.threadId, result.result.title);
     if (result.result.status === "loading") {
       await this.options.registry.recordLoading(thread.threadId);
@@ -1544,10 +1722,17 @@ export function authenticateSupportExtension(req: Request, res: Response, extens
 export function supportCommandClaimHandler(commands: SupportCommandBus, extensionToken: string): RequestHandler {
   const bodySchema = z.object({
     browserId: z.string().min(1).max(200),
-    features: z.array(supportFeatureSchema).max(4),
+    features: z.array(supportFeatureSchema).max(5),
     conversationUnavailable: z.boolean().optional(),
     automationPausedUntil: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
     statusOnly: z.boolean().optional(),
+    recoveryConversationUrl: z.string().max(2048).refine(value => {
+      try { parseConversationUrl(value); return true; } catch { return false; }
+    }).optional(),
+    recoveryReservation: z.discriminatedUnion("action", [
+      z.object({ action: z.literal("acquire"), commandId: z.string().uuid().optional() }).strict(),
+      z.object({ action: z.literal("release"), id: z.string().uuid() }).strict(),
+    ]).optional(),
     openThreads: z.array(z.string().max(2048).refine(value => {
       try { parseConversationUrl(value); return true; } catch { return false; }
     })).max(2000).optional(),
@@ -1559,6 +1744,10 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
       res.status(400).json({ error: "Invalid support command claim." });
       return;
     }
+    if (parsed.data.recoveryReservation && (!parsed.data.statusOnly || !parsed.data.recoveryConversationUrl)) {
+      res.status(400).json({ error: "A recovery reservation requires a status-only conversation request." });
+      return;
+    }
     const abortController = new AbortController();
     const onDisconnect = () => abortController.abort();
     req.once("aborted", onDisconnect);
@@ -1566,7 +1755,24 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
     try {
       if (parsed.data.conversationUnavailable) await commands.pauseAutomation(parsed.data.automationPausedUntil);
       if (parsed.data.statusOnly) {
+        if (parsed.data.recoveryReservation) {
+          const url = parsed.data.recoveryConversationUrl;
+          if (!url) { res.status(400).json({ error: "Recovery requires a conversation URL." }); return; }
+          const reservation = parsed.data.recoveryReservation;
+          if (reservation.action === "release") {
+            commands.releaseRecovery(parsed.data.browserId, url, reservation.id);
+            res.status(204).end();
+          } else {
+            try { res.json(commands.reserveRecovery(parsed.data.browserId, url, reservation.commandId)); }
+            catch (error) { res.status(409).json({ error: error instanceof Error ? error.message : String(error) }); }
+          }
+          return;
+        }
         res.setHeader("X-Automation-Paused-Until", String(commands.automationPausedUntil()));
+        res.setHeader("X-Voice-Conversation-Url", commands.voiceConversationUrl() ?? "");
+        if (parsed.data.recoveryConversationUrl) {
+          res.setHeader("X-Recovery-Message-Pending", String(commands.hasPendingMessage(parsed.data.recoveryConversationUrl)));
+        }
         res.status(204).end();
         return;
       }
@@ -1574,6 +1780,7 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
       if (abortController.signal.aborted) return;
       res.setHeader("Cache-Control", "no-store");
       res.setHeader("X-Automation-Paused-Until", String(commands.automationPausedUntil()));
+      res.setHeader("X-Voice-Conversation-Url", commands.voiceConversationUrl() ?? "");
       if (!command) {
         res.status(204).end();
         return;
@@ -1594,6 +1801,7 @@ export function ralphRegistrationHandler(
   const bodySchema = z.object({
     conversationUrl: z.string().max(2048),
     manual: z.boolean().optional(),
+    checkForCompletion: z.boolean().optional(),
     reactivate: z.boolean().optional(),
     externalUpdate: z.boolean().optional(),
     agentCreated: z.boolean().optional(),
@@ -1625,12 +1833,18 @@ export function ralphRegistrationHandler(
       }
       const registration = await registry.register(parsed.data.conversationUrl, {
         manual: parsed.data.manual === true,
+        checkForCompletion: parsed.data.checkForCompletion,
         reactivate: parsed.data.reactivate === true,
         externalUpdate: parsed.data.externalUpdate === true,
         agentCreated: parsed.data.agentCreated === true,
         title: parsed.data.title,
         activity: parsed.data.activity,
       });
+      const { threadId } = parseConversationUrl(parsed.data.conversationUrl);
+      if (parsed.data.activity === "running" ||
+          (parsed.data.checkForCompletion === false && !await registry.isCheckCurrent(threadId))) {
+        commands?.cancelThreadChecks(threadId, true);
+      }
       res.setHeader("Cache-Control", "no-store");
       res.json({ status: registration === "ignored" ? "ignored" : "registered" });
     } catch (error) {
