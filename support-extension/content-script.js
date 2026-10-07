@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.20.0";
+  const contentScriptVersion = "1.20.1";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -271,12 +271,20 @@
     watchVoice();
     const targetUrl = command.targetUrl;
     const newChat = targetUrl === "https://chatgpt.com/";
-    const observedUrl = () => conversationUrl() ?? "https://chatgpt.com/";
+    const observedUrl = () => {
+      const url = new URL(location.href);
+      if (url.origin !== "https://chatgpt.com" || url.username || url.password || url.searchParams.get("temporary-chat") === "true") return null;
+      if (url.pathname === "/") return "https://chatgpt.com/";
+      const local = url.pathname.match(/^\/c\/local-chatgpt(?:%3A|:)([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/?$/i);
+      if (local) return `https://chatgpt.com/c/local-chatgpt%3A${local[1].toLowerCase()}`;
+      const saved = conversationUrl();
+      return saved && !saved.includes("/g/") ? saved : null;
+    };
     const result = () => ({ status: voiceState(), conversationUrl: observedUrl(), microphone: microphoneState() });
     const assertTarget = () => {
-      if (!targetUrl || location.origin !== "https://chatgpt.com" || (!newChat && conversationUrl() !== targetUrl) ||
-          (newChat && location.pathname !== "/" && !/^\/c\/[\da-f-]+\/?$/i.test(location.pathname)) ||
-          new URL(location.href).searchParams.get("temporary-chat") === "true") {
+      const current = observedUrl();
+      const promoted = targetUrl?.startsWith("https://chatgpt.com/c/local-chatgpt%3A") && current === conversationUrl();
+      if (!targetUrl || !current || (!newChat && current !== targetUrl && !promoted)) {
         throw new Error("Voice control is no longer on the configured regular conversation.");
       }
     };

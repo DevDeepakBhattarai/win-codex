@@ -4,6 +4,7 @@ import { chromium } from "playwright-core";
 
 // Voice button labels observed in the account's Chrome session on October 5, 2026.
 const url = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
+const localUrl = "https://chatgpt.com/c/local-chatgpt%3A0247af84-32ff-4a12-a96e-59f8fffaba27";
 const browser = await chromium.launch({ channel: "chrome", headless: true });
 try {
 	const page = await browser.newPage();
@@ -23,6 +24,7 @@ try {
 		document.querySelector('button[aria-label="Stop"]').onclick = () => globalThis.textStopClicks++;
 		document.querySelector('button[aria-label="Start Voice"]').onclick = event => {
 			globalThis.startClicks++;
+			if (globalThis.provisionalUrl) history.replaceState({}, "", globalThis.provisionalUrl);
 			event.target.remove();
 			setTimeout(() => {
 				const end = document.createElement("button");
@@ -49,31 +51,35 @@ try {
 		};
 	});
 	await page.addScriptTag({ content: await readFile(process.argv[2] ?? "support-extension/content-script.js", "utf8") });
-	const begin = kind => page.evaluate(({ kind, url }) => {
+	const begin = (kind, targetUrl = url) => page.evaluate(({ kind, url }) => {
 		globalThis.voiceResult = null;
 		globalThis.voiceListener({ type: "local-codex-support/automation-v1", command: { kind, feature: "voice", targetUrl: url } }, {},
 			result => { globalThis.voiceResult = result; });
-	}, { kind, url });
+	}, { kind, url: targetUrl });
 	const result = () => page.evaluate(() => globalThis.voiceResult);
 	await begin("voice_status");
 	await page.clock.runFor(100);
 	assert.equal((await result()).ok, true, "injecting the updated extension replaces the previously installed page handler");
 	assert.equal((await result()).result.status, "closed");
-	await page.evaluate(() => {
+	await page.evaluate(localUrl => {
+		history.replaceState({}, "", "/");
+		globalThis.provisionalUrl = localUrl;
 		const start = document.querySelector('button[aria-label="Start Voice"]');
 		start.hidden = true;
 		setTimeout(() => { start.hidden = false; }, 1000);
-	});
-	await begin("voice_start");
+	}, localUrl);
+	await begin("voice_start", "https://chatgpt.com/");
 	await page.clock.runFor(500);
 	assert.equal(await result(), null, "a newly loaded chat waits for its Voice control instead of failing during hydration");
 	await page.clock.runFor(2500);
+	assert.equal((await result()).ok, true, "starting a fresh Voice chat accepts ChatGPT's provisional conversation URL");
 	assert.equal((await result()).result.status, "active");
-	assert.equal((await result()).result.conversationUrl, url);
-	await begin("voice_start");
+	assert.equal((await result()).result.conversationUrl, localUrl);
+	await begin("voice_start", localUrl);
 	await page.clock.runFor(100);
 	assert.equal((await result()).result.status, "active");
 	assert.equal(await page.evaluate(() => globalThis.startClicks), 1, "another wake cannot toggle an active call off");
+	await page.evaluate(url => { history.replaceState({}, "", url); globalThis.provisionalUrl = undefined; }, url);
 	const micLabel = () => page.evaluate(() => document.querySelector('[aria-label="Turn off microphone"], [aria-label="Turn on microphone"]').getAttribute("aria-label"));
 	const audio = async (duration, userSpeaking = false, assistantSpeaking = false, inputAvailable = true) => {
 		await page.evaluate(({ userSpeaking, assistantSpeaking, inputAvailable }) => {

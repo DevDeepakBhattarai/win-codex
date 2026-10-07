@@ -680,7 +680,8 @@ async function isVoiceConversation(value) {
   if (Number.isInteger(stored.voiceTabId)) {
     const tab = await extensionApi.tabs.get(stored.voiceTabId).catch(() => null);
     const tracked = tab && voicePageUrl(tab.url);
-    if (tracked && (tracked === stored.voiceTabUrl || stored.voiceTabUrl === "https://chatgpt.com/") && voicePageUrl(value) === tracked) return true;
+    if (tracked && (tracked === stored.voiceTabUrl || stored.voiceTabUrl === "https://chatgpt.com/" ||
+        (stored.voiceTabUrl?.startsWith("https://chatgpt.com/c/local-chatgpt%3A") && tracked === conversationUrl(tab.url))) && voicePageUrl(value) === tracked) return true;
   }
   return Boolean(current && [stored.voiceConversationUrl, stored.serverVoiceConversationUrl].some(configured =>
     configured && current.split("/c/")[1]?.split("?")[0] === configured.split("/c/")[1]?.split("?")[0]));
@@ -689,8 +690,10 @@ async function isVoiceConversation(value) {
 function voicePageUrl(value) {
   try {
     const parsed = new URL(value);
-    if (parsed.origin !== "https://chatgpt.com" || parsed.searchParams.get("temporary-chat") === "true") return null;
+    if (parsed.origin !== "https://chatgpt.com" || parsed.username || parsed.password || parsed.searchParams.get("temporary-chat") === "true") return null;
     if (parsed.pathname === "/") return "https://chatgpt.com/";
+    const local = parsed.pathname.match(/^\/c\/local-chatgpt(?:%3A|:)([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/?$/i);
+    if (local) return `https://chatgpt.com/c/local-chatgpt%3A${local[1].toLowerCase()}`;
     const saved = conversationUrl(value);
     return saved && !saved.includes("/g/") ? saved : null;
   } catch { return null; }
@@ -709,7 +712,8 @@ async function executeVoiceCommand(command, browserId) {
       const eligible = tabs.filter(tab => voicePageUrl(tab.url) && !tab.incognito &&
         !Object.values(stored.automationThreadTabsV1 ?? {}).includes(tab.id));
       const remembered = eligible.find(tab => tab.id === stored.voiceTabId &&
-        (voicePageUrl(tab.url) === stored.voiceTabUrl || stored.voiceTabUrl === "https://chatgpt.com/")) ??
+        (voicePageUrl(tab.url) === stored.voiceTabUrl || stored.voiceTabUrl === "https://chatgpt.com/" ||
+          (stored.voiceTabUrl?.startsWith("https://chatgpt.com/c/local-chatgpt%3A") && voicePageUrl(tab.url) === conversationUrl(tab.url)))) ??
         eligible.find(tab => [stored.voiceConversationUrl, stored.serverVoiceConversationUrl].includes(voicePageUrl(tab.url)));
       const observed = command.kind === "voice_status" && remembered ? [] : await Promise.allSettled(eligible.filter(tab => tab.status === "complete").map(async tab => {
         const response = await sendAutomationMessageWithTimeout(tab.id, { feature: "voice", kind: "voice_status", targetUrl: voicePageUrl(tab.url) });
@@ -758,7 +762,8 @@ async function executeVoiceCommand(command, browserId) {
       if (!response?.ok) throw new Error(response?.error || "ChatGPT Voice control failed.");
       result = { ...response.result, tabId: tab.id };
       const finalUrl = voicePageUrl((await extensionApi.tabs.get(tab.id)).url);
-      if (!finalUrl || result?.conversationUrl !== finalUrl || (targetUrl !== "https://chatgpt.com/" && finalUrl !== targetUrl)) throw new Error("Voice command returned a different conversation.");
+      const promoted = targetUrl.startsWith("https://chatgpt.com/c/local-chatgpt%3A") && finalUrl === conversationUrl((await extensionApi.tabs.get(tab.id)).url);
+      if (!finalUrl || result?.conversationUrl !== finalUrl || (targetUrl !== "https://chatgpt.com/" && finalUrl !== targetUrl && !promoted)) throw new Error("Voice command returned a different conversation.");
       await extensionApi.storage.local.set({ voiceTabUrl: finalUrl, voiceConversationUrl: finalUrl });
     }
     await postResult({ commandId: command.id, browserId, kind: command.kind, ok: true, result });

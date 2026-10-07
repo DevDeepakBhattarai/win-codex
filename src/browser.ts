@@ -551,7 +551,7 @@ export class BrowserService {
 
   async observeVoiceAudio(tabId: number, conversationUrl: string) {
     if (!this.status().connected) throw new Error("Connect Browser Bridge to monitor the existing Voice call.");
-    if (!/^https:\/\/chatgpt\.com\/(?:c\/[a-f0-9-]+)?$/.test(conversationUrl)) throw new Error("Voice audio requires a regular ChatGPT tab.");
+    if (!/^https:\/\/chatgpt\.com\/(?:c\/(?:local-chatgpt%3A)?[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})?$/.test(conversationUrl)) throw new Error("Voice audio requires a regular ChatGPT tab.");
     await this.withTabLock(tabId, async () => {
       const tab = await this.bridge.request<BrowserTab>("tabs.get", { tabId });
       const current = new URL(tab.url ?? "about:blank");

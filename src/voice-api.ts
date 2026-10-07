@@ -29,7 +29,8 @@ export function createVoiceApi(input: { token: string; registry: RalphRegistry; 
 			throw new Error("Voice received the wrong support command result.");
 		}
 		const observedUrl = result.result.conversationUrl;
-		if (observedUrl !== newChatUrl) await input.registry.validateVoiceConversation(observedUrl);
+		const provisional = /^https:\/\/chatgpt\.com\/c\/local-chatgpt%3A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(observedUrl);
+		if (observedUrl !== newChatUrl && !provisional) await input.registry.validateVoiceConversation(observedUrl);
 		if (!discover && observedUrl !== targetUrl) {
 			throw new Error("Voice command returned a different conversation.");
 		}
@@ -43,7 +44,7 @@ export function createVoiceApi(input: { token: string; registry: RalphRegistry; 
 			if (result.result.tabId === undefined) throw new Error("Reload Local Codex Support to enable Voice audio monitoring.");
 			await input.observeAudio(result.result.tabId, observedUrl);
 		}
-		if (discover && observedUrl !== newChatUrl && input.registry.voiceConversationUrl() !== observedUrl) {
+		if (discover && observedUrl !== newChatUrl && !provisional && input.registry.voiceConversationUrl() !== observedUrl) {
 			await input.registry.setVoiceConversation(observedUrl);
 			input.commands.cancelThreadChecks(parseConversationUrl(observedUrl).threadId);
 		}

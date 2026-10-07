@@ -167,7 +167,8 @@ try {
 
   // A reused call can create native peers before the Voice observer loads.
   await userPage.route("https://chatgpt.com/**", route => route.fulfill({ contentType: "text/html", body: "<!doctype html><title>Voice reuse fixture</title>" }));
-  await userPage.goto("https://chatgpt.com/?model=auto");
+  const provisionalVoiceUrl = "https://chatgpt.com/c/local-chatgpt%3A0247af84-32ff-4a12-a96e-59f8fffaba27";
+  await userPage.goto(provisionalVoiceUrl + "?model=auto");
   await userPage.evaluate(async () => {
     const sender = new RTCPeerConnection();
     const receiver = new RTCPeerConnection();
@@ -195,9 +196,9 @@ try {
   });
   await userPage.addScriptTag({ content: await readFile(process.argv[2] ?? "support-extension/voice-audio.js", "utf8") });
   await userPage.evaluate(() => window.postMessage({ type: "local-codex-voice-monitor-v1", active: true }, location.origin));
-  const voiceTab = (await service.listTabs()).find(tab => tab.url === "https://chatgpt.com/?model=auto");
+  const voiceTab = (await service.listTabs()).find(tab => tab.url === provisionalVoiceUrl + "?model=auto");
   assert.ok(voiceTab);
-  await service.observeVoiceAudio(voiceTab.id, "https://chatgpt.com/");
+  await service.observeVoiceAudio(voiceTab.id, provisionalVoiceUrl);
   try {
     await waitUntil(() => userPage.evaluate(() => window.voiceActivity.some(event => event.assistantSpeaking)), 10_000, "playback from a native peer created before observer injection");
   } catch (error) {

@@ -5,8 +5,9 @@ import vm from "node:vm";
 const root = "https://chatgpt.com/";
 const first = root + "c/11111111-1111-4111-8111-111111111111";
 const second = root + "c/22222222-2222-4222-8222-222222222222";
+const localUrl = root + "c/local-chatgpt%3A0247af84-32ff-4a12-a96e-59f8fffaba27";
 const script = await readFile("support-extension/service-worker.js", "utf8");
-async function run({ tabs = [], storage = {}, kind = "voice_start", responses = [] }) {
+async function run({ tabs = [], storage = {}, kind = "voice_start", responses = [], onCommand = () => {} }) {
 	const calls = [];
 	const created = [];
 	const reloaded = [];
@@ -30,6 +31,7 @@ async function run({ tabs = [], storage = {}, kind = "voice_start", responses = 
 				async sendMessage(id, { command }) {
 					calls.push({ id, kind: command.kind, targetUrl: command.targetUrl });
 					if (command.kind === "voice_status") return { ok: true, result: { status: tabs.find(tab => tab.id === id).voice ?? "closed", conversationUrl: command.targetUrl } };
+					onCommand(tabs.find(tab => tab.id === id));
 					return responses.shift() ?? { ok: true, result: { status: "active", conversationUrl: command.targetUrl, microphone: "unmuted" } };
 				},
 			},
@@ -48,6 +50,25 @@ async function run({ tabs = [], storage = {}, kind = "voice_start", responses = 
 	return { calls, created, reloaded, results, storage };
 }
 const tab = (id, url, voice = "closed") => ({ id, url, voice, status: "complete" });
+{
+	const result = await run({ onCommand: tab => { tab.url = localUrl; }, responses: [
+		{ ok: true, result: { status: "active", conversationUrl: localUrl, microphone: "unmuted" } },
+	] });
+	assert.equal(result.results[0].ok, true, "fresh startup retains the tab after ChatGPT assigns a provisional URL");
+	assert.equal(result.storage.voiceTabUrl, localUrl);
+}
+{
+	const result = await run({ tabs: [tab(1, localUrl, "active")], kind: "voice_stop", responses: [
+		{ ok: true, result: { status: "closed", conversationUrl: localUrl } },
+	] });
+	assert.equal(result.calls.at(-1).id, 1, "stop reaches the active provisional Voice tab");
+	assert.equal(result.results[0].result.status, "closed");
+}
+{
+	const result = await run({ tabs: [tab(1, first)], storage: { voiceTabId: 1, voiceTabUrl: localUrl } });
+	assert.equal(result.created.length, 0, "promotion to a saved URL keeps the disconnected Voice tab reusable");
+	assert.equal(result.calls.at(-1).id, 1);
+}
 {
 	const result = await run({ tabs: [tab(1, first), tab(2, second, "active")], storage: { voiceConversationUrl: first } });
 	assert.equal(result.calls.at(-1).id, 2, "an active call wins over an old configured conversation");

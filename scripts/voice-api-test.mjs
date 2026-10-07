@@ -34,6 +34,7 @@ const server = await new Promise(resolve => { const listener = app.listen(0, "12
 const base = `http://127.0.0.1:${server.address().port}/chatgpt-support/voice`;
 const url = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
 const other = "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222";
+const localUrl = "https://chatgpt.com/c/local-chatgpt%3A0247af84-32ff-4a12-a96e-59f8fffaba27";
 const headers = { authorization: "Bearer test-token", "content-type": "application/json" };
 const request = (method, suffix = "", body, extra = {}) => fetch(base + suffix, {
 	method, headers: { ...headers, ...extra }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(5000),
@@ -48,9 +49,16 @@ try {
 	const freshCommand = await claim();
 	assert.ok(freshCommand, "A wake without a saved URL must ask Chrome to select or create a Voice chat");
 	assert.equal(freshCommand.targetUrl, "https://chatgpt.com/");
-	complete(freshCommand, "active");
+	complete(freshCommand, "active", localUrl);
 	assert.equal((await freshStart).status, 200);
-	assert.deepEqual(observations, [{ tabId: 1, conversationUrl: "https://chatgpt.com/" }], "A wake monitors the tab Chrome actually selected");
+	assert.deepEqual(observations, [{ tabId: 1, conversationUrl: localUrl }], "A wake monitors the provisional tab Chrome actually selected");
+	assert.equal(registry.voiceConversationUrl(), undefined, "A provisional URL is not persisted as a saved conversation binding");
+	assert.equal((await request("PUT", "", { conversationUrl: localUrl })).status, 400, "Explicit configuration still requires a saved conversation");
+	for (const invalid of [localUrl + "?temporary-chat=true", localUrl.replace("/c/", "/g/g-p-" + "a".repeat(32) + "/c/"), localUrl + "-invalid"]) {
+		const pending = request("POST", "/status", {});
+		complete(await claim(), "active", invalid);
+		assert.equal((await pending).status, 503, "Provisional Voice URLs cannot bypass regular-chat validation");
+	}
 	observationError = "Browser Bridge is disconnected";
 	const unobservedStart = request("POST", "/start", {});
 	complete(await claim(), "active");
