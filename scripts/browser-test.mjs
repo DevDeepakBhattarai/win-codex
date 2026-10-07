@@ -212,6 +212,18 @@ try {
     throw error;
   }
   assert.equal((await service.listTabs()).find(tab => tab.id === voiceTab.id).ownership, "user", "audio discovery does not claim the user's Voice tab");
+  const voiceWorker = context.serviceWorkers()[0];
+  await voiceWorker.evaluate(() => {
+    globalThis.voiceOriginalSendCommand = chrome.debugger.sendCommand.bind(chrome.debugger);
+    chrome.debugger.sendCommand = (target, method, params) => method === "Runtime.queryObjects"
+      ? Promise.reject(new Error("Heap inspection is unavailable"))
+      : globalThis.voiceOriginalSendCommand(target, method, params);
+  });
+  try {
+    await service.observeVoiceAudio(voiceTab.id, provisionalVoiceUrl);
+  } finally {
+    await voiceWorker.evaluate(() => { chrome.debugger.sendCommand = globalThis.voiceOriginalSendCommand; delete globalThis.voiceOriginalSendCommand; });
+  }
   await assert.rejects(service.observeVoiceAudio(voiceTab.id, "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111"), /navigated away/);
   await userPage.evaluate(async () => {
     window.postMessage({ type: "local-codex-voice-monitor-v1", active: false }, location.origin);

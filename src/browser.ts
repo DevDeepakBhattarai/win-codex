@@ -561,9 +561,10 @@ export class BrowserService {
       const objectGroup = `voice-audio-${randomUUID()}`;
       try {
         const prototype = await this.sendCdp<CdpRuntimeResult>(tabId, "Runtime.evaluate", {
-          expression: "globalThis.__localCodexVoiceAudio?.registerPeers && RTCPeerConnection.prototype",
+          expression: "globalThis.__localCodexVoiceAudio?.registerPeers && (globalThis.__localCodexVoiceAudio.registerPeers([]) || RTCPeerConnection.prototype)",
           returnByValue: false, objectGroup,
         });
+        if (!prototype.exceptionDetails && typeof prototype.result?.value === "number" && prototype.result.value > 0) return;
         if (prototype.exceptionDetails || !prototype.result?.objectId) throw new Error("Voice audio observer is unavailable. Reload Local Codex Support.");
         const peers = await this.sendCdp<{ objects: { objectId: string } }>(tabId, "Runtime.queryObjects", {
           prototypeObjectId: prototype.result.objectId, objectGroup,
