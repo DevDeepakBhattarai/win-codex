@@ -85,44 +85,51 @@ async function testInlineStreamFailureDetection() {
 }
 
 async function testIdleCompletionClassification() {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "ralph-monitor-regression-"));
-  const registry = await RalphRegistry.open(directory, 1);
-  const commands = new SupportCommandBus();
-  const previousFetch = globalThis.fetch;
-  let apiCalls = 0;
-  globalThis.fetch = async () => {
-    apiCalls += 1;
-    return new Response(JSON.stringify({ output: [{ content: [{ type: "output_text", text: "CONTINUE" }] }] }),
-      { headers: { "content-type": "application/json" } });
-  };
-  const controller = new RalphController({ registry, commands, apiKey: "fixture-key", model: "fixture-model",
-    auditLogPath: path.join(directory, "audit.log"), checkEveryMs: 60_000 });
-  try {
-    const url = "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222";
-    const threadId = url.split("/c/")[1];
-    await registry.register(url, { manual: true });
-    await registry.scheduleNow(threadId);
-    await controller.tick();
-    const inspect = await commands.claim("chrome", ["ralph"], 1000, undefined, [url]);
-    assert.equal(inspect.kind, "inspect_thread");
-    commands.complete({ commandId: inspect.id, browserId: "chrome", kind: inspect.kind, ok: true, result: {
-      status: "idle", workedSeconds: null,
-      users: [{ id: "u1", text: "Finish the task." }],
-      assistant: { id: "a1", synthetic: false, text: "I stopped before finishing the task." },
-    } });
-    await new Promise(resolve => setTimeout(resolve, 25));
-    assert.equal(apiCalls, 1, "every real final response must reach the classifier even without a worked-time label");
-    const send = await commands.claim("chrome", ["ralph"], 1000, undefined, [url]);
-    assert.equal(send.kind, "send_message", "an unfinished idle turn receives a continuation");
-    assert.equal(send.message, "Continue");
-    commands.complete({ commandId: send.id, browserId: "chrome", kind: send.kind, ok: true,
-      result: { status: "sent", conversationUrl: url } });
-    assert.equal(await registry.isActive(threadId), true, "unfinished work stays monitored");
-  } finally {
-    controller.close();
-    commands.close();
-    globalThis.fetch = previousFetch;
-    await rm(directory, { recursive: true, force: true });
+  for (const workedSeconds of [null, 60, 1800, 1801]) {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "ralph-monitor-regression-"));
+    const registry = await RalphRegistry.open(directory, 1);
+    const commands = new SupportCommandBus();
+    const previousFetch = globalThis.fetch;
+    let apiCalls = 0;
+    globalThis.fetch = async () => {
+      apiCalls += 1;
+      return new Response(JSON.stringify({ output: [{ content: [{ type: "output_text", text: "CONTINUE" }] }] }),
+        { headers: { "content-type": "application/json" } });
+    };
+    const controller = new RalphController({ registry, commands, apiKey: "fixture-key", model: "fixture-model",
+      auditLogPath: path.join(directory, "audit.log"), checkEveryMs: 60_000 });
+    try {
+      const url = "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222";
+      const threadId = url.split("/c/")[1];
+      await registry.register(url, { manual: true });
+      await registry.scheduleNow(threadId);
+      await controller.tick();
+      const inspect = await commands.claim("chrome", ["ralph"], 1000, undefined, [url]);
+      assert.equal(inspect.kind, "inspect_thread");
+      commands.complete({ commandId: inspect.id, browserId: "chrome", kind: inspect.kind, ok: true, result: {
+        status: "idle", workedSeconds,
+        users: [{ id: "u1", text: "Finish the task." }],
+        assistant: { id: "a1", synthetic: false, text: "I stopped before finishing the task." },
+      } });
+      await new Promise(resolve => setTimeout(resolve, 25));
+      if (workedSeconds === null || workedSeconds <= 1800) {
+        assert.equal(apiCalls, 0, "only final responses above 30 minutes reach the inspector");
+        assert.equal(await commands.claim("chrome", ["ralph"], 0), undefined, "short final responses receive no unsolicited continuation");
+        continue;
+      }
+      assert.equal(apiCalls, 1, "a final response above 30 minutes reaches the inspector");
+      const send = await commands.claim("chrome", ["ralph"], 1000, undefined, [url]);
+      assert.equal(send.kind, "send_message", "an unfinished idle turn receives a continuation");
+      assert.equal(send.message, "Continue");
+      commands.complete({ commandId: send.id, browserId: "chrome", kind: send.kind, ok: true,
+        result: { status: "sent", conversationUrl: url } });
+      assert.equal(await registry.isActive(threadId), true, "unfinished work stays monitored");
+    } finally {
+      controller.close();
+      commands.close();
+      globalThis.fetch = previousFetch;
+      await rm(directory, { recursive: true, force: true });
+    }
   }
 }
 

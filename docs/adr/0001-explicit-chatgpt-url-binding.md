@@ -84,16 +84,11 @@ Reviewer threads are registered for RALPH immediately and store their implemente
 
 The extension reports readable ChatGPT titles during route updates, sends, and inspections so operator views do not need to identify threads by UUID alone.
 
-RALPH stores two independent fields:
+RALPH stores `state` as `active` or `complete`.
 
-- `state` is `active` or `complete`.
-- `mode` is `normal` or `continuous`.
+RALPH repeatedly inspects active enrolled threads. The default check interval is 180 seconds, or 3 minutes, and configured intervals below 120 seconds are rejected. Registration, running and loading observations, and continuations use the same interval. Loading and running reschedule inspection. Chrome confirms the idle state before the completion classifier receives a final assistant response. Only final responses with a worked duration above the configured threshold reach the inspector. The default threshold is 1800 seconds, or 30 minutes. A stopped turn without a final response receives `Continue` directly. Ordinary unfinished responses also receive `Continue`. Explicit engineering checkpoints retain their existing continuation instructions.
 
-Normal mode repeatedly inspects active threads. The default check interval is 180 seconds (3 minutes), and configured intervals below 120 seconds are rejected. Registration, running/loading observations, and continuations use the same interval. Loading and running only reschedule inspection. For a settled idle normal turn, an unavailable worked duration or a duration at or below 1200 seconds marks the thread complete locally; only a duration strictly above 20 minutes reaches the completion classifier. Continuous mode is explicit per thread, uses the same inspection loop, skips completion classification, and sends a fixed continuation instruction when the thread is settled, idle, and due. Continuous mode never starts automatically.
-
-Continuous mode is operator-controlled. The agent has no MCP action that disables it. Ending a turn does not change the mode. The popup can switch the thread back to normal mode with **Stop continuous** or stop RALPH checks with **Mark complete**.
-
-Both modes defer implementer threads while a review is pending or its report awaits notification. Finished and cancelled reviewer jobs suppress further reviewer continuation. Ready reports for an implementer share a one-second collection window and one wake-up. Visible recognized ChatGPT rate-limit notices trigger a shared 10-minute message cooldown. The extension persists the first-seen provider-notice time across service-worker restarts and does not reload or dismiss the notice during that interval. Sends blocked before the Send click remain queued for retry after cooldown. If the provider notice appears after Send was clicked, delivery is uncertain and the command is not replayed automatically. Page errors and timeouts refresh the same tab once and retry inspection when safe. Stop-thread commands bypass message cooldown.
+RALPH defers implementer threads while a review is pending or its report awaits notification. Finished and cancelled reviewer jobs suppress further reviewer continuation. Ready reports for an implementer share a one-second collection window and one wake-up. Visible recognized ChatGPT rate-limit notices trigger a shared 10-minute message cooldown. The extension persists the first-seen provider-notice time across service-worker restarts and does not reload or dismiss the notice during that interval. Sends blocked before the Send click remain queued for retry after cooldown. If the provider notice appears after Send was clicked, delivery is uncertain and the command is not replayed automatically. Page errors and timeouts refresh the same tab once and retry inspection when safe. Stop-thread commands bypass message cooldown.
 
 ### Claim automation commands atomically
 
@@ -109,7 +104,7 @@ Browser delivery retries a prompt after one refresh only when the page confirms 
 
 Automation-owned conversation tabs are persistent working state. Creation, preparation, Thread Sync, title capture, RALPH inspection, and existing-thread messaging reuse the same tab. Active threads are never closed by lifecycle cleanup. Ten minutes after a RALPH thread becomes complete, the backend requests cleanup; only tabs recorded as automation-owned are closed, while pre-existing user tabs are left alone. Support work starts Chrome when the configured browser is closed. A running browser is reused without another launch. New message tabs target an existing normal window explicitly.
 
-RALPH remains a continuation runtime. Normal work can complete. Continuous execution exists only after the user explicitly selects **Run continuously**.
+RALPH continues unfinished enrolled work. **Mark complete** stops checks for that thread.
 
 
 ### Reuse an existing conversation across browsers

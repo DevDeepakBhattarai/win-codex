@@ -21,6 +21,7 @@ try {
   }));
   const task = { jobId: reviewId, childThreadId: reviewId, childConversationUrl: url(reviewId) + "?temporary-chat=true", parentThreadId: parentId, title: "Independent review", state: "pending" };
   let settingsRequests = 0;
+  const ralphSettings = { loopIntervalSeconds: 180, minWorkedSeconds: 1800 };
   let cancelled = false;
   let automationPausedUntil = 0;
   let schedules = [];
@@ -40,7 +41,11 @@ try {
     const pathname = new URL(route.request().url()).pathname;
     let data;
     if (pathname === "/chatgpt-support/ralph/threads") data = { threads: [parent, active, legacyActive, ...complete], tasks: [task], continuationEnabled: true, automationPausedUntil };
-    else if (pathname === "/chatgpt-support/ralph/settings") { settingsRequests += 1; data = { loopIntervalSeconds: 1800 }; }
+    else if (pathname === "/chatgpt-support/ralph/settings") {
+      settingsRequests += 1;
+      if (route.request().method() === "PUT") Object.assign(ralphSettings, route.request().postDataJSON());
+      data = ralphSettings;
+    }
     else if (pathname === "/chatgpt-support/ralph/projects") data = { projects: [] };
     else if (pathname === "/chatgpt-support/schedules") {
       if (route.request().method() === "POST") {
@@ -100,12 +105,18 @@ try {
   await page.locator("#subagentThreadsSection").waitFor({ state: "hidden" });
   assert.equal(cancelled, true);
   await page.getByRole("tab", { name: "Settings", exact: true }).click();
-  await page.waitForFunction(() => document.getElementById("ralphLoopIntervalSeconds").value === "1800");
+  await page.waitForFunction(() => document.getElementById("ralphLoopIntervalSeconds").value === "180");
   assert.equal(settingsRequests, 1);
+  assert.equal(await page.getByLabel("Check unfinished chats", { exact: false }).isVisible(), true, "the continuation setting is available in Settings");
   assert.equal(await page.getByLabel("Recover interrupted chats").isChecked(), true, "In-place error recovery is enabled independently of the executor and RALPH toggles");
+  assert.equal(await page.getByLabel("Minimum worked duration (seconds)").inputValue(), "1800");
+  await page.getByLabel("Minimum worked duration (seconds)").fill("1900");
+  await page.getByRole("button", { name: "Save duration", exact: true }).click();
+  await page.getByText("Final responses must have worked longer than 1900 seconds before an inspector check.", { exact: true }).waitFor();
+  assert.deepEqual(ralphSettings, { loopIntervalSeconds: 180, minWorkedSeconds: 1900 }, "saving the worked duration leaves the polling interval unchanged");
   await page.getByRole("tab", { name: "Threads", exact: true }).click();
   await page.getByRole("tab", { name: "Settings", exact: true }).click();
-  assert.equal(settingsRequests, 1, "settings remain lazy and cached");
+  assert.equal(settingsRequests, 2, "settings remain lazy and cached after saving the duration");
   await page.getByRole("tab", { name: "Schedules", exact: true }).click();
   assert.match(await page.locator("#scheduleTimezone").textContent(), /Asia\/(?:Katmandu|Kathmandu)/);
   await page.getByLabel("Prompt", { exact: true }).fill("Run my scheduled check");

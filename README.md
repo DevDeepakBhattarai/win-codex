@@ -218,13 +218,13 @@ Workers write their complete report to the supplied temporary file and rename it
 
 Safe failures before Send use bounded retry. Uncertain delivery after Send requires operator inspection. The Support extension shows saved errors and offers recovery controls. Recognized rate limits defer queued sends, while Stop remains available.
 
-The service checks unfinished workers every 30 minutes without classifier calls. It waits while a worker runs and resumes an idle worker until the worker publishes its report. Report collection releases the waiting parent and closes the owned worker tab. A chat answer alone never marks an assignment complete.
+The service checks unfinished workers every 3 minutes by default, without classifier calls. It waits while a worker runs and resumes an idle worker until the worker publishes its report. Report collection releases the waiting parent and closes the owned worker tab. A chat answer alone never marks an assignment complete.
 
 ## Automatic continuation
 
-`RALPH_ENABLED` defaults to true and controls continuation of marked manual threads. Worker recovery uses task messaging and needs no classifier API key. The default interval is 1800 seconds. Observing an ordinary manual conversation updates its sidebar status without enabling continuation.
+`RALPH_ENABLED` defaults to true and controls continuation of enrolled threads. Enable **Check unfinished chats** in both Helium and Chrome to enroll ordinary chats. Keep **Automation browser executor** enabled only in Chrome. Every 180 seconds by default, Helium can report the chat's state, and Chrome confirms an idle state before the API classifies its final response. `COMPLETE` settles the chat. `CONTINUE` sends `Continue`. A stopped chat without a final response receives `Continue` without a classifier call. Only final responses with a worked duration above 1800 seconds, or 30 minutes, reach the inspector by default. The Minimum worked duration setting changes this threshold independently of the check interval. Worker recovery uses task messaging and needs no classifier API key.
 
-The extension detects visible stream interruptions, retry errors, and rate-limit notices in each browser. With **Recover interrupted chats** enabled, it stops the affected turn and sends one continuation in the same tab. This includes user-opened Helium and Chrome chats. A rate limit waits ten minutes before dismissal and continuation. Recovery preserves temporary chats, protects the dedicated Voice chat, and stops if the tab navigates to another conversation. Error recovery does not start a RALPH loop.
+The extension detects visible stream interruptions, recognized response errors, and rate-limit notices in each browser. With **Recover interrupted chats** enabled, it stops the affected turn and sends `Continue` in the same tab. It scans open chats every 3 minutes as well as reacting to page changes, so a missed event or failed recovery gets another check. This includes user-opened Helium and Chrome chats. A rate limit waits ten minutes before dismissal and continuation. Recovery preserves temporary chats, protects the dedicated Voice chat, and stops if the tab navigates to another conversation. Error recovery does not start a RALPH loop.
 
 ## Windows startup
 

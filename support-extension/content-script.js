@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.12.0";
+  const contentScriptVersion = "1.19.0";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -51,9 +51,6 @@
   const THREAD_SETTLE_TIMEOUT_MS = 2.5 * 60_000;
   let inspectionSignature;
   let inspectionStableSince = 0;
-  const RALPH_MIN_WORKED_SECONDS_KEY = "ralphMinWorkedSeconds";
-  const LEGACY_RALPH_MIN_WORKED_SECONDS = 19 * 60;
-  const DEFAULT_RALPH_MIN_WORKED_SECONDS = 20 * 60;
 
   function conversationUrl(url = location) {
     const match = url.pathname.match(/^(?:\/g\/([A-Za-z0-9_-]+))?\/c\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/?$/i);
@@ -127,6 +124,7 @@
   installRalphComposerObserver();
 
   extensionApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (globalThis[handlerKey]?.version !== contentScriptVersion) return;
     if (message?.type !== automationType || !message.command) return;
     void runAutomation(message.command).then(
       (result) => sendResponse({ ok: true, result }),
@@ -156,11 +154,12 @@
       if (button) button.click();
       return { status: button ? "dismissed" : "not_found" };
     }
-    if (command.kind === "stop_thread") return await stopThread(command.recovering ? command.targetUrl : undefined, command.recoveryExpiresAt);
+    if (command.kind === "stop_thread") return await stopThread(command.recovering ? command.targetUrl : undefined, command.recoveryExpiresAt, command.requireFailure === true);
     if (command.kind === "resume_interrupted") {
       const failed = Boolean(connectionInterruptedNotice() || pageErrorNotice() || inlineAssistantFailureNotice());
-      const stopped = await stopThread();
-      if (stopped.status === "idle" && !failed) return stopped;
+      if (!failed) return { status: "idle", conversationUrl: conversationUrl() };
+      const stopped = await stopThread(undefined, undefined, true);
+      if (stopped.status === "error_cleared") return { status: "idle", conversationUrl: conversationUrl() };
       return await sendMessage(command.message, undefined, false, true);
     }
     if (command.kind === "recover_page") {
@@ -237,13 +236,16 @@
     }
   }
 
-  async function stopThread(targetUrl, expiresAt) {
+  async function stopThread(targetUrl, expiresAt, requireFailure = false) {
     const ready = await waitForCancellationState(30_000);
     if (!ready) throw new Error("ChatGPT child state did not become ready for cancellation.");
 
     const currentUrl = conversationUrl();
     if (targetUrl && currentUrl !== conversationUrl(new URL(targetUrl))) throw new Error("Recovery stopped because the tab navigated away.");
     if (!currentUrl) throw new Error("ChatGPT cancellation is not on a saved conversation.");
+    if (requireFailure && !["connection_interrupted", "recoverable_error"].includes(pageHealth().status)) {
+      return { status: "error_cleared", conversationUrl: currentUrl };
+    }
     if (!ready.stopButton) return { status: "idle", conversationUrl: currentUrl };
 
     checkRecoveryDeadline(expiresAt);
@@ -308,19 +310,20 @@
     const settled = await waitForStableTurns(20_000);
     if (!settled) return { status: "loading", ...(title ? { title } : {}) };
     if (isRunning()) return { status: "running", ...(title ? { title } : {}) };
-    const workedSeconds = getWorkedDurationSeconds(await getRalphMinWorkedSeconds());
+    const workedSeconds = getWorkedDurationSeconds();
     const turns = [...document.querySelectorAll("section[data-turn]")];
     if (!turns.length) {
       const users = userTurns().map(turn => ({ id: userTurnId(turn), text: extractText(userContent(turn)) }));
       const lastTurn = userTurns().at(-1)?.closest("[data-turn-key]") ??
         [...document.querySelectorAll("[data-turn-key]")].at(-1);
-      const finalMessage = [...(lastTurn?.querySelectorAll('[data-markdown-text-tone="primary"]') ?? [])].at(-1);
+      const finalMessage = finalAssistantMessage(lastTurn);
+      const text = finalMessage ? extractText(finalMessage) : "";
       if (isRunning()) return { status: "running", ...(title ? { title } : {}) };
       return {
         status: "idle", ...(title ? { title } : {}), workedSeconds, users,
         assistant: {
-          synthetic: !finalMessage,
-          text: finalMessage ? extractText(finalMessage) : "[Thread stopped before an assistant response was produced.]",
+          synthetic: !text,
+          text: text || "[Thread stopped before an assistant response was produced.]",
         },
       };
     }
@@ -383,7 +386,6 @@
 
     if (isRunning()) return { status: "running", ...(title ? { title } : {}) };
     const text = extractText(finalMessage);
-    if (!text) throw new Error("Could not extract the text of the final ChatGPT assistant message.");
     if (isPageFailure(text)) throw new Error(`CHATGPT_PAGE_ERROR: ${text.slice(0, 500)}`);
     return {
       status: "idle",
@@ -391,9 +393,9 @@
       workedSeconds,
       users,
       assistant: {
-        synthetic: false,
+        synthetic: !text,
         id: finalMessage.getAttribute("data-message-id"),
-        text,
+        text: text || "[Thread stopped before a final assistant response was produced.]",
       },
     };
   }
@@ -425,6 +427,7 @@
       if (existingConversationUrl) {
         const loadedUserTurn = await waitFor(
           () => document.querySelector('section[data-turn="user"] [data-message-author-role="user"]') ??
+            document.querySelector('[data-chatgpt-search-unit-key$=":user"] [data-user-message-bubble="true"]') ??
             document.querySelector('[data-chatgpt-search-unit-key$=":user"] [data-markdown-text-tone="user-message"]'),
           SEND_READY_TIMEOUT_MS, recovering,
         );
@@ -548,13 +551,22 @@
 
   function connectionInterruptedNotice() {
     return [...document.querySelectorAll('[role="status"] .text-chatgpt-recovery')].find(element =>
-      element.getClientRects?.().length && /^Connection interrupted\. Waiting for the complete answer$/i.test(element.textContent?.trim() ?? ""));
+      element.getClientRects?.().length && noticeBelongsToCurrentTurn(element) && /^Connection interrupted\. Waiting for the complete answer$/i.test(element.textContent?.trim() ?? ""));
   }
 
   function pageErrorNotice() {
     const notices = [...document.querySelectorAll('[role="alert"], [role="dialog"], [data-testid="toast"]')];
     return notices.find(element => element.getClientRects?.().length &&
+      noticeBelongsToCurrentTurn(element) &&
       /something went wrong|(?:error (?:generating|processing)|failure to (?:generate|process)) (?:a |the )?(?:response|message)|network error|stream (?:interrupted|disconnected|failed)|connection (?:lost|interrupted)|(?:request|response) timed out|message delivery failed/i.test(element.textContent ?? ""));
+  }
+
+  function noticeBelongsToCurrentTurn(notice) {
+    if (notice.closest?.('[data-message-author-role], [data-markdown-text-tone], [data-testid*="tool"], [data-tool-call-id]')) return false;
+    const main = document.querySelector("main");
+    if (!main?.contains(notice)) return true;
+    const user = userTurns().at(-1);
+    return !user || Boolean(user.compareDocumentPosition(notice) & 4);
   }
 
   function inlineAssistantFailureNotice() {
@@ -563,7 +575,9 @@
       const lastUserIndex = turns.findLastIndex(turn => turn.dataset.turn === "user");
       if (lastUserIndex < 0) return null;
       const assistantTurn = turns.slice(lastUserIndex + 1).filter(turn => turn.dataset.turn === "assistant").at(-1);
-      if (!assistantTurn) return null;
+      if (!assistantTurn) return terminalResponseNotice(turns.at(-1));
+      const notice = terminalResponseNotice(assistantTurn);
+      if (notice) return notice;
       const finalMessage = [...assistantTurn.querySelectorAll('[data-message-author-role="assistant"]')].at(-1) ??
         [...assistantTurn.querySelectorAll('[data-markdown-text-tone="primary"]')].at(-1);
       const failureText = finalMessage?.textContent ?? assistantTurn.textContent ?? "";
@@ -572,12 +586,27 @@
 
     const lastUserTurn = userTurns().at(-1);
     const lastTurn = lastUserTurn?.closest?.("[data-turn-key]") ?? [...document.querySelectorAll("[data-turn-key]")].at(-1);
+    const notice = terminalResponseNotice(lastTurn);
+    if (notice) return notice;
     const finalMessage = lastTurn && [...lastTurn.querySelectorAll('[data-markdown-text-tone="primary"]')].at(-1);
     return finalMessage && isPageFailure(finalMessage.textContent ?? "") ? finalMessage : null;
   }
 
+  function terminalResponseNotice(lastTurn) {
+    if (!lastTurn) return null;
+    const notices = [...(document.querySelector("main")?.querySelectorAll('[role="alert"], [role="status"], .text-chatgpt-recovery') ?? [])];
+    return notices.find(notice => {
+      if (!notice.getClientRects().length || !isPageFailure(notice.textContent ?? "")) return false;
+      if (!noticeBelongsToCurrentTurn(notice) || getComposer()?.composer.contains(notice)) return false;
+      // Only a notice after the current turn's messages can interrupt that turn.
+      const messages = [...lastTurn.querySelectorAll('[data-message-author-role], [data-markdown-text-tone], [data-testid*="tool"], [data-tool-call-id]')];
+      const lastMessage = messages.at(-1) ?? lastTurn;
+      return Boolean(lastMessage.compareDocumentPosition(notice) & 4);
+    }) ?? null;
+  }
+
   function isPageFailure(text) {
-    return /^(?:message delivery failed|something went wrong|there was an error (?:generating|processing) (?:a |the )?(?:response|message)|network error|stream (?:interrupted|disconnected|failed)|connection (?:lost|interrupted))(?:[.!]|\s+please try again\.?)*$/i.test(text.trim());
+    return /^(?:message delivery failed|something went wrong|there was an error (?:generating|processing) (?:a |the )?(?:response|message)|network error|stream (?:interrupted|disconnected|failed)|connection (?:lost|interrupted)|waiting for (?:the )?complete answer|(?:request|response) timed out)(?:[.!]|\s+(?:please try again|waiting for (?:the )?complete answer)\.?)*$/i.test(text.trim());
   }
 
   function assertNotRateLimited() {
@@ -591,7 +620,7 @@
     assertNotRateLimited();
     if (allowInterrupted) return;
     if (!allowInterrupted && connectionInterruptedNotice()) throw new Error("CHATGPT_CONNECTION_INTERRUPTED: Waiting for the complete answer.");
-    const notice = pageErrorNotice();
+    const notice = pageErrorNotice() || inlineAssistantFailureNotice();
     if (notice) throw new Error(`CHATGPT_PAGE_ERROR: ${(notice.textContent ?? "").trim().slice(0, 500)}`);
   }
 
@@ -627,6 +656,7 @@
     let discoveryObserver;
 
     const report = () => {
+      if (globalThis[handlerKey]?.version !== contentScriptVersion) return;
       const currentUrl = conversationUrl();
       const title = threadTitle();
       if (!currentUrl || !title ||
@@ -683,6 +713,7 @@
     let reportingUnavailable = false;
 
     const observeComposerAction = () => {
+      if (globalThis[handlerKey]?.version !== contentScriptVersion) return;
       const currentUrl = conversationUrl();
       if (currentUrl !== observedConversationUrl) {
         observedConversationUrl = currentUrl;
@@ -704,7 +735,7 @@
       const health = pageHealth().status;
       const interrupted = health === "connection_interrupted";
       const action = health !== "ok" ? "blocked"
-        : isRunning() ? "running" : getSendButton(composer) && userTurns().length ? "idle" : null;
+        : isRunning() ? "running" : userTurns().length ? "idle" : null;
       if (!action) return;
       const signature = `${action}:${health}`;
 
@@ -806,7 +837,7 @@
         const lastTurn = users.at(-1)?.closest("[data-turn-key]") ??
           [...document.querySelectorAll("[data-turn-key]")].at(-1);
         if (!lastTurn) return null;
-        const hasAssistant = Boolean(lastTurn.querySelector('[data-markdown-text-tone="primary"]'));
+        const hasAssistant = Boolean(finalAssistantMessage(lastTurn));
         const signature = location.href + lastTurn.textContent;
         if (signature !== inspectionSignature) {
           inspectionSignature = signature;
@@ -885,22 +916,13 @@
       user.querySelector('[data-testid="collapsible-user-message-content"]') ?? user;
   }
 
-  async function getRalphMinWorkedSeconds() {
-    if (!extensionApi.storage?.local?.get) return DEFAULT_RALPH_MIN_WORKED_SECONDS;
-    const stored = await extensionApi.storage.local.get({
-      [RALPH_MIN_WORKED_SECONDS_KEY]: DEFAULT_RALPH_MIN_WORKED_SECONDS,
-    });
-    const value = stored[RALPH_MIN_WORKED_SECONDS_KEY];
-    if (value === LEGACY_RALPH_MIN_WORKED_SECONDS) {
-      await extensionApi.storage.local.set?.({ [RALPH_MIN_WORKED_SECONDS_KEY]: DEFAULT_RALPH_MIN_WORKED_SECONDS });
-      return DEFAULT_RALPH_MIN_WORKED_SECONDS;
-    }
-    return Number.isInteger(value) && value >= 0 ? value : DEFAULT_RALPH_MIN_WORKED_SECONDS;
+  function finalAssistantMessage(turn) {
+    return [...(turn?.querySelectorAll('[data-chatgpt-search-unit-key$=":assistant"] [data-markdown-text-style="assistant-message"], [data-markdown-text-tone="primary"]:not([data-markdown-text-style])') ?? [])].at(-1);
   }
 
-  function getWorkedDurationSeconds(minWorkedSeconds) {
+  function getWorkedDurationSeconds() {
     const assistantTurns = [...document.querySelectorAll('section[data-turn="assistant"]')];
-    const lastAssistantTurn = assistantTurns.at(-1);
+    const lastAssistantTurn = assistantTurns.at(-1) ?? userTurns().at(-1)?.closest?.('[data-turn-key]');
     if (!lastAssistantTurn) return null;
 
     const durationButton = [...lastAssistantTurn.querySelectorAll("button")].find((button) =>
@@ -913,7 +935,7 @@
     if (!match || (!match[1] && !match[2] && !match[3])) return null;
 
     const workedSeconds = Number(match[1] ?? 0) * 3600 + Number(match[2] ?? 0) * 60 + Number(match[3] ?? 0);
-    return workedSeconds > minWorkedSeconds ? workedSeconds : null;
+    return workedSeconds;
   }
 
   function extractText(element) {

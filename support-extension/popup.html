@@ -114,8 +114,8 @@
           <span class="toggle-text">Recover interrupted chats<small>Stop and continue after connection errors in this browser. Wait ten minutes after a rate limit. Works in Helium and Chrome.</small></span>
           <span class="switch"><input id="errorRecovery" type="checkbox"><i aria-hidden="true"></i></span>
         </label>
-        <label class="toggle" data-legacy-continuation hidden>
-          <span class="toggle-text">Check unfinished chats<small>Every 30 minutes, ask the API whether an idle chat has finished its task. Chrome sends a continuation when work remains.</small></span>
+        <label class="toggle">
+          <span class="toggle-text">Check unfinished chats<small>Check idle chats every 3 minutes. Chrome checks final responses only above the worked-duration threshold. A stopped chat without a final response receives Continue.</small></span>
           <span class="switch"><input id="ralph" type="checkbox"><i aria-hidden="true"></i></span>
         </label>
         <label class="toggle">
@@ -130,16 +130,16 @@
           <input id="ralphLoopIntervalSeconds" type="number" min="120" max="86400" step="1" inputmode="numeric">
           <button id="saveRalphLoopInterval" class="button" type="button">Save interval</button>
         </div>
-        <p id="ralphLoopIntervalStatus" class="note">Default is 1800 seconds (30 minutes). Idle chats receive an API completion check. Worker recovery uses the same interval. Reports are collected immediately.</p>
+        <p id="ralphLoopIntervalStatus" class="note">Default is 180 seconds (3 minutes). This controls how often chats are checked. Worker recovery uses the same interval.</p>
       </div>
 
-      <div class="card" data-legacy-continuation hidden>
-        <h2><label for="ralphMinWorkedSeconds">RALPH worked-time metadata threshold (seconds)</label></h2>
+      <div class="card">
+        <h2><label for="ralphMinWorkedSeconds">Minimum worked duration (seconds)</label></h2>
         <div class="input-row">
           <input id="ralphMinWorkedSeconds" type="number" min="0" max="86400" step="1" inputmode="numeric">
-          <button id="saveRalphTime" class="button" type="button">Save threshold</button>
+          <button id="saveRalphMinWorkedSeconds" class="button" type="button">Save duration</button>
         </div>
-        <p id="ralphTimeStatus" class="note">Default is 1200 seconds (20 minutes). Only final responses strictly above this threshold use the completion classifier. Stopped turns without a final response resume directly.</p>
+        <p id="ralphMinWorkedStatus" class="note">Default is 1800 seconds (30 minutes). Only a final response with a longer worked duration reaches the inspector. Error recovery and missing final responses continue directly.</p>
       </div>
 
       <div class="card" data-legacy-continuation hidden>

@@ -57,7 +57,7 @@ try {
   assert.equal(completionCheckResponse.statusCode, 200, "extension completion-check registration is accepted");
   assert.equal((await registry.threads())[0].observedOnly, undefined, "enabling checks promotes an existing observed chat");
   const defaultInterval = (await registry.settings()).loopIntervalSeconds;
-  assert.equal(defaultInterval, 1800, "completion checks use the requested thirty-minute interval");
+  assert.equal(defaultInterval, 180, "completion checks use the requested three-minute interval");
   const nextCheckAt = (await registry.threads())[0].nextCheckAt;
   assert.deepEqual(await registry.due(nextCheckAt - 1), [], "completion checking does not run before its timer");
   assert.equal((await registry.due(nextCheckAt))[0].threadId, threadId, "the idle chat becomes due on the timer");
@@ -89,7 +89,7 @@ try {
   await registry.register(url, { manual: true, checkForCompletion: true, activity: "running", reactivate: true });
   const resumedThread = (await registry.threads())[0];
   assert.equal(resumedThread.state, "active", "a new user turn reactivates completion checks");
-  assert.ok(resumedThread.nextCheckAt >= resumedAt + 1800_000, "the new turn receives a fresh thirty-minute timer");
+  assert.ok(resumedThread.nextCheckAt >= resumedAt + 180_000, "the new turn receives a fresh three-minute timer");
   assert.deepEqual(await registry.due(resumedAt), [], "the old expired timer cannot immediately check new work");
   await registry.recordComplete(threadId);
 
@@ -121,7 +121,7 @@ try {
         const inspect = await raceCommands.claim("chrome", ["ralph"], 1000, undefined, [raceUrl]);
         assert.equal(inspect.kind, "inspect_thread");
         raceCommands.complete({ commandId: inspect.id, browserId: "chrome", kind: inspect.kind, ok: true,
-          result: { status: "idle", workedSeconds: 20 * 60 + 1, users: [{ id: "u1", text: "Finish the task" }],
+          result: { status: "idle", workedSeconds: 30 * 60 + 1, users: [{ id: "u1", text: "Finish the task" }],
             assistant: { id: "a1", synthetic: false, text: "Work remains" } } });
         await apiStarted;
         if (change === "reenrolled") {
@@ -174,6 +174,8 @@ try {
     version: 2, projects: [], loopIntervalMs: 1800_000, threads: retained,
   }));
   const capacityRegistry = await RalphRegistry.open(capacityDirectory);
+  assert.equal((await capacityRegistry.settings()).loopIntervalSeconds, 180,
+    "the saved thirty-minute default migrates to three minutes on restart");
   assert.equal(await capacityRegistry.register(url, { agentCreated: true, parentThreadId: "api:new" }), "registered",
     "settled history cannot exhaust registration capacity");
   const remaining = await capacityRegistry.threads();

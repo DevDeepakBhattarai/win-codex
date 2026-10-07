@@ -11,7 +11,7 @@ const MAX_RALPH_THREADS = 2_000;
 const MAX_RALPH_PROJECTS = 100;
 const LEGACY_RALPH_DEFAULT_INTERVAL_MS = 25 * 60 * 1000;
 const INTERIM_RALPH_DEFAULT_INTERVAL_MS = 10 * 1000;
-const DEFAULT_RALPH_CHECK_INTERVAL_MS = 30 * 60 * 1000;
+const DEFAULT_RALPH_CHECK_INTERVAL_MS = 3 * 60 * 1000;
 const MIN_RALPH_INTERVAL_SECONDS = 2 * 60;
 const MAX_RALPH_INTERVAL_SECONDS = 24 * 60 * 60;
 const RALPH_SCHEDULER_TICK_MS = 1_000;
@@ -790,6 +790,7 @@ const ralphStoreSchema = z.object({
   projects: z.array(z.string()).max(MAX_RALPH_PROJECTS),
   threads: z.array(ralphThreadSchema).max(MAX_RALPH_THREADS),
   loopIntervalMs: z.number().int().positive().max(MAX_RALPH_INTERVAL_SECONDS * 1000).default(DEFAULT_RALPH_CHECK_INTERVAL_MS),
+  minWorkedSeconds: z.number().int().min(0).max(86_400).default(30 * 60),
   subagentProjectUrl: z.string().url().optional(),
   automationPausedUntil: z.number().int().nonnegative().optional(),
   voiceConversationUrl: z.string().url().optional(),
@@ -815,6 +816,7 @@ export class RalphRegistry {
       projects: [],
       threads: [],
       loopIntervalMs: DEFAULT_RALPH_CHECK_INTERVAL_MS,
+      minWorkedSeconds: 30 * 60,
     };
     let migrated = false;
     try {
@@ -851,7 +853,7 @@ export class RalphRegistry {
     if (intervalMs === undefined &&
         (state.loopIntervalMs === LEGACY_RALPH_DEFAULT_INTERVAL_MS ||
          state.loopIntervalMs === INTERIM_RALPH_DEFAULT_INTERVAL_MS ||
-         state.loopIntervalMs === 3 * 60 * 1000)) {
+         state.loopIntervalMs === 30 * 60 * 1000)) {
       state.loopIntervalMs = DEFAULT_RALPH_CHECK_INTERVAL_MS;
       const nextCheckAt = Date.now() + DEFAULT_RALPH_CHECK_INTERVAL_MS;
       for (const thread of state.threads) {
@@ -947,6 +949,7 @@ export class RalphRegistry {
     await this.queue;
     return {
       loopIntervalSeconds: this.state.loopIntervalMs / 1000,
+      minWorkedSeconds: this.state.minWorkedSeconds,
       subagentProjectUrl: this.state.subagentProjectUrl,
     };
   }
@@ -969,6 +972,14 @@ export class RalphRegistry {
         if (thread.state === "active") thread.nextCheckAt = nextCheckAt;
       }
       return { loopIntervalSeconds };
+    });
+  }
+
+  async setMinWorkedSeconds(value: number) {
+    const minWorkedSeconds = ralphStoreSchema.shape.minWorkedSeconds.parse(value);
+    return this.update((state) => {
+      state.minWorkedSeconds = minWorkedSeconds;
+      return { minWorkedSeconds };
     });
   }
 
@@ -1443,7 +1454,8 @@ export class RalphController {
         return;
       }
       if (!inspection.assistant.synthetic) {
-        if (inspection.workedSeconds === null) {
+        const { minWorkedSeconds } = await this.options.registry.settings();
+        if (inspection.workedSeconds === null || inspection.workedSeconds <= minWorkedSeconds) {
           await this.options.registry.recordComplete(thread.threadId);
           return;
         }
@@ -1477,7 +1489,7 @@ export class RalphController {
         feature: "ralph",
         kind: "send_message",
         targetUrl: thread.conversationUrl,
-        message: "Continue the existing task from its current state. Do not repeat completed work.",
+        message: "Continue",
       });
       if (!sendResult.ok) throw new Error(sendResult.error);
       if (sendResult.kind !== "send_message") throw new Error("RALPH received the wrong send-message result.");
@@ -1981,8 +1993,9 @@ export function ralphSettingsGetHandler(registry: RalphRegistry, extensionToken:
 export function ralphSettingsPutHandler(registry: RalphRegistry, extensionToken: string): RequestHandler {
   const bodySchema = z.object({
     loopIntervalSeconds: ralphLoopIntervalSecondsSchema.optional(),
+    minWorkedSeconds: ralphStoreSchema.shape.minWorkedSeconds.optional(),
     subagentProjectUrl: z.string().max(2048).nullable().optional(),
-  }).strict().refine((value) => value.loopIntervalSeconds !== undefined || value.subagentProjectUrl !== undefined);
+  }).strict().refine((value) => value.loopIntervalSeconds !== undefined || value.minWorkedSeconds !== undefined || value.subagentProjectUrl !== undefined);
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
     const parsed = bodySchema.safeParse(req.body);
@@ -1993,6 +2006,9 @@ export function ralphSettingsPutHandler(registry: RalphRegistry, extensionToken:
     try {
       if (parsed.data.loopIntervalSeconds !== undefined) {
         await registry.setLoopIntervalSeconds(parsed.data.loopIntervalSeconds);
+      }
+      if (parsed.data.minWorkedSeconds !== undefined) {
+        await registry.setMinWorkedSeconds(parsed.data.minWorkedSeconds);
       }
       if (parsed.data.subagentProjectUrl !== undefined) {
         await registry.setSubagentProjectUrl(parsed.data.subagentProjectUrl);
@@ -2207,7 +2223,7 @@ function agentPrompt(message: string, jobId: string, resultPath: string) {
     message.trim(),
     "",
     "ROLE: ChatGPT worker. The specification above is your complete assignment. The parent handles planning and implementation.",
-    "Execute this bounded assignment yourself. Use terminal for specified commands and this server's browser_* tools for browser work. Change files only when the specification authorizes it. Submit a blocker if the specification or access is insufficient. Do not delegate again. The service resumes interrupted work every 30 minutes until you publish the report.",
+    "Execute this bounded assignment yourself. Use terminal for specified commands and this server's browser_* tools for browser work. Change files only when the specification authorizes it. Submit a blocker if the specification or access is insufficient. Do not delegate again. The service periodically resumes interrupted work until you publish the report.",
     `For browser work, save important evidence with browser_screenshot and jobId ${JSON.stringify(jobId)}. When recording is requested, start browser_recording before interacting, stop it before releasing the tab, and include the video path.`,
     "Inspect a fresh browser_snapshot before interacting and verify the observed result after each meaningful action. Never report an unperformed check as passed.",
     "Write the report with the tested workspace and revision, each check's expected and observed result, pass or fail, reproduction steps, evidence paths, and any blocker. An unsuccessful test or missing login is a reportable result.",

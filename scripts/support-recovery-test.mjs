@@ -33,6 +33,7 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
   let sharedPauseUntil = globalPause === "restart" ? clock + 300_000 : 0;
   let serviceOnline = true;
   const storage = globalPause === "restart" ? { automationPausedUntil: sharedPauseUntil } : {};
+  storage.errorRecovery = false;
   if (duplicateTabs) storage.voiceConversationUrl = url.replace("11111111", "22222222");
   if (globalPause === "stale") storage["pageRecovery:11"] = { conversationUnavailableAt: clock - 300_001, conversationUnavailableUrl: tabUrl };
   let messageListener;
@@ -275,7 +276,7 @@ for (const kind of ["connection_interrupted", "recoverable_error"]) {
   const run = await runWorker({ ...sendCommand("queued-after-recovery-send"), targetUrl: url + "?temporary-chat=true" }, [
     { ok: true, result: { status: "stopped" } }, { ok: true, result: { status: "sent", conversationUrl: url } },
   ], [{ ok: true, result: { status: "connection_interrupted" } }], [], true, false, "sending");
-  assert.deepEqual(run.deliveredMessages, ["Continue the existing task from its current state. Do not repeat completed work."], "an irreversible recovery send never receives a second queued prompt");
+  assert.deepEqual(run.deliveredMessages, ["Continue"], "an irreversible recovery send never receives a second queued prompt");
   assert.equal(run.results[0].ok, false);
   assert.equal(run.results[0].deliveryUncertain, false, "the original queued message definitely was not dispatched");
   assert.match(run.results[0].error, /queued message was not sent/);

@@ -55,7 +55,7 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.16.0");
+  assert.equal(manifest.version, "1.19.0");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["alarms", "scripting", "sidePanel", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, undefined);
@@ -102,7 +102,7 @@ try {
     "thread sending does not use acknowledgement or DOM-stability heuristics");
   assert.match(preparedContentScript, /const SEND_SETTLE_MS = 5_000;/,
     "thread sending uses the fixed five-second settle requested for typing and sending");
-  assert.match(preparedContentScript, /contentScriptVersion = "1\.12\.0"/,
+  assert.match(preparedContentScript, /contentScriptVersion = "1\.19\.0"/,
     "extension reloads can replace a stale page script with the current content-script version");
   assert.equal(parseRalphProjectId(namedProjectHome), projectId);
   assert.equal(parseRalphProjectId(urlA), projectId);
@@ -510,9 +510,9 @@ try {
   const registeredAt = Date.now();
   await timingRegistry.register(urlA);
   const [initiallyScheduledThread] = await timingRegistry.threads();
-  assert.ok(initiallyScheduledThread.nextCheckAt >= registeredAt + 1_799_900 &&
-    initiallyScheduledThread.nextCheckAt <= registeredAt + 1_800_100,
-  "a new RALPH thread is scheduled for the default 30-minute repeated check");
+  assert.ok(initiallyScheduledThread.nextCheckAt >= registeredAt + 179_900 &&
+    initiallyScheduledThread.nextCheckAt <= registeredAt + 180_100,
+  "a new RALPH thread is scheduled for the default 3-minute repeated check");
   async function requestRalphSettings(handler, body, authorization = `Bearer ${sync.extensionToken}`) {
     const result = { status: 200, body: undefined };
     const req = { body, get: name => (name === "authorization" ? authorization : undefined) };
@@ -526,22 +526,27 @@ try {
   }
   const getRalphSettings = ralphSettingsGetHandler(timingRegistry, sync.extensionToken);
   const putRalphSettings = ralphSettingsPutHandler(timingRegistry, sync.extensionToken);
-  assert.deepEqual((await requestRalphSettings(getRalphSettings)).body, { loopIntervalSeconds: 1800, subagentProjectUrl: undefined });
+  assert.deepEqual((await requestRalphSettings(getRalphSettings)).body, { loopIntervalSeconds: 180, minWorkedSeconds: 1800, subagentProjectUrl: undefined });
   assert.equal((await requestRalphSettings(getRalphSettings, undefined, "Bearer wrong")).status, 401);
   const intervalChangedAt = Date.now();
   assert.deepEqual((await requestRalphSettings(putRalphSettings, { loopIntervalSeconds: 120 })).body,
-    { loopIntervalSeconds: 120, subagentProjectUrl: undefined });
+    { loopIntervalSeconds: 120, minWorkedSeconds: 1800, subagentProjectUrl: undefined });
   const [rescheduledThread] = await timingRegistry.threads();
   assert.ok(rescheduledThread.nextCheckAt >= intervalChangedAt + 119_900 &&
     rescheduledThread.nextCheckAt <= intervalChangedAt + 120_100,
     "changing the check interval reschedules active threads from the current time");
-  assert.deepEqual((await requestRalphSettings(getRalphSettings)).body, { loopIntervalSeconds: 120, subagentProjectUrl: undefined });
+  assert.deepEqual((await requestRalphSettings(getRalphSettings)).body, { loopIntervalSeconds: 120, minWorkedSeconds: 1800, subagentProjectUrl: undefined });
   assert.equal((await requestRalphSettings(putRalphSettings, { loopIntervalSeconds: 119 })).status, 400);
+  assert.equal((await requestRalphSettings(putRalphSettings, { minWorkedSeconds: -1 })).status, 400);
+  assert.equal((await requestRalphSettings(putRalphSettings, { minWorkedSeconds: 86_401 })).status, 400);
+  assert.equal((await requestRalphSettings(putRalphSettings, { minWorkedSeconds: 1801 })).body.minWorkedSeconds, 1801);
+  assert.equal((await (await RalphRegistry.open(timingRoot)).settings()).minWorkedSeconds, 1801, "the worked-duration setting survives restart independently of the polling interval");
+  await requestRalphSettings(putRalphSettings, { minWorkedSeconds: 1800 });
   assert.deepEqual(await (await RalphRegistry.open(timingRoot)).settings(),
-    { loopIntervalSeconds: 120, subagentProjectUrl: undefined },
+    { loopIntervalSeconds: 120, minWorkedSeconds: 1800, subagentProjectUrl: undefined },
     "the RALPH check interval survives a server restart");
-  assert.deepEqual((await requestRalphSettings(putRalphSettings, { subagentProjectUrl: namedProjectHome })).body,
-    { loopIntervalSeconds: 120, subagentProjectUrl: namedProjectHome });
+  assert.deepEqual((await requestRalphSettings(putRalphSettings, { minWorkedSeconds: 1800, subagentProjectUrl: namedProjectHome })).body,
+    { loopIntervalSeconds: 120, minWorkedSeconds: 1800, subagentProjectUrl: namedProjectHome });
   assert.equal((await (await RalphRegistry.open(timingRoot)).settings()).subagentProjectUrl, namedProjectHome,
     "the Sub-agent project is persisted by the server");
 
@@ -563,11 +568,11 @@ try {
   }));
   const oldIntervalOpenedAt = Date.now();
   const migratedIntervalRegistry = await RalphRegistry.open(oldIntervalRoot);
-  assert.deepEqual(await migratedIntervalRegistry.settings(), { loopIntervalSeconds: 1800, subagentProjectUrl: undefined },
-    "the previous 25-minute default migrates to the repeated 30-minute check interval");
+  assert.deepEqual(await migratedIntervalRegistry.settings(), { loopIntervalSeconds: 180, minWorkedSeconds: 1800, subagentProjectUrl: undefined },
+    "the previous 25-minute default migrates to the repeated 3-minute check interval");
   const [migratedIntervalThread] = await migratedIntervalRegistry.threads();
-  assert.ok(migratedIntervalThread.nextCheckAt >= oldIntervalOpenedAt + 1_799_900 &&
-    migratedIntervalThread.nextCheckAt <= oldIntervalOpenedAt + 1_800_100,
+  assert.ok(migratedIntervalThread.nextCheckAt >= oldIntervalOpenedAt + 179_900 &&
+    migratedIntervalThread.nextCheckAt <= oldIntervalOpenedAt + 180_100,
     "migration pulls already-active threads forward instead of leaving an old 25-minute wait in place");
 
   const interimIntervalRoot = path.join(temporaryRoot, "ralph-interim-default-interval");
@@ -587,11 +592,11 @@ try {
   }));
   const interimOpenedAt = Date.now();
   const interimIntervalRegistry = await RalphRegistry.open(interimIntervalRoot);
-  assert.deepEqual(await interimIntervalRegistry.settings(), { loopIntervalSeconds: 1800, subagentProjectUrl: undefined },
-    "the temporary 10-second default also migrates to the 30-minute check interval");
+  assert.deepEqual(await interimIntervalRegistry.settings(), { loopIntervalSeconds: 180, minWorkedSeconds: 1800, subagentProjectUrl: undefined },
+    "the temporary 10-second default also migrates to the 3-minute check interval");
   const [interimIntervalThread] = await interimIntervalRegistry.threads();
-  assert.ok(interimIntervalThread.nextCheckAt >= interimOpenedAt + 1_799_900 &&
-    interimIntervalThread.nextCheckAt <= interimOpenedAt + 1_800_100);
+  assert.ok(interimIntervalThread.nextCheckAt >= interimOpenedAt + 179_900 &&
+    interimIntervalThread.nextCheckAt <= interimOpenedAt + 180_100);
 
   const legacyRalphRoot = path.join(temporaryRoot, "legacy-ralph");
   await mkdir(legacyRalphRoot, { recursive: true });
@@ -1148,7 +1153,7 @@ try {
       ok: true,
       result: {
         status: "idle",
-        workedSeconds: 20 * 60 + 1,
+        workedSeconds: 30 * 60 + 1,
         users: [
           { id: "u1", text: "Fix the implementation end to end." },
           { id: "u2", text: "Do not stop until CI is handled." },
@@ -1159,7 +1164,7 @@ try {
     const continueCommand = await ralphCommands.claim("chrome-browser", ["ralph"], 1000);
     assert.equal(continueCommand.kind, "send_message");
     assert.equal(continueCommand.targetUrl, ralphUrl);
-    assert.equal(continueCommand.message, "Continue the existing task from its current state. Do not repeat completed work.");
+    assert.equal(continueCommand.message, "Continue");
     assert.equal(apiRequest.model, "gpt-5.6-terra");
     assert.deepEqual(apiRequest.reasoning, { effort: "low" });
     assert.equal("max_output_tokens" in apiRequest, false,
@@ -1228,10 +1233,10 @@ try {
       },
     });
     await new Promise(resolve => setTimeout(resolve, 20));
-    assert.equal(apiRequestCount, 1, "a final response at or below the worked-time threshold skips the completion classifier");
+    assert.equal(apiRequestCount, 1, "a short final response skips the completion classifier");
     assert.equal(await ralphCommands.claim("chrome-browser", ["ralph"], 0), undefined);
     assert.equal(await ralphControllerRegistry.isActive(parseConversationUrl(shortRalphUrl).threadId), false,
-      "a short settled turn completes without a classifier call");
+      "a short settled turn does not enter the continuation loop");
 
     const staleObserverRalphUrl = `https://chatgpt.com/g/${projectId}/c/30303030-3030-4030-8030-303030303030`;
     await ralphControllerRegistry.register(staleObserverRalphUrl);
@@ -1250,7 +1255,7 @@ try {
       result: {
         status: "idle",
         title: "Stale Helium copy - ChatGPT",
-        workedSeconds: 20 * 60 + 1,
+        workedSeconds: 30 * 60 + 1,
         users: [{ id: "u-stale", text: "Finish the task without duplicate wake-ups." }],
         assistant: { synthetic: false, id: "a-stale", text: "Stale Helium says work remains." },
       },
@@ -1293,7 +1298,7 @@ try {
       },
     });
     await new Promise(resolve => setTimeout(resolve, 20));
-    assert.equal(apiRequestCount, 1, "an idle final response without worked-time eligibility skips the classifier");
+    assert.equal(apiRequestCount, 1, "a final response without duration cannot meet the inspector threshold");
     assert.equal(await ralphCommands.claim("chrome-browser", ["ralph"], 0), undefined);
 
     const failedRalphUrl = `https://chatgpt.com/g/${projectId}/c/55555555-5555-4555-8555-555555555555`;
@@ -1310,7 +1315,7 @@ try {
       ok: true,
       result: {
         status: "idle",
-        workedSeconds: 20 * 60 + 1,
+        workedSeconds: 30 * 60 + 1,
         users: [{ id: "u5", text: "Finish the failing task." }],
         assistant: { synthetic: false, id: "a4", text: "A blocker remains." },
       },
@@ -1342,7 +1347,7 @@ try {
       ok: true,
       result: {
         status: "idle",
-        workedSeconds: 20 * 60 + 1,
+        workedSeconds: 30 * 60 + 1,
         users: [{ id: "u7", text: "" }],
         assistant: { synthetic: false, id: "a6", text: "" },
       },
@@ -1393,7 +1398,7 @@ try {
       ok: true,
       result: {
         status: "idle",
-        workedSeconds: 20 * 60 + 1,
+        workedSeconds: 30 * 60 + 1,
         users: [{ id: "u6", text: "Finish this audited task." }],
         assistant: { synthetic: false, id: "a5", text: "Work remains." },
       },
@@ -1621,6 +1626,7 @@ async function testSendWaitsForLoadedConversationAndClicksOnce(acceptSend = true
           dataset: { turn: "assistant", turnId: "a1" },
           textContent: "Ready",
           querySelector: query => query === '[data-message-author-role="assistant"]' ? {} : null,
+          querySelectorAll: () => [],
         });
         return turns;
       }
@@ -1903,6 +1909,7 @@ async function testReactTrackedTextareaEnablesSendButton() {
     dataset: { turn: "assistant", turnId: "a1" },
     textContent: "finished response",
     querySelector: selector => selector === '[data-message-author-role="assistant"]' ? {} : null,
+    querySelectorAll: () => [],
   };
   const document = {
     readyState: "complete",
@@ -2042,7 +2049,6 @@ async function testRunningHydrationDetection() {
 async function testWorkedDurationDetection() {
   let automationListener;
   let now = 0;
-  let ralphMinWorkedSeconds = 19 * 60;
 
   const textNode = text => ({
     textContent: text,
@@ -2110,8 +2116,8 @@ async function testWorkedDurationDetection() {
     },
     storage: {
       local: {
-        get: async defaults => typeof defaults === "string" ? {} : ({ ...defaults, ralphMinWorkedSeconds }),
-        set: async values => { if (Number.isInteger(values.ralphMinWorkedSeconds)) ralphMinWorkedSeconds = values.ralphMinWorkedSeconds; },
+        get: async defaults => typeof defaults === "string" ? {} : defaults,
+        set: async () => {},
       },
     },
   };
@@ -2151,8 +2157,6 @@ async function testWorkedDurationDetection() {
     "RALPH inspection extracts the visible final assistant message text");
   assert.equal(response.result.workedSeconds, 26 * 60 + 15,
     "RALPH inspection must parse a Worked for label that appears late during hydration");
-  assert.equal(ralphMinWorkedSeconds, 20 * 60,
-    "the old 19-minute default migrates to the 20-minute classifier threshold");
   assert.ok(now >= 8_000, "RALPH waits for the hydrated assistant turn to remain settled before reading duration");
 
   durationButton.textContent = "Worked for 20m";
@@ -2163,8 +2167,8 @@ async function testWorkedDurationDetection() {
     }, {}, resolve);
   });
   assert.equal(shortResponse.ok, true);
-  assert.equal(shortResponse.result.workedSeconds, null,
-    "exactly 20 minutes stays below the strict classifier threshold");
+  assert.equal(shortResponse.result.workedSeconds, 20 * 60,
+    "the content script reports the raw duration for the server threshold check");
 
   durationButton.textContent = "Worked for 20m 1s";
   const testModeResponse = await new Promise(resolve => {
@@ -2175,7 +2179,7 @@ async function testWorkedDurationDetection() {
   });
   assert.equal(testModeResponse.ok, true);
   assert.equal(testModeResponse.result.workedSeconds, 20 * 60 + 1,
-    "only a settled turn strictly above 20 minutes passes the classifier gate");
+    "the worked duration retains seconds");
 }
 
 

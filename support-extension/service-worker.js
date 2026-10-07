@@ -36,6 +36,7 @@ const WORKER_KEEPALIVE_INTERVAL_MS = 20_000;
 const AUTOMATION_RESPONSE_TIMEOUT_MS = 8 * 60_000;
 const SUPPORT_POLL_ALARM = "local-codex-support/poll";
 const SUPPORT_POLL_PERIOD_MINUTES = 1;
+const PAGE_HEALTH_CHECK_INTERVAL_MS = 3 * 60_000;
 let pollGeneration = 0;
 let pollController = null;
 let voicePollController = null;
@@ -1046,13 +1047,15 @@ async function recoverPageOnce(tabId, recovery) {
     const current = await extensionApi.tabs.get(tabId);
     if (!automationTargetMatches(current.url, targetUrl)) throw new Error("Recovery stopped because the tab navigated away.");
     recovery.targetUrl = targetUrl;
-    const stopped = await sendAutomationMessageWithTimeout(tabId, { kind: "stop_thread", recovering: true, targetUrl }).catch(error => {
+    const stopped = await sendAutomationMessageWithTimeout(tabId, { kind: "stop_thread", recovering: true, targetUrl,
+      requireFailure: !rateLimitDismissed }).catch(error => {
         throw new Error(`CHATGPT_RECOVERY_FAILED: ${error instanceof Error ? error.message : String(error)}`);
       });
+    if (stopped?.ok && stopped.result?.status === "error_cleared") return false;
     if (!stopped?.ok || !["stopped", "idle"].includes(stopped.result?.status)) throw new Error(`CHATGPT_RECOVERY_FAILED: ${stopped?.error || "The interrupted turn could not stop."}`);
     if (recovery.resume) {
       const resumed = await sendAutomationMessageWithTimeout(tabId, { kind: "send_message", recovering: true, targetUrl,
-        recoveryContinuation: true, message: "Continue the existing task from its current state. Do not repeat completed work." })
+        recoveryContinuation: true, message: "Continue" })
         .catch(error => { throw new Error(`CHATGPT_RECOVERY_FAILED: ${error instanceof Error ? error.message : String(error)}`); });
       if (!resumed?.ok || !["sent", "idle"].includes(resumed.result?.status)) throw new Error(`CHATGPT_RECOVERY_FAILED: ${resumed?.error || "The interrupted turn could not resume."}`);
     }
@@ -1103,9 +1106,13 @@ async function pollCommands(generation, voiceOnly = false) {
       if (!Number.isInteger(tab.id) || !conversationUrl(tab.url)) continue;
       const key = `pageRecovery:${tab.id}`;
       const saved = await extensionApi.storage.local.get(key);
-      if ((settings.errorRecovery && saved[key]?.conversationUnavailableAt) ||
-          (settings.errorRecovery && saved[key]?.rateLimitedAt && Date.now() - saved[key].rateLimitedAt >= RATE_LIMIT_WAIT_MS)) {
-        await recoverPage(tab.id).catch(() => undefined);
+      const healthCheckKey = `pageHealthCheckedAt:${tab.id}`;
+      const checked = await extensionApi.storage.local.get(healthCheckKey);
+      if (settings.errorRecovery && (saved[key]?.conversationUnavailableAt ||
+          (saved[key]?.rateLimitedAt && Date.now() - saved[key].rateLimitedAt >= RATE_LIMIT_WAIT_MS) ||
+          Date.now() - (checked[healthCheckKey] ?? 0) >= PAGE_HEALTH_CHECK_INTERVAL_MS)) {
+        await extensionApi.storage.local.set({ [healthCheckKey]: Date.now() });
+        await keepWorkerAliveUntil(recoverPage(tab.id)).catch(() => undefined);
       }
     }
     const idleObserver = features.length === 0 && openThreads.length === 0;

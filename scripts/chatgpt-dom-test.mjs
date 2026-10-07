@@ -11,7 +11,7 @@ try {
 	await page.route("https://chatgpt.com/**", route => route.fulfill({ contentType: "text/html", body: `<!doctype html>
 		<title>DOM regression - ChatGPT</title><button aria-label="Temporary chat">Temporary</button>
 		<main><div data-turn-key="old"><div data-chatgpt-search-unit-key="fallback-turn-0:0:user" data-chatgpt-search-message-ids="old">
-		<div data-markdown-text-tone="user-message">An earlier assignment</div></div></div></main>
+		<div data-user-message-bubble="true"><div class="whitespace-pre-wrap">An earlier assignment</div></div></div></div></main>
 		<div data-composer-body><div contenteditable="true" data-composer-markdown></div><button aria-label="Add files and more">Add</button><button aria-label="Send">Send</button></div>` }));
 	await page.goto("https://chatgpt.com/");
 	await page.evaluate(() => {
@@ -55,9 +55,9 @@ try {
 			editor.querySelector('[app-mention-display-name]')?.remove();
 			const turn = document.createElement("div");
 			turn.setAttribute("data-turn-key", "new");
-			turn.innerHTML = '<div data-chatgpt-search-unit-key="fallback-turn-1:0:user" data-chatgpt-search-message-ids="new"><div data-user-message-bubble="true"><div data-markdown-text-tone="user-message"></div><button>Show more</button></div></div>';
+			turn.innerHTML = '<div data-chatgpt-search-unit-key="fallback-turn-1:0:user" data-chatgpt-search-message-ids="new"><div data-user-message-bubble="true"><div class="whitespace-pre-wrap"></div><button>Show more</button></div></div>';
 			turn.querySelector('[data-chatgpt-search-message-ids]').setAttribute("data-chatgpt-search-message-ids", globalThis.sendClicks === 1 ? "new" : `new-${globalThis.sendClicks}`);
-			const text = turn.querySelector('[data-markdown-text-tone="user-message"]');
+			const text = turn.querySelector('.whitespace-pre-wrap');
 			for (const line of editor.innerText.split("\n").filter(Boolean)) {
 				const paragraph = document.createElement("p");
 				paragraph.textContent = line;

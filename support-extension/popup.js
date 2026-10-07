@@ -7,10 +7,7 @@ const DEFAULT_SETTINGS = {
   ralph: true,
   threadMessaging: false,
 };
-const RALPH_MIN_WORKED_SECONDS_KEY = "ralphMinWorkedSeconds";
-const LEGACY_RALPH_MIN_WORKED_SECONDS = 19 * 60;
-const DEFAULT_RALPH_MIN_WORKED_SECONDS = 20 * 60;
-const DEFAULT_RALPH_LOOP_INTERVAL_SECONDS = 30 * 60;
+const DEFAULT_RALPH_LOOP_INTERVAL_SECONDS = 3 * 60;
 document.body.dataset.view = "sidepanel";
 
 function validateLoopbackEndpoint(value, pathname) {
@@ -562,16 +559,10 @@ element("refreshSchedules").addEventListener("click", () => void loadSchedules()
 async function loadSettings() {
   const settings = await extensionApi.storage.local.get({
     ...DEFAULT_SETTINGS,
-    [RALPH_MIN_WORKED_SECONDS_KEY]: DEFAULT_RALPH_MIN_WORKED_SECONDS,
   });
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     element(key).checked = Boolean(settings[key]);
   }
-  if (settings[RALPH_MIN_WORKED_SECONDS_KEY] === LEGACY_RALPH_MIN_WORKED_SECONDS) {
-    settings[RALPH_MIN_WORKED_SECONDS_KEY] = DEFAULT_RALPH_MIN_WORKED_SECONDS;
-    await extensionApi.storage.local.set({ [RALPH_MIN_WORKED_SECONDS_KEY]: DEFAULT_RALPH_MIN_WORKED_SECONDS });
-  }
-  element(RALPH_MIN_WORKED_SECONDS_KEY).value = String(settings[RALPH_MIN_WORKED_SECONDS_KEY]);
   await Promise.all([loadRalphProjects(), loadRalphSettings()]);
 }
 
@@ -588,32 +579,15 @@ async function saveSettings() {
   await notifySettingsChanged();
 }
 
-async function saveRalphTime() {
-  const button = element("saveRalphTime");
-  const status = element("ralphTimeStatus");
-  const seconds = Number(element(RALPH_MIN_WORKED_SECONDS_KEY).value);
-  if (!Number.isInteger(seconds) || seconds < 0 || seconds > 86_400) {
-    setNote(status, "Enter a whole number from 0 to 86400 seconds.", "error");
-    return;
-  }
-
-  button.disabled = true;
-  try {
-    await extensionApi.storage.local.set({ [RALPH_MIN_WORKED_SECONDS_KEY]: seconds });
-    setNote(status, `Saved ${seconds} second${seconds === 1 ? "" : "s"}. Only final responses above this threshold use the completion classifier.`);
-    await notifySettingsChanged();
-  } finally {
-    button.disabled = false;
-  }
-}
-
 async function loadRalphSettings() {
   const status = element("ralphLoopIntervalStatus");
   try {
     const settings = await callServer(ralphSettingsEndpoint);
     element("ralphLoopIntervalSeconds").value = String(settings.loopIntervalSeconds);
+    element("ralphMinWorkedSeconds").value = String(settings.minWorkedSeconds ?? 1800);
   } catch (error) {
     element("ralphLoopIntervalSeconds").value = String(DEFAULT_RALPH_LOOP_INTERVAL_SECONDS);
+    element("ralphMinWorkedSeconds").value = "1800";
     setNote(status, errorMessage(error, "Could not load Local Codex support settings."), "error");
   }
 }
@@ -640,6 +614,29 @@ async function saveRalphLoopInterval() {
     await loadThreads();
   } catch (error) {
     setNote(status, errorMessage(error, "Could not save the RALPH check interval."), "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function saveRalphMinWorkedSeconds() {
+  const button = element("saveRalphMinWorkedSeconds");
+  const input = element("ralphMinWorkedSeconds");
+  const status = element("ralphMinWorkedStatus");
+  const minWorkedSeconds = Number(input.value);
+  if (!Number.isInteger(minWorkedSeconds) || minWorkedSeconds < 0 || minWorkedSeconds > 86_400) {
+    setNote(status, "Enter a whole number from 0 to 86400 seconds.", "error");
+    return;
+  }
+  button.disabled = true;
+  try {
+    const settings = await callServer(ralphSettingsEndpoint, {
+      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ minWorkedSeconds }),
+    });
+    input.value = String(settings.minWorkedSeconds);
+    setNote(status, `Final responses must have worked longer than ${settings.minWorkedSeconds} seconds before an inspector check.`);
+  } catch (error) {
+    setNote(status, errorMessage(error, "Could not save the worked duration."), "error");
   } finally {
     button.disabled = false;
   }
@@ -685,7 +682,7 @@ for (const key of Object.keys(DEFAULT_SETTINGS)) {
   element(key).addEventListener("change", () => void saveSettings());
 }
 element("saveRalphLoopInterval").addEventListener("click", () => void saveRalphLoopInterval());
-element("saveRalphTime").addEventListener("click", () => void saveRalphTime());
+element("saveRalphMinWorkedSeconds").addEventListener("click", () => void saveRalphMinWorkedSeconds());
 element("saveRalphProjects").addEventListener("click", () => void saveRalphProjects());
 element("markCurrentThread").addEventListener("click", () => void markCurrentThread());
 element("refreshThreads").addEventListener("click", () => void loadThreads());
