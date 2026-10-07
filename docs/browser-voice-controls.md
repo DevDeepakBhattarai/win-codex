@@ -1,6 +1,6 @@
 # Control ChatGPT Voice from the local service
 
-Use Super App's Jarvis or Nova wake word, the local CLI, or the agent's `chatgpt_voice` tool to control Voice in Chrome.
+Use Super App's Jarvis wake word, the local CLI, or the agent's `chatgpt_voice` tool to control Voice in Chrome.
 
 ## Prepare the service and extension
 
@@ -14,7 +14,7 @@ Run these commands from the connector checkout:
 
 Restart the local service with its existing launch method after the build. In Chrome's extensions page, reload the generated `.data/support-extension`. Enable the designated automation executor and Thread messaging in Local Codex Support. Keep Browser Bridge connected in the same Chrome profile.
 
-Complete microphone permission and Voice onboarding in Chrome. In Super App, turn on **Listen for Jarvis or Nova**.
+Complete microphone permission and Voice onboarding in Chrome. In Super App, turn on **Listen for Jarvis**.
 
 To designate an already-open saved chat before its first call, configure its URL:
 
@@ -58,7 +58,7 @@ If multiple active calls exist, end the extra call before retrying. To change th
 
 Refresh the computer connector's tools in ChatGPT after updating the service. Attach the connector to your Voice chat. Ask the agent to disconnect with `chatgpt_voice` and `action: "stop"`. Use `status` to inspect the call, `start` to resume Voice, or `mute` and `unmute` to change the microphone.
 
-After disconnecting, say "Jarvis" or "Nova" with Super App listening enabled to reconnect. You can also click **Start Voice** in Super App. The disconnected ChatGPT call cannot hear your request.
+After disconnecting, say "Jarvis" with Super App listening enabled to reconnect. You can also click **Start Voice** in Super App. The disconnected ChatGPT call cannot hear your request.
 
 Auto-mute leaves the call connected and keeps your Voice speaker selected. Super App restores your previous Windows outputs after the call ends. Turn listening off to release the local wake microphone.
 

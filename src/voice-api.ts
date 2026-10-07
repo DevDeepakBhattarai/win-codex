@@ -96,7 +96,7 @@ export function createVoiceApi(input: { token: string; registry: RalphRegistry; 
 export function registerVoiceTool(server: McpServer, voice: ReturnType<typeof createVoiceApi>) {
 	server.registerTool("chatgpt_voice", {
 		title: "Control ChatGPT Voice call",
-		description: "Control ChatGPT Voice in Chrome. Start reuses an open Voice tab and unmutes an active call, or opens a fresh chat if no Voice tab remains. Mute and unmute change the microphone without ending the call. Stop ends the call only when the user asks to disconnect. Status inspects the current call. All changes require browser confirmation. Say the local Jarvis or Nova wake word, or use Start Voice in Super App, to resume after muting or disconnecting.",
+		description: "Control ChatGPT Voice in Chrome. Start reuses an open Voice tab and unmutes an active call, or opens a fresh chat if no Voice tab remains. Mute and unmute change the microphone without ending the call. Stop ends the call only when the user asks to disconnect. Status inspects the current call. All changes require browser confirmation. Say the local Jarvis wake word, or use Start Voice in Super App, to resume after muting or disconnecting.",
 		inputSchema: { action: voiceAction },
 		annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
 	}, async ({ action }) => {
