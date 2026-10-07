@@ -549,6 +549,43 @@ export class BrowserService {
     return tabs.map((tab) => this.describeTab(tab));
   }
 
+  async observeVoiceAudio(tabId: number, conversationUrl: string) {
+    if (!this.status().connected) throw new Error("Connect Browser Bridge to monitor the existing Voice call.");
+    if (!/^https:\/\/chatgpt\.com\/(?:c\/[a-f0-9-]+)?$/.test(conversationUrl)) throw new Error("Voice audio requires a regular ChatGPT tab.");
+    await this.withTabLock(tabId, async () => {
+      const tab = await this.bridge.request<BrowserTab>("tabs.get", { tabId });
+      const current = new URL(tab.url ?? "about:blank");
+      const targetPath = new URL(conversationUrl).pathname.replace(/\/$/, "").toLowerCase();
+      if (current.origin !== "https://chatgpt.com" || current.searchParams.get("temporary-chat") === "true" || current.pathname.replace(/\/$/, "").toLowerCase() !== targetPath) throw new Error("Voice tab navigated away before audio discovery.");
+      const attached = this.states.get(tabId)?.attached === true;
+      const objectGroup = `voice-audio-${randomUUID()}`;
+      try {
+        const prototype = await this.sendCdp<CdpRuntimeResult>(tabId, "Runtime.evaluate", {
+          expression: "globalThis.__localCodexVoiceAudio?.registerPeers && RTCPeerConnection.prototype",
+          returnByValue: false, objectGroup,
+        });
+        if (prototype.exceptionDetails || !prototype.result?.objectId) throw new Error("Voice audio observer is unavailable. Reload Local Codex Support.");
+        const peers = await this.sendCdp<{ objects: { objectId: string } }>(tabId, "Runtime.queryObjects", {
+          prototypeObjectId: prototype.result.objectId, objectGroup,
+        });
+        const registered = await this.sendCdp<CdpRuntimeResult>(tabId, "Runtime.callFunctionOn", {
+          objectId: peers.objects.objectId,
+          functionDeclaration: `function () {
+            const current = new URL(location.href);
+            if (current.origin !== "https://chatgpt.com" || current.searchParams.get("temporary-chat") === "true" || current.pathname.replace(/\\/$/, "").toLowerCase() !== ${JSON.stringify(targetPath)}) throw new Error("Voice tab navigated during audio discovery.");
+            return globalThis.__localCodexVoiceAudio.registerPeers(this);
+          }`, returnByValue: true,
+        });
+        if (registered.exceptionDetails || typeof registered.result?.value !== "number" || registered.result.value < 1) {
+          throw new Error("The Voice call has no observable WebRTC audio connection.");
+        }
+      } finally {
+        await this.sendCdp(tabId, "Runtime.releaseObjectGroup", { objectGroup }).catch(() => undefined);
+        if (!attached) await this.bridge.request("debugger.detach", { tabId }).catch(() => undefined);
+      }
+    });
+  }
+
   async open(input: { url?: string; active?: boolean; newWindow?: boolean }) {
     if (input.url) validateNavigationUrl(input.url);
     await this.ensureConnected();

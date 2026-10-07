@@ -8,7 +8,7 @@ const voiceAction = z.enum(["status", "start", "stop", "mute", "unmute"]);
 type VoiceAction = z.infer<typeof voiceAction>;
 const newChatUrl = "https://chatgpt.com/";
 
-export function createVoiceApi(input: { token: string; registry: RalphRegistry; commands: SupportCommandBus }) {
+export function createVoiceApi(input: { token: string; registry: RalphRegistry; commands: SupportCommandBus; observeAudio?: (tabId: number, conversationUrl: string) => Promise<void> }) {
 	const router = Router();
 	let busy = false;
 	router.use((req, res, next) => {
@@ -38,6 +38,10 @@ export function createVoiceApi(input: { token: string; registry: RalphRegistry; 
 		}
 		if ((action === "start" || action === "mute" || action === "unmute") && result.result.microphone !== (action === "mute" ? "muted" : "unmuted")) {
 			throw new Error("ChatGPT did not confirm the requested microphone state.");
+		}
+		if ((action === "start" || action === "unmute") && input.observeAudio) {
+			if (result.result.tabId === undefined) throw new Error("Reload Local Codex Support to enable Voice audio monitoring.");
+			await input.observeAudio(result.result.tabId, observedUrl);
 		}
 		if (discover && observedUrl !== newChatUrl && input.registry.voiceConversationUrl() !== observedUrl) {
 			await input.registry.setVoiceConversation(observedUrl);

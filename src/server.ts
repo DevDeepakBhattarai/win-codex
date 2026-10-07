@@ -2791,7 +2791,11 @@ const threadPreparer = supportCommands && threadSync
   ? new ThreadPreparationCoordinator(supportCommands, threadSync.registry, launchChrome)
   : undefined;
 const voiceApi = threadSync && ralphRegistry && supportCommands
-  ? createVoiceApi({ token: threadSync.extensionToken, registry: ralphRegistry, commands: supportCommands })
+  ? createVoiceApi({ token: threadSync.extensionToken, registry: ralphRegistry, commands: supportCommands,
+      observeAudio: async (tabId, conversationUrl) => {
+        if (!browserService) throw new Error("Enable Browser Bridge for Voice audio monitoring.");
+        await browserService.observeVoiceAudio(tabId, conversationUrl);
+      } })
   : undefined;
 const scheduledTasks = threadSync ? await ScheduledTasks.open(DATA_DIR) : undefined;
 if (scheduledTasks && supportCommands && ralphRegistry && threadPreparer) {

@@ -170,6 +170,7 @@ const commandResultSchema = z.union([
       status: z.enum(["closed", "active", "loading", "unavailable"]),
       conversationUrl: z.string().url(),
       microphone: z.enum(["muted", "unmuted", "unavailable"]).optional(),
+      tabId: z.number().int().nonnegative().optional(),
     }),
   }),
   z.object({

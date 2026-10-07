@@ -12,7 +12,7 @@ Run these commands from the connector checkout:
 	pnpm support:prepare
 ```
 
-Restart the local service with its existing launch method after the build. In Chrome's extensions page, reload the generated `.data/support-extension`. Enable the designated automation executor and Thread messaging in Local Codex Support. Keep one automation browser profile connected.
+Restart the local service with its existing launch method after the build. In Chrome's extensions page, reload the generated `.data/support-extension`. Enable the designated automation executor and Thread messaging in Local Codex Support. Keep Browser Bridge connected in the same Chrome profile.
 
 Complete microphone permission and Voice onboarding in Chrome. In Super App, turn on **Listen for Jarvis or Nova**.
 
@@ -44,7 +44,7 @@ Run:
 
 Voice automatically mutes after 4.5 seconds of user silence. It also mutes after 1.5 seconds of user silence when the assistant has spoken continuously for 1.5 seconds. User speech resets the silence timer. Playback gaps under 300 milliseconds do not restart the assistant timer.
 
-The extension measures local input energy and received WebRTC audio energy. It sends only activity flags between the page scripts. Missing input measurements do not count as silence. For a call opened before the monitor was installed, the extension uses a separate local input monitor and releases that monitor when the call ends.
+The extension measures local input energy and received WebRTC audio energy. It sends only activity flags between the page scripts. Missing input measurements do not count as silence. On a wake, Browser Bridge registers existing WebRTC connections with the observer, including calls opened before the extension loaded. It releases its temporary debugger attachment after discovery. For a call opened before the monitor was installed, the extension uses a separate local input monitor and releases that monitor when the call ends.
 
 `stop` clicks **End Voice** and waits for **Start Voice** to return. It keeps the saved tab open. Ending a call does not stop delegated jobs or text generation. If the tab is already closed, `stop` returns `closed`.
 

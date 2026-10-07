@@ -15,7 +15,12 @@ const registry = await RalphRegistry.open(directory);
 const commands = new SupportCommandBus(undefined, undefined, undefined, undefined, registry);
 const app = express();
 app.use(express.json());
-const voice = createVoiceApi({ token: "test-token", registry, commands });
+const observations = [];
+let observationError;
+const voice = createVoiceApi({ token: "test-token", registry, commands, observeAudio: async (tabId, conversationUrl) => {
+	if (observationError) throw new Error(observationError);
+	observations.push({ tabId, conversationUrl });
+} });
 app.use("/chatgpt-support/voice", voice.router);
 const mcp = new McpServer({ name: "voice-test", version: "1" });
 registerVoiceTool(mcp, voice);
@@ -36,7 +41,7 @@ const request = (method, suffix = "", body, extra = {}) => fetch(base + suffix, 
 const claim = () => commands.claim("voice-browser", ["voice"], 1000);
 const complete = (command, status, conversationUrl = command.discover ? registry.voiceConversationUrl() ?? command.targetUrl : command.targetUrl) => commands.complete({
 	commandId: command.id, browserId: "voice-browser", kind: command.kind, ok: true,
-	result: { status, conversationUrl, ...(command.kind === "voice_start" ? { microphone: "unmuted" } : {}) },
+	result: { status, conversationUrl, ...(command.kind === "voice_start" ? { microphone: "unmuted", tabId: 1 } : {}) },
 });
 try {
 	const freshStart = request("POST", "/start", {});
@@ -45,6 +50,14 @@ try {
 	assert.equal(freshCommand.targetUrl, "https://chatgpt.com/");
 	complete(freshCommand, "active");
 	assert.equal((await freshStart).status, 200);
+	assert.deepEqual(observations, [{ tabId: 1, conversationUrl: "https://chatgpt.com/" }], "A wake monitors the tab Chrome actually selected");
+	observationError = "Browser Bridge is disconnected";
+	const unobservedStart = request("POST", "/start", {});
+	complete(await claim(), "active");
+	const unobservedResponse = await unobservedStart;
+	assert.equal(unobservedResponse.status, 503, "A wake cannot claim audio monitoring succeeded without peer discovery");
+	assert.match((await unobservedResponse.json()).error, /Browser Bridge is disconnected/);
+	observationError = undefined;
 	for (const action of ["toggle_mute"]) {
 		assert.equal((await request("POST", "/" + action, {})).status, 400, "Removed microphone actions are rejected");
 		const rejected = await callTool(action);
@@ -106,7 +119,7 @@ try {
 		const command = await claim();
 		assert.equal(command.kind, "voice_" + action);
 		commands.complete({ commandId: command.id, browserId: "voice-browser", kind: command.kind,
-			ok: true, result: { status: "active", conversationUrl: url, microphone } });
+			ok: true, result: { status: "active", conversationUrl: url, microphone, tabId: 1 } });
 		assert.equal((await pending).status, 200, "Microphone actions leave the call connected");
 	}
 	const unconfirmedMute = callTool("mute");
@@ -135,7 +148,7 @@ try {
 	assert.equal(agentStartCommand.targetUrl, "https://chatgpt.com/");
 	assert.equal((await request("PUT", "", { conversationUrl: other })).status, 409, "Agent operations protect the configured target from rebinding");
 	complete(agentStartCommand, "active");
-	assert.deepEqual((await agentStart).structuredContent, { status: "active", conversationUrl: url, microphone: "unmuted" });
+	assert.deepEqual((await agentStart).structuredContent, { status: "active", conversationUrl: url, microphone: "unmuted", tabId: 1 });
 	const agentStop = callTool("stop");
 	complete(await claim(), "active");
 	assert.equal((await agentStop).isError, true, "An agent cannot claim it disconnected without browser confirmation");

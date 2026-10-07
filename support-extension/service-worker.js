@@ -756,7 +756,7 @@ async function executeVoiceCommand(command, browserId) {
         response = await sendAutomationMessageWithTimeout(tab.id, { ...command, targetUrl });
       }
       if (!response?.ok) throw new Error(response?.error || "ChatGPT Voice control failed.");
-      result = response.result;
+      result = { ...response.result, tabId: tab.id };
       const finalUrl = voicePageUrl((await extensionApi.tabs.get(tab.id)).url);
       if (!finalUrl || result?.conversationUrl !== finalUrl || (targetUrl !== "https://chatgpt.com/" && finalUrl !== targetUrl)) throw new Error("Voice command returned a different conversation.");
       await extensionApi.storage.local.set({ voiceTabUrl: finalUrl, voiceConversationUrl: finalUrl });

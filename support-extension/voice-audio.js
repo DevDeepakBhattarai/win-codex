@@ -1,8 +1,13 @@
 (() => {
   if (globalThis.__localCodexVoiceAudio) return;
-  globalThis.__localCodexVoiceAudio = true;
   const peers = new Set();
   const Peer = globalThis.RTCPeerConnection;
+  globalThis.__localCodexVoiceAudio = {
+    registerPeers(existing) {
+      for (const peer of existing) if (peer instanceof Peer && peer.connectionState !== "closed") peers.add(peer);
+      return peers.size;
+    },
+  };
   if (Peer) globalThis.RTCPeerConnection = new Proxy(Peer, {
     construct(target, args, newTarget) {
       const peer = Reflect.construct(target, args, newTarget);

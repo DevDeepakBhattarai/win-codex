@@ -105,6 +105,7 @@ try {
       executablePath,
       headless: false,
       args: [
+        "--mute-audio",
         `--disable-extensions-except=${extensionDirectory}`,
         `--load-extension=${extensionDirectory}`,
         `--remote-debugging-port=${debuggingPort}`,
@@ -163,6 +164,64 @@ try {
 
   const userPage = context.pages()[0];
   await userPage.goto(`${baseUrl}/user`);
+
+  // A reused call can create native peers before the Voice observer loads.
+  await userPage.route("https://chatgpt.com/**", route => route.fulfill({ contentType: "text/html", body: "<!doctype html><title>Voice reuse fixture</title>" }));
+  await userPage.goto("https://chatgpt.com/?model=auto");
+  await userPage.evaluate(async () => {
+    const sender = new RTCPeerConnection();
+    const receiver = new RTCPeerConnection();
+    const speaker = new Audio();
+    receiver.ontrack = event => { speaker.srcObject = event.streams[0]; void speaker.play(); };
+    sender.onicecandidate = event => { if (event.candidate) void receiver.addIceCandidate(event.candidate); };
+    receiver.onicecandidate = event => { if (event.candidate) void sender.addIceCandidate(event.candidate); };
+    const audio = new AudioContext();
+    await audio.resume();
+    const oscillator = audio.createOscillator();
+    const output = audio.createMediaStreamDestination();
+    oscillator.connect(output);
+    oscillator.start();
+    sender.addTrack(output.stream.getAudioTracks()[0], output.stream);
+    await sender.setLocalDescription(await sender.createOffer());
+    await receiver.setRemoteDescription(sender.localDescription);
+    await receiver.setLocalDescription(await receiver.createAnswer());
+    await sender.setRemoteDescription(receiver.localDescription);
+    window.voiceFixture = { sender, receiver, audio, oscillator, speaker };
+    window.voiceActivity = [];
+    window.addEventListener("message", event => {
+      if (event.data?.type === "local-codex-voice-activity-v1") window.voiceActivity.push(event.data);
+    });
+    navigator.mediaDevices.getUserMedia = async () => { throw new Error("No microphone needed in loopback fixture"); };
+  });
+  await userPage.addScriptTag({ content: await readFile(process.argv[2] ?? "support-extension/voice-audio.js", "utf8") });
+  await userPage.evaluate(() => window.postMessage({ type: "local-codex-voice-monitor-v1", active: true }, location.origin));
+  const voiceTab = (await service.listTabs()).find(tab => tab.url === "https://chatgpt.com/?model=auto");
+  assert.ok(voiceTab);
+  await service.observeVoiceAudio(voiceTab.id, "https://chatgpt.com/");
+  try {
+    await waitUntil(() => userPage.evaluate(() => window.voiceActivity.some(event => event.assistantSpeaking)), 10_000, "playback from a native peer created before observer injection");
+  } catch (error) {
+    console.error(await userPage.evaluate(async () => ({
+      audioState: window.voiceFixture.audio.state,
+      sender: window.voiceFixture.sender.connectionState,
+      receiver: window.voiceFixture.receiver.connectionState,
+      stats: [...(await window.voiceFixture.receiver.getStats()).values()].filter(report => report.type === "inbound-rtp"),
+      activity: window.voiceActivity.slice(-2),
+    })));
+    throw error;
+  }
+  assert.equal((await service.listTabs()).find(tab => tab.id === voiceTab.id).ownership, "user", "audio discovery does not claim the user's Voice tab");
+  await assert.rejects(service.observeVoiceAudio(voiceTab.id, "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111"), /navigated away/);
+  await userPage.evaluate(async () => {
+    window.postMessage({ type: "local-codex-voice-monitor-v1", active: false }, location.origin);
+    window.voiceFixture.sender.close();
+    window.voiceFixture.receiver.close();
+    window.voiceFixture.oscillator.stop();
+    await window.voiceFixture.audio.close();
+  });
+  await userPage.unroute("https://chatgpt.com/**");
+  await userPage.goto(`${baseUrl}/user`);
+  console.log("Voice reuse passed: existing native WebRTC playback observed without claiming or refreshing the tab");
 
   let result = await service.open({ url: baseUrl, active: true });
   const agentTabId = result.snapshot.tabId;
