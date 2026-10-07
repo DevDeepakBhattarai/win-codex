@@ -12,7 +12,7 @@
         "dev": "tsx src/server.ts",
         "agent": "node dist/cli.js",
         "agent-api-test": "pnpm build && node scripts/agent-api-test.mjs",
-        "voice-test": "pnpm build && node scripts/voice-api-test.mjs && node scripts/voice-dom-test.mjs",
+        "voice-test": "pnpm build && node scripts/voice-api-test.mjs && node scripts/voice-worker-test.mjs && node scripts/voice-audio-test.mjs && node scripts/voice-dom-test.mjs",
         "build": "tsc -p tsconfig.build.json",
         "start": "node dist/server.js",
         "type": "tsc --noEmit",

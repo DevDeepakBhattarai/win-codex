@@ -565,6 +565,7 @@ async function sendAutomationMessage(tabId, command) {
   // Establish the receiver before dispatching a side-effecting command. A lost response
   // does not prove that the page failed to send the message.
   try {
+    if (command.feature === "voice") await extensionApi.scripting.executeScript({ target: { tabId }, world: "MAIN", files: ["voice-audio.js"] });
     await extensionApi.scripting.executeScript({ target: { tabId }, files: ["content-script.js"] });
   } catch (error) {
     if (command.kind === "send_message" && error instanceof Error) error.retryable = true;
@@ -597,7 +598,7 @@ async function sendAutomationMessageWithTimeout(tabId, command) {
     return await Promise.race([
       sendAutomationMessage(tabId, command),
       new Promise((_, reject) => {
-        const timeoutMs = command.feature === "voice" ? 45_000 : command.kind === "inspect_thread" ? 30_000 : command.kind === "page_health" ? 15_000 : AUTOMATION_RESPONSE_TIMEOUT_MS;
+        const timeoutMs = command.feature === "voice" ? (command.kind === "voice_status" ? 2000 : 45_000) : command.kind === "inspect_thread" ? 30_000 : command.kind === "page_health" ? 15_000 : AUTOMATION_RESPONSE_TIMEOUT_MS;
         const expire = async () => {
           const { automationPausedUntil = 0 } = await extensionApi.storage.local.get("automationPausedUntil");
           if (command.feature !== "voice" && automationPausedUntil > Date.now()) timeout = setTimeout(expire, automationPausedUntil - Date.now() + timeoutMs);
@@ -673,23 +674,57 @@ function executeCommand(command, browserId) {
 }
 
 async function isVoiceConversation(value) {
-  const stored = await extensionApi.storage.local.get(["voiceConversationUrl", "serverVoiceConversationUrl"]);
+  const stored = await extensionApi.storage.local.get(["voiceConversationUrl", "serverVoiceConversationUrl", "voiceTabId", "voiceTabUrl"]);
   if (!value) return false;
   const current = conversationUrl(value);
+  if (Number.isInteger(stored.voiceTabId)) {
+    const tab = await extensionApi.tabs.get(stored.voiceTabId).catch(() => null);
+    const tracked = tab && voicePageUrl(tab.url);
+    if (tracked && (tracked === stored.voiceTabUrl || stored.voiceTabUrl === "https://chatgpt.com/") && voicePageUrl(value) === tracked) return true;
+  }
   return Boolean(current && [stored.voiceConversationUrl, stored.serverVoiceConversationUrl].some(configured =>
     configured && current.split("/c/")[1]?.split("?")[0] === configured.split("/c/")[1]?.split("?")[0]));
 }
 
+function voicePageUrl(value) {
+  try {
+    const parsed = new URL(value);
+    if (parsed.origin !== "https://chatgpt.com" || parsed.searchParams.get("temporary-chat") === "true") return null;
+    if (parsed.pathname === "/") return "https://chatgpt.com/";
+    const saved = conversationUrl(value);
+    return saved && !saved.includes("/g/") ? saved : null;
+  } catch { return null; }
+}
+
 async function executeVoiceCommand(command, browserId) {
   try {
-    const targetUrl = conversationUrl(command.targetUrl);
-    if (!targetUrl || targetUrl.includes("/g/") || new URL(targetUrl).searchParams.get("temporary-chat") === "true") {
-      throw new Error("Voice requires a regular saved ChatGPT conversation.");
+    let targetUrl = voicePageUrl(command.targetUrl);
+    if (!targetUrl) {
+      throw new Error("Voice requires a regular ChatGPT conversation.");
     }
-    const matches = (await extensionApi.tabs.query({ url: "https://chatgpt.com/*" })).filter(tab => automationTargetMatches(tab.url, targetUrl));
-    if (matches.length > 1) throw new Error("The Voice conversation is open in multiple tabs. Close the duplicate before controlling its call.");
-    if (command.kind !== "voice_status") await extensionApi.storage.local.set({ voiceConversationUrl: targetUrl });
-    let acquired = matches[0] ? { tab: matches[0] } : null;
+    const tabs = await extensionApi.tabs.query({ url: "https://chatgpt.com/*" });
+    let selected;
+    if (command.discover) {
+      const stored = await extensionApi.storage.local.get(["voiceTabId", "voiceTabUrl", "voiceConversationUrl", "serverVoiceConversationUrl", "automationThreadTabsV1"]);
+      const eligible = tabs.filter(tab => voicePageUrl(tab.url) && !tab.incognito &&
+        !Object.values(stored.automationThreadTabsV1 ?? {}).includes(tab.id));
+      const remembered = eligible.find(tab => tab.id === stored.voiceTabId &&
+        (voicePageUrl(tab.url) === stored.voiceTabUrl || stored.voiceTabUrl === "https://chatgpt.com/")) ??
+        eligible.find(tab => [stored.voiceConversationUrl, stored.serverVoiceConversationUrl].includes(voicePageUrl(tab.url)));
+      const observed = command.kind === "voice_status" && remembered ? [] : await Promise.allSettled(eligible.filter(tab => tab.status === "complete").map(async tab => {
+        const response = await sendAutomationMessageWithTimeout(tab.id, { feature: "voice", kind: "voice_status", targetUrl: voicePageUrl(tab.url) });
+        return response?.ok && response.result.status === "active" ? tab : null;
+      }));
+      const active = observed.flatMap(result => result.status === "fulfilled" && result.value ? [result.value] : []);
+      if (active.length > 1) throw new Error("Multiple Voice calls are open. End the extra call before waking Voice.");
+      selected = active[0] ?? remembered;
+      targetUrl = selected ? voicePageUrl(selected.url) : "https://chatgpt.com/";
+    } else {
+      const matches = tabs.filter(tab => voicePageUrl(tab.url) === targetUrl);
+      if (matches.length > 1) throw new Error("The Voice conversation is open in multiple tabs. Close the duplicate before controlling its call.");
+      selected = matches[0];
+    }
+    let acquired = selected ? { tab: selected } : null;
     if (!acquired && command.kind === "voice_start") {
       const tabs = await extensionApi.tabs.query({ windowType: "normal" });
       const windowId = tabs.find(tab => Number.isInteger(tab.windowId) && !tab.incognito)?.windowId;
@@ -698,22 +733,34 @@ async function executeVoiceCommand(command, browserId) {
     }
     let result;
     if (!acquired) {
+      if (command.kind === "voice_mute" || command.kind === "voice_unmute") throw new Error("No active Voice call to mute or unmute.");
       result = { status: "closed", conversationUrl: targetUrl };
     } else {
-      const tab = await waitForTabComplete(acquired.tab.id, 30_000);
-      if (!automationTargetMatches(tab.url, targetUrl)) throw new Error("Voice tab navigated away from the configured conversation.");
+      const tab = command.kind === "voice_status" ? await extensionApi.tabs.get(acquired.tab.id) : await waitForTabComplete(acquired.tab.id, 30_000);
+      if (voicePageUrl(tab.url) !== targetUrl) throw new Error("Voice tab navigated away from the selected conversation.");
       const recovery = recoveringPages.get(tab.id);
       if (recovery?.continuationStarted || [...pendingMessages.values()].some(url => automationTargetMatches(url, targetUrl))) {
         throw new Error("Wait for the current message delivery before configuring or controlling Voice.");
       }
       if (recovery) recovery.resume = false;
+      await extensionApi.storage.local.set({ voiceTabId: tab.id, voiceTabUrl: targetUrl, voiceConversationUrl: targetUrl });
       if (command.kind === "voice_start") await extensionApi.tabs.update(tab.id, { active: true });
-      const response = await sendAutomationMessageWithTimeout(tab.id, command);
+      let response = command.kind === "voice_status" && tab.status !== "complete"
+        ? { ok: true, result: { status: "loading", conversationUrl: targetUrl, microphone: "unavailable" } }
+        : await sendAutomationMessageWithTimeout(tab.id, { ...command, targetUrl });
+      if (command.kind === "voice_start" && !response?.ok && response?.error?.startsWith("VOICE_LOADING_STUCK:")) {
+        if (voicePageUrl((await extensionApi.tabs.get(tab.id)).url) !== targetUrl) throw new Error("Voice tab navigated away before loading recovery.");
+        await extensionApi.tabs.reload(tab.id);
+        const refreshed = await waitForTabComplete(tab.id, 30_000);
+        if (voicePageUrl(refreshed.url) !== targetUrl) throw new Error("Voice tab navigated away during loading recovery.");
+        response = await sendAutomationMessageWithTimeout(tab.id, { ...command, targetUrl });
+      }
       if (!response?.ok) throw new Error(response?.error || "ChatGPT Voice control failed.");
       result = response.result;
+      const finalUrl = voicePageUrl((await extensionApi.tabs.get(tab.id)).url);
+      if (!finalUrl || result?.conversationUrl !== finalUrl || (targetUrl !== "https://chatgpt.com/" && finalUrl !== targetUrl)) throw new Error("Voice command returned a different conversation.");
+      await extensionApi.storage.local.set({ voiceTabUrl: finalUrl, voiceConversationUrl: finalUrl });
     }
-    if (result?.conversationUrl !== targetUrl) throw new Error("Voice command returned a different conversation.");
-    if (command.kind === "voice_status") await extensionApi.storage.local.set({ voiceConversationUrl: targetUrl });
     await postResult({ commandId: command.id, browserId, kind: command.kind, ok: true, result });
   } catch (error) {
     await postResult({ commandId: command.id, browserId, kind: command.kind, ok: false,

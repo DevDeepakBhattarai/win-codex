@@ -32,15 +32,23 @@ try {
 					globalThis.endClicks++;
 					if (globalThis.ignoreEnd) return;
 					end.remove();
+					document.querySelector('[aria-label="Turn off microphone"], [aria-label="Turn on microphone"]')?.remove();
 					const start = document.createElement("button");
 					start.setAttribute("aria-label", "Start Voice");
 					document.body.appendChild(start);
 				};
 				document.body.appendChild(end);
+				const mic = document.createElement("button");
+				mic.setAttribute("aria-label", "Turn off microphone");
+				mic.onclick = () => {
+					const next = mic.getAttribute("aria-label") === "Turn off microphone" ? "Turn on microphone" : "Turn off microphone";
+					setTimeout(() => mic.setAttribute("aria-label", next), globalThis.micDelay ?? 0);
+				};
+				document.body.appendChild(mic);
 			}, 1000);
 		};
 	});
-	await page.addScriptTag({ content: await readFile("support-extension/content-script.js", "utf8") });
+	await page.addScriptTag({ content: await readFile(process.argv[2] ?? "support-extension/content-script.js", "utf8") });
 	const begin = kind => page.evaluate(({ kind, url }) => {
 		globalThis.voiceResult = null;
 		globalThis.voiceListener({ type: "local-codex-support/automation-v1", command: { kind, feature: "voice", targetUrl: url } }, {},
@@ -60,11 +68,47 @@ try {
 	await page.clock.runFor(500);
 	assert.equal(await result(), null, "a newly loaded chat waits for its Voice control instead of failing during hydration");
 	await page.clock.runFor(2500);
-	assert.deepEqual(await result(), { ok: true, result: { status: "active", conversationUrl: url } });
+	assert.equal((await result()).result.status, "active");
+	assert.equal((await result()).result.conversationUrl, url);
 	await begin("voice_start");
 	await page.clock.runFor(100);
 	assert.equal((await result()).result.status, "active");
 	assert.equal(await page.evaluate(() => globalThis.startClicks), 1, "another wake cannot toggle an active call off");
+	const micLabel = () => page.evaluate(() => document.querySelector('[aria-label="Turn off microphone"], [aria-label="Turn on microphone"]').getAttribute("aria-label"));
+	const audio = async (duration, userSpeaking = false, assistantSpeaking = false, inputAvailable = true) => {
+		await page.evaluate(({ userSpeaking, assistantSpeaking, inputAvailable }) => {
+			clearInterval(globalThis.audioTimer);
+			globalThis.audioTimer = setInterval(() => window.postMessage({ type: "local-codex-voice-activity-v1", userSpeaking, assistantSpeaking, inputAvailable }, location.origin), 100);
+		}, { userSpeaking, assistantSpeaking, inputAvailable });
+		await page.clock.runFor(duration);
+	};
+	await audio(100, true);
+	await audio(4400);
+	assert.equal(await micLabel(), "Turn off microphone", "silence below 4.5 seconds leaves the microphone open");
+	await audio(200);
+	assert.equal(await micLabel(), "Turn on microphone", "4.5 seconds of silence mutes without disconnecting");
+	assert.equal(await page.evaluate(() => globalThis.endClicks), 0);
+	await begin("voice_start");
+	await page.clock.runFor(100);
+	assert.equal(await micLabel(), "Turn off microphone", "wake unmutes an existing call");
+	await audio(100, true);
+	await audio(1300, false, true);
+	assert.equal(await micLabel(), "Turn off microphone", "a brief assistant response cannot trigger early mute");
+	await audio(400, false, true);
+	assert.equal(await micLabel(), "Turn on microphone", "sustained assistant speech mutes earlier after user silence");
+	await begin("voice_start");
+	await page.clock.runFor(100);
+	await audio(3000, true, true);
+	assert.equal(await micLabel(), "Turn off microphone", "user speech keeps the mic open during assistant playback");
+	await audio(5000, false, false, false);
+	assert.equal(await micLabel(), "Turn off microphone", "missing audio measurements never count as silence");
+	await page.evaluate(() => { globalThis.micDelay = 200; });
+	await audio(100, true);
+	await audio(4500);
+	await begin("voice_start");
+	await page.clock.runFor(600);
+	assert.equal(await micLabel(), "Turn off microphone", "a wake queued behind an automatic mute restores the mic after confirmation");
+	await page.evaluate(() => { clearInterval(globalThis.audioTimer); globalThis.micDelay = 0; });
 	await page.evaluate(() => { globalThis.ignoreEnd = true; });
 	await begin("voice_stop");
 	await page.clock.runFor(30_100);
@@ -86,9 +130,17 @@ try {
 	await begin("voice_status");
 	await page.clock.runFor(100);
 	assert.equal((await result()).result.status, "unavailable");
+	await page.evaluate(() => {
+		const start = document.querySelector('[aria-label="Start Voice"]');
+		start.hidden = false; start.disabled = true; start.setAttribute("aria-busy", "true");
+	});
+	await begin("voice_start");
+	await page.clock.runFor(8200);
+	assert.equal((await result()).ok, false);
+	assert.match((await result()).error, /^VOICE_LOADING_STUCK:/, "stuck Voice loading is distinct from missing Voice access");
 	await page.evaluate(() => history.replaceState({}, "", location.pathname + "?temporary-chat=true"));
 	await begin("voice_start");
 	await page.clock.runFor(100);
 	assert.equal((await result()).ok, false, "a navigated or temporary page cannot receive Voice commands");
-	console.log("Voice DOM passed: observed state transitions, duplicate wakes, ignored end click, pause bypass, text-stop isolation, missing controls, and navigation rejection.");
+	console.log("Voice DOM passed: silence and playback mute timing, speech resets, missing measurements, wake during mute, loading detection, call transitions, and navigation rejection.");
 } finally { await browser.close(); }

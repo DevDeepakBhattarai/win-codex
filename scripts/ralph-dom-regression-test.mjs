@@ -21,7 +21,7 @@ try {
 			globalThis.chrome = { runtime: { sendMessage: async message => { globalThis.activity.push(message); return { ok: true }; },
 				onMessage: { addListener(listener) { globalThis.automationListeners.push(listener); } } } };
 		});
-		await page.addScriptTag({ content: source.replace('const contentScriptVersion = "1.19.0";', 'const contentScriptVersion = "stale-regression";')
+		await page.addScriptTag({ content: source.replace(/const contentScriptVersion = "[^"]+";/, 'const contentScriptVersion = "stale-regression";')
 			.replace('function pageHealth() {', 'function pageHealth() { return { status: "stale" };') });
 		await page.addScriptTag({ content: source });
 		const execute = command => page.evaluate(command => new Promise(resolve =>

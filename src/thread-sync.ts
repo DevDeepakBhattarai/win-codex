@@ -204,7 +204,7 @@ export async function prepareThreadSync(dataDirectory: string, port = 6002) {
   const legacyExtensionDirectory = path.resolve(dataDirectory, "thread-sync-extension");
   await rm(legacyExtensionDirectory, { recursive: true, force: true });
   await mkdir(extensionDirectory, { recursive: true });
-  await Promise.all(["manifest.json", "content-script.js", "service-worker.js", "popup.html", "popup.js", "popup.css"].map((file) =>
+  await Promise.all(["manifest.json", "content-script.js", "voice-audio.js", "service-worker.js", "popup.html", "popup.js", "popup.css"].map((file) =>
     copyFile(path.join(sourceDirectory, file), path.join(extensionDirectory, file)),
   ));
   await writeFile(path.join(extensionDirectory, "config.js"),

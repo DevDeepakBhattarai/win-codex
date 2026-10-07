@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.19.0";
+  const contentScriptVersion = "1.20.0";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -78,6 +78,7 @@
   }
 
   const messageHandler = async (event) => {
+    observeVoiceActivity(event);
     const message = event.data;
     if (message?.type !== requestType || typeof message.token !== "string" ||
         !/^[A-Za-z0-9_-]{43}$/.test(message.token) || event.source === window || !event.source) return;
@@ -138,7 +139,7 @@
   });
 
   async function runAutomation(command) {
-    if (["voice_status", "voice_start", "voice_stop"].includes(command.kind) && command.feature === "voice") {
+    if (["voice_status", "voice_start", "voice_stop", "voice_mute", "voice_unmute"].includes(command.kind) && command.feature === "voice") {
       return await controlVoice(command);
     }
     await waitForAutomationResume();
@@ -190,44 +191,142 @@
   function voiceState() {
     const start = visibleVoiceButton("Start Voice");
     const end = visibleVoiceButton("End Voice");
+    if ((start || end) && (!isActionableButton(start ?? end) || (start ?? end).getAttribute("aria-busy") === "true")) return "loading";
     if (end && !start) return "active";
     if (isActionableButton(start) && !end) return "closed";
     return "unavailable";
   }
 
+  function microphoneState() {
+    if (isActionableButton(visibleVoiceButton("Turn on microphone"))) return "muted";
+    if (isActionableButton(visibleVoiceButton("Turn off microphone"))) return "unmuted";
+    return "unavailable";
+  }
+
+  let lastUserSpeech = Date.now();
+  let assistantSince = 0;
+  let lastAssistantSpeech = 0;
+  let voiceStarting = false;
+  let microphoneOperation = false;
+  let microphoneTail = Promise.resolve();
+  let wakeRevision = 0;
+  let monitorActive = false;
+  let lastVoiceSample = 0;
+  let monitorTimer;
+  function watchVoice() {
+    if (monitorTimer) return;
+    monitorTimer = setInterval(() => {
+      if (globalThis[handlerKey]?.version !== contentScriptVersion) { clearInterval(monitorTimer); return; }
+      const active = voiceStarting || voiceState() === "active";
+      if (active === monitorActive) return;
+      monitorActive = active;
+      lastUserSpeech = Date.now();
+      assistantSince = lastAssistantSpeech = 0;
+      window.postMessage({ type: "local-codex-voice-monitor-v1", active }, location.origin);
+    }, 100);
+  }
+  function observeVoiceActivity(event) {
+    if (globalThis[handlerKey]?.version !== contentScriptVersion || event.source !== window || event.data?.type !== "local-codex-voice-activity-v1") return;
+    if (voiceState() !== "active" || microphoneState() !== "unmuted") return;
+    const now = Date.now();
+    if (!event.data.inputAvailable || now - lastVoiceSample > 1500) { lastUserSpeech = now; assistantSince = 0; }
+    lastVoiceSample = now;
+    if (!event.data.inputAvailable) return;
+    if (event.data.userSpeaking) lastUserSpeech = now;
+    if (event.data.assistantSpeaking) {
+      if (!assistantSince || now - lastAssistantSpeech > 300) assistantSince = now;
+      lastAssistantSpeech = now;
+    } else if (now - lastAssistantSpeech > 300) assistantSince = 0;
+    const quiet = now - lastUserSpeech;
+    if (!voiceStarting && !microphoneOperation && (quiet >= 4500 || (quiet >= 1500 && assistantSince && now - assistantSince >= 1500))) {
+      void setMicrophone(true).catch(() => {});
+    }
+  }
+
+  async function setMicrophone(muted) {
+    const revision = ++wakeRevision;
+    if (!muted) { lastUserSpeech = Date.now(); assistantSince = lastAssistantSpeech = 0; }
+    const desired = muted ? "muted" : "unmuted";
+    microphoneOperation = true;
+    const operation = microphoneTail.catch(() => {}).then(async () => {
+      if (revision !== wakeRevision) return;
+      if (microphoneState() === desired) return;
+      const button = visibleVoiceButton(muted ? "Turn off microphone" : "Turn on microphone");
+      if (voiceState() !== "active" || !isActionableButton(button)) throw new Error("ChatGPT microphone control is unavailable.");
+      button.click();
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        if (voiceState() !== "active") throw new Error("Voice ended before the microphone change was confirmed.");
+        if (microphoneState() === desired) return;
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      throw new Error("ChatGPT did not confirm the requested microphone state.");
+    });
+    microphoneTail = operation;
+    try { await operation; }
+    finally { if (microphoneTail === operation) microphoneOperation = false; }
+  }
+
   async function controlVoice(command) {
+    watchVoice();
     const targetUrl = command.targetUrl;
+    const newChat = targetUrl === "https://chatgpt.com/";
+    const observedUrl = () => conversationUrl() ?? "https://chatgpt.com/";
+    const result = () => ({ status: voiceState(), conversationUrl: observedUrl(), microphone: microphoneState() });
     const assertTarget = () => {
-      if (!targetUrl || conversationUrl() !== targetUrl || new URL(targetUrl).searchParams.get("temporary-chat") === "true") {
+      if (!targetUrl || location.origin !== "https://chatgpt.com" || (!newChat && conversationUrl() !== targetUrl) ||
+          (newChat && location.pathname !== "/" && !/^\/c\/[\da-f-]+\/?$/i.test(location.pathname)) ||
+          new URL(location.href).searchParams.get("temporary-chat") === "true") {
         throw new Error("Voice control is no longer on the configured regular conversation.");
       }
     };
     assertTarget();
-    if (command.kind === "voice_status") return { status: voiceState(), conversationUrl: targetUrl };
+    if (command.kind === "voice_status") return result();
+    if (command.kind === "voice_mute" || command.kind === "voice_unmute" || (command.kind === "voice_start" && voiceState() === "active")) {
+      await setMicrophone(command.kind === "voice_mute");
+      assertTarget();
+      return result();
+    }
     const desired = command.kind === "voice_start" ? "active" : "closed";
     const deadline = Date.now() + 30_000;
     let button;
-    while (Date.now() < deadline) {
-      assertTarget();
-      if (voiceState() === desired) return { status: desired, conversationUrl: targetUrl };
-      button = visibleVoiceButton(command.kind === "voice_start" ? "Start Voice" : "End Voice");
-      if (isActionableButton(button)) break;
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-    if (!isActionableButton(button)) throw new Error("ChatGPT Voice control is unavailable. Check login, Voice access, and microphone permission.");
-    button.click();
-    let stableSince = 0;
+    let loadingSince = 0;
     while (Date.now() < deadline) {
       assertTarget();
       if (voiceState() === desired) {
-        if (!stableSince) stableSince = Date.now();
-        if (Date.now() - stableSince >= 500) return { status: desired, conversationUrl: targetUrl };
-      } else {
-        stableSince = 0;
+        if (command.kind === "voice_start") await setMicrophone(false);
+        return result();
       }
+      if (command.kind === "voice_start" && voiceState() === "loading") {
+        if (!loadingSince) loadingSince = Date.now();
+        if (Date.now() - loadingSince >= 8000) throw new Error("VOICE_LOADING_STUCK: Voice controls stayed in loading state.");
+      } else loadingSince = 0;
+      button = visibleVoiceButton(command.kind === "voice_start" ? "Start Voice" : "End Voice");
+      if (isActionableButton(button) && voiceState() !== "loading") break;
       await new Promise(resolve => setTimeout(resolve, 100));
     }
-    throw new Error(`ChatGPT did not confirm Voice ${desired}. Check its call controls before retrying.`);
+    if (!isActionableButton(button)) throw new Error("ChatGPT Voice control is unavailable. Check login, Voice access, and microphone permission.");
+    voiceStarting = command.kind === "voice_start";
+    try {
+      button.click();
+      let stableSince = 0;
+      while (Date.now() < deadline) {
+        assertTarget();
+        if (voiceState() === desired) {
+          if (!stableSince) stableSince = Date.now();
+          if (Date.now() - stableSince >= 500) {
+            if (command.kind === "voice_start") await setMicrophone(false);
+            assertTarget();
+            return result();
+          }
+        } else {
+          stableSince = 0;
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      if (command.kind === "voice_start" && voiceState() === "loading") throw new Error("VOICE_LOADING_STUCK: Voice controls stayed in loading state.");
+      throw new Error(`ChatGPT did not confirm Voice ${desired}. Check its call controls before retrying.`);
+    } finally { voiceStarting = false; }
   }
 
   function checkRecoveryDeadline(expiresAt) {
