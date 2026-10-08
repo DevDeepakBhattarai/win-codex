@@ -104,8 +104,9 @@ const supportCommandSchema = z.union([
   z.object({
     id: z.string(),
     feature: z.literal("voice"),
-    kind: z.enum(["voice_status", "voice_start", "voice_stop"]),
+    kind: z.enum(["voice_status", "voice_start", "voice_stop", "voice_mute", "voice_unmute"]),
     targetUrl: z.string().url(),
+    discover: z.boolean().optional(),
   }),
   z.object({
     id: z.string(),
@@ -163,11 +164,13 @@ const commandResultSchema = z.union([
   z.object({
     commandId: z.string(),
     browserId: z.string(),
-    kind: z.enum(["voice_status", "voice_start", "voice_stop"]),
+    kind: z.enum(["voice_status", "voice_start", "voice_stop", "voice_mute", "voice_unmute"]),
     ok: z.literal(true),
     result: z.object({
-      status: z.enum(["closed", "active", "unavailable"]),
+      status: z.enum(["closed", "active", "loading", "unavailable"]),
       conversationUrl: z.string().url(),
+      microphone: z.enum(["muted", "unmuted", "unavailable"]).optional(),
+      tabId: z.number().int().nonnegative().optional(),
     }),
   }),
   z.object({
@@ -214,7 +217,7 @@ const commandResultSchema = z.union([
   z.object({
     commandId: z.string(),
     browserId: z.string(),
-    kind: z.enum(["inspect_thread", "prepare_thread", "close_thread", "send_message", "stop_thread", "voice_status", "voice_start", "voice_stop"]),
+    kind: z.enum(["inspect_thread", "prepare_thread", "close_thread", "send_message", "stop_thread", "voice_status", "voice_start", "voice_stop", "voice_mute", "voice_unmute"]),
     ok: z.literal(false),
     error: z.string().min(1).max(2_000),
     deliveryUncertain: z.boolean().optional(),

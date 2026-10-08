@@ -1,6 +1,6 @@
 # Control ChatGPT Voice from the local service
 
-Use these commands to start and end Voice in a dedicated saved chat on chatgpt.com. Super App's wake listener and the agent's `chatgpt_voice` tool use the same configured conversation.
+Use Super App's Jarvis wake word, the local CLI, or the agent's `chatgpt_voice` tool to control Voice in Chrome.
 
 ## Prepare the service and extension
 
@@ -12,17 +12,17 @@ Run these commands from the connector checkout:
 	pnpm support:prepare
 ```
 
-Restart the local service with its existing launch method after the build. In Chrome's extensions page, reload the generated `.data/support-extension`. Enable the designated automation executor and Thread messaging in Local Codex Support. Keep one automation browser profile connected.
+Restart the local service with its existing launch method after the build. In Chrome's extensions page, reload the generated `.data/support-extension`. Enable the designated automation executor and Thread messaging in Local Codex Support. Keep Browser Bridge connected in the same Chrome profile.
 
-Open a regular ChatGPT chat outside a project. Send a short setup message to save the conversation. Attach the computer connector for later tool use. Complete any microphone permission or Voice onboarding screens in Chrome.
+Complete microphone permission and Voice onboarding in Chrome. In Super App, turn on **Listen for Jarvis**.
 
-Configure the chat with its saved URL:
+To designate an already-open saved chat before its first call, configure its URL:
 
 ```powershell
 	pnpm agent voice configure https://chatgpt.com/c/YOUR_CONVERSATION_ID
 ```
 
-The command checks the new target through the connected extension before it saves the URL. The extension records its protection before it acknowledges that check. The service then saves the URL in `ralph.json` and excludes the chat from continuation and worker cleanup. Temporary chats, delegated worker chats, and duplicate tabs cannot be configured.
+Configuration is optional. It checks the tab through the extension before saving its URL. It does not make the service reopen a closed tab. Temporary chats, project chats, delegated worker chats, and duplicate tabs cannot be configured.
 
 ## Start and end a call
 
@@ -31,26 +31,36 @@ Run:
 ```powershell
 	pnpm agent voice status
 	pnpm agent voice start
+	pnpm agent voice mute
+	pnpm agent voice unmute
 	pnpm agent voice stop
 ```
 
-`status` returns `closed`, `active`, or `unavailable` with the conversation URL. These values describe the observed page controls. `active` does not prove that a spoken MCP request succeeded.
+`status` returns `closed`, `active`, `loading`, or `unavailable`, the observed conversation URL, and the microphone state when controls exist. A fresh chat reports `https://chatgpt.com/` until ChatGPT saves its conversation. `active` does not prove that a spoken MCP request succeeded.
 
-`start` activates the configured tab and clicks **Start Voice**. It opens the saved conversation if its tab is closed. A second start request leaves an active call active.
+`start` selects an active Voice call first. Otherwise, it selects the tracked Voice tab if that tab is still open. If no Voice tab remains, it opens a fresh regular chat. A saved URL alone does not cause the service to reopen a closed tab. If Voice is active, `start` unmutes its microphone. If Voice is closed, `start` starts it.
+
+`mute` and `unmute` change the microphone without ending the call. A wake word or **Start Voice** also unmutes an active call.
+
+Voice automatically mutes after 4.5 seconds of user silence. It also mutes after 1.5 seconds of user silence when the assistant has spoken continuously for 1.5 seconds. User speech resets the silence timer. Playback gaps under 300 milliseconds do not restart the assistant timer.
+
+The extension measures local input energy and received WebRTC audio energy. It sends only activity flags between the page scripts. Missing input measurements do not count as silence. On a wake, Browser Bridge registers existing WebRTC connections with the observer, including calls opened before the extension loaded. It releases its temporary debugger attachment after discovery. For a call opened before the monitor was installed, the extension uses a separate local input monitor and releases that monitor when the call ends.
 
 `stop` clicks **End Voice** and waits for **Start Voice** to return. It keeps the saved tab open. Ending a call does not stop delegated jobs or text generation. If the tab is already closed, `stop` returns `closed`.
 
-The page has 30 seconds to confirm a state change. If a click fails, the command returns an error. Inspect the call controls before retrying. A failed stop never triggers a page refresh or closes the tab automatically.
+The page has 30 seconds to confirm a state change. If a wake sees Voice controls stuck in loading for eight seconds, the extension refreshes that same tab once and retries startup. A startup that remains stuck after its click also gets one refresh. A second failure reports an error.
 
-If the conversation is open in multiple tabs, close the duplicate before controlling Voice. To change the configured chat, end its current call first. The service checks that the previous chat is closed before replacing its URL.
+Missing controls during text generation, login failures, and microphone permission failures do not trigger a refresh. A failed stop leaves the tab available for the next wake to recover.
+
+If multiple active calls exist, end the extra call before retrying. To change the configured chat, end its current call first. The service checks that the previous chat is closed before replacing its URL. The selected tab and its saved URL are protected from worker continuation, page recovery, and cleanup.
 
 ## Let the agent end its call
 
-Refresh the computer connector's tools in ChatGPT after updating the service. Attach the connector to the configured Voice chat. Ask the agent to disconnect, and have it call `chatgpt_voice` with `action: "stop"`. Use `action: "status"` to inspect the call or `action: "start"` to start it through the browser.
+Refresh the computer connector's tools in ChatGPT after updating the service. Attach the connector to your Voice chat. Ask the agent to disconnect with `chatgpt_voice` and `action: "stop"`. Use `status` to inspect the call, `start` to resume Voice, or `mute` and `unmute` to change the microphone.
 
-After disconnecting, say "Jarvis" or "Chat" with Super App listening enabled to reconnect. You can also click **Start Voice** in Super App. The disconnected ChatGPT call cannot hear your request.
+After disconnecting, say "Jarvis" with Super App listening enabled to reconnect. You can also click **Start Voice** in Super App. The disconnected ChatGPT call cannot hear your request.
 
-To ask the agent to stay quiet while it works, give it that instruction during the call. This instruction leaves the microphone connected. Super App has no local mute command or DJI double-press microphone shortcut.
+Auto-mute leaves the call connected and keeps your Voice speaker selected. Super App restores your previous Windows outputs after the call ends. Turn listening off to release the local wake microphone.
 
 ## Check failures
 
