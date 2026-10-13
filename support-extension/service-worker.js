@@ -763,7 +763,8 @@ async function executeVoiceCommand(command, browserId) {
       result = { ...response.result, tabId: tab.id };
       const finalUrl = voicePageUrl((await extensionApi.tabs.get(tab.id)).url);
       const promoted = targetUrl.startsWith("https://chatgpt.com/c/local-chatgpt%3A") && finalUrl === conversationUrl((await extensionApi.tabs.get(tab.id)).url);
-      if (!finalUrl || result?.conversationUrl !== finalUrl || (targetUrl !== "https://chatgpt.com/" && finalUrl !== targetUrl && !promoted)) throw new Error("Voice command returned a different conversation.");
+      const endedUnsavedCall = command.kind === "voice_stop" && targetUrl.startsWith("https://chatgpt.com/c/local-chatgpt%3A") && finalUrl === "https://chatgpt.com/" && result.status === "closed";
+      if (!finalUrl || result?.conversationUrl !== finalUrl || (targetUrl !== "https://chatgpt.com/" && finalUrl !== targetUrl && !promoted && !endedUnsavedCall)) throw new Error("Voice command returned a different conversation.");
       await extensionApi.storage.local.set({ voiceTabUrl: finalUrl, voiceConversationUrl: finalUrl });
     }
     await postResult({ commandId: command.id, browserId, kind: command.kind, ok: true, result });

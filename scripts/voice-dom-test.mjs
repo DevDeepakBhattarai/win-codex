@@ -33,6 +33,7 @@ try {
 				end.onclick = () => {
 					globalThis.endClicks++;
 					if (globalThis.ignoreEnd) return;
+					if (globalThis.resetUnsavedVoice) history.replaceState({}, "", "/");
 					end.remove();
 					document.querySelector('[aria-label="Turn off microphone"], [aria-label="Turn on microphone"]')?.remove();
 					const start = document.createElement("button");
@@ -49,6 +50,7 @@ try {
 				document.body.appendChild(mic);
 			}, 1000);
 		};
+		globalThis.restartVoice = document.querySelector('button[aria-label="Start Voice"]').onclick;
 	});
 	await page.addScriptTag({ content: await readFile(process.argv[2] ?? "support-extension/content-script.js", "utf8") });
 	const begin = (kind, targetUrl = url) => page.evaluate(({ kind, url }) => {
@@ -79,6 +81,30 @@ try {
 	await page.clock.runFor(100);
 	assert.equal((await result()).result.status, "active");
 	assert.equal(await page.evaluate(() => globalThis.startClicks), 1, "another wake cannot toggle an active call off");
+	await page.evaluate(() => { history.replaceState({}, "", "/"); });
+	await begin("voice_stop", localUrl);
+	await page.clock.runFor(100);
+	assert.equal((await result()).ok, false, "navigation to the new-chat page before a stop click remains rejected");
+	assert.equal(await page.evaluate(() => globalThis.endClicks), 0);
+	await page.evaluate(localUrl => { history.replaceState({}, "", localUrl); }, localUrl);
+	await page.evaluate(() => { globalThis.resetUnsavedVoice = true; });
+	await begin("voice_stop", localUrl);
+	await page.clock.runFor(1000);
+	assert.equal((await result()).ok, true, "ending unsaved Voice accepts the same tab returning to the new-chat page after the call closes");
+	assert.equal((await result()).result.status, "closed");
+	assert.equal((await result()).result.conversationUrl, "https://chatgpt.com/");
+	await page.evaluate(() => {
+		globalThis.resetUnsavedVoice = false;
+		globalThis.startClicks = globalThis.endClicks = 0;
+		document.querySelector('button[aria-label="Start Voice"]').remove();
+		const start = document.createElement("button");
+		start.setAttribute("aria-label", "Start Voice");
+		start.onclick = globalThis.restartVoice;
+		document.body.appendChild(start);
+	});
+	await begin("voice_start", "https://chatgpt.com/");
+	await page.clock.runFor(2000);
+	assert.equal((await result()).result.status, "active");
 	await page.evaluate(url => { history.replaceState({}, "", url); globalThis.provisionalUrl = undefined; }, url);
 	const micLabel = () => page.evaluate(() => document.querySelector('[aria-label="Turn off microphone"], [aria-label="Turn on microphone"]').getAttribute("aria-label"));
 	const audio = async (duration, userSpeaking = false, assistantSpeaking = false, inputAvailable = true) => {
