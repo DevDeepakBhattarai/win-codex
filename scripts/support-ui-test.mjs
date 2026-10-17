@@ -41,6 +41,12 @@ try {
     const pathname = new URL(route.request().url()).pathname;
     let data;
     if (pathname === "/chatgpt-support/ralph/threads") data = { threads: [parent, active, legacyActive, ...complete], tasks: [task], continuationEnabled: true, automationPausedUntil };
+    else if (pathname === "/chatgpt-support/ralph/register") {
+      const input = route.request().postDataJSON();
+      const thread = [parent, active, legacyActive].find(thread => thread.conversationUrl === input.conversationUrl);
+      if (thread && typeof input.paused === "boolean") thread.paused = input.paused;
+      data = { status: input.paused ? "paused" : "resumed" };
+    }
     else if (pathname === "/chatgpt-support/ralph/settings") {
       settingsRequests += 1;
       if (route.request().method() === "PUT") Object.assign(ralphSettings, route.request().postDataJSON());
@@ -60,11 +66,15 @@ try {
     } else if (pathname.startsWith("/chatgpt-support/schedules/") && route.request().method() === "DELETE") {
       schedules = []; data = { status: "removed" };
     } else if (pathname === `/chatgpt-support/tasks/${reviewId}`) {
-      assert.equal(route.request().postDataJSON().action, "cancel");
-      cancelled = true;
-      task.state = "cancelled";
-      parent.waitingForTask = false;
-      parent.activity = "running";
+      const action = route.request().postDataJSON().action;
+      if (action === "pause" || action === "resume") task.paused = action === "pause";
+      else {
+        assert.equal(action, "cancel");
+        cancelled = true;
+        task.state = "cancelled";
+        parent.waitingForTask = false;
+        parent.activity = "running";
+      }
       data = { status: "accepted" };
     }
     if (data) { await route.fulfill({ json: data }); return; }
@@ -100,6 +110,20 @@ try {
   assert.equal(await page.locator("#settledList .thread-id").count(), 1);
   await page.getByRole("searchbox", { name: "Search threads" }).fill("");
   await page.getByRole("tab", { name: "Threads", exact: true }).click();
+  const activeCard = page.locator(".thread").filter({ hasText: active.title });
+  await activeCard.getByRole("button", { name: "Pause", exact: true }).click();
+  await activeCard.getByRole("button", { name: "Resume", exact: true }).waitFor();
+  assert.equal(active.paused, true);
+  assert.equal(await activeCard.getByRole("button", { name: "Check now", exact: true }).count(), 0);
+  await activeCard.getByRole("button", { name: "Resume", exact: true }).click();
+  await activeCard.getByRole("button", { name: "Pause", exact: true }).waitFor();
+  assert.equal(active.paused, false);
+  await page.getByRole("button", { name: "Pause task", exact: true }).click();
+  await page.getByRole("button", { name: "Resume task", exact: true }).waitFor();
+  assert.equal(task.paused, true);
+  await page.getByRole("button", { name: "Resume task", exact: true }).click();
+  await page.getByRole("button", { name: "Pause task", exact: true }).waitFor();
+  assert.equal(task.paused, false);
   page.once("dialog", dialog => dialog.accept());
   await page.getByRole("button", { name: "Cancel task", exact: true }).click();
   await page.locator("#subagentThreadsSection").waitFor({ state: "hidden" });

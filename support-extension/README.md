@@ -20,7 +20,9 @@ Schedules survive restarts. The server skips times missed while it was off and r
 
 Settlements retry after a server outage. The registry discards settled history when it needs space for a new thread.
 
-Inspect uncertain delivery before cancelling an abandoned startup. A known worker must stop before cancellation releases the reservation.
+Use **Cancel task** to remove an abandoned task even if its worker tab or browser is gone. Closing the last tab for a worker cancels its pending task. Cancellation saves the task state first and attempts to stop a live worker afterward.
+
+Use **Pause** on a thread or **Pause task** on a worker to suspend automatic checks, completion reviews, recovery, and follow-up messages for that item. Pause survives service restarts and activity updates. Use **Resume** or **Resume task** to enable automation again. Clicking ChatGPT's **Stop** button manually also pauses that thread. Stopping a run through automatic recovery does not pause it.
 
 Follow [the delegation workflow](../docs/delegation.md) for parent and worker prompts. Workers publish reports through the supplied temporary file and rename. The local request waits until the server collects the report. A final chat answer alone does not finish the job.
 

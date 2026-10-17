@@ -143,22 +143,12 @@ try {
   try {
     const pending = await recoveryJobs.create(parent);
     assert.equal((await requestAction(pending.jobId, { action: "cancel" }, false)).status, 401);
-    assert.equal((await requestAction(pending.jobId, { action: "cancel", confirmedStopped: true })).status, 409);
-    await recoveryJobs.recordPreparationFailure(pending.jobId, "unconfirmed startup");
-    assert.equal((await requestAction(pending.jobId, { action: "cancel" })).status, 409);
-    assert.equal((await requestAction(pending.jobId, { action: "cancel", confirmedStopped: true })).status, 200);
+    assert.equal((await requestAction(pending.jobId, { action: "cancel" })).status, 200, "cancellation does not depend on uncertain startup");
     const known = await recoveryJobs.create(parent);
     await recoveryJobs.assignChild(known.jobId, child);
-    const cancel = requestAction(known.jobId, { action: "cancel" });
-    const stop = await recoveryBus.claim("browser", ["threadMessaging"], 1000);
-    assert.equal(stop.kind, "stop_thread");
-    recoveryBus.complete({ commandId: stop.id, browserId: "browser", kind: "stop_thread", ok: false, error: "cannot confirm stop" });
-    assert.equal((await cancel).status, 409);
-    assert.equal((await recoveryJobs.job(known.jobId)).state, "pending");
-    const retryCancel = requestAction(known.jobId, { action: "cancel" });
-    const confirmed = await recoveryBus.claim("browser", ["threadMessaging"], 1000);
-    recoveryBus.complete({ commandId: confirmed.id, browserId: "browser", kind: "stop_thread", ok: true, result: { status: "stopped", conversationUrl: child.conversationUrl } });
-    assert.equal((await retryCancel).status, 200);
+    assert.equal((await requestAction(known.jobId, { action: "cancel" })).status, 200);
+    assert.equal((await recoveryJobs.job(known.jobId)).state, "cancelled");
+    assert.equal((await requestAction(known.jobId, { action: "cancel" })).status, 200, "cancellation is idempotent");
     assert.equal((await requestAction(known.jobId, { action: "retry" })).status, 400, "parent notification retries no longer exist");
   } finally { recoveryBus.close(); await recoveryJobs.close(); }
   console.log("Task service passed: missing reports, resumed workers, operator cancellation, migration, and continuation checkpoints.");

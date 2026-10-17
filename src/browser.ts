@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { copyFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
@@ -7,6 +8,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import { getPlaywrightInstallExpression } from "./browser-playwright.js";
 import { launchChrome } from "./browser-launch.js";
 import { startVideo } from "./browser-recording.js";
+import { ElectronBridge } from "./electron-bridge.js";
 
 const BRIDGE_PROTOCOL_VERSION = 1;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
@@ -25,6 +27,12 @@ const BROWSER_CONNECT_TIMEOUT_MS = 15_000;
 export type BrowserTab = {
   id: number;
   windowId: number;
+  nativeTabId?: number;
+  targetId?: string;
+  targetKind?: "chrome" | "electron";
+  processId?: number;
+  rendererId?: number;
+  appName?: string;
   index: number;
   active: boolean;
   pinned: boolean;
@@ -190,7 +198,7 @@ type BridgeResponse = {
   error?: { message?: string };
 };
 
-type BridgeEvent = {
+export type BridgeEvent = {
   type: "event";
   event: string;
   tabId?: number;
@@ -454,7 +462,7 @@ export class BrowserService {
   private readonly dialogs = new Map<number, { type: string; message: string; defaultPrompt?: string }>();
 
   private constructor(
-    private readonly bridge: BrowserBridge,
+    private readonly bridge: Pick<BrowserBridge, "status" | "onEvent" | "request" | "close">,
     private readonly extensionDirectory: string,
     private readonly launchBrowser: () => Promise<void>,
     private readonly dataDirectory: string,
@@ -467,15 +475,21 @@ export class BrowserService {
     host?: string;
     port: number;
     launchBrowser?: () => Promise<void>;
+    prepareExtension?: boolean;
+    kind?: "chrome" | "electron";
   }) {
     const host = input.host ?? "127.0.0.1";
     const token = await loadOrCreateBridgeToken(input.dataDirectory);
-    const extensionDirectory = await prepareBrowserExtension(
-      input.dataDirectory,
-      `ws://${host}:${input.port}`,
-      token,
-    );
-    const bridge = await BrowserBridge.listen(host, input.port, token);
+    const extensionDirectory = input.prepareExtension === false
+      ? ""
+      : await prepareBrowserExtension(
+          input.dataDirectory,
+          `ws://${host}:${input.port}`,
+          token,
+        );
+    const bridge = input.kind === "electron"
+      ? await ElectronBridge.listen(host, input.port, token)
+      : await BrowserBridge.listen(host, input.port, token);
     return new BrowserService(bridge, extensionDirectory, input.launchBrowser ?? launchChrome, input.dataDirectory);
   }
 
@@ -486,6 +500,7 @@ export class BrowserService {
   private async ensureConnected() {
     if (this.closed) throw new Error("Browser service is shutting down.");
     if (this.status().connected) return;
+    if (this.bridge instanceof ElectronBridge) throw new Error("The selected Electron process disconnected. Start the app in dev:agent mode, then list targets and claim it again.");
     if (!this.starting) {
       this.starting = this.startBrowser().finally(() => {
         this.starting = undefined;
@@ -1676,6 +1691,8 @@ export class BrowserService {
       this.fileChooserWaiters.get(tabId)?.reject(new Error("Browser tab closed before the file chooser completed."));
       this.fileChooserWaiters.delete(tabId);
       this.states.delete(tabId);
+      this.claimListings.delete(tabId);
+      this.dialogs.delete(tabId);
       return;
     }
 
@@ -1817,6 +1834,284 @@ export class BrowserService {
       release();
       if (this.locks.get(tabId) === queued) this.locks.delete(tabId);
     }
+  }
+}
+
+
+type UnifiedTargetKind = "chrome" | "electron";
+
+type UnifiedRoute = {
+  kind: UnifiedTargetKind;
+  nativeTabId: number;
+};
+
+export class UnifiedBrowserService {
+  private readonly routes = new Map<number, UnifiedRoute>();
+  private readonly reverseRoutes = new Map<string, number>();
+  private nextTabId = 1;
+  private activeTabId: number | undefined;
+  private readonly downloadRoutes = new Map<number, { kind: UnifiedTargetKind; nativeId: number }>();
+  private readonly downloadIds = new Map<string, number>();
+
+  constructor(
+    private readonly chrome: BrowserService,
+    private readonly electron: BrowserService,
+    private readonly descriptorPath: string,
+  ) {}
+
+  private readonly sessions = new Map<string, UnifiedBrowserService>();
+
+  forSession(key: string) {
+    let session = this.sessions.get(key);
+    if (!session) {
+      session = new UnifiedBrowserService(this.chrome, this.electron, this.descriptorPath);
+      this.sessions.set(key, session);
+    }
+    return session;
+  }
+
+  status() {
+    const chrome = this.chrome.status();
+    const electron = this.electron.status();
+    return {
+      ...chrome,
+      connected: chrome.connected || electron.connected,
+      electronConnected: electron.connected,
+      electronBridgeUrl: electron.bridgeUrl,
+      descriptorPath: this.descriptorPath,
+    };
+  }
+
+  async close() {
+    await Promise.all([this.chrome.close(), this.electron.close()]);
+  }
+
+  async listTabs() {
+    const chromeConnected = this.chrome.status().connected;
+    const electronConnected = this.electron.status().connected;
+    const [chromeTabs, electronTabs] = await Promise.all([
+      chromeConnected ? this.chrome.listTabs() : Promise.resolve([]),
+      electronConnected ? this.electron.listTabs() : Promise.resolve([]),
+    ]);
+    return [
+      ...chromeTabs.map((tab) => this.mapTab("chrome", tab)),
+      ...electronTabs.map((tab) => this.mapTab("electron", tab)),
+    ];
+  }
+
+  async open(input: { url?: string; active?: boolean; newWindow?: boolean }) {
+    const result = await this.chrome.open(input);
+    const mapped = this.mapSnapshotResult("chrome", result);
+    this.activeTabId = mapped.snapshot.tabId;
+    return mapped;
+  }
+
+  async claimTab(input: { tabId: number; title: string; url: string }) {
+    const route = this.route(this.resolveControlledTab(input.tabId));
+    const service = this.service(route.kind);
+    const result = await service.claimTab({ ...input, tabId: route.nativeTabId });
+    const tab = this.mapTab(route.kind, result.tab);
+    this.activeTabId = tab.id;
+    return { tab };
+  }
+
+  async releaseTab(tabId: number) {
+    const route = this.route(tabId);
+    const result = await this.service(route.kind).releaseTab(route.nativeTabId);
+    if (this.activeTabId === tabId) this.activeTabId = undefined;
+    return { ...result, tabId };
+  }
+
+  async snapshot(tabId?: number, includeScreenshot = true) {
+    const resolved = this.resolveControlledTab(tabId);
+    const route = this.route(resolved);
+    const result = this.mapSnapshotResult(
+      route.kind,
+      await this.service(route.kind).snapshot(route.nativeTabId, includeScreenshot),
+    );
+    this.activeTabId = resolved;
+    return result;
+  }
+
+  async action(input: BrowserActionInput) {
+    const resolved = this.resolveControlledTab(input.tabId);
+    const route = this.route(resolved);
+    const result = await this.service(route.kind).action({ ...input, tabId: route.nativeTabId });
+    const mapped = this.mapSnapshotResult(route.kind, result);
+    if (input.action === "close") {
+      if (this.activeTabId === resolved) this.activeTabId = undefined;
+    } else {
+      this.activeTabId = mapped.snapshot.tabId;
+    }
+    return mapped;
+  }
+
+  async screenshot(input: { tabId?: number; fullPage?: boolean; clip?: { x: number; y: number; width: number; height: number }; jobId?: string }) {
+    const route = this.route(this.resolveControlledTab(input.tabId));
+    return await this.service(route.kind).screenshot({ ...input, tabId: route.nativeTabId });
+  }
+
+  async viewport(input: { tabId?: number; width?: number; height?: number }) {
+    const route = this.route(this.resolveControlledTab(input.tabId));
+    return this.mapSnapshotResult(route.kind, await this.service(route.kind).viewport({ ...input, tabId: route.nativeTabId }));
+  }
+
+  async dialog(input: { tabId?: number; action: "get" | "accept" | "dismiss"; text?: string }) {
+    const route = this.route(this.resolveControlledTab(input.tabId));
+    return await this.service(route.kind).dialog({ ...input, tabId: route.nativeTabId });
+  }
+
+  async recording(input: { action: "start" | "stop" | "status"; tabId?: number; jobId?: string }) {
+    const route = this.route(this.resolveControlledTab(input.tabId));
+    return await this.service(route.kind).recording({ ...input, tabId: route.nativeTabId });
+  }
+
+  async upload(input: { tabId?: number; ref?: string; locator?: string; files: string[]; timeoutMs?: number }) {
+    const resolved = this.resolveControlledTab(input.tabId);
+    const route = this.route(resolved);
+    const result = await this.service(route.kind).upload({ ...input, tabId: route.nativeTabId });
+    return { ...result, snapshot: this.mapSnapshotResult(route.kind, { snapshot: result.snapshot }).snapshot };
+  }
+
+  async download(input: BrowserDownloadInput) {
+    let kind: UnifiedTargetKind;
+    let params = input;
+    if (input.action === "wait" || input.action === "cancel") {
+      const route = this.downloadRoutes.get(input.downloadId ?? -1);
+      if (!route) throw new Error("Unknown download. List downloads or trigger one first.");
+      kind = route.kind;
+      params = { ...input, downloadId: route.nativeId };
+    } else {
+      const route = this.route(this.resolveControlledTab(input.tabId));
+      kind = route.kind;
+      params = { ...input, tabId: route.nativeTabId };
+    }
+    const result = await this.service(kind).download(params);
+    const downloads = result.downloads;
+    return downloads
+      ? { downloads: downloads.map((download) => this.mapDownload(kind, download)) }
+      : { download: result.download ? this.mapDownload(kind, result.download) : null };
+  }
+
+  private mapDownload(kind: UnifiedTargetKind, download: BrowserDownload) {
+    const key = `${kind}:${download.id}`;
+    let id = this.downloadIds.get(key);
+    if (id === undefined) {
+      id = this.downloadIds.size + 1;
+      this.downloadIds.set(key, id);
+      this.downloadRoutes.set(id, { kind, nativeId: download.id });
+    }
+    return { ...download, id, ...(download.tabId !== undefined ? { tabId: this.globalTabId(kind, download.tabId) } : {}) };
+  }
+
+  async evaluate(tabId: number | undefined, expression: string, awaitPromise = true) {
+    const resolved = this.resolveControlledTab(tabId);
+    const route = this.route(resolved);
+    const result = await this.service(route.kind).evaluate(route.nativeTabId, expression, awaitPromise);
+    return { ...result, tabId: resolved };
+  }
+
+  async observeVoiceAudio(tabId: number, conversationUrl: string) {
+    // Voice support reports Chrome's native tab ID directly, outside the unified MCP target namespace.
+    return await this.chrome.observeVoiceAudio(tabId, conversationUrl);
+  }
+
+  private service(kind: UnifiedTargetKind) {
+    return kind === "electron" ? this.electron : this.chrome;
+  }
+
+  private resolveControlledTab(tabId?: number) {
+    if (tabId !== undefined) return tabId;
+    if (this.activeTabId !== undefined) return this.activeTabId;
+    throw new Error("No sticky control target is selected. List targets and claim one, or open a Chrome tab first.");
+  }
+
+  private route(tabId: number) {
+    const route = this.routes.get(tabId);
+    if (!route) throw new Error(`Unknown browser/app target ${tabId}. List targets again before controlling it.`);
+    return route;
+  }
+
+  private mapTab(kind: UnifiedTargetKind, tab: BrowserTab): BrowserTab {
+    const nativeTabId = tab.id;
+    const id = this.globalTabId(kind, nativeTabId);
+    const openerTabId = tab.openerTabId !== undefined ? this.globalTabId(kind, tab.openerTabId) : undefined;
+    const processId = kind === "electron" ? tab.processId : undefined;
+    return {
+      ...tab,
+      id,
+      nativeTabId: tab.rendererId ?? nativeTabId,
+      targetKind: kind,
+      targetId: kind === "electron"
+        ? `electron:${processId ?? "unknown"}:${tab.rendererId ?? nativeTabId}`
+        : `chrome:${nativeTabId}`,
+      ...(openerTabId !== undefined ? { openerTabId } : {}),
+      ...(tab.parentTabId !== undefined ? { parentTabId: this.globalTabId(kind, tab.parentTabId) } : {}),
+    };
+  }
+
+  private mapSnapshotResult(kind: UnifiedTargetKind, result: BrowserSnapshotResult): BrowserSnapshotResult {
+    const tabId = this.globalTabId(kind, result.snapshot.tabId);
+    return {
+      ...result,
+      snapshot: {
+        ...result.snapshot,
+        tabId,
+        relatedTabs: result.snapshot.relatedTabs.map((tab) => this.mapTab(kind, tab)),
+      },
+    };
+  }
+
+  private globalTabId(kind: UnifiedTargetKind, nativeTabId: number) {
+    const key = `${kind}:${nativeTabId}`;
+    const existing = this.reverseRoutes.get(key);
+    if (existing !== undefined) return existing;
+    while (this.routes.has(this.nextTabId)) this.nextTabId += 1;
+    const id = this.nextTabId++;
+    this.reverseRoutes.set(key, id);
+    this.routes.set(id, { kind, nativeTabId });
+    return id;
+  }
+}
+
+export async function createUnifiedBrowserService(input: {
+  dataDirectory: string;
+  port: number;
+  electronPort: number;
+  host?: string;
+  launchBrowser?: () => Promise<void>;
+  descriptorPath?: string;
+}) {
+  const host = input.host ?? "127.0.0.1";
+  const chrome = await BrowserService.create({
+    dataDirectory: input.dataDirectory,
+    host,
+    port: input.port,
+    launchBrowser: input.launchBrowser,
+  });
+  let electron: BrowserService | undefined;
+  try {
+    electron = await BrowserService.create({
+      dataDirectory: path.join(input.dataDirectory, "electron"),
+      host,
+      port: input.electronPort,
+      kind: "electron",
+      launchBrowser: async () => undefined,
+      prepareExtension: false,
+    });
+    const token = await loadOrCreateBridgeToken(path.join(input.dataDirectory, "electron"));
+    const descriptorPath = input.descriptorPath ?? path.join(homedir(), ".win-codex", "electron-browser-bridge.json");
+    const descriptorDirectory = path.dirname(descriptorPath);
+    await mkdir(descriptorDirectory, { recursive: true });
+    await writeFile(
+      descriptorPath,
+      `${JSON.stringify({ bridgeUrl: `ws://${host}:${input.electronPort}`, token }, null, 2)}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+    return new UnifiedBrowserService(chrome, electron, descriptorPath);
+  } catch (error) {
+    await Promise.all([chrome.close(), electron?.close()]);
+    throw error;
   }
 }
 

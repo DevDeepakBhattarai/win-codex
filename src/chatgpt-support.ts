@@ -147,6 +147,7 @@ const supportCommandSchema = z.union([
     message: z.string(),
     connectorName: z.string().min(1).optional(),
     temporary: z.boolean().optional(),
+    taskJobId: z.uuid().optional(),
   }),
   z.object({
     id: z.string(),
@@ -297,7 +298,7 @@ export class SupportCommandBus {
         throw new Error("Recovery command does not belong to this browser and conversation.");
       }
     }
-    if (this.pauseInFlight || this.automationPausedUntil() || this.registry?.isVoiceConversation(conversationUrl) || this.voiceConfigurations.has(threadId) ||
+    if (this.isThreadPaused(threadId) || this.pauseInFlight || this.automationPausedUntil() || this.registry?.isVoiceConversation(conversationUrl) || this.voiceConfigurations.has(threadId) ||
         this.recoveryReservation(threadId) || this.hasPendingMessage(conversationUrl, commandId)) {
       throw new Error("Recovery conflicts with Voice, a pending message, or another browser's recovery.");
     }
@@ -354,6 +355,48 @@ export class SupportCommandBus {
     return until;
   }
 
+  isThreadPaused(threadId: string) {
+    return this.registry?.isPaused(threadId) === true || this.jobs?.isPausedNow(threadId) === true;
+  }
+
+  cancelThreadAutomation(threadId: string) {
+    this.recoveryReservations.delete(threadId);
+    for (const pending of this.pending.values()) {
+      const command = pending.command;
+      const url = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
+      if (command.feature === "voice" || command.kind === "stop_thread" || command.kind === "close_thread") continue;
+      let pendingThreadId: string;
+      try { pendingThreadId = parseConversationUrl(url).threadId; } catch { continue; }
+      if (pendingThreadId !== threadId) continue;
+      this.removePending(command.id);
+      pending.reject(new Error("Thread automation was paused or cancelled."));
+    }
+  }
+
+  setTaskPaused(jobId: string, paused: boolean) {
+    for (const pending of this.pending.values()) {
+      if (!("taskJobId" in pending.command) || pending.command.taskJobId !== jobId || pending.claimedBy) continue;
+      clearTimeout(pending.timeout);
+      if (!paused) {
+        pending.deadline = Date.now() + pending.timeoutMs;
+        pending.timeout = setTimeout(() => {
+          this.removePending(pending.command.id);
+          pending.reject(new Error("Task startup command timed out."));
+        }, pending.timeoutMs);
+        pending.timeout.unref();
+      }
+    }
+    if (!paused) this.dispatchQueuedCommandsToWaiters();
+  }
+
+  cancelTaskStartup(jobId: string) {
+    for (const pending of this.pending.values()) {
+      if (!("taskJobId" in pending.command) || pending.command.taskJobId !== jobId || pending.claimedBy) continue;
+      this.removePending(pending.command.id);
+      pending.reject(new Error("Task startup was cancelled."));
+    }
+  }
+
   cancelThreadChecks(threadId: string, ralphOnly = false) {
     for (const pending of this.pending.values()) {
       const command = pending.command;
@@ -393,6 +436,7 @@ export class SupportCommandBus {
         (this.voiceConfigurations.has(targetThreadId) || (command.kind === "send_message" && this.recoveryReservation(targetThreadId)))) {
       throw new Error("The conversation has Voice configuration or recovery in progress. The command was not sent. Retry after it finishes.");
     }
+    if (targetThreadId && command.feature !== "voice" && command.kind !== "stop_thread" && command.kind !== "close_thread" && this.isThreadPaused(targetThreadId)) throw new Error("Thread automation is paused.");
     if (command.feature === "ralph" && targetThreadId && this.jobs?.blocksContinuationNow(targetThreadId)) {
       throw new Error("RALPH is paused for this task handoff.");
     }
@@ -412,6 +456,7 @@ export class SupportCommandBus {
           (command.kind === "send_message" && this.recoveryReservation(targetThreadId)))) {
       throw new Error("The conversation has Voice configuration or recovery in progress. The command was not sent. Retry after it finishes.");
     }
+    if (targetThreadId && command.feature !== "voice" && command.kind !== "stop_thread" && command.kind !== "close_thread" && this.isThreadPaused(targetThreadId)) throw new Error("Thread automation is paused.");
     return new Promise<SupportCommandResult>((resolve, reject) => {
       const pending: PendingCommand = {
         command: fullCommand,
@@ -427,6 +472,7 @@ export class SupportCommandBus {
       };
       pending.timeout.unref();
       this.pending.set(fullCommand.id, pending);
+      if ("taskJobId" in fullCommand && fullCommand.taskJobId && this.jobs?.isTaskPausedNow(fullCommand.taskJobId)) clearTimeout(pending.timeout);
 
       const waiter = [...this.waiters].find((candidate) =>
         this.browserCanClaim(candidate.browserId, fullCommand) && this.canClaim(fullCommand));
@@ -719,8 +765,12 @@ export class SupportCommandBus {
 
   private canClaim(command: SupportCommand) {
     if (command.feature === "voice") return true;
+    if ("taskJobId" in command && command.taskJobId && this.jobs?.isTaskPausedNow(command.taskJobId)) return false;
     const target = "conversationUrl" in command ? command.conversationUrl : command.targetUrl;
     if (this.registry?.isVoiceConversation(target)) return false;
+    let threadId: string | undefined;
+    try { threadId = parseConversationUrl(target).threadId; } catch { /* New chats have no saved thread yet. */ }
+    if (threadId && command.kind !== "stop_thread" && command.kind !== "close_thread" && this.isThreadPaused(threadId)) return false;
     if (this.automationPausedUntil()) return false;
     if (command.kind !== "send_message") return true;
     if (this.messageCooldownUntil()) return false;
@@ -764,6 +814,7 @@ const ralphThreadSchema = z.object({
   registeredAt: z.string(),
   nextCheckAt: z.number(),
   state: z.enum(["active", "complete"]),
+  paused: z.boolean().optional(),
   activity: z.enum(["running", "idle", "blocked"]).optional(),
   activityAt: z.string().optional(),
   attentionAt: z.string().optional(),
@@ -940,6 +991,21 @@ export class RalphRegistry {
     catch { return undefined; }
     await this.queue;
     return this.state.threads.find((thread) => thread.threadId === threadId)?.externalRevision;
+  }
+
+  isPaused(threadId: string) {
+    return this.state.threads.some(thread => thread.threadId === threadId && thread.paused === true);
+  }
+
+  async setPaused(threadId: string, paused: boolean) {
+    return this.update(state => {
+      const thread = state.threads.find(entry => entry.threadId === threadId);
+      if (!thread) return false;
+      thread.paused = paused;
+      thread.checkRevision = randomUUID();
+      if (!paused) thread.nextCheckAt = Date.now() + state.loopIntervalMs;
+      return true;
+    });
   }
 
   async remove(threadId: string) {
@@ -1119,26 +1185,27 @@ export class RalphRegistry {
   async due(now = Date.now()) {
     await this.queue;
     return this.state.threads
-      .filter((entry) => entry.state === "active" && !entry.settledAt && !entry.observedOnly && !entry.parentThreadId && entry.nextCheckAt <= now)
+      .filter((entry) => entry.state === "active" && !entry.paused && !entry.settledAt && !entry.observedOnly && !entry.parentThreadId && entry.nextCheckAt <= now)
       .map((entry) => ({ ...entry }));
   }
 
   async isActive(threadId: string) {
     await this.queue;
-    return this.state.threads.some(thread => thread.threadId === threadId && thread.state === "active" && !thread.settledAt);
+    return this.state.threads.some(thread => thread.threadId === threadId && thread.state === "active" && !thread.paused && !thread.settledAt);
   }
 
   async isCheckCurrent(threadId: string, expected?: { checkRevision?: string }) {
     await this.queue;
-    return this.state.threads.some(thread => thread.threadId === threadId && thread.state === "active" &&
+    return this.state.threads.some(thread => thread.threadId === threadId && thread.state === "active" && !thread.paused &&
       !thread.settledAt && !thread.observedOnly && (expected === undefined || thread.checkRevision === expected.checkRevision));
   }
 
-  async scheduleNow(threadId: string): Promise<"scheduled" | "complete" | "missing"> {
+  async scheduleNow(threadId: string): Promise<"scheduled" | "complete" | "paused" | "missing"> {
     return this.update((state) => {
       const thread = state.threads.find((entry) => entry.threadId === threadId);
       if (!thread) return "missing";
       if (thread.state === "complete") return "complete";
+      if (thread.paused) return "paused";
       thread.observedOnly = undefined;
       thread.settledAt = undefined;
       thread.nextCheckAt = Date.now();
@@ -1787,6 +1854,7 @@ export function supportCommandClaimHandler(commands: SupportCommandBus, extensio
         res.setHeader("X-Voice-Conversation-Url", commands.voiceConversationUrl() ?? "");
         if (parsed.data.recoveryConversationUrl) {
           res.setHeader("X-Recovery-Message-Pending", String(commands.hasPendingMessage(parsed.data.recoveryConversationUrl)));
+          res.setHeader("X-Thread-Automation-Paused", String(commands.isThreadPaused(parseConversationUrl(parsed.data.recoveryConversationUrl).threadId)));
         }
         res.status(204).end();
         return;
@@ -1812,6 +1880,7 @@ export function ralphRegistrationHandler(
   registry: RalphRegistry,
   extensionToken: string,
   commands?: SupportCommandBus,
+  jobs?: SubagentJobRegistry,
 ): RequestHandler {
   const bodySchema = z.object({
     conversationUrl: z.string().max(2048),
@@ -1823,6 +1892,7 @@ export function ralphRegistrationHandler(
     title: z.string().max(300).optional(),
     removed: z.boolean().optional(),
     settled: z.boolean().optional(),
+    paused: z.boolean().optional(),
     activity: z.enum(["running", "idle", "blocked"]).optional(),
   }).strict();
   return async (req, res) => {
@@ -1833,6 +1903,22 @@ export function ralphRegistrationHandler(
       return;
     }
     try {
+      if (parsed.data.paused !== undefined) {
+        const { threadId } = parseConversationUrl(parsed.data.conversationUrl);
+        if (parsed.data.paused && !(await registry.threads()).some(thread => thread.threadId === threadId)) {
+          await registry.register(parsed.data.conversationUrl, { manual: true, checkForCompletion: false });
+        }
+        await registry.setPaused(threadId, parsed.data.paused);
+        for (const job of await jobs?.all() ?? []) {
+          if (job.childThreadId === threadId && job.state === "pending") {
+            await jobs?.setPaused(job.jobId, parsed.data.paused);
+            commands?.setTaskPaused(job.jobId, parsed.data.paused);
+          }
+        }
+        if (parsed.data.paused) commands?.cancelThreadAutomation(threadId);
+        res.json({ status: parsed.data.paused ? "paused" : "resumed" });
+        return;
+      }
       if (parsed.data.settled) {
         const { threadId } = parseConversationUrl(parsed.data.conversationUrl);
         const settled = await registry.settle(threadId);
@@ -1841,8 +1927,12 @@ export function ralphRegistrationHandler(
       }
       if (parsed.data.removed) {
         const { threadId } = parseConversationUrl(parsed.data.conversationUrl);
-        await registry.remove(threadId);
+        for (const job of await jobs?.all() ?? []) {
+          if (job.childThreadId === threadId && job.state === "pending") await jobs?.cancel(job.jobId);
+        }
         commands?.cancelThreadChecks(threadId);
+        commands?.cancelThreadAutomation(threadId);
+        await registry.remove(threadId);
         res.json({ status: "removed" });
         return;
       }
@@ -1896,25 +1986,34 @@ export function taskActionHandler(
 ): RequestHandler {
   return async (req, res) => {
     if (!authenticateSupportExtension(req, res, extensionToken)) return;
-    const input = z.object({ action: z.literal("cancel"), confirmedStopped: z.boolean().optional() }).strict().safeParse(req.body);
+    const input = z.object({ action: z.enum(["cancel", "pause", "resume"]), confirmedStopped: z.boolean().optional() }).strict().safeParse(req.body);
     const id = z.string().uuid().safeParse(req.params.jobId);
     if (!input.success || !id.success) { res.status(400).json({ error: "Invalid task action." }); return; }
     try {
       const job = await jobs.job(id.data);
       if (!job) { res.status(404).json({ error: "Task not found." }); return; }
-      if (job.state === "pending") {
-        if (job.childConversationUrl) {
-          await commands.ensureBrowser("threadMessaging", launchBrowser);
-          const stopped = await commands.execute({ feature: "threadMessaging", kind: "stop_thread", targetUrl: job.childConversationUrl });
-          if (!stopped.ok) throw new Error(stopped.error);
-          if (stopped.kind !== "stop_thread") throw new Error("Unexpected worker stop result.");
-        } else if (!job.preparationError || input.data.confirmedStopped !== true) {
-          throw new Error("Startup is unresolved. Inspect the automation browser and confirm any untracked worker has stopped before cancelling.");
-        }
-        if (job.childThreadId) await registry.recordComplete(job.childThreadId);
+      if (job.state !== "pending") {
+        if (input.data.action !== "cancel" || job.state !== "cancelled") throw new Error("Only pending tasks can be changed.");
+      } else if (input.data.action === "cancel") {
+        // Cancellation is durable even when the worker tab or browser is gone.
         await jobs.cancel(job.jobId);
+        commands.cancelTaskStartup(job.jobId);
+        if (job.childThreadId) {
+          commands.cancelThreadAutomation(job.childThreadId);
+          await registry.recordComplete(job.childThreadId);
+        }
+        if (job.childConversationUrl && commands.hasBrowser("threadMessaging")) {
+          void commands.execute({ feature: "threadMessaging", kind: "stop_thread", targetUrl: job.childConversationUrl },
+            30_000, { allowBrowserLaunch: false }).catch(() => undefined);
+        }
       } else {
-        throw new Error("Only pending tasks can be cancelled.");
+        const paused = input.data.action === "pause";
+        await jobs.setPaused(job.jobId, paused);
+        commands.setTaskPaused(job.jobId, paused);
+        if (job.childThreadId) {
+          await registry.setPaused(job.childThreadId, paused);
+          if (paused) commands.cancelThreadAutomation(job.childThreadId);
+        }
       }
       res.setHeader("Cache-Control", "no-store");
       res.json({ status: "accepted" });
@@ -1975,8 +2074,8 @@ export function ralphThreadCheckHandler(
       res.status(404).json({ error: "RALPH thread not found." });
       return;
     }
-    if (result === "complete") {
-      res.status(409).json({ error: "Mark this RALPH thread active before checking it again." });
+    if (result === "complete" || result === "paused") {
+      res.status(409).json({ error: "Resume this thread or mark it active before checking it again." });
       return;
     }
     await controller.tick();
@@ -2247,11 +2346,13 @@ type AgentServices = {
 export async function startSubagentJob(job: SubagentJob, message: string,
   { commands, registry, jobs, preparer, launchBrowser }: AgentServices & { preparer: ThreadPreparationCoordinator }) {
   let deliveryUncertain = false;
+  let createdConversationUrl: string | undefined;
   try {
     await commands.ensureBrowser("threadMessaging", launchBrowser);
+    if ((await jobs.job(job.jobId))?.state !== "pending") throw new Error("Task startup was cancelled.");
     deliveryUncertain = true;
     const result = await commands.execute({
-      feature: "threadMessaging", kind: "send_message", targetUrl: "https://chatgpt.com/", temporary: true,
+      feature: "threadMessaging", kind: "send_message", targetUrl: "https://chatgpt.com/", temporary: true, taskJobId: job.jobId,
       message: agentPrompt(message, job.jobId, job.resultPath),
       connectorName: process.env.CHATGPT_WORKER_CONNECTOR_NAME ?? "Codex",
     });
@@ -2261,10 +2362,19 @@ export async function startSubagentJob(job: SubagentJob, message: string,
     }
     if (result.kind !== "send_message") throw new Error("Sub-agent creation received the wrong support command result.");
     const child = parseConversationUrl(result.result.conversationUrl);
+    createdConversationUrl = child.conversationUrl;
     await jobs.assignChild(job.jobId, { ...child, title: result.result.title });
     await registry.register(child.conversationUrl, { agentCreated: true, parentThreadId: job.parentThreadId, title: result.result.title });
+    const current = await jobs.job(job.jobId);
+    if (current?.state === "cancelled") throw new Error("Task startup was cancelled.");
+    if (current?.state === "complete") await registry.recordComplete(child.threadId);
+    if (current?.paused && current.state === "pending") await registry.setPaused(child.threadId, true);
     preparer.markPrepared(child.conversationUrl);
   } catch (error) {
+    if (createdConversationUrl && (await jobs.job(job.jobId))?.state === "cancelled") {
+      await registry.remove(parseConversationUrl(createdConversationUrl).threadId);
+      await commands.execute({ feature: "threadMessaging", kind: "stop_thread", targetUrl: createdConversationUrl }, 30_000, { allowBrowserLaunch: false }).catch(() => undefined);
+    }
     await jobs.recordPreparationFailure(job.jobId, error instanceof Error ? error.message : String(error), deliveryUncertain);
     throw error;
   }
@@ -2398,7 +2508,7 @@ export class SubagentResultController {
       }
       await this.jobs.collectReport(job.jobId).catch((error: unknown) => console.error("[tasks] Report read failed:", error));
       if ((await this.jobs.job(job.jobId))?.state !== "pending") continue;
-      if (job.preparationError || !job.childConversationUrl || this.commands.automationPausedUntil() || this.commands.messageCooldownUntil()) continue;
+      if (job.paused || (job.childThreadId && this.commands.isThreadPaused(job.childThreadId)) || job.preparationError || !job.childConversationUrl || this.commands.automationPausedUntil() || this.commands.messageCooldownUntil()) continue;
       if (this.inFlight.has(job.jobId) || (this.inspectionAfter.get(job.jobId) ?? Date.parse(job.createdAt) + intervalMs) > now) continue;
       this.inFlight.add(job.jobId);
       void this.inspectUnreportedWorker(job.jobId, job.childConversationUrl).catch((error: unknown) => {
@@ -2422,7 +2532,7 @@ export class SubagentResultController {
     if (inspection.result.status !== "idle") return;
     await this.jobs.collectReport(jobId);
     const current = await this.jobs.job(jobId);
-    if (current?.state !== "pending") return;
+    if (current?.state !== "pending" || current.paused || (current.childThreadId && this.commands.isThreadPaused(current.childThreadId))) return;
     const resumed = await this.commands.execute({
       feature: "threadMessaging", kind: "send_message", targetUrl: conversationUrl,
       message: `Resume your existing assignment from its current state. Do not repeat completed checks. If work remains, continue it. If you are finished or blocked, publish your complete report, including observed failures and blockers. Write it to ${JSON.stringify(current.resultPath + ".tmp")}, then rename it to ${JSON.stringify(current.resultPath)}. The report file is the completion signal.`,

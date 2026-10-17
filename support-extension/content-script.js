@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.20.2";
+  const contentScriptVersion = "1.20.3";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -120,6 +120,15 @@
   };
 
   window.addEventListener("message", messageHandler);
+
+  document.addEventListener?.("click", (event) => {
+    if (!event.isTrusted || globalThis[handlerKey]?.version !== contentScriptVersion) return;
+    const stop = event.target?.closest?.('button[data-testid="stop-button"], button[aria-label="Stop"]');
+    const url = conversationUrl();
+    if (stop && url) void Promise.resolve(extensionApi.runtime.sendMessage({
+      type: "local-codex-support/pause-thread-v1", conversationUrl: url,
+    })).catch(() => undefined);
+  }, true);
 
   installTitleObserver();
   installRalphComposerObserver();

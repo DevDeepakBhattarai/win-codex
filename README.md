@@ -39,8 +39,8 @@ The core MCP server always exposes these tools:
 
 When `BROWSER_BRIDGE_ENABLED` is not `false`, the server also exposes:
 
-- `browser_tabs` lists tabs in the user's real Chrome profile.
-- `browser_claim` takes control of one existing user tab after checking its tab ID, title, and URL.
+- `browser_tabs` lists Chrome tabs and dev-mode Electron renderers through the same interface.
+- `browser_claim` selects and controls one listed target after checking its tab ID, title, and URL.
 - `browser_release` ends control. It closes an agent-created tab and leaves a claimed user tab open.
 - `browser_open` opens and controls a new tab or an explicitly requested window in Chrome. It starts Chrome when needed and reuses a running browser.
 - `browser_snapshot` returns visible text, fresh element references, accessibility information, diagnostics, and an optional screenshot.
@@ -50,6 +50,18 @@ When `BROWSER_BRIDGE_ENABLED` is not `false`, the server also exposes:
 - `browser_evaluate` evaluates JavaScript through CDP for development and debugging cases where structured actions are not enough.
 
 A normal browser workflow is `browser_open`, or `browser_tabs` followed by `browser_claim`, then `browser_snapshot` and actions, and finally `browser_release`.
+
+### Control an Electron app
+
+Start this server, then run `pnpm --filter desktop dev:agent` in the ALLWEONE checkout. Regular desktop development does not connect the automation bridge. Packaged builds refuse the bridge even when an automation flag is set. Electron connects outward to an authenticated loopback WebSocket. No debugging port opens in the app.
+
+Use the existing `browser_*` tools for both apps. List with `browser_tabs`, choose `targetKind=electron` for desktop work or `targetKind=chrome` for web work, then call `browser_claim` with the entry's `id`, title, and URL. Each Electron entry has `processId`, `rendererId`, `windowId`, `appName`, and a `targetId` such as `electron:1234:1`. Multiple Electron processes may use the same renderer ID without sharing a control target.
+
+The selected target stays selected across calls in the same authenticated ChatGPT session. Omit `tabId` on subsequent inspection, input, screenshot, viewport, dialog, upload, or evaluation calls. Listing targets and changing OS focus do not change selection. When a renderer disconnects, its old target rejects commands. List and claim it again after restarting the app. To follow external OAuth, explicitly claim the Chrome tab, then explicitly select the Electron target when returning.
+
+The server writes the Electron connection descriptor to `~/.win-codex/electron-browser-bridge.json`. The app accepts an override through `LOCAL_CODEX_ELECTRON_BRIDGE_DESCRIPTOR`. `ELECTRON_BRIDGE_PORT` defaults to `BROWSER_BRIDGE_PORT + 2` and must differ from the HTTP, Chrome, and thread-sync ports. The Electron token is separate from the Chrome extension token.
+
+Run `pnpm electron-test` with `ELECTRON_CONTROL_APP_DIR` set to the absolute ALLWEONE `apps/desktop` directory to test the real adapter against isolated Electron processes. Run `pnpm browser-test` for the Chrome integration suite.
 
 ### ChatGPT thread tools
 

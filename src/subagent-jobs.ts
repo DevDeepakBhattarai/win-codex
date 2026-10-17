@@ -32,6 +32,7 @@ const subagentJobSchema = z.object({
   specPath: z.string().optional(),
   state: z.enum(["pending", "complete", "cancelled"]),
   cancelledAt: z.string().optional(),
+  paused: z.boolean().optional(),
   createdAt: z.string(),
   completedAt: z.string().optional(),
   preparationError: z.string().optional(),
@@ -162,6 +163,7 @@ export class SubagentJobRegistry {
     return await this.update((state) => {
       const job = state.jobs.find((entry) => entry.jobId === jobId);
       if (!job) throw new Error("Task job not found.");
+      if (job.state === "cancelled") throw new Error("The task was cancelled before worker creation completed.");
       job.childThreadId = child.threadId;
       job.childConversationUrl = child.conversationUrl;
       if (child.title) job.title = child.title;
@@ -181,6 +183,23 @@ export class SubagentJobRegistry {
     });
   }
 
+  async setPaused(jobId: string, paused: boolean) {
+    return this.update(state => {
+      const job = state.jobs.find(entry => entry.jobId === jobId);
+      if (!job || job.state !== "pending") throw new Error("Only pending tasks can be paused or resumed.");
+      job.paused = paused;
+      return { ...job };
+    });
+  }
+
+  isPausedNow(threadId: string) {
+    return this.state.jobs.some(job => job.childThreadId === threadId && (job.state !== "pending" || job.paused));
+  }
+
+  isTaskPausedNow(jobId: string) {
+    return this.state.jobs.some(job => job.jobId === jobId && job.paused === true);
+  }
+
   async isWorker(threadId: string) {
     await this.queue;
     return this.state.jobs.some((job) => job.childThreadId === threadId);
@@ -198,7 +217,7 @@ export class SubagentJobRegistry {
 
   blocksContinuationNow(threadId: string) {
     return this.state.jobs.some((job) =>
-      (job.childThreadId === threadId && job.state !== "pending") ||
+      (job.childThreadId === threadId && (job.state !== "pending" || job.paused)) ||
       (job.parentThreadId === threadId && job.state === "pending"));
   }
 
@@ -207,6 +226,7 @@ export class SubagentJobRegistry {
     const operation = this.queue.then(async () => {
       const current = this.state.jobs.find((entry) => entry.jobId === jobId);
       if (!current) throw new Error("Task job not found.");
+      if (current.paused) throw new Error("This task is paused. Resume it before collecting its report.");
       if (current.state === "cancelled") throw new Error("This task was cancelled. End this assignment.");
       if (current.state === "complete") return { job: { ...current }, newlyCompleted: false };
 
@@ -249,7 +269,7 @@ export class SubagentJobRegistry {
 
   async collectReport(jobId: string) {
     const job = await this.job(jobId);
-    if (!job || job.state !== "pending") return;
+    if (!job || job.state !== "pending" || job.paused) return;
     let result: string;
     try {
       result = await readFile(job.resultPath, "utf8");

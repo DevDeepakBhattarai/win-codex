@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 import cors from "cors";
 import express, {
@@ -49,7 +50,7 @@ import {
   terminalSignalTarget,
 } from "./terminal.js";
 import {
-  createBrowserService,
+  createUnifiedBrowserService,
   type BrowserActionInput,
   type BrowserDownloadInput,
 } from "./browser.js";
@@ -137,6 +138,12 @@ const RALPH_OPENAI_AUDIT_LOG_PATH = path.resolve(DATA_DIR, "ralph-openai.log");
 const BROWSER_BRIDGE_PORT = boundedIntegerEnv(
   "BROWSER_BRIDGE_PORT",
   PORT + 1,
+  1,
+  65535,
+);
+const ELECTRON_BRIDGE_PORT = boundedIntegerEnv(
+  "ELECTRON_BRIDGE_PORT",
+  BROWSER_BRIDGE_PORT + 2,
   1,
   65535,
 );
@@ -757,6 +764,7 @@ app.post("/oauth/revoke", revokeRateLimit, async (req, res) => {
   return res.status(200).send("");
 });
 
+const controlSessionContext = new AsyncLocalStorage<string | undefined>();
 const mcpHandler = createMcpHandler(({ authInfo }) => {
   const grantId = authInfo?.extra?.grantId;
   if (typeof grantId !== "string") throw new Error("Verified OAuth grant required.");
@@ -767,7 +775,7 @@ const handleMcpRequest = toNodeHandler(mcpHandler);
 app.post("/mcp", requireOAuth, async (req: AuthedRequest, res: Response) => {
   const client = z.object({ id: z.union([z.string(), z.number(), z.null()]).optional(), params: z.object({
     clientInfo: z.object({ name: z.string() }).optional(),
-    _meta: z.object({ "io.modelcontextprotocol/clientInfo": z.object({ name: z.string() }).optional() }).optional(),
+    _meta: z.object({ "io.modelcontextprotocol/clientInfo": z.object({ name: z.string() }).optional(), "openai/session": z.string().min(1).max(2048).optional() }).optional(),
   }).optional() }).safeParse(req.body);
   const name = client.success ? client.data.params?._meta?.["io.modelcontextprotocol/clientInfo"]?.name
     ?? client.data.params?.clientInfo?.name : undefined;
@@ -776,7 +784,8 @@ app.post("/mcp", requireOAuth, async (req: AuthedRequest, res: Response) => {
       error: { code: -32000, message: "This computer connector is for ChatGPT. Codex delegates through the local CLI or /agents API." } });
     return;
   }
-  await handleMcpRequest(req, res, req.body);
+  const session = client.success ? client.data.params?._meta?.["openai/session"] : undefined;
+  await controlSessionContext.run(session, () => handleMcpRequest(req, res, req.body));
 });
 
 app.get("/mcp", requireOAuth, (_req: AuthedRequest, res: Response) => {
@@ -1618,14 +1627,16 @@ function detectSupportedImageMimeType(buffer: Buffer) {
 }
 
 function createMcpServer(ownerId: string) {
+  const controls = browserService?.forSession(JSON.stringify([ownerId, controlSessionContext.getStore() ?? "default"]));
   const instructions = [
     ...(threadSync ? [
       THREAD_SYNC_AGENT_INSTRUCTION,
       SUBAGENT_AGENT_INSTRUCTION,
     ] : []),
     ...(BROWSER_BRIDGE_ENABLED ? [
-      "Start each tab exactly once. Call browser_open for a new tab; it returns an already-controlled tabId. To use an existing user tab, call browser_tabs, then browser_claim with that tab's exact tabId, title, and URL. Never claim a tab returned by browser_open or a tab whose controlled field is already true.",
-      "Keep the returned tabId and pass it to later browser calls. Use browser_snapshot before interacting and use fresh element refs.",
+      "Use one browser control surface for both Chrome and Electron. browser_tabs lists available targets with targetKind, targetId, nativeTabId, and Electron processId/appName when applicable. If the task says desktop/Electron, choose targetKind=electron; if it says website/Chrome/browser, choose targetKind=chrome. Do not switch kinds unless the workflow itself crosses applications (for example Electron opening OAuth in Chrome).",
+      "Start each target exactly once. Call browser_open only for a new Chrome tab; it returns an already-controlled tabId. To use an existing Chrome or Electron target, call browser_tabs, then browser_claim with that target's exact tabId, title, and URL. Never claim a target returned by browser_open or one whose controlled field is already true.",
+      "Target selection is sticky after browser_open or browser_claim, so tabId may be omitted on later snapshot/action/evaluate calls. Prefer passing the tabId explicitly when working across multiple targets. Use browser_snapshot before interacting and use fresh element refs.",
       "For each tab you opened or claimed, browser_release is the last browser call for that tab. It closes tabs created by browser_open and removes control from claimed user tabs without closing them. Do not release a tab that this task did not open or claim, and do not use a tab after releasing it.",
     ] : []),
   ];
@@ -1874,43 +1885,43 @@ function createMcpServer(ownerId: string) {
     },
   );
 
-  if (browserService) {
+  if (controls) {
     server.registerTool("browser_screenshot", {
       title: "Save Browser Screenshot", description: "Capture and save a PNG image. Returns the actual image and a local path. Supports full-page or cropped screenshots. Pass jobId to include it in the API job's screenshots.",
-      inputSchema: { tabId: z.number().int().nonnegative(), fullPage: z.boolean().default(false), jobId: z.string().uuid().optional(),
+      inputSchema: { tabId: z.number().int().nonnegative().optional(), fullPage: z.boolean().default(false), jobId: z.string().uuid().optional(),
         clip: z.object({ x: z.number().nonnegative(), y: z.number().nonnegative(), width: z.number().positive(), height: z.number().positive() }).optional() },
     }, async (input) => {
       if (input.jobId && !(await subagentJobs?.job(input.jobId))) throw new Error("Sub-agent job not found.");
-      const result = await browserService.screenshot(input);
+      const result = await controls.screenshot(input);
       return { content: [{ type: "text", text: result.path }, { type: "image", mimeType: "image/png", data: result.data }], structuredContent: { path: result.path } };
     });
     server.registerTool("browser_viewport", {
       title: "Set Browser Viewport", description: "Set width and height in CSS pixels for responsive testing. Omit both to reset the viewport.",
-      inputSchema: { tabId: z.number().int().nonnegative(), width: z.number().int().min(100).max(3840).optional(), height: z.number().int().min(100).max(3840).optional() },
-    }, async (input) => browserSnapshotToolResponse(await browserService.viewport(input)));
+      inputSchema: { tabId: z.number().int().nonnegative().optional(), width: z.number().int().min(100).max(3840).optional(), height: z.number().int().min(100).max(3840).optional() },
+    }, async (input) => browserSnapshotToolResponse(await controls.viewport(input)));
     server.registerTool("browser_dialog", {
       title: "Handle Browser Dialog", description: "Inspect, accept, or dismiss a JavaScript alert, confirm, prompt, or beforeunload dialog. For prompts, pass text when accepting.",
-      inputSchema: { tabId: z.number().int().nonnegative(), action: z.enum(["get", "accept", "dismiss"]), text: z.string().optional() },
+      inputSchema: { tabId: z.number().int().nonnegative().optional(), action: z.enum(["get", "accept", "dismiss"]), text: z.string().optional() },
     }, async (input) => {
-      const structuredContent = await browserService.dialog(input);
+      const structuredContent = await controls.dialog(input);
       return { content: textContentFromStructuredContent(structuredContent), structuredContent };
     });
     server.registerTool("browser_recording", {
       title: "Record Browser Video",
       description: "Start, stop, or inspect a video recording of a controlled test tab. Start before testing and stop before submitting a report. Returns a local WebM path. Requires FFmpeg. Recordings have no audio and stop after 30 minutes. Pass the sub-agent jobId to attach the video to its API result.",
-      inputSchema: { action: z.enum(["start", "stop", "status"]), tabId: z.number().int().nonnegative(), jobId: z.string().uuid().optional() },
+      inputSchema: { action: z.enum(["start", "stop", "status"]), tabId: z.number().int().nonnegative().optional(), jobId: z.string().uuid().optional() },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     }, async (input) => {
       if (input.jobId && !(await subagentJobs?.job(input.jobId))) throw new Error("Sub-agent job not found.");
-      const structuredContent = await browserService.recording(input);
+      const structuredContent = await controls.recording(input);
       return { content: textContentFromStructuredContent(structuredContent), structuredContent };
     });
     server.registerTool(
       "browser_tabs",
       {
-        title: "List Chrome Tabs",
+        title: "List Browser/App Targets",
         description:
-          "List tabs in the user's real Chrome profile before claiming an existing tab. Claim only a tab with ownership=user and controlled=false. Pass its exact tabId, title, and URL to browser_claim. The claim fails if the tab changes after listing.",
+          "List controllable Chrome tabs and Electron renderer targets. Electron targets are available when an Electron app runs with agent control enabled. Use targetKind/processId/appName to choose the intended application, then claim only a target with ownership=user and controlled=false. Pass its exact tabId, title, and URL to browser_claim.",
         inputSchema: {},
         annotations: {
           readOnlyHint: false,
@@ -1919,7 +1930,7 @@ function createMcpServer(ownerId: string) {
         },
       },
       async () => {
-        const structuredContent = { tabs: await browserService.listTabs() };
+        const structuredContent = { tabs: await controls.listTabs() };
         return {
           content: textContentFromStructuredContent(structuredContent),
           structuredContent,
@@ -1930,11 +1941,11 @@ function createMcpServer(ownerId: string) {
     server.registerTool(
       "browser_claim",
       {
-        title: "Claim Existing Chrome Tab",
+        title: "Claim Existing Browser/App Target",
         description:
-          "Take control of one existing user tab. This must be the first control operation for that tab. Pass the exact tabId, title, and URL from the latest browser_tabs result. Do not call this for tabs created by browser_open or tabs whose controlled field is already true.",
+          "Take control of one existing Chrome or Electron target. This must be the first control operation for that target. Pass the exact tabId, title, and URL from the latest browser_tabs result. Selection becomes sticky for later calls that omit tabId.",
         inputSchema: {
-          tabId: z.number().int().nonnegative().describe("Exact Chrome tab ID from browser_tabs."),
+          tabId: z.number().int().nonnegative().describe("Exact Chrome/Electron target ID from browser_tabs."),
           title: z.string().describe("Exact title from browser_tabs."),
           url: z.string().describe("Exact URL from browser_tabs."),
         },
@@ -1945,7 +1956,7 @@ function createMcpServer(ownerId: string) {
         },
       },
       async (input) => {
-        const structuredContent = await browserService.claimTab(input);
+        const structuredContent = await controls.claimTab(input);
         return {
           content: textContentFromStructuredContent(structuredContent),
           structuredContent,
@@ -1956,11 +1967,11 @@ function createMcpServer(ownerId: string) {
     server.registerTool(
       "browser_release",
       {
-        title: "Release Chrome Tab",
+        title: "Release Browser/App Target",
         description:
           "End control of one tab. This must be the last browser operation for that tab. It closes a tab created by browser_open. It removes control from an existing user tab claimed with browser_claim without closing that tab. Release only tabs the current task opened or claimed.",
         inputSchema: {
-          tabId: z.number().int().nonnegative().describe("Exact Chrome tab ID returned when control began."),
+          tabId: z.number().int().nonnegative().describe("Exact target ID returned when control began."),
         },
         annotations: {
           readOnlyHint: false,
@@ -1969,7 +1980,7 @@ function createMcpServer(ownerId: string) {
         },
       },
       async ({ tabId }) => {
-        const structuredContent = await browserService.releaseTab(tabId);
+        const structuredContent = await controls.releaseTab(tabId);
         return {
           content: textContentFromStructuredContent(structuredContent),
           structuredContent,
@@ -1994,17 +2005,17 @@ function createMcpServer(ownerId: string) {
           openWorldHint: true,
         },
       },
-      async ({ url, active, newWindow }) => browserSnapshotToolResponse(await browserService.open({ url, active, newWindow })),
+      async ({ url, active, newWindow }) => browserSnapshotToolResponse(await controls.open({ url, active, newWindow })),
     );
 
     server.registerTool(
       "browser_snapshot",
       {
-        title: "Inspect Chrome Page",
+        title: "Inspect Browser/App Target",
         description:
-          "Inspect a controlled Chrome tab before interacting, starting Chrome if disconnected. tabId is optional and defaults to the active tab. Returns visible text, fresh element refs, accessibility tree, diagnostics, recent actions, and by default a PNG screenshot. Refs are valid only for the latest snapshot and become stale after page changes.",
+          "Inspect the sticky controlled Chrome or Electron target before interacting. tabId is optional after browser_open/browser_claim. Returns visible text, fresh element refs, accessibility tree, diagnostics, recent actions, and by default a PNG screenshot. Refs are valid only for the latest snapshot and become stale after page changes.",
         inputSchema: {
-          tabId: z.number().int().nonnegative().optional().describe("Chrome tab ID. Omit to inspect the active tab in the last-focused window."),
+          tabId: z.number().int().nonnegative().optional().describe("Controlled target ID. Omit to use the sticky target selected by browser_open/browser_claim."),
           includeScreenshot: z.boolean().default(true).describe("Attach a viewport PNG screenshot to the MCP result."),
         },
         annotations: {
@@ -2014,17 +2025,17 @@ function createMcpServer(ownerId: string) {
         },
       },
       async ({ tabId, includeScreenshot }) =>
-        browserSnapshotToolResponse(await browserService.snapshot(tabId, includeScreenshot)),
+        browserSnapshotToolResponse(await controls.snapshot(tabId, includeScreenshot)),
     );
 
     server.registerTool(
       "browser_action",
       {
-        title: "Act In Chrome",
+        title: "Act In Browser/App",
         description:
-          "Perform one action in a controlled Chrome tab and return a fresh snapshot. Pass the tabId returned by browser_open or browser_claim. Existing user tabs must be claimed first. Prefer fresh element refs from browser_snapshot over selectors or coordinates. Use close only when you intentionally need to close a tab immediately; browser_release is the normal final operation.",
+          "Perform one action in the sticky controlled Chrome or Electron target and return a fresh snapshot. Existing targets must be claimed first. Prefer fresh element refs from browser_snapshot over selectors or coordinates. Use close only when intentionally closing the target; browser_release is the normal final operation.",
         inputSchema: {
-          tabId: z.number().int().nonnegative().optional().describe("Chrome tab ID. Omit to use the active tab in the last-focused window."),
+          tabId: z.number().int().nonnegative().optional().describe("Controlled target ID. Omit to use the sticky target."),
           action: z.enum(["navigate", "back", "forward", "reload", "click", "dblclick", "type", "press", "scroll", "wait", "activate", "close", "hover", "drag", "select", "check"])
             .describe("Action to perform. Prefer browser_release over close when finishing normal browser work."),
           url: z.string().optional().describe("Destination for navigate."),
@@ -2055,7 +2066,7 @@ function createMcpServer(ownerId: string) {
       },
       async (input) =>
         browserSnapshotToolResponse(
-          await browserService.action(input as BrowserActionInput),
+          await controls.action(input as BrowserActionInput),
         ),
     );
 
@@ -2064,7 +2075,7 @@ function createMcpServer(ownerId: string) {
       {
         title: "Upload Files In Chrome",
         description:
-          "Upload absolute local file paths through a file input or intercepted chooser. Starts Chrome if disconnected. The target tab must be controlled; omit tabId for the active tab. Use a fresh ref from browser_snapshot when possible.",
+          "Upload absolute local file paths through a file input or intercepted chooser in Chrome or Electron. The target must be controlled. Omit tabId for the sticky target. Use a fresh ref from browser_snapshot when possible.",
         inputSchema: {
           tabId: z.number().int().nonnegative().optional(),
           ref: z.string().optional(),
@@ -2079,7 +2090,7 @@ function createMcpServer(ownerId: string) {
         },
       },
       async (input) => {
-        const structuredContent = await browserService.upload(input);
+        const structuredContent = await controls.upload(input);
         return {
           content: textContentFromStructuredContent(structuredContent),
           structuredContent,
@@ -2090,9 +2101,9 @@ function createMcpServer(ownerId: string) {
     server.registerTool(
       "browser_download",
       {
-        title: "Manage Chrome Downloads",
+        title: "Manage Browser/App Downloads",
         description:
-          "List downloads from controlled tabs, trigger one with a fresh ref or selector, wait for a known download, or cancel it. Starts Chrome if disconnected. Trigger uses the active tab when tabId is omitted and arms its listener before clicking. Downloads are shared across tasks.",
+          "List downloads from controlled tabs, trigger one with a fresh ref or selector, wait for a known download, or cancel it in Chrome or Electron. Trigger uses the sticky target when tabId is omitted and arms its listener before clicking. Downloads are shared across tasks.",
         inputSchema: {
           action: z.enum(["list", "trigger", "wait", "cancel"]),
           tabId: z.number().int().nonnegative().optional(),
@@ -2109,7 +2120,7 @@ function createMcpServer(ownerId: string) {
         },
       },
       async (input) => {
-        const structuredContent = await browserService.download(input as BrowserDownloadInput);
+        const structuredContent = await controls.download(input as BrowserDownloadInput);
         return {
           content: textContentFromStructuredContent(structuredContent),
           structuredContent,
@@ -2120,11 +2131,11 @@ function createMcpServer(ownerId: string) {
     server.registerTool(
       "browser_evaluate",
       {
-        title: "Evaluate JavaScript In Chrome",
+        title: "Evaluate JavaScript In Browser/App",
         description:
-          "Evaluate JavaScript in a controlled Chrome tab through CDP Runtime.evaluate, starting Chrome if disconnected. Omit tabId for the active tab. Prefer browser_snapshot and browser_action for normal interaction; use this for development/debugging when structured actions are insufficient.",
+          "Evaluate JavaScript in a controlled Chrome or Electron target through CDP Runtime.evaluate. Omit tabId to use the sticky target. Prefer browser_snapshot and browser_action for normal interaction; use this for development/debugging when structured actions are insufficient.",
         inputSchema: {
-          tabId: z.number().int().nonnegative().optional().describe("Chrome tab ID. Omit to use the active tab."),
+          tabId: z.number().int().nonnegative().optional().describe("Controlled target ID. Omit to use the sticky target."),
           expression: z.string().min(1).max(100000).describe("JavaScript expression to evaluate in the page."),
           awaitPromise: z.boolean().default(true).describe("Await a returned Promise before returning the result."),
         },
@@ -2135,7 +2146,7 @@ function createMcpServer(ownerId: string) {
         },
       },
       async ({ tabId, expression, awaitPromise }) => {
-        const structuredContent = await browserService.evaluate(tabId, expression, awaitPromise);
+        const structuredContent = await controls.evaluate(tabId, expression, awaitPromise);
         return {
           content: textContentFromStructuredContent(structuredContent),
           structuredContent,
@@ -2773,9 +2784,14 @@ validateConfiguration();
 if (
   THREAD_SYNC_ENABLED &&
   (THREAD_SYNC_PORT === PORT ||
-    (BROWSER_BRIDGE_ENABLED && THREAD_SYNC_PORT === BROWSER_BRIDGE_PORT))
+    (BROWSER_BRIDGE_ENABLED &&
+      (THREAD_SYNC_PORT === BROWSER_BRIDGE_PORT ||
+        THREAD_SYNC_PORT === ELECTRON_BRIDGE_PORT)))
 ) {
-  throw new Error("THREAD_SYNC_PORT must differ from PORT and BROWSER_BRIDGE_PORT.");
+  throw new Error("THREAD_SYNC_PORT must differ from PORT, BROWSER_BRIDGE_PORT, and ELECTRON_BRIDGE_PORT.");
+}
+if (BROWSER_BRIDGE_ENABLED && (ELECTRON_BRIDGE_PORT === BROWSER_BRIDGE_PORT || ELECTRON_BRIDGE_PORT === PORT)) {
+  throw new Error("ELECTRON_BRIDGE_PORT must differ from PORT and BROWSER_BRIDGE_PORT.");
 }
 await initializeAuthStore();
 
@@ -2822,9 +2838,11 @@ const threadTabCleanupController = supportCommands && ralphRegistry
   : undefined;
 
 const browserService = BROWSER_BRIDGE_ENABLED
-  ? await createBrowserService({
+  ? await createUnifiedBrowserService({
       dataDirectory: DATA_DIR,
       port: BROWSER_BRIDGE_PORT,
+      electronPort: ELECTRON_BRIDGE_PORT,
+      descriptorPath: process.env.LOCAL_CODEX_ELECTRON_BRIDGE_DESCRIPTOR,
     })
   : undefined;
 
@@ -2850,7 +2868,7 @@ const threadSyncHttpServer = threadSync
         ));
       if (ralphRegistry) {
         syncApp.post("/chatgpt-support/ralph/register", createRateLimiter("ralph-register", 60_000, 240),
-          ralphRegistrationHandler(ralphRegistry, threadSync.extensionToken, supportCommands));
+          ralphRegistrationHandler(ralphRegistry, threadSync.extensionToken, supportCommands, subagentJobs));
         syncApp.get("/chatgpt-support/ralph/projects",
           ralphProjectsGetHandler(ralphRegistry, threadSync.extensionToken));
         syncApp.put("/chatgpt-support/ralph/projects",
@@ -2918,6 +2936,8 @@ const httpServer = app.listen(PORT, HOST, () => {
     const browserStatus = browserService.status();
     console.log(`Browser bridge: ${browserStatus.bridgeUrl}`);
     console.log(`Browser extension: ${browserStatus.extensionDirectory}`);
+    console.log(`Electron bridge: ${browserStatus.electronBridgeUrl}`);
+    console.log(`Electron bridge descriptor: ${browserStatus.descriptorPath}`);
   } else {
     console.log("Browser bridge: disabled");
   }

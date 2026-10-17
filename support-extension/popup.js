@@ -180,6 +180,7 @@ async function openConversation(conversation) {
 }
 function threadState(thread) {
   if (thread.state === "complete") return "complete";
+  if (thread.paused) return "paused";
   if (thread.waitingForTask) return "waiting for task";
   if (thread.activity === "running") return "running";
   if (thread.activity === "blocked") return "needs attention";
@@ -234,7 +235,7 @@ function renderThread(thread) {
     meta.append(metaEntry("Checked", formatRelative(Date.parse(thread.lastCheckedAt))));
   }
   if (thread.parentThreadId) meta.append(metaEntry("Parent", thread.parentThreadId.slice(0, 8)));
-  if (thread.state === "active" && !thread.waitingForTask && !thread.observedOnly && thread.activity !== "idle") meta.append(metaEntry("Next check", formatRelative(thread.nextCheckAt)));
+  if (thread.state === "active" && !thread.paused && !thread.waitingForTask && !thread.observedOnly && thread.activity !== "idle") meta.append(metaEntry("Next check", formatRelative(thread.nextCheckAt)));
 
   link.title = thread.conversationUrl;
   link.append(head, meta);
@@ -247,13 +248,17 @@ function renderThread(thread) {
   }
 
   card.append(link);
-  if (thread.state === "complete" || thread.waitingForTask || !continuationEnabled) {
+  if (thread.state === "complete") {
     item.append(card);
     return item;
   }
   const actions = document.createElement("div");
   actions.className = "thread-actions";
-  if (thread.state === "active" && !thread.waitingForTask) {
+  const pauseButton = Object.assign(document.createElement("button"), { className: "button button-outline button-sm", type: "button", textContent: thread.paused ? "Resume" : "Pause" });
+  pauseButton.title = thread.paused ? "Resume automatic checks and follow-up messages" : "Pause all automatic checks and follow-up messages";
+  pauseButton.addEventListener("click", () => void pauseThread(thread, pauseButton));
+  actions.append(pauseButton);
+  if (continuationEnabled && thread.state === "active" && !thread.paused && !thread.waitingForTask) {
     const checkButton = document.createElement("button");
     checkButton.className = "button button-sm";
     checkButton.type = "button";
@@ -272,6 +277,17 @@ function renderThread(thread) {
 
   item.append(card);
   return item;
+}
+
+async function pauseThread(thread, button) {
+  button.disabled = true;
+  try {
+    await callServer(ralphRegisterEndpoint, { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ conversationUrl: thread.conversationUrl, paused: !thread.paused }) });
+    await loadThreads();
+  } catch (error) {
+    setNote(element("threadsStatus"), errorMessage(error, "Could not change thread pause."), "error");
+  } finally { button.disabled = false; }
 }
 
 function threadStateEndpoint(threadId, state) {
@@ -337,7 +353,7 @@ function renderThreads() {
   const childIds = new Set(loadedTasks.map(job => job.childThreadId));
   const regular = loadedThreads.filter(thread => !thread.parentThreadId && !childIds.has(thread.threadId) && matches(thread));
   const active = regular.filter(thread => thread.state !== "complete");
-  const working = active.filter(thread => thread.activity === "running" || thread.waitingForTask);
+  const working = active.filter(thread => !thread.paused && (thread.activity === "running" || thread.waitingForTask));
   const ready = active.filter(thread => !working.includes(thread));
   const settled = regular.filter(thread => thread.state === "complete");
   renderThreadList(element("threadList"), ready);
@@ -360,7 +376,7 @@ function renderThreads() {
 function renderTask(job) {
   const item = document.createElement("li");
   const card = Object.assign(document.createElement("div"), { className: "thread" });
-  const [label, state] = job.preparationError ? ["Needs attention", "needs attention"]
+  const [label, state] = job.paused ? ["Paused", "paused"] : job.preparationError ? ["Needs attention", "needs attention"]
     : job.state === "cancelled" ? ["Cancelled", "complete"]
     : job.state === "complete" ? ["Report available", "finished"] : ["Task in progress", "running"];
   const title = document.createElement(job.childConversationUrl ? "a" : "strong");
@@ -396,6 +412,9 @@ function renderTask(job) {
     actions.append(reviewUrl);
   }
   if (job.state === "pending") {
+    const pause = Object.assign(document.createElement("button"), { className: "button button-outline button-sm", type: "button", textContent: job.paused ? "Resume task" : "Pause task" });
+    pause.addEventListener("click", () => void changeReview(job, job.paused ? "resume" : "pause", pause));
+    actions.append(pause);
     const action = "cancel";
     const button = Object.assign(document.createElement("button"), { className: "button button-outline button-sm button-danger", type: "button", textContent: "Cancel task" });
     button.addEventListener("click", () => void changeReview(job, action, button));
@@ -408,13 +427,13 @@ function renderTask(job) {
 
 async function changeReview(job, action, button) {
   if (action === "cancel" && !globalThis.confirm(job.childConversationUrl
-    ? "Stop this worker and cancel its task?"
+    ? "Cancel this task and stop its automatic follow-up messages?"
     : "Inspect the automation browser first. Confirm that any worker created by this startup has stopped, then cancel the saved job?")) return;
   button.disabled = true;
   try {
     const endpoint = new URL(ralphThreadsEndpoint.href);
     endpoint.pathname = `/chatgpt-support/tasks/${encodeURIComponent(job.jobId)}`;
-    await callServer(endpoint, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, confirmedStopped: action === "cancel" }) }, 9 * 60_000);
+    await callServer(endpoint, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, confirmedStopped: action === "cancel" }) }, 10_000);
     await loadThreads();
   } catch (error) {
     setNote(element("threadsStatus"), errorMessage(error, "Task action failed."), "error");
