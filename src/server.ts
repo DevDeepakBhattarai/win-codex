@@ -2850,7 +2850,7 @@ const threadSyncHttpServer = threadSync
         ));
       if (ralphRegistry) {
         syncApp.post("/chatgpt-support/ralph/register", createRateLimiter("ralph-register", 60_000, 240),
-          ralphRegistrationHandler(ralphRegistry, threadSync.extensionToken, supportCommands));
+          ralphRegistrationHandler(ralphRegistry, threadSync.extensionToken, supportCommands, subagentJobs));
         syncApp.get("/chatgpt-support/ralph/projects",
           ralphProjectsGetHandler(ralphRegistry, threadSync.extensionToken));
         syncApp.put("/chatgpt-support/ralph/projects",

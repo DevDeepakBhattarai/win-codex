@@ -210,5 +210,5 @@ try {
 	server.closeAllConnections();
 	await new Promise(resolve => server.close(resolve));
 	assert.equal(path.dirname(directory), os.tmpdir());
-	await rm(directory, { recursive: true, force: true });
+	await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }

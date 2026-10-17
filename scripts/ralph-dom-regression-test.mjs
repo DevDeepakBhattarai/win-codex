@@ -182,6 +182,20 @@ try {
 		await page.close();
 	}
 	console.log(`RALPH DOM regression case ${process.argv[2] ?? "all"} passed.`);
+  const stopPage = await browser.newPage();
+  await stopPage.route("https://chatgpt.com/**", route => route.fulfill({ contentType: "text/html", body: '<div data-composer-body><div contenteditable="true" data-composer-markdown></div><button data-testid="stop-button" aria-label="Stop"><span>Stop</span></button></div>' }));
+  await stopPage.goto("https://chatgpt.com/c/11111111-1111-4111-8111-111111111111");
+  await stopPage.evaluate(() => {
+    globalThis.messages = [];
+    globalThis.chrome = { runtime: { sendMessage: async message => { globalThis.messages.push(message); return { ok: true }; }, onMessage: { addListener() {} } } };
+  });
+  await stopPage.addScriptTag({ content: source });
+  await stopPage.evaluate(() => document.querySelector('[aria-label="Stop"]').click());
+  assert.equal(await stopPage.evaluate(() => globalThis.messages.filter(message => message.type === "local-codex-support/pause-thread-v1").length), 0, "automation Stop must not pause the user's thread");
+  await stopPage.getByRole("button", { name: "Stop", exact: true }).click();
+  await stopPage.waitForFunction(() => globalThis.messages.some(message => message.type === "local-codex-support/pause-thread-v1"));
+  assert.equal(await stopPage.evaluate(() => globalThis.messages.find(message => message.type === "local-codex-support/pause-thread-v1").conversationUrl), "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111");
+  await stopPage.close();
 } finally {
 	await browser.close();
 }
