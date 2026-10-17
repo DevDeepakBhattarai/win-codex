@@ -779,6 +779,7 @@ export class BrowserService {
           const point = typeof input.x === "number" && typeof input.y === "number" ? { x: input.x, y: input.y }
             : await this.waitForClickPoint(tabId, this.resolveLocator(tabId, input)!, timeoutMs);
           await this.sendCdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...point, modifiers: keyboardModifiers(input.modifiers ?? []) });
+          await this.bridge.request("overlay.move", { tabId, ...point }).catch(() => undefined);
           this.recordAction(tabId, "hover");
           break;
         }
@@ -786,10 +787,13 @@ export class BrowserService {
           const points = input.path;
           if (!points || points.length < 2) throw new Error("drag requires a path with at least two points.");
           const modifiers = keyboardModifiers(input.modifiers ?? []);
+          await this.bridge.request("overlay.move", { tabId, ...points[0] }).catch(() => undefined);
           await this.sendCdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...points[0], modifiers });
           await this.sendCdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...points[0], button: "left", buttons: 1, clickCount: 1, modifiers });
+          await this.bridge.request("overlay.click", { tabId }).catch(() => undefined);
           try {
             for (const point of points.slice(1)) {
+              await this.bridge.request("overlay.move", { tabId, ...point }).catch(() => undefined);
               await this.sendCdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...point, button: "left", buttons: 1, modifiers });
               await sleep(30);
             }
@@ -2145,6 +2149,7 @@ async function prepareBrowserExtension(dataDirectory: string, bridgeUrl: string,
   await Promise.all([
     copyFile(path.join(sourceDirectory, "manifest.json"), path.join(extensionDirectory, "manifest.json")),
     copyFile(path.join(sourceDirectory, "service-worker.js"), path.join(extensionDirectory, "service-worker.js")),
+    copyFile(path.join(sourceDirectory, "control-overlay.js"), path.join(extensionDirectory, "control-overlay.js")),
     copyFile(path.join(sourceDirectory, "content-script.js"), path.join(extensionDirectory, "content-script.js")),
     copyFile(path.join(sourceDirectory, "cursor.svg"), path.join(extensionDirectory, "cursor.svg")),
     copyFile(path.join(sourceDirectory, "empty.svg"), path.join(extensionDirectory, "empty.svg")),

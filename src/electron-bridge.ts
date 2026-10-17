@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { timingSafeEqual } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import type { BrowserTab, BrowserDownload, BridgeEvent } from "./browser.js";
@@ -85,6 +86,13 @@ export class ElectronBridge {
     const route = this.routes.get(Number(params.tabId));
     if (!route || !this.clients.has(route.client)) {
       throw new Error("The selected Electron renderer is unavailable. List targets and claim a live renderer. The target was not switched.");
+    }
+    if (method === "overlay.show") {
+      const [source, cursor] = await Promise.all([
+        readFile(new URL("../browser-extension/control-overlay.js", import.meta.url), "utf8"),
+        readFile(new URL("../browser-extension/cursor.svg", import.meta.url), "base64"),
+      ]);
+      params = { ...params, source, cursorUrl: `data:image/svg+xml;base64,${cursor}` };
     }
     const result = await this.send(route.client, method, { ...params, tabId: route.rendererId }, timeoutMs);
     return (method.startsWith("tabs.") && method !== "tabs.close"

@@ -45,6 +45,7 @@ async function launch(name, { enabled = true, packaged = false } = {}) {
   const adapterUrl = pathToFileURL(path.join(temporaryRoot, "adapter", "control.mjs")).href;
   await writeFile(fixture, `
     import { app, BrowserWindow } from 'electron';
+    import { writeFile } from 'node:fs/promises';
     import { startElectronControlBridge } from ${JSON.stringify(adapterUrl)};
     app.setName(${JSON.stringify(name)});
     app.setPath('userData', ${JSON.stringify(path.join(temporaryRoot, name))});
@@ -63,7 +64,12 @@ async function launch(name, { enabled = true, packaged = false } = {}) {
       <div style="height:2000px">Scroll test</div><p>End</p>
     `)}));
     const stop = await startElectronControlBridge({ getMainWindow: () => window });
-    app.on('before-quit', stop);
+    const overlayState = setInterval(async () => {
+      if (window.isDestroyed()) return;
+      const visible = await window.webContents.executeJavaScript("!!document.querySelector('#__local-codex-control-overlay')").catch(() => null);
+      await writeFile(${JSON.stringify(path.join(temporaryRoot, name + '-overlay.json'))}, JSON.stringify(visible));
+    }, 100);
+    app.on('before-quit', () => { clearInterval(overlayState); stop(); });
     app.on('window-all-closed', () => app.quit());
     if (!${enabled} || ${packaged}) { setTimeout(() => { stop(); app.exit(0); }, 750); }
     });
@@ -134,7 +140,9 @@ try {
   assert.notEqual(a.id, b.id);
   assert.equal(a.targetId, `electron:${first.pid}:${a.rendererId}`);
   assert.equal(a.appName, "Electron first");
+  await until(async () => { try { return JSON.parse(await readFile(path.join(temporaryRoot, "Electron first-overlay.json"), "utf8")); } catch { return null; } }, value => value === false, "unclaimed renderer has no overlay");
   await controls.claimTab({ tabId: a.id, title: a.title, url: a.url });
+  assert.equal((await controls.evaluate(undefined, "!!document.querySelector('#__local-codex-control-overlay')")).value, true, "claim displays the control overlay");
   await assert.rejects(service.forSession("second-chat").snapshot(), /No sticky/);
   assert.equal(service.forSession("first-chat"), controls, "selection persists between stateless requests");
   await controls.action({ action: "click", locator: "#click" });
@@ -151,6 +159,11 @@ try {
   const point = (await controls.evaluate(undefined, "(() => { const r=document.querySelector('#drag').getBoundingClientRect(); return {x:r.x+20,y:r.y+20}; })()")).value;
   await controls.action({ action: "drag", path: [point, { x: point.x + 60, y: point.y }] });
   assert.equal((await controls.evaluate(undefined, "document.querySelector('#drag').textContent")).value, "Dropped");
+  const feedback = (await controls.evaluate(undefined, "(() => { const h=document.querySelector('#__local-codex-control-overlay'); return {x:Number(h.dataset.pointerX), y:Number(h.dataset.pointerY), clicks:Number(h.dataset.clickCount), ignored:h.getAttribute('aria-hidden')}; })()")).value;
+  assert.equal(feedback.x, point.x + 60);
+  assert.equal(feedback.y, point.y);
+  assert.ok(feedback.clicks >= 2, "click and drag produce visual feedback");
+  assert.equal(feedback.ignored, "true");
   const upload = path.join(temporaryRoot, "upload.txt");
   await writeFile(upload, "upload works");
   const uploaded = await controls.upload({ locator: "#file", files: [upload] });
@@ -166,10 +179,17 @@ try {
   assert.ok((await controls.evaluate(undefined, "scrollY")).value > 0);
   const shot = await controls.screenshot({ fullPage: true });
   assert.ok((await readFile(shot.path)).byteLength > 100);
+  if (process.env.ELECTRON_OVERLAY_SCREENSHOT) await writeFile(process.env.ELECTRON_OVERLAY_SCREENSHOT, await readFile(shot.path));
   const snapshot = await controls.snapshot();
   assert.ok(snapshot.screenshotData);
   assert.ok(snapshot.snapshot.accessibilityTree.length > 0);
   assert.equal(snapshot.snapshot.tabId, a.id);
+
+  await controls.action({ action: "reload" });
+  assert.equal((await controls.evaluate(undefined, "!!document.querySelector('#__local-codex-control-overlay')")).value, true, "overlay survives document reload");
+  await controls.releaseTab(a.id);
+  await controls.claimTab({ tabId: a.id, title: a.title, url: a.url });
+  assert.equal((await controls.evaluate(undefined, "!!document.querySelector('#__local-codex-control-overlay')")).value, true, "overlay returns when control resumes");
 
   // Activating another process outside this session must not retarget it.
   const other = service.forSession("second-chat");
@@ -193,8 +213,14 @@ try {
   await assert.rejects(controls.evaluate(undefined, "document.title"), /unavailable|not controlled|closed|disconnected/);
   assert.equal((await other.evaluate(undefined, "document.title")).value, "Electron second");
   await other.releaseTab(otherB.id);
+
   assert.ok((await other.listTabs()).some((tab) => tab.processId === second.pid), "release leaves the app open");
-  console.log("PASS: unified Chrome/Electron routing, real input, screenshots, upload, process collisions, sticky sessions, disconnect rejection, normal and packaged gates");
+  await until(async () => { try { return JSON.parse(await readFile(path.join(temporaryRoot, "Electron second-overlay.json"), "utf8")); } catch { return null; } }, value => value === false, "release removes second overlay");
+  await other.claimTab({ tabId: otherB.id, title: otherB.title, url: otherB.url });
+  await service.close();
+  service = undefined;
+  await until(async () => { try { return JSON.parse(await readFile(path.join(temporaryRoot, "Electron second-overlay.json"), "utf8")); } catch { return null; } }, value => value === false, "disconnect removes the overlay");
+  console.log("PASS: control overlay, pointer feedback, reload restoration, release/disconnect cleanup; unified Chrome/Electron routing, real input, screenshots, upload, process collisions, sticky sessions, disconnect rejection, normal and packaged gates");
 } catch (error) {
   for (const child of children) console.error(child.log());
   throw error;
