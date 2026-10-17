@@ -188,6 +188,7 @@ try {
   await controls.action({ action: "reload" });
   assert.equal((await controls.evaluate(undefined, "!!document.querySelector('#__local-codex-control-overlay')")).value, true, "overlay survives document reload");
   await controls.releaseTab(a.id);
+  await controls.listTabs();
   await controls.claimTab({ tabId: a.id, title: a.title, url: a.url });
   assert.equal((await controls.evaluate(undefined, "!!document.querySelector('#__local-codex-control-overlay')")).value, true, "overlay returns when control resumes");
 
@@ -216,6 +217,7 @@ try {
 
   assert.ok((await other.listTabs()).some((tab) => tab.processId === second.pid), "release leaves the app open");
   await until(async () => { try { return JSON.parse(await readFile(path.join(temporaryRoot, "Electron second-overlay.json"), "utf8")); } catch { return null; } }, value => value === false, "release removes second overlay");
+  await other.listTabs();
   await other.claimTab({ tabId: otherB.id, title: otherB.title, url: otherB.url });
   await service.close();
   service = undefined;
