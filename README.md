@@ -101,7 +101,7 @@ The default access-token lifetime is 600 seconds. Refresh tokens rotate on use. 
 - Node.js 24 or newer is recommended. The repository intentionally has no `.nvmrc` or `engines` major-version pin.
 - pnpm 11.8.0 is the package-manager version declared by `package.json`.
 - PowerShell is required for the included management scripts. On macOS and Linux, use `pwsh` for those scripts.
-- A public HTTPS tunnel such as ngrok or Cloudflare Tunnel is required when ChatGPT needs to reach the local MCP endpoint.
+- A public HTTPS tunnel is required when ChatGPT needs to reach the local MCP endpoint. Cloudflare Tunnel remains supported, and Tailscale Funnel can provide a stable `*.ts.net` URL without owning a domain.
 - Google Chrome is required for the general browser-control bridge.
 
 ### Install dependencies
@@ -163,6 +163,18 @@ The hardening script restricts access to `.env` and `.data`. On Windows it appli
 pnpm build
 pnpm start
 ```
+
+Plain `pnpm start` does not configure or change tunnel state. To have the application configure a public tunnel as it starts, pass a tunnel provider:
+
+```powershell
+# Stable public *.ts.net URL; no owned domain required.
+pnpm start -- --tunnel tailscale
+
+# Existing named Cloudflare tunnel support.
+pnpm start -- --tunnel cloudflare --tunnel-name local
+```
+
+Tailscale mode reads the signed-in device's MagicDNS name, configures Funnel in background mode for `PORT`, overrides `PUBLIC_BASE_URL`, `MCP_PUBLIC_URL`, and `AUTH_ISSUER` only for that server process, and prints the public URL plus the MCP and OAuth endpoints. It does not rewrite `.env`, so an existing Cloudflare configuration remains intact. The first Tailscale Funnel use may require a one-time tailnet approval; if so, the start command prints the exact approval URL and exits instead of hanging. Once approved, rerun the same command. Funnel is configured with Tailscale background mode, so that routing state can persist independently of the Node process; use `tailscale funnel reset` intentionally if you later want to remove Funnel configuration.
 
 For development:
 
@@ -228,13 +240,17 @@ The extension detects visible stream interruptions, recognized response errors, 
 
 ## Windows startup
 
-After building and configuring the server, install the sign-in shortcut:
+After building and configuring the server, install the sign-in shortcut with the tunnel provider you want:
 
 ```powershell
-	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-startup.ps1 -TunnelName local
+# Existing Cloudflare behavior (also the default).
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-startup.ps1 -TunnelProvider cloudflare -TunnelName local
+
+# Tailscale Funnel. The same stable *.ts.net URL is restored after sign-in/restart.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-startup.ps1 -TunnelProvider tailscale
 ```
 
-The shortcut starts a hidden supervisor at user sign-in. It starts Chrome when needed, reuses a healthy MCP server and the configured Cloudflare tunnel, and restarts exited processes. A named mutex prevents duplicate supervisors. Logs live in `.data/runtime`. The tunnel must already have credentials and ingress configuration. ChatGPT and both generated extensions still need their existing signed-in browser profile.
+The shortcut starts a hidden supervisor at user sign-in. It starts Chrome when needed, reuses a healthy MCP server, and starts or restores the selected tunnel. A named mutex prevents duplicate supervisors. Logs live in `.data/runtime`. Cloudflare still requires its existing tunnel credentials and ingress configuration. Tailscale requires the desktop service to be signed in and Funnel to have been enabled once for the device; the installer prints the stable public URL and a one-time approval URL when approval is still required. ChatGPT and both generated extensions still need their existing signed-in browser profile.
 
 ## Connect ChatGPT
 
@@ -292,6 +308,12 @@ Run the OAuth and tool smoke test against a running instance:
 
 ```powershell
 pnpm smoke
+```
+
+Run the tunnel startup regression tests:
+
+```powershell
+pnpm tunnel-test
 ```
 
 Run the security regression suite:
