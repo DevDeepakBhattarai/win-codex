@@ -1,0 +1,35 @@
+name: Desktop tray
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tray:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Windows lifecycle checks
+        if: runner.os == 'Windows'
+        run: pnpm tray:windows-test
+      - name: macOS lifecycle and native app checks
+        if: runner.os == 'macOS'
+        run: |
+          cp .env.example .env
+          pnpm tray:macos-test
