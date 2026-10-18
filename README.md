@@ -238,19 +238,51 @@ The service checks unfinished workers every 3 minutes by default, without classi
 
 The extension detects visible stream interruptions, recognized response errors, and rate-limit notices in each browser. With **Recover interrupted chats** enabled, it stops the affected turn and sends `Continue` in the same tab. It scans open chats every 3 minutes as well as reacting to page changes, so a missed event or failed recovery gets another check. This includes user-opened Helium and Chrome chats. A rate limit waits ten minutes before dismissal and continuation. Recovery preserves temporary chats, protects the dedicated Voice chat, and stops if the tab navigates to another conversation. Error recovery does not start a RALPH loop.
 
-## Windows startup
+## Desktop tray and sign-in startup
 
-After building and configuring the server, install the sign-in shortcut with the tunnel provider you want:
+Build and configure the server, then start the desktop controls:
 
-```powershell
-# Existing Cloudflare behavior (also the default).
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-startup.ps1 -TunnelProvider cloudflare -TunnelName local
-
-# Tailscale Funnel. The same stable *.ts.net URL is restored after sign-in/restart.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-startup.ps1 -TunnelProvider tailscale
+```sh
+	pnpm build
+	pnpm tray
 ```
 
-The shortcut starts a hidden supervisor at user sign-in. It starts Chrome when needed, reuses a healthy MCP server, and starts or restores the selected tunnel. A named mutex prevents duplicate supervisors. Logs live in `.data/runtime`. Cloudflare still requires its existing tunnel credentials and ingress configuration. Tailscale requires the desktop service to be signed in and Funnel to have been enabled once for the device; the installer prints the stable public URL and a one-time approval URL when approval is still required. ChatGPT and both generated extensions still need their existing signed-in browser profile.
+On Windows, right-click the Local Codex icon in the system tray. On macOS, click the logo in the menu bar. Both menus have these controls:
+
+- **Pause everything** stops the local server, Cloudflare tunnel, and supervisor checks.
+- **Resume everything** starts the server and resumes checks. It starts Cloudflare unless you stopped the tunnel separately.
+- **Stop Cloudflare tunnel** disconnects remote access while the local server continues to run. The same item starts the tunnel again.
+- **Quit Local Codex and Cloudflare** stops both processes and closes the tray icon.
+- **Open logs** opens `.data/runtime`.
+
+To start the controls at sign-in, install the startup entry:
+
+```sh
+	pnpm startup:install
+```
+
+The default Cloudflare tunnel name is `local`. To use another name, run `pnpm tray my-tunnel` or `pnpm startup:install my-tunnel`. The tunnel must already have credentials and ingress configuration. ChatGPT and both generated extensions need their existing signed-in browser profile.
+
+To keep an existing Windows Tailscale startup configuration, use the provider-specific installer:
+
+```powershell
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-startup.ps1 -TunnelProvider tailscale
+```
+
+This starts the tray with Tailscale Funnel and disables the Cloudflare-only menu item. Tailscale still requires its desktop service to be signed in and Funnel to have been enabled once. The installer prints the public URL and any required approval URL. Pausing stops the local server. Tailscale's background routing remains configured, as it does with plain server startup.
+
+Windows installs a shortcut in your Startup folder. macOS builds `.data/runtime/Local Codex.app` and installs `~/Library/LaunchAgents/com.local-codex.menubar.plist`. The Mac app requires macOS 12 or newer and Xcode Command Line Tools. Run `xcode-select --install` if those tools are missing. Node.js and `cloudflared` must be on your terminal's `PATH` when you run the installer. The app records their absolute paths. Run the installer again after moving the repository or replacing those executables.
+
+Pause and tunnel settings survive sign-in. Run `pnpm tray` after quitting to reopen the controls, then choose **Resume everything**. Quit does not trigger an immediate restart. Existing ChatGPT responses and browser windows remain open. The supervisor starts Chrome when needed and restarts its exited processes while running. It adopts an existing server after verifying its installation identifier, listening process, and Node executable. It also adopts the configured tunnel after verifying its executable. Pause and quit control adopted processes too. The tray preserves servers from other installations and reports an unchanged error once until recovery. An installation lock prevents duplicate supervisors.
+
+To remove macOS sign-in startup, run these commands:
+
+```sh
+	launchctl bootout "gui/$(id -u)/com.local-codex.menubar"
+	rm "$HOME/Library/LaunchAgents/com.local-codex.menubar.plist"
+```
+
+Run `pnpm tray:windows-test` on Windows or `pnpm tray:macos-test` on a Mac to check server and tunnel adoption, pause and resume, recovery, and isolation from another installation. The macOS check also compiles and validates the native app bundle. GitHub Actions runs both platform checks.
 
 ## Connect ChatGPT
 
