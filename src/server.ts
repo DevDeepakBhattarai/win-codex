@@ -2073,14 +2073,14 @@ function createMcpServer(ownerId: string) {
     server.registerTool(
       "browser_upload",
       {
-        title: "Upload Files In Chrome",
+        title: "Upload Files Or Folders",
         description:
-          "Upload absolute local file paths through a file input or intercepted chooser in Chrome or Electron. The target must be controlled. Omit tabId for the sticky target. Use a fresh ref from browser_snapshot when possible.",
+          "Upload local files or one folder by absolute path through a file input or intercepted chooser in Chrome or Electron. A folder requires an input with webkitdirectory. The chooser is handled automatically; do not open the native file picker first. The target must be controlled. Omit tabId for the sticky target. Use a fresh ref from browser_snapshot when possible.",
         inputSchema: {
           tabId: z.number().int().nonnegative().optional(),
           ref: z.string().optional(),
           locator: z.string().optional().describe("Playwright selector string used when no fresh ref is available."),
-          files: z.array(z.string().min(1)).min(1).max(20).describe("Absolute paths to local files."),
+          files: z.array(z.string().min(1)).min(1).max(20).describe("Absolute paths to local files, or one folder when the page supports folder selection (webkitdirectory)."),
           timeoutMs: z.number().int().min(100).max(30000).default(5000),
         },
         annotations: {

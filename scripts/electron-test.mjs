@@ -57,6 +57,12 @@ async function launch(name, { enabled = true, packaged = false } = {}) {
       <!doctype html><title>${name}</title><h1>${name}</h1>
       <button id="click" onclick="this.textContent='Clicked'">Click me</button>
       <input aria-label="Text" id="text"><input type="file" id="file">
+      <button id="file-button" onclick="document.querySelector('#file').click()">Pick file</button>
+      <input id="multi-file" type="file" multiple hidden>
+      <button id="multi-file-button" onclick="document.querySelector('#multi-file').click()">Pick files</button>
+      <input id="folder-file" type="file" webkitdirectory multiple hidden>
+      <button id="folder-file-button" onclick="document.querySelector('#folder-file').click()">Pick folder</button>
+      <button id="dynamic-file-button" onclick="const f=document.createElement('input');f.type='file';f.id='dynamic-upload';document.body.append(f);f.click()">Pick dynamic</button>
       <a id="download" download="bridge.txt" href="data:text/plain;base64,ZWxlY3Ryb24gZG93bmxvYWQ=">Download</a>
       <input id="check" type="checkbox"><select id="choice"><option value="a">Alpha</option><option value="b">Beta</option></select>
       <button id="hover" onmouseenter="this.textContent='Hovered'">Hover me</button>
@@ -169,6 +175,29 @@ try {
   const uploaded = await controls.upload({ locator: "#file", files: [upload] });
   assert.equal(uploaded.snapshot.tabId, a.id, "nested upload snapshots use the public target ID");
   assert.equal((await controls.evaluate(undefined, "document.querySelector('#file').files[0].name")).value, "upload.txt");
+  await controls.upload({ locator: "#file-button", files: [upload] });
+  assert.equal((await controls.evaluate(undefined, "document.querySelector('#file').files[0].name")).value, "upload.txt");
+  await controls.upload({ locator: "#dynamic-file-button", files: [upload] });
+  assert.equal((await controls.evaluate(undefined, "document.querySelector('#dynamic-upload').files[0].name")).value, "upload.txt");
+  const secondUpload = path.join(temporaryRoot, "second.txt");
+  await writeFile(secondUpload, "second upload");
+  await controls.upload({ locator: "#multi-file-button", files: [upload, secondUpload] });
+  assert.deepEqual((await controls.evaluate(undefined, "[...document.querySelector('#multi-file').files].map(f=>f.name)")).value, ["upload.txt", "second.txt"]);
+  const uploadFolder = path.join(temporaryRoot, "nested-folder");
+  await mkdir(path.join(uploadFolder, "nested"), { recursive: true });
+  await writeFile(path.join(uploadFolder, "root.txt"), "root");
+  await writeFile(path.join(uploadFolder, "nested", "child.txt"), "child");
+  await controls.upload({ locator: "#folder-file", files: [uploadFolder] });
+  let relativeFiles = (await controls.evaluate(undefined, "[...document.querySelector('#folder-file').files].map(f=>f.webkitRelativePath).sort()")).value;
+  assert.deepEqual(relativeFiles, ["nested-folder/nested/child.txt", "nested-folder/root.txt"]);
+  await controls.upload({ locator: "#folder-file-button", files: [uploadFolder] });
+  relativeFiles = (await controls.evaluate(undefined, "[...document.querySelector('#folder-file').files].map(f=>f.webkitRelativePath).sort()")).value;
+  assert.deepEqual(relativeFiles, ["nested-folder/nested/child.txt", "nested-folder/root.txt"]);
+  await assert.rejects(controls.upload({ locator: "#file-button", files: [uploadFolder] }), /folder/i);
+  await assert.rejects(controls.upload({ locator: "#folder-file-button", files: [upload] }), /folder/i);
+  await controls.upload({ locator: "#file-button", files: [upload] });
+  await controls.action({ action: "type", locator: "#text", text: "Chooser closed", clear: true });
+  assert.equal((await controls.evaluate(undefined, "document.querySelector('#text').value")).value, "Chooser closed");
   const downloaded = await controls.download({ action: "trigger", locator: "#download" });
   assert.equal(downloaded.download.state, "complete");
   assert.equal(downloaded.download.tabId, a.id);
