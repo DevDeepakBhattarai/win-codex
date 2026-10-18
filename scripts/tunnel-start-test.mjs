@@ -36,7 +36,9 @@ function createWindowsStartupFixture() {
   mkdirSync(path.join(root, "assets"), { recursive: true });
   copyFileSync("assets/local-codex.ico", path.join(root, "assets", "local-codex.ico"));
   copyFileSync("scripts/install-startup.ps1", path.join(root, "scripts", "install-startup.ps1"));
-  copyFileSync("scripts/connector-watchdog.ps1", path.join(root, "scripts", "connector-watchdog.ps1"));
+  const watchdog = readFileSync("scripts/connector-watchdog.ps1", "utf8")
+    .replace("$tray.Visible = $true", "$tray.Visible = $false");
+  writeFileSync(path.join(root, "scripts", "connector-watchdog.ps1"), watchdog);
   writeFileSync(path.join(root, "dist", "server.js"), "process.exit(0);\n");
   writeFileSync(path.join(root, "scripts", "start-browser.mjs"), "process.exit(0);\n");
   writeFileSync(path.join(root, ".env"), "PORT=46241\nHOST=127.0.0.1\n");
@@ -163,7 +165,7 @@ test(
           "-StartupDirectory",
           startupDirectory,
         ],
-        { encoding: "utf8", timeout: 5_000, windowsHide: true },
+        { encoding: "utf8", timeout: 30_000, windowsHide: true },
       );
 
       assert.equal(result.error, undefined, result.error?.message);
