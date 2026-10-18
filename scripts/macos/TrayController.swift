@@ -22,6 +22,14 @@ enum TrayError: LocalizedError {
     }
 }
 
+private func canonicalPath(_ path: String) throws -> String {
+    guard let resolved = Darwin.realpath(path, nil) else {
+        throw TrayError.message("Cannot resolve path: \(path)")
+    }
+    defer { free(resolved) }
+    return String(cString: resolved)
+}
+
 // All operations run on the app's single service queue.
 final class TrayController {
     let root: URL
@@ -41,9 +49,10 @@ final class TrayController {
 
     init(configuration: TrayConfiguration) throws {
         self.configuration = configuration
-        root = URL(fileURLWithPath: configuration.connectorDirectory).resolvingSymlinksInPath()
+        let directory = try canonicalPath(configuration.connectorDirectory)
+        root = URL(fileURLWithPath: directory)
         runtime = root.appendingPathComponent(".data/runtime")
-        installationID = SHA256.hash(data: Data(root.path.utf8)).map { String(format: "%02x", $0) }.joined()
+        installationID = SHA256.hash(data: Data(directory.utf8)).map { String(format: "%02x", $0) }.joined()
         guard configuration.tunnelName.range(of: "^[a-zA-Z0-9_-]+$", options: .regularExpression) != nil else {
             throw TrayError.message("The tunnel name must be a name or UUID.")
         }
@@ -125,7 +134,7 @@ final class TrayController {
     }
 
     private func executableMatches(_ pid: Int32, _ executable: String) throws -> Bool {
-        let expected = URL(fileURLWithPath: executable).resolvingSymlinksInPath().path
+        let expected = try canonicalPath(executable)
         let files = try output("/usr/sbin/lsof", ["-a", "-p", String(pid), "-d", "txt", "-Fn"])
         return files.components(separatedBy: .newlines).contains("n" + expected)
     }
