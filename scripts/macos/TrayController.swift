@@ -198,9 +198,14 @@ final class TrayController {
             let status = health()
             if status?.ok == true && status?.name == "local-codex" {
                 if !alive(serverPID) {
-                    guard status?.installationId == installationID, let pid = status?.pid, listeners.contains(pid),
-                          try executableMatches(pid, configuration.nodeExecutable) else {
+                    guard status?.installationId == installationID else {
                         throw TrayError.message("Port \(port) belongs to another or older installation. Its server has been left running.")
+                    }
+                    guard let pid = status?.pid, listeners.contains(pid) else {
+                        throw TrayError.message("The health response does not match the listening process on port \(port).")
+                    }
+                    guard try executableMatches(pid, configuration.nodeExecutable) else {
+                        throw TrayError.message("Cannot verify the Node executable for server PID \(pid).")
                     }
                     serverPID = pid
                     log("Adopted existing MCP server PID \(pid).")

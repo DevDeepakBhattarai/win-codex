@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, realpath, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -35,7 +35,13 @@ const config = path.join(temporary, "configuration.json");
 await writeFile(config, JSON.stringify({ connectorDirectory: await realpath(fixture), nodeExecutable: await realpath(process.execPath), cloudflaredExecutable, tunnelName: "tray-test" }));
 const test = path.join(temporary, "tray-tests");
 execFileSync("/usr/bin/xcrun", ["swiftc", "-swift-version", "5", "-O", path.join(root, "scripts/macos/TrayController.swift"), path.join(root, "scripts/macos/TrayControllerTests.swift"), "-o", test], { stdio: "inherit" });
-execFileSync(test, [config, String(port)], { stdio: "inherit", timeout: 120_000 });
+try {
+  execFileSync(test, [config, String(port)], { stdio: "inherit", timeout: 120_000 });
+} catch (error) {
+  console.error(await readFile(path.join(fixture, ".data/runtime/watchdog.log"), "utf8").catch(() => "No supervisor log."));
+  console.error("Fixture installation:", await realpath(fixture));
+  throw error;
+}
 // Exercise app packaging with the same native toolchain and a harmless tunnel executable.
 execFileSync(process.execPath, ["scripts/tray.mjs", "build", "tray-test"], { cwd: root, stdio: "inherit", env: { ...process.env, PATH: `${temporary}:${process.env.PATH}` } });
 execFileSync("/usr/bin/plutil", ["-lint", path.join(root, ".data/runtime/Local Codex.app/Contents/Info.plist")], { stdio: "inherit" });
