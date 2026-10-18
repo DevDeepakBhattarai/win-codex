@@ -13,7 +13,7 @@ $cloudflaredExecutable = ''
 $tailscaleExecutable = ''
 if ($TunnelProvider -eq 'cloudflare') { $cloudflaredExecutable = (Get-Command cloudflared.exe -ErrorAction Stop).Source }
 if ($TunnelProvider -eq 'tailscale') { $tailscaleExecutable = (Get-Command tailscale.exe -ErrorAction Stop).Source }
-foreach ($requiredPath in @($watchdogPath, (Join-Path $connectorRoot 'dist/server.js'), (Join-Path $connectorRoot '.env'))) {
+foreach ($requiredPath in @($watchdogPath, (Join-Path $connectorRoot 'dist/server.js'), (Join-Path $connectorRoot '.env'), (Join-Path $connectorRoot 'assets/local-codex.ico'))) {
     if (!(Test-Path -LiteralPath $requiredPath)) { throw "Required file missing: $requiredPath" }
 }
 if ($TunnelProvider -eq 'cloudflare' -and $TunnelName -notmatch '^[a-zA-Z0-9_-]+$') {
@@ -23,6 +23,7 @@ if ($TunnelProvider -eq 'cloudflare' -and $TunnelName -notmatch '^[a-zA-Z0-9_-]+
 $arguments = @(
     '-NoProfile',
     '-NonInteractive',
+    '-STA',
     '-ExecutionPolicy', 'Bypass',
     '-WindowStyle', 'Hidden',
     '-File', "`"$watchdogPath`"",
@@ -46,6 +47,7 @@ $shortcut.TargetPath = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.
 $shortcut.Arguments = ($arguments -join ' ')
 $shortcut.WorkingDirectory = $connectorRoot
 $shortcut.WindowStyle = 7
+$shortcut.IconLocation = (Join-Path $connectorRoot 'assets/local-codex.ico') + ',0'
 $shortcut.Save()
 Write-Output "Installed Windows sign-in startup: $shortcutPath"
 Write-Output "Tunnel provider: $TunnelProvider"
