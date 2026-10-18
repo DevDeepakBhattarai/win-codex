@@ -216,19 +216,28 @@ test(
     );
 
     try {
-      await new Promise((resolve) => setTimeout(resolve, 2_300));
+      const deadline = Date.now() + 15_000;
+      let attempts = [];
+      while (Date.now() < deadline) {
+        const checks = path.join(root, "status-checks.txt");
+        if (existsSync(checks)) attempts = readFileSync(checks, "utf8").trim().split(/\r?\n/).filter(Boolean);
+        if (attempts.length >= 2 || child.exitCode !== null) break;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
       assert.equal(child.exitCode, null, "watchdog exited instead of retrying");
       const runtime = path.join(root, ".data", "runtime");
       const log = readFileSync(path.join(runtime, "watchdog.log"), "utf8");
       const failures = log.match(/Tailscale Funnel is not enabled/g) ?? [];
-      const attempts = readFileSync(path.join(root, "status-checks.txt"), "utf8").trim().split(/\r?\n/);
       assert.ok(attempts.length >= 2, `expected at least two readiness checks, got ${attempts.length}`);
       assert.equal(failures.length, 1, "unchanged readiness errors are reported once");
       assert.equal(existsSync(path.join(runtime, "browser.stdout.log")), false);
       assert.equal(existsSync(path.join(runtime, "server.stdout.log")), false);
     } finally {
-      child.kill();
-      await new Promise((resolve) => child.once("exit", resolve));
+      if (child.exitCode === null && child.signalCode === null) {
+        const stopped = new Promise(resolve => child.once("exit", resolve));
+        child.kill();
+        await stopped;
+      }
       rmSync(root, { recursive: true, force: true });
     }
   },
