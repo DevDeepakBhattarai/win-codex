@@ -45,7 +45,7 @@ When `BROWSER_BRIDGE_ENABLED` is not `false`, the server also exposes:
 - `browser_open` opens and controls a new tab or an explicitly requested window in Chrome. It starts Chrome when needed and reuses a running browser.
 - `browser_snapshot` returns visible text, fresh element references, accessibility information, diagnostics, and an optional screenshot.
 - `browser_action` navigates, clicks, types, presses keys, scrolls, waits, activates, reloads, or closes a controlled tab.
-- `browser_upload` uploads local files through a file input or intercepted file chooser.
+- `browser_upload` uploads up to 20 local files or one directory (for a `webkitdirectory` input) through an input or attachment button. It intercepts and resolves the chooser in Chrome or development Electron so no native Explorer/Finder dialog must stay open. Pass absolute paths; do not open the native picker separately before calling the tool.
 - `browser_download` triggers, lists, waits for, or cancels browser downloads.
 - `browser_evaluate` evaluates JavaScript through CDP for development and debugging cases where structured actions are not enough.
 

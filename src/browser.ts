@@ -218,7 +218,7 @@ type PendingBridgeRequest = {
 };
 
 type FileChooserEvent = {
-  mode?: "selectSingle" | "selectMultiple";
+  mode?: "selectSingle" | "selectMultiple" | "selectFolder";
   backendNodeId?: number;
 };
 
@@ -862,15 +862,17 @@ export class BrowserService {
     const tabId = await this.resolveTabId(input.tabId);
     this.requireControlled(tabId);
     const selector = this.resolveLocator(tabId, { action: "click", ref: input.ref, locator: input.locator })!;
-    const files = await validateUploadFiles(input.files);
+    const selection = await validateUploadFiles(input.files);
+    const files = selection.files;
 
     return await this.withTabLock(tabId, async () => {
       await this.ensureAttached(tabId);
       const directFileInput = await this.fileInputBackendNodeId(tabId, selector);
       if (directFileInput !== undefined) {
+        validateUploadMode(selection, directFileInput.directory ? "selectFolder" : directFileInput.multiple ? "selectMultiple" : "selectSingle");
         await this.sendCdp(tabId, "DOM.setFileInputFiles", {
           files,
-          backendNodeId: directFileInput,
+          backendNodeId: directFileInput.backendNodeId,
         });
         this.recordAction(tabId, "upload", `${files.length} file(s) via ${selector}`);
         await sleep(100);
@@ -879,18 +881,29 @@ export class BrowserService {
 
       await this.sendCdp(tabId, "Page.setInterceptFileChooserDialog", { enabled: true });
       const waiter = this.createFileChooserWaiter(tabId, timeoutMs);
+      let openedInputNodeId: number | undefined;
+      let submitted = false;
       try {
         await this.click(tabId, { action: "click", locator: selector, force: true }, timeoutMs, 1);
         const chooser = await waiter.promise;
-        if (!chooser.backendNodeId) throw new Error("Chrome did not identify the file input for the chooser.");
-        if (chooser.mode !== "selectMultiple" && files.length > 1) {
-          throw new Error("The browser file chooser accepts only one file.");
-        }
+        openedInputNodeId = chooser.backendNodeId;
+        if (openedInputNodeId === undefined) throw new Error("Chrome did not identify the file input for the chooser.");
+        const chooserInput = await this.describeFileInput(tabId, openedInputNodeId);
+        validateUploadMode(selection, chooserInput.directory ? "selectFolder" : chooser.mode);
         await this.sendCdp(tabId, "DOM.setFileInputFiles", {
           files,
-          backendNodeId: chooser.backendNodeId,
+          backendNodeId: openedInputNodeId,
         });
+        submitted = true;
       } finally {
+        // An intercepted chooser has no native dialog to close. Resolve failed
+        // selections too, so a rejected upload does not strand the chooser.
+        if (openedInputNodeId !== undefined && !submitted) {
+          await this.sendCdp(tabId, "DOM.setFileInputFiles", {
+            files: [],
+            backendNodeId: openedInputNodeId,
+          }).catch(() => undefined);
+        }
         waiter.cancel();
         await this.sendCdp(tabId, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => undefined);
       }
@@ -1161,10 +1174,21 @@ export class BrowserService {
     if (!objectId || response.result?.subtype === "null") return undefined;
     try {
       const described = await this.sendCdp<{ node?: { backendNodeId?: number } }>(tabId, "DOM.describeNode", { objectId });
-      return described.node?.backendNodeId;
+      if (described.node?.backendNodeId === undefined) return undefined;
+      return await this.describeFileInput(tabId, described.node.backendNodeId);
     } finally {
       await this.sendCdp(tabId, "Runtime.releaseObject", { objectId }).catch(() => undefined);
     }
+  }
+
+  private async describeFileInput(tabId: number, backendNodeId: number) {
+    const described = await this.sendCdp<{ node?: { attributes?: string[] } }>(tabId, "DOM.describeNode", { backendNodeId });
+    const attributes = described.node?.attributes ?? [];
+    return {
+      backendNodeId,
+      multiple: attributes.includes("multiple"),
+      directory: attributes.includes("webkitdirectory"),
+    };
   }
 
   private async ensurePlaywrightInjected(tabId: number) {
@@ -1731,7 +1755,7 @@ export class BrowserService {
       clearTimeout(pending.timer);
       this.fileChooserWaiters.delete(tabId);
       pending.resolve({
-        ...(event.params?.mode === "selectSingle" || event.params?.mode === "selectMultiple"
+        ...(event.params?.mode === "selectSingle" || event.params?.mode === "selectMultiple" || event.params?.mode === "selectFolder"
           ? { mode: event.params.mode }
           : {}),
         ...(typeof event.params?.backendNodeId === "number"
@@ -2300,20 +2324,41 @@ function validateNavigationUrl(value: string) {
   }
 }
 
-async function validateUploadFiles(values: string[]) {
-  if (!Array.isArray(values) || values.length === 0) throw new Error("At least one upload file is required.");
-  if (values.length > MAX_UPLOAD_FILES) throw new Error(`At most ${MAX_UPLOAD_FILES} files can be uploaded at once.`);
+type UploadSelection = { files: string[]; directory: boolean };
+
+async function validateUploadFiles(values: string[]): Promise<UploadSelection> {
+  if (!Array.isArray(values) || values.length === 0) throw new Error("At least one upload file or folder is required.");
+  if (values.length > MAX_UPLOAD_FILES) throw new Error(`At most ${MAX_UPLOAD_FILES} paths can be uploaded at once.`);
   const files: string[] = [];
+  let directory = false;
   for (const value of values) {
     if (typeof value !== "string" || !path.isAbsolute(value)) {
       throw new Error(`Browser upload paths must be absolute: ${value}`);
     }
     const resolved = path.resolve(value);
     const metadata = await stat(resolved).catch(() => undefined);
-    if (!metadata?.isFile()) throw new Error(`Browser upload file does not exist or is not a regular file: ${resolved}`);
+    if (!metadata?.isFile() && !metadata?.isDirectory()) {
+      throw new Error(`Browser upload file or folder does not exist: ${resolved}`);
+    }
+    if (metadata.isDirectory()) directory = true;
     files.push(resolved);
   }
-  return files;
+  if (directory && files.length !== 1) {
+    throw new Error("A folder chooser accepts one folder at a time; do not mix folders and files.");
+  }
+  return { files, directory };
+}
+
+function validateUploadMode(selection: UploadSelection, mode: FileChooserEvent["mode"]) {
+  if (selection.directory && mode !== "selectFolder") {
+    throw new Error(`A folder can only be uploaded through an input with webkitdirectory enabled (chooser mode: ${mode ?? "unknown"}).`);
+  }
+  if (!selection.directory && mode === "selectFolder") {
+    throw new Error("The folder chooser requires a folder path, not individual files.");
+  }
+  if (selection.files.length > 1 && mode !== "selectMultiple") {
+    throw new Error("The browser file chooser accepts only one file.");
+  }
 }
 
 function requireDownloadId(value: number | undefined) {
