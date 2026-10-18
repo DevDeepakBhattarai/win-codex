@@ -25,6 +25,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+      - run: pnpm tunnel-test
       - name: Windows lifecycle checks
         if: runner.os == 'Windows'
         run: pnpm tray:windows-test

@@ -123,7 +123,7 @@ function Update-Tray {
     $resumeItem.Enabled = $script:paused
     $tunnelItem.Enabled = !$script:paused -and $TunnelProvider -eq 'cloudflare'
     $tunnelItem.Text = if ($script:tunnelEnabled) { 'Stop Cloudflare tunnel' } else { 'Start Cloudflare tunnel' }
-    $tray.Text = if ($script:paused) { 'Local Codex - paused' } elseif (!$script:tunnelEnabled) { 'Local Codex - tunnel stopped' } else { 'Local Codex - running' }
+    $tray.Text = if ($script:paused) { 'Local Codex - paused' } elseif ($TunnelProvider -eq 'cloudflare' -and !$script:tunnelEnabled) { 'Local Codex - tunnel stopped' } else { 'Local Codex - running' }
 }
 
 function Sync-Services {
@@ -222,7 +222,8 @@ try {
     $tunnelItem = $menu.Items.Add('Stop Cloudflare tunnel')
     [void]$menu.Items.Add('-')
     $logsItem = $menu.Items.Add('Open logs')
-    $quitItem = $menu.Items.Add('Quit Local Codex and Cloudflare')
+    $quitLabel = if ($TunnelProvider -eq 'cloudflare') { 'Quit Local Codex and Cloudflare' } else { 'Quit Local Codex' }
+    $quitItem = $menu.Items.Add($quitLabel)
     $tray.ContextMenuStrip = $menu
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = $RetrySeconds * 1000

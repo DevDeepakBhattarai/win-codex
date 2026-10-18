@@ -263,6 +263,14 @@ To start the controls at sign-in, install the startup entry:
 
 The default Cloudflare tunnel name is `local`. To use another name, run `pnpm tray my-tunnel` or `pnpm startup:install my-tunnel`. The tunnel must already have credentials and ingress configuration. ChatGPT and both generated extensions need their existing signed-in browser profile.
 
+To keep an existing Windows Tailscale startup configuration, use the provider-specific installer:
+
+```powershell
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-startup.ps1 -TunnelProvider tailscale
+```
+
+This starts the tray with Tailscale Funnel and disables the Cloudflare-only menu item. Tailscale still requires its desktop service to be signed in and Funnel to have been enabled once. The installer prints the public URL and any required approval URL. Pausing stops the local server. Tailscale's background routing remains configured, as it does with plain server startup.
+
 Windows installs a shortcut in your Startup folder. macOS builds `.data/runtime/Local Codex.app` and installs `~/Library/LaunchAgents/com.local-codex.menubar.plist`. The Mac app requires macOS 12 or newer and Xcode Command Line Tools. Run `xcode-select --install` if those tools are missing. Node.js and `cloudflared` must be on your terminal's `PATH` when you run the installer. The app records their absolute paths. Run the installer again after moving the repository or replacing those executables.
 
 Pause and tunnel settings survive sign-in. Run `pnpm tray` after quitting to reopen the controls, then choose **Resume everything**. Quit does not trigger an immediate restart. Existing ChatGPT responses and browser windows remain open. The supervisor starts Chrome when needed and restarts its exited processes while running. It adopts an existing server after verifying its installation identifier, listening process, and Node executable. It also adopts the configured tunnel after verifying its executable. Pause and quit control adopted processes too. The tray preserves servers from other installations and reports an unchanged error once until recovery. An installation lock prevents duplicate supervisors.

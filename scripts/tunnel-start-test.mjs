@@ -33,6 +33,8 @@ function createWindowsStartupFixture() {
   const root = mkdtempSync(path.join(tmpdir(), "local-control-tunnel-test-"));
   mkdirSync(path.join(root, "scripts"), { recursive: true });
   mkdirSync(path.join(root, "dist"), { recursive: true });
+  mkdirSync(path.join(root, "assets"), { recursive: true });
+  copyFileSync("assets/local-codex.ico", path.join(root, "assets", "local-codex.ico"));
   copyFileSync("scripts/install-startup.ps1", path.join(root, "scripts", "install-startup.ps1"));
   copyFileSync("scripts/connector-watchdog.ps1", path.join(root, "scripts", "connector-watchdog.ps1"));
   writeFileSync(path.join(root, "dist", "server.js"), "process.exit(0);\n");
@@ -183,6 +185,7 @@ test(
       fakeTailscale,
       [
         "@echo off",
+        'echo check>> "%~dp0status-checks.txt"',
         'if /I "%1"=="status" echo {"BackendState":"Running","Self":{"ID":"fixture-node","DNSName":"fixture.example.ts.net.","CapMap":{}}}',
         "exit /b 0",
         "",
@@ -218,7 +221,9 @@ test(
       const runtime = path.join(root, ".data", "runtime");
       const log = readFileSync(path.join(runtime, "watchdog.log"), "utf8");
       const failures = log.match(/Tailscale Funnel is not enabled/g) ?? [];
-      assert.ok(failures.length >= 2, `expected at least two retries, got ${failures.length}`);
+      const attempts = readFileSync(path.join(root, "status-checks.txt"), "utf8").trim().split(/\r?\n/);
+      assert.ok(attempts.length >= 2, `expected at least two readiness checks, got ${attempts.length}`);
+      assert.equal(failures.length, 1, "unchanged readiness errors are reported once");
       assert.equal(existsSync(path.join(runtime, "browser.stdout.log")), false);
       assert.equal(existsSync(path.join(runtime, "server.stdout.log")), false);
     } finally {
