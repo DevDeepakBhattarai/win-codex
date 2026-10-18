@@ -30,6 +30,4 @@ jobs:
         run: pnpm tray:windows-test
       - name: macOS lifecycle and native app checks
         if: runner.os == 'macOS'
-        run: |
-          cp .env.example .env
-          pnpm tray:macos-test
+        run: pnpm tray:macos-test

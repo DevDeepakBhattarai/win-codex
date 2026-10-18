@@ -1,5 +1,7 @@
-import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
+import assert from "node:assert/strict";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
+import { copyFile, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -42,8 +44,29 @@ try {
   console.error("Fixture installation:", await realpath(fixture));
   throw error;
 }
-// Exercise app packaging with the same native toolchain and a harmless tunnel executable.
-execFileSync(process.execPath, ["scripts/tray.mjs", "build", "tray-test"], { cwd: root, stdio: "inherit", env: { ...process.env, PATH: `${temporary}:${process.env.PATH}` } });
-execFileSync("/usr/bin/plutil", ["-lint", path.join(root, ".data/runtime/Local Codex.app/Contents/Info.plist")], { stdio: "inherit" });
-execFileSync("/usr/bin/codesign", ["--verify", "--deep", "--strict", path.join(root, ".data/runtime/Local Codex.app")], { stdio: "inherit" });
-console.log("PASS: native menu bar app compiles, bundles and validates on macOS.");
+// Package and launch a separate installation so tests never replace the user's app or settings.
+for (const file of ["scripts/tray.mjs", "scripts/macos/TrayController.swift", "scripts/macos/main.swift", "assets/local-codex-logo.png"]) {
+  const destination = path.join(fixture, file);
+  await mkdir(path.dirname(destination), { recursive: true });
+  await copyFile(path.join(root, file), destination);
+}
+execFileSync(process.execPath, [path.join(fixture, "scripts/tray.mjs"), "build", "tray-test"], { stdio: "inherit", env: { ...process.env, PATH: `${temporary}:${process.env.PATH}` } });
+const app = path.join(fixture, ".data/runtime/Local Codex.app");
+execFileSync("/usr/bin/plutil", ["-lint", path.join(app, "Contents/Info.plist")], { stdio: "inherit" });
+execFileSync("/usr/bin/codesign", ["--verify", "--deep", "--strict", app], { stdio: "inherit" });
+const menuBar = spawn(path.join(app, "Contents/MacOS/local-codex"), [], { stdio: ["ignore", "ignore", "pipe"] });
+let diagnostics = "";
+menuBar.stderr.setEncoding("utf8").on("data", chunk => { diagnostics += chunk; });
+try {
+  await once(menuBar, "spawn");
+  await new Promise(resolve => setTimeout(resolve, 2000));
+  assert.equal(menuBar.exitCode, null, diagnostics || "The packaged menu bar app exited during startup.");
+  assert.equal(menuBar.signalCode, null, diagnostics || "The packaged menu bar app crashed during startup.");
+} finally {
+  if (menuBar.exitCode === null && menuBar.signalCode === null) {
+    const stopped = once(menuBar, "exit");
+    menuBar.kill("SIGTERM");
+    await stopped;
+  }
+}
+console.log("PASS: native menu bar app compiles, bundles, validates and launches on macOS.");
