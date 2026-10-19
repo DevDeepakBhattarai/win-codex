@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.20.3";
+  const contentScriptVersion = "1.20.5";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -170,7 +170,7 @@
       if (!failed) return { status: "idle", conversationUrl: conversationUrl() };
       const stopped = await stopThread(undefined, undefined, true);
       if (stopped.status === "error_cleared") return { status: "idle", conversationUrl: conversationUrl() };
-      return await sendMessage(command.message, undefined, false, true);
+      return await sendMessage(command.message, undefined, true);
     }
     if (command.kind === "recover_page") {
       const notice = conversationUnavailableNotice() ?? pageErrorNotice();
@@ -180,7 +180,7 @@
       retry.click();
       return { status: "recovery_started" };
     }
-    if (command.kind === "send_message") return await sendMessage(command.message, command.connectorName, command.temporary,
+    if (command.kind === "send_message") return await sendMessage(command.message, command.connectorName,
       command.recovering === true, command.recoveryContinuation === true, command.recoveryExpiresAt);
     assertNoPageError();
     if (command.kind === "inspect_thread") {
@@ -519,7 +519,7 @@
     };
   }
 
-  async function sendMessage(message, connectorName, temporary = false, recovering = false, preserveDraft = false, expiresAt) {
+  async function sendMessage(message, connectorName, recovering = false, preserveDraft = false, expiresAt) {
     let sendClicked = false;
     const recoveryUrl = recovering ? conversationUrl() : undefined;
     const checkPage = () => {
@@ -532,17 +532,6 @@
       if (typeof message !== "string" || !message.trim()) throw new Error("A non-empty ChatGPT message is required.");
 
       const existingConversationUrl = conversationUrl();
-      if (temporary && !existingConversationUrl) {
-        await waitForComposer(SEND_READY_TIMEOUT_MS);
-        const deadline = automationNow() + SEND_READY_TIMEOUT_MS;
-        while (!document.querySelector('button[aria-label="Turn off temporary chat"]')) {
-          checkPage();
-          if (automationNow() >= deadline) throw new Error("Temporary chat did not become active. The task was not sent.");
-          // An early click can precede page hydration. Recheck the current control before retrying.
-          document.querySelector('button[aria-label="Temporary chat"]')?.click();
-          await sleep(SEND_SETTLE_MS);
-        }
-      }
       if (existingConversationUrl) {
         const loadedUserTurn = await waitFor(
           () => document.querySelector('section[data-turn="user"] [data-message-author-role="user"]') ??

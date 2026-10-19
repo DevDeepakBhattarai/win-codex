@@ -14,7 +14,7 @@ Use delegation for a review, browser work, or application testing. For a large t
 3. Keep the parent turn active until the command returns. If the shell runner yields a session, wait on that same command. The CLI holds one HTTP request while the server watches for the worker's report.
 4. Read the returned JSON and the complete report. Evaluate observed results and blockers against the assignment. Implement confirmed fixes in the parent.
 
-The CLI loads configuration from its installation directory, so you can run it from another workspace. It uses the caller's thread identifier when available, otherwise the workspace directory, to group assignments. It creates a unique request ID and prints recovery details. The service opens a temporary worker chat and supplies the completion path. The caller does not bind or sync a conversation.
+The CLI loads configuration from its installation directory, so you can run it from another workspace. It uses the caller's thread identifier when available, otherwise the workspace directory, to group assignments. It creates a unique request ID and prints recovery details. The service opens a normal worker chat and supplies the completion path. The caller does not bind or sync a conversation.
 
 The service checks unfinished workers every 3 minutes by default. The RALPH check interval controls this timer. It waits while a worker runs and resumes an idle worker that has not published its report. After report collection, the service closes the worker's tab. Reports remain in the local task directory. The parent keeps waiting through recovery.
 

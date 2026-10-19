@@ -128,6 +128,10 @@ const CHATGPT_FILE_DOWNLOAD_TIMEOUT_MS = boundedIntegerEnv(
 );
 const MAX_CHATGPT_FILE_REDIRECTS = 5;
 const SERVER_NAME = "local-codex";
+const INSTALLATION_ROOT = path.resolve(import.meta.dirname, "..");
+const INSTALLATION_ID = createHash("sha256")
+  .update(process.platform === "win32" ? INSTALLATION_ROOT.toLowerCase() : INSTALLATION_ROOT)
+  .digest("hex");
 const DATA_DIR = process.env.DATA_DIR ?? path.join(process.cwd(), ".data");
 const BROWSER_BRIDGE_ENABLED = process.env.BROWSER_BRIDGE_ENABLED !== "false";
 const THREAD_SYNC_ENABLED = process.env.THREAD_SYNC_ENABLED !== "false";
@@ -359,6 +363,8 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     name: SERVER_NAME,
+    installationId: INSTALLATION_ID,
+    pid: process.pid,
     mcp: MCP_PUBLIC_URL,
     issuer: AUTH_ISSUER,
     transportMode: "stateless",
