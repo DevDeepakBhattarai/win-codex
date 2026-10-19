@@ -815,7 +815,7 @@ async function executeCommandOnce(command, browserId) {
 
   try {
     const settings = await getSettings();
-    const temporary = command.temporary === true || new URL(targetUrl).searchParams.get("temporary-chat") === "true";
+    const temporary = new URL(targetUrl).searchParams.get("temporary-chat") === "true";
     const observing = !settings.automationExecutor;
     if (observing && command.kind !== "inspect_thread") {
       throw new Error("This browser is only available for thread observation.");
