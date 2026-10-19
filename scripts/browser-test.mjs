@@ -73,7 +73,7 @@ const testServer = http.createServer((request, response) => {
     <p id="double-count">Double count: 0</p>
     <button id="double">Double click</button>
     <button id="popup">Open popup</button>
-    <input id="upload" type="file" hidden>
+    <input id="upload" name="webkitdirectory" type="file" hidden>
     <button id="upload-button" onclick="document.querySelector('#upload').click()">Choose a file</button>
     <input id="multi" type="file" multiple hidden>
     <button id="multi-button" onclick="document.querySelector('#multi').click()">Choose multiple files</button>

@@ -1186,8 +1186,8 @@ export class BrowserService {
     const attributes = described.node?.attributes ?? [];
     return {
       backendNodeId,
-      multiple: attributes.includes("multiple"),
-      directory: attributes.includes("webkitdirectory"),
+      multiple: attributes.some((attribute, index) => index % 2 === 0 && attribute === "multiple"),
+      directory: attributes.some((attribute, index) => index % 2 === 0 && attribute === "webkitdirectory"),
     };
   }
 
@@ -2002,6 +2002,15 @@ export class UnifiedBrowserService {
   }
 
   async download(input: BrowserDownloadInput) {
+    if (input.action === "list") {
+      const groups = await Promise.all((["chrome", "electron"] as const).map(async kind => {
+        const service = this.service(kind);
+        if (!service.status().connected) return [];
+        const result = await service.download(input);
+        return (result.downloads ?? []).map(download => this.mapDownload(kind, download));
+      }));
+      return { downloads: groups.flat() };
+    }
     let kind: UnifiedTargetKind;
     let params = input;
     if (input.action === "wait" || input.action === "cancel") {

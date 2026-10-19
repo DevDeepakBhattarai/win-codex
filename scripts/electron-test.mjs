@@ -118,6 +118,7 @@ try {
     let result = {};
     if (request.method === "tabs.list") result = [chromeTab];
     else if (request.method.startsWith("tabs.")) result = chromeTab;
+    else if (request.method === "downloads.list") result = [{ id: 1, tabId: chromeTab.id, filename: "chrome-peer.txt", state: "complete" }];
     else if (request.method === "debugger.command") {
       if (request.params.method.startsWith("Input.")) chromeInputs++;
       if (request.params.method === "Runtime.evaluate") result = { result: { value: "chrome-selected" } };
@@ -203,7 +204,15 @@ try {
   assert.equal(downloaded.download.tabId, a.id);
   assert.equal(await readFile(downloaded.download.filename, "utf8"), "electron download");
   assert.equal((await controls.download({ action: "wait", downloadId: downloaded.download.id })).download.state, "complete");
-  assert.equal((await controls.download({ action: "list" })).downloads[0].id, downloaded.download.id);
+  await controls.claimTab({ tabId: c.id, title: c.title, url: c.url });
+  await controls.claimTab({ tabId: a.id, title: a.title, url: a.url });
+  const listedDownloads = (await controls.download({ action: "list" })).downloads;
+  assert.deepEqual(listedDownloads.map(download => download.filename).sort(), ["chrome-peer.txt", downloaded.download.filename].sort(),
+    "download listing includes both controlled platforms regardless of the sticky target");
+  const chromeDownload = listedDownloads.find(download => download.filename === "chrome-peer.txt");
+  assert.equal(chromeDownload.tabId, c.id);
+  assert.notEqual(chromeDownload.id, downloaded.download.id, "platform-local download IDs remain distinct");
+  assert.equal(listedDownloads.find(download => download.filename === downloaded.download.filename).id, downloaded.download.id);
   await controls.action({ action: "scroll", deltaY: 600 });
   assert.ok((await controls.evaluate(undefined, "scrollY")).value > 0);
   const shot = await controls.screenshot({ fullPage: true });
