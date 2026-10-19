@@ -1523,6 +1523,7 @@ async function testContentScript(tokenA, tokenB) {
   } };
   vm.runInNewContext(await readFile("support-extension/content-script.js", "utf8"), {
     window, location, browser,
+    document: { addEventListener() {}, querySelector() { return null; } },
   });
   const message = (source, token, origin = "https://web-sandbox.oaiusercontent.com") =>
     listeners.get("message")({ source, origin, data: { type: "local-codex-thread-sync/bind-v1", token } });
