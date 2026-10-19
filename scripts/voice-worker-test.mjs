@@ -65,6 +65,19 @@ const tab = (id, url, voice = "closed") => ({ id, url, voice, status: "complete"
 	assert.equal(result.results[0].result.status, "closed");
 }
 {
+	const result = await run({ tabs: [tab(1, localUrl, "active")], kind: "voice_stop", onCommand: tab => { tab.url = root; }, responses: [
+		{ ok: true, result: { status: "closed", conversationUrl: root } },
+	] });
+	assert.equal(result.results[0].ok, true, "a confirmed unsaved Voice stop can return the same tab to the new-chat page");
+	assert.equal(result.storage.voiceTabUrl, root);
+}
+{
+	const result = await run({ tabs: [tab(1, localUrl, "active")], kind: "voice_stop", onCommand: tab => { tab.url = root; }, responses: [
+		{ ok: true, result: { status: "active", conversationUrl: root } },
+	] });
+	assert.equal(result.results[0].ok, false, "a URL reset without a closed call cannot confirm a stop");
+}
+{
 	const result = await run({ tabs: [tab(1, first)], storage: { voiceTabId: 1, voiceTabUrl: localUrl } });
 	assert.equal(result.created.length, 0, "promotion to a saved URL keeps the disconnected Voice tab reusable");
 	assert.equal(result.calls.at(-1).id, 1);

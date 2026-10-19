@@ -1,8 +1,10 @@
 import { createHash, randomBytes } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { rm, writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import path from "node:path";
+import { once } from "node:events";
+import { WebSocket } from "ws";
 
 import {
   createTerminalInvocation,
@@ -107,11 +109,14 @@ const child = spawn(process.execPath, ["dist/server.js"], {
   env: {
     ...process.env,
     PORT: String(port),
+    BROWSER_BRIDGE_PORT: String(port + 1),
+    ELECTRON_BRIDGE_PORT: String(port + 3),
     HOST: "127.0.0.1",
     PUBLIC_BASE_URL: baseUrl,
     MCP_PUBLIC_URL: mcpUrl,
     AUTH_ISSUER: baseUrl,
     DATA_DIR: dataDir,
+    LOCAL_CODEX_ELECTRON_BRIDGE_DESCRIPTOR: path.join(dataDir, "electron-descriptor.json"),
     THREAD_SYNC_ENABLED: "false",
     BROWSER_EXECUTABLE_PATH: path.join(dataDir, "missing-chrome"),
     OAUTH_STORE_PATH: path.join(dataDir, "oauth-store.json"),
@@ -177,6 +182,7 @@ function postModernMcp(body, accessToken, extraHeaders = {}) {
         "io.modelcontextprotocol/protocolVersion": "2026-07-28",
         "io.modelcontextprotocol/clientInfo": { name: "stateless-test", version: "1.0.0" },
         "io.modelcontextprotocol/clientCapabilities": {},
+        ...body.params?._meta,
       },
     },
   }, accessToken, {
@@ -383,9 +389,37 @@ try {
   const discovery = parseMcpPayload(discovered.responseText);
   if (discovered.status !== 200 || discovered.sessionId !== null ||
       !discovery.result?.supportedVersions.includes("2026-07-28") ||
-      !discovery.result?.instructions.includes("Start each tab exactly once")) {
+      !discovery.result?.instructions.includes("Start each target exactly once")) {
     throw new Error(`Modern discovery failed: ${JSON.stringify(discovered)}`);
   }
+
+  const bridgeToken = (await readFile(path.join(dataDir, "browser-bridge-token"), "utf8")).trim();
+  const peer = new WebSocket(`ws://127.0.0.1:${port + 1}?token=${bridgeToken}`);
+  await once(peer, "open");
+  peer.send(JSON.stringify({ type: "hello", protocolVersion: 1, extensionId: "session-test", extensionVersion: "1" }));
+  const tab = { id: 71, windowId: 1, title: "Sticky target", url: "https://example.test", active: true, pinned: false, highlighted: true, index: 0 };
+  peer.on("message", raw => {
+    const request = JSON.parse(String(raw));
+    const result = request.method === "tabs.list" ? [tab] : request.method === "tabs.get" ? tab :
+      request.method === "debugger.command" && request.params.method === "Runtime.evaluate" ? { result: { value: "sticky-session" } } : {};
+    peer.send(JSON.stringify({ type: "response", id: request.id, ok: true, result }));
+  });
+  const browserCall = async (session, name, args = {}) => parseMcpPayload((await postModernMcp({ jsonrpc: "2.0", id: "session-call", method: "tools/call", params: {
+    name, arguments: args, _meta: { "openai/session": session },
+  } }, token.access_token)).responseText).result;
+  try {
+    const listing = await browserCall("first-session", "browser_tabs");
+    const selected = listing.structuredContent.tabs[0];
+    const claim = await browserCall("first-session", "browser_claim", { tabId: selected.id, title: selected.title, url: selected.url });
+    if (claim.isError) throw new Error("Could not claim the stateless session fixture.");
+    const evaluation = await browserCall("first-session", "browser_evaluate", { expression: "document.title" });
+    if (evaluation.isError || evaluation.structuredContent.value !== "sticky-session") throw new Error("Sticky target did not survive stateless MCP calls.");
+    const isolated = await browserCall("second-session", "browser_evaluate", { expression: "document.title" });
+    if (!isolated.isError) throw new Error("A separate ChatGPT session inherited another session's control target.");
+    await browserCall("first-session", "browser_release", { tabId: selected.id });
+    const released = await browserCall("first-session", "browser_evaluate", { expression: "document.title" });
+    if (!released.isError) throw new Error("Release did not clear sticky selection.");
+  } finally { peer.terminate(); }
 
   const modernListBody = { jsonrpc: "2.0", id: "modern-list", method: "tools/list" };
   for (const headers of [
@@ -435,7 +469,7 @@ try {
     throw new Error(`Stateless initialize unexpectedly returned Mcp-Session-Id: ${initialized.sessionId}`);
   }
   if (
-    !initialized.responseText.includes("Start each tab exactly once") ||
+    !initialized.responseText.includes("Start each target exactly once") ||
     !initialized.responseText.includes("browser_release is the last browser call")
   ) {
     throw new Error("Initialize did not deliver the browser tab lifecycle instructions.");

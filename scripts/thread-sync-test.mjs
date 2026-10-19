@@ -55,7 +55,8 @@ try {
     "the obsolete generated thread-sync extension is removed");
   const manifest = JSON.parse(await readFile(path.join(sync.extensionDirectory, "manifest.json"), "utf8"));
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "http://127.0.0.1/*"]);
-  assert.equal(manifest.version, "1.20.1");
+  const sourceManifest = JSON.parse(await readFile("support-extension/manifest.json", "utf8"));
+  assert.equal(manifest.version, sourceManifest.version, "the generated extension keeps the source version");
   assert.equal(manifest.minimum_chrome_version, undefined, "thread sync is not tied to a Chrome-branded minimum");
   assert.deepEqual(manifest.permissions, ["alarms", "scripting", "sidePanel", "storage", "tabs", "webNavigation"]);
   assert.equal(manifest.action.default_popup, undefined);
@@ -102,7 +103,7 @@ try {
     "thread sending does not use acknowledgement or DOM-stability heuristics");
   assert.match(preparedContentScript, /const SEND_SETTLE_MS = 5_000;/,
     "thread sending uses the fixed five-second settle requested for typing and sending");
-  assert.match(preparedContentScript, /contentScriptVersion = "1\.20\.1"/,
+  assert.equal(preparedContentScript.match(/contentScriptVersion = "([^"]+)"/)?.[1], sourceManifest.version,
     "extension reloads can replace a stale page script with the current content-script version");
   assert.equal(parseRalphProjectId(namedProjectHome), projectId);
   assert.equal(parseRalphProjectId(urlA), projectId);
@@ -1522,6 +1523,7 @@ async function testContentScript(tokenA, tokenB) {
   } };
   vm.runInNewContext(await readFile("support-extension/content-script.js", "utf8"), {
     window, location, browser,
+    document: { addEventListener() {}, querySelector() { return null; } },
   });
   const message = (source, token, origin = "https://web-sandbox.oaiusercontent.com") =>
     listeners.get("message")({ source, origin, data: { type: "local-codex-thread-sync/bind-v1", token } });

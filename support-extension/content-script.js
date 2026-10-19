@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.20.4";
+  const contentScriptVersion = "1.20.5";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -120,6 +120,15 @@
   };
 
   window.addEventListener("message", messageHandler);
+
+  document.addEventListener?.("click", (event) => {
+    if (!event.isTrusted || globalThis[handlerKey]?.version !== contentScriptVersion) return;
+    const stop = event.target?.closest?.('button[data-testid="stop-button"], button[aria-label="Stop"]');
+    const url = conversationUrl();
+    if (stop && url) void Promise.resolve(extensionApi.runtime.sendMessage({
+      type: "local-codex-support/pause-thread-v1", conversationUrl: url,
+    })).catch(() => undefined);
+  }, true);
 
   installTitleObserver();
   installRalphComposerObserver();
@@ -271,6 +280,7 @@
     watchVoice();
     const targetUrl = command.targetUrl;
     const newChat = targetUrl === "https://chatgpt.com/";
+    let endingUnsavedCall = false;
     const observedUrl = () => {
       const url = new URL(location.href);
       if (url.origin !== "https://chatgpt.com" || url.username || url.password || url.searchParams.get("temporary-chat") === "true") return null;
@@ -284,7 +294,8 @@
     const assertTarget = () => {
       const current = observedUrl();
       const promoted = targetUrl?.startsWith("https://chatgpt.com/c/local-chatgpt%3A") && current === conversationUrl();
-      if (!targetUrl || !current || (!newChat && current !== targetUrl && !promoted)) {
+      const endedUnsavedCall = endingUnsavedCall && current === "https://chatgpt.com/" && voiceState() === "closed";
+      if (!targetUrl || !current || (!newChat && current !== targetUrl && !promoted && !endedUnsavedCall)) {
         throw new Error("Voice control is no longer on the configured regular conversation.");
       }
     };
@@ -316,6 +327,7 @@
     if (!isActionableButton(button)) throw new Error("ChatGPT Voice control is unavailable. Check login, Voice access, and microphone permission.");
     voiceStarting = command.kind === "voice_start";
     try {
+      endingUnsavedCall = command.kind === "voice_stop" && targetUrl?.startsWith("https://chatgpt.com/c/local-chatgpt%3A");
       button.click();
       let stableSince = 0;
       while (Date.now() < deadline) {

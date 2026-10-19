@@ -51,6 +51,7 @@ let pauseSync;
 let pauseSyncedAt = 0;
 
 async function syncAutomationPause(unavailable = false, recoveryConversationUrl) {
+  await reportPendingThreadPauses();
   if (pauseSync) {
     await pauseSync;
     if (!unavailable && !recoveryConversationUrl) return;
@@ -80,6 +81,7 @@ async function syncAutomationPause(unavailable = false, recoveryConversationUrl)
         await extensionApi.storage.local.set({ automationPausedUntil: until, automationPausePending: false });
       }
     }
+    if (recoveryConversationUrl) await extensionApi.storage.local.set({ [`threadPaused:${recoveryConversationUrl}`]: response.headers.get("X-Thread-Automation-Paused") === "true" });
     pauseSyncedAt = Date.now();
     return response.headers.get("X-Recovery-Message-Pending") === "true";
   })();
@@ -162,7 +164,20 @@ function trackThreadTab(tabId, value) {
   return tracking;
 }
 
+async function reportPendingThreadPauses() {
+  const stored = await extensionApi.storage.local.get(null);
+  for (const [key, url] of Object.entries(stored)) {
+    if (!key.startsWith("threadPausePending:") || typeof url !== "string") continue;
+    const response = await fetch(ralphRegisterEndpoint.href, { method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${config.extensionToken}` },
+      body: JSON.stringify({ conversationUrl: url, paused: true }), signal: AbortSignal.timeout(5000), redirect: "error" });
+    if (!response.ok) throw new Error("Could not persist the thread pause.");
+    await extensionApi.storage.local.remove(key);
+  }
+}
+
 async function reportClosedThreadTabs() {
+  await reportPendingThreadPauses();
   const stored = await extensionApi.storage.local.get(null);
   for (const [key, url] of Object.entries(stored)) {
     if (key.startsWith("viewedCompletion:") && url) {
@@ -172,7 +187,7 @@ async function reportClosedThreadTabs() {
     const response = await fetch(ralphRegisterEndpoint.href, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${config.extensionToken}` },
-      body: JSON.stringify({ conversationUrl: url, settled: true }),
+      body: JSON.stringify({ conversationUrl: url, removed: true }),
       signal: AbortSignal.timeout(5000), redirect: "error",
     });
     if (!response.ok) throw new Error(`RALPH tab removal returned ${response.status}.`);
@@ -543,6 +558,14 @@ async function waitForTabComplete(tabId, timeoutMs = 5 * 60_000) {
 }
 
 async function sendAutomationMessage(tabId, command) {
+  if (command.feature !== "voice" && command.kind !== "stop_thread" && command.kind !== "page_health") {
+    const targetUrl = conversationUrl((await extensionApi.tabs.get(tabId)).url);
+    if (targetUrl) {
+      await syncAutomationPause(false, targetUrl);
+      const key = `threadPaused:${targetUrl}`;
+      if ((await extensionApi.storage.local.get(key))[key]) throw new Error("Thread automation is paused.");
+    }
+  }
   const recovery = command.recovering ? recoveringPages.get(tabId) : undefined;
   if (command.feature !== "voice") {
     if (command.recovering && command.targetUrl && await syncAutomationPause(false, command.targetUrl)) {
@@ -763,7 +786,8 @@ async function executeVoiceCommand(command, browserId) {
       result = { ...response.result, tabId: tab.id };
       const finalUrl = voicePageUrl((await extensionApi.tabs.get(tab.id)).url);
       const promoted = targetUrl.startsWith("https://chatgpt.com/c/local-chatgpt%3A") && finalUrl === conversationUrl((await extensionApi.tabs.get(tab.id)).url);
-      if (!finalUrl || result?.conversationUrl !== finalUrl || (targetUrl !== "https://chatgpt.com/" && finalUrl !== targetUrl && !promoted)) throw new Error("Voice command returned a different conversation.");
+      const endedUnsavedCall = command.kind === "voice_stop" && targetUrl.startsWith("https://chatgpt.com/c/local-chatgpt%3A") && finalUrl === "https://chatgpt.com/" && result.status === "closed";
+      if (!finalUrl || result?.conversationUrl !== finalUrl || (targetUrl !== "https://chatgpt.com/" && finalUrl !== targetUrl && !promoted && !endedUnsavedCall)) throw new Error("Voice command returned a different conversation.");
       await extensionApi.storage.local.set({ voiceTabUrl: finalUrl, voiceConversationUrl: finalUrl });
     }
     await postResult({ commandId: command.id, browserId, kind: command.kind, ok: true, result });
@@ -822,9 +846,13 @@ async function executeCommandOnce(command, browserId) {
     }
     const closedKey = `closedThread:${conversationUrl(targetUrl)}`;
     const closed = await extensionApi.storage.local.get(closedKey);
-    const acquired = observing || (closed[closedKey] && (command.kind === "inspect_thread" || command.kind === "prepare_thread"))
+    const acquired = observing || command.kind === "stop_thread" || (closed[closedKey] && (command.kind === "inspect_thread" || command.kind === "prepare_thread"))
       ? await findConversationTab(targetUrl)
       : await acquireAutomationTab(targetUrl, createsNewThread);
+    if (!acquired && command.kind === "stop_thread") {
+      await postResult({ commandId: command.id, browserId, kind: command.kind, ok: true, result: { status: "stopped", conversationUrl: targetUrl } });
+      return;
+    }
     if (!acquired) throw new Error("CHATGPT_TAB_UNAVAILABLE: The thread tab has closed or navigated away.");
     tabId = acquired.tab.id;
     created = acquired.created === true;
@@ -1025,6 +1053,8 @@ async function recoverPage(tabId, resume = true, commandId) {
   const currentUrl = (await extensionApi.tabs.get(tabId)).url;
   if (await syncAutomationPause(false, conversationUrl(currentUrl))) resume = false;
   if (await isVoiceConversation(currentUrl)) return false;
+  const pauseKey = `threadPaused:${conversationUrl(currentUrl)}`;
+  if ((await extensionApi.storage.local.get(pauseKey))[pauseKey]) return false;
   const existing = recoveringPages.get(tabId);
   if (existing) {
     if (!resume) {
@@ -1219,6 +1249,18 @@ function sleep(ms) {
 }
 
 extensionApi.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "local-codex-support/pause-thread-v1") {
+    void (async () => {
+      if (sender.id !== extensionApi.runtime.id || sender.frameId !== 0 || !Number.isInteger(sender.tab?.id)) return { ok: false };
+      const url = conversationUrl((await extensionApi.tabs.get(sender.tab.id)).url);
+      if (!url || url !== conversationUrl(message.conversationUrl)) return { ok: false };
+      const key = `threadPaused:${url}`;
+      await extensionApi.storage.local.set({ [key]: true, [`threadPausePending:${url}`]: url });
+      await reportPendingThreadPauses();
+      return { ok: true };
+    })().then(sendResponse, () => sendResponse({ ok: false }));
+    return true;
+  }
   if (message?.type === CONVERSATION_UNAVAILABLE_MESSAGE) {
     void conversationUnavailable(message, sender).then(sendResponse, () => sendResponse({ ok: false }));
     return true;

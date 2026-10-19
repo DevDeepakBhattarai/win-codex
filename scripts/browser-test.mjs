@@ -15,8 +15,23 @@ import { launchChrome } from "../dist/browser-launch.js";
 const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "win-codex-browser-test-"));
 const uploadPath = path.join(temporaryRoot, "upload.txt");
 await writeFile(uploadPath, "browser upload test", "utf8");
+const secondUploadPath = path.join(temporaryRoot, "second-upload.txt");
+await writeFile(secondUploadPath, "second upload test", "utf8");
+const uploadDirectory = path.join(temporaryRoot, "folder-uploads");
+await mkdir(path.join(uploadDirectory, "nested"), { recursive: true });
+await writeFile(path.join(uploadDirectory, "a.txt"), "folder root", "utf8");
+await writeFile(path.join(uploadDirectory, "nested", "b.txt"), "folder nested", "utf8");
 
 const testServer = http.createServer((request, response) => {
+  if (request.url === "/receive" && request.method === "POST") {
+    const chunks = [];
+    request.on("data", chunk => chunks.push(chunk));
+    request.on("end", () => {
+      response.writeHead(200, { "content-type": "text/plain" });
+      response.end(Buffer.concat(chunks));
+    });
+    return;
+  }
   if (request.url === "/favicon.svg" || request.url === "/updated.svg") {
     response.writeHead(200, { "content-type": "image/svg+xml" });
     response.end('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><circle cx="16" cy="16" r="14" fill="green"/></svg>');
@@ -58,13 +73,22 @@ const testServer = http.createServer((request, response) => {
     <p id="double-count">Double count: 0</p>
     <button id="double">Double click</button>
     <button id="popup">Open popup</button>
-    <input id="upload" type="file" hidden>
+    <input id="upload" name="webkitdirectory" type="file" hidden>
+    <button id="upload-button" onclick="document.querySelector('#upload').click()">Choose a file</button>
+    <input id="multi" type="file" multiple hidden>
+    <button id="multi-button" onclick="document.querySelector('#multi').click()">Choose multiple files</button>
+    <input id="folder" type="file" webkitdirectory multiple hidden>
+    <button id="folder-button" onclick="document.querySelector('#folder').click()">Choose folder</button>
+    <button id="dynamic-button" onclick="const file=document.createElement('input');file.type='file';file.id='dynamic-file';file.onchange=()=>document.querySelector('#dynamic-result').textContent='Dynamic: '+file.files[0].name;document.body.append(file);file.click()">Choose dynamic file</button>
     <input id="text" aria-label="Text">
     <input id="checked" type="checkbox">
     <select id="choice"><option value="a">Alpha</option><option value="b">Beta</option></select>
     <button id="hover" onmouseenter="this.textContent='Hovered'">Hover me</button>
     <div id="drag" style="width:200px;height:60px;background:#eee" onmousedown="this.textContent='Dragging'" onmouseup="this.textContent='Dropped'">Drag here</div>
     <p id="upload-result">Upload: empty</p>
+    <p id="multi-result">Multi: empty</p>
+    <p id="folder-result">Folder: empty</p>
+    <p id="dynamic-result">Dynamic: empty</p>
     <a id="download" href="/download" download>Download</a>
     <a id="next" href="/second">Next</a>
     <script>
@@ -77,7 +101,13 @@ const testServer = http.createServer((request, response) => {
         window.open('/popup', 'browser-bridge-popup', 'width=500,height=400');
       });
       document.querySelector('#upload').addEventListener('change', (event) => {
-        document.querySelector('#upload-result').textContent = 'Upload: ' + event.target.files[0].name;
+        document.querySelector('#upload-result').textContent = 'Upload: ' + (event.target.files[0]?.name ?? 'empty');
+      });
+      document.querySelector('#multi').addEventListener('change', (event) => {
+        document.querySelector('#multi-result').textContent = 'Multi: ' + [...event.target.files].map(file => file.name).join(', ');
+      });
+      document.querySelector('#folder').addEventListener('change', (event) => {
+        document.querySelector('#folder-result').textContent = 'Folder: ' + [...event.target.files].map(file => file.webkitRelativePath).sort().join(', ');
       });
     </script>`);
 });
@@ -370,6 +400,32 @@ try {
 
   result = await service.upload({ tabId: agentTabId, locator: "css=#upload", files: [uploadPath] });
   assert.match(result.snapshot.visibleText, /Upload: upload\.txt/);
+  result = await service.upload({ tabId: agentTabId, locator: "css=#upload-button", files: [secondUploadPath] });
+  assert.match(result.snapshot.visibleText, /Upload: second-upload\.txt/);
+  result = await service.upload({ tabId: agentTabId, locator: "css=#multi-button", files: [uploadPath, secondUploadPath] });
+  assert.match(result.snapshot.visibleText, /Multi: upload\.txt, second-upload\.txt/);
+  result = await service.upload({ tabId: agentTabId, locator: "css=#dynamic-button", files: [uploadPath] });
+  assert.match(result.snapshot.visibleText, /Dynamic: upload\.txt/);
+  result = await service.upload({ tabId: agentTabId, locator: "css=#folder", files: [uploadDirectory] });
+  assert.match(result.snapshot.visibleText, /folder-uploads\/a\.txt/);
+  assert.match(result.snapshot.visibleText, /folder-uploads\/nested\/b\.txt/);
+  result = await service.upload({ tabId: agentTabId, locator: "css=#folder-button", files: [uploadDirectory] });
+  assert.match(result.snapshot.visibleText, /folder-uploads\/nested\/b\.txt/);
+  await assert.rejects(service.upload({ tabId: agentTabId, locator: "css=#upload-button", files: [uploadDirectory] }), /folder|directory|file/i);
+  await assert.rejects(service.upload({ tabId: agentTabId, locator: "css=#folder-button", files: [uploadPath] }), /folder|directory|file/i);
+  result = await service.upload({ tabId: agentTabId, locator: "css=#folder-button", files: [uploadDirectory] });
+  assert.match(result.snapshot.visibleText, /folder-uploads\/nested\/b\.txt/);
+  const uploadedBody = await agentPage.evaluate(async () => {
+    const body = new FormData();
+    for (const file of document.querySelector('#folder').files) body.append('upload', file);
+    return await (await fetch('/receive', { method: 'POST', body })).text();
+  });
+  assert.match(uploadedBody, /folder root/);
+  assert.match(uploadedBody, /folder nested/);
+  await assert.rejects(service.upload({ tabId: agentTabId, locator: "css=#upload", files: [uploadDirectory] }), /folder|directory|file/i);
+  await assert.rejects(service.upload({ tabId: agentTabId, locator: "css=#upload", files: [uploadPath, secondUploadPath] }), /one file|multiple/i);
+  await service.action({ tabId: agentTabId, action: "type", locator: "css=#text", text: "Chooser closed" });
+  assert.equal((await service.evaluate(agentTabId, "document.querySelector('#text').value")).value, "Chooser closed");
 
   const downloadResult = await service.download({
     action: "trigger",
