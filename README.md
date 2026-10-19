@@ -62,7 +62,7 @@ When `THREAD_SYNC_ENABLED` is not `false`, the server exposes:
 
 Local agents delegate through [the blocking CLI or HTTP API](docs/agent-api.md). The request waits for the report. Include the revision in the specification. The CLI supplies a unique request ID, and retries with that ID reuse the saved job. Each caller group supports two pending assignments. The local caller requires no ChatGPT conversation binding.
 
-State, specifications, and reports live under `<DATA_DIR>/tasks`. Legacy reviews and subagents migrate on first open. Workers use temporary chats. Cancellation and uncertain-delivery recovery remain operator actions in the Support extension.
+State, specifications, and reports live under `<DATA_DIR>/tasks`. Legacy reviews and subagents migrate on first open. Workers use normal chats. Cancellation and uncertain-delivery recovery remain operator actions in the Support extension.
 
 ## OAuth and MCP flow
 

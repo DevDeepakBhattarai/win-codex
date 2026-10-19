@@ -91,9 +91,9 @@ try {
 		message: "Run the assigned check.\n\nPublish its complete report." });
 	assert.equal(sent.ok, true, sent.error);
 	assert.equal(sent.result.status, "sent");
-	assert.equal(sent.result.conversationUrl, "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111?temporary-chat=true", "worker creation preserves temporary mode through Send and connector attachment");
+	assert.equal(sent.result.conversationUrl, "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111", "worker creation uses a normal chat even when the server requests temporary mode");
 	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1);
-	assert.equal(await page.evaluate(() => globalThis.temporaryClicks), 2, "startup retries an ignored click without turning temporary mode off");
+	assert.equal(await page.evaluate(() => globalThis.temporaryClicks), 0, "startup leaves temporary chat disabled");
 	await page.evaluate(() => {
 		const alert = document.createElement("div");
 		alert.setAttribute("role", "alert");
@@ -125,14 +125,14 @@ try {
 		document.body.appendChild(alert);
 	});
 	const preserveDraft = await execute({ kind: "send_message", recovering: true, recoveryContinuation: true,
-		targetUrl: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111?temporary-chat=true", message: "Continue" });
+		targetUrl: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111", message: "Continue" });
 	assert.equal(preserveDraft.ok, true, preserveDraft.error);
 	assert.equal(preserveDraft.result.status, "idle");
 	assert.equal(await page.locator('[data-composer-markdown]').innerText(), "My unsent note", "Automatic continuation preserves a user draft");
 	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1);
 	await page.evaluate(() => { document.querySelector('[data-composer-markdown]').textContent = ""; document.querySelector('[role="alert"]').remove(); });
 	const expiredRecovery = await execute({ kind: "send_message", recovering: true, recoveryContinuation: true,
-		targetUrl: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111?temporary-chat=true", message: "Continue", recoveryExpiresAt: Date.now() + 300 });
+		targetUrl: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111", message: "Continue", recoveryExpiresAt: Date.now() + 300 });
 	assert.equal(expiredRecovery.ok, false);
 	assert.match(expiredRecovery.error, /reservation expired/);
 	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1, "A reservation that expires while the page waits cannot click Send");
