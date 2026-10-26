@@ -71,11 +71,11 @@
     <section id="panel-schedules" class="panel" role="tabpanel" aria-labelledby="tab-schedules" hidden>
       <form id="scheduleForm" class="card">
         <div class="card-header">
-          <h2>Schedule a task</h2>
+          <h2 id="scheduleFormTitle">Schedule a task</h2>
           <p class="note">Each run starts a new normal ChatGPT chat. Keep the server running and Chrome's automation executor and task messaging enabled. Missed times are skipped.</p>
         </div>
         <label class="field">Prompt<textarea id="schedulePrompt" rows="3" required maxlength="180000" placeholder="What should ChatGPT do?"></textarea></label>
-        <label class="field">Date and time<input id="scheduleAt" type="datetime-local" required></label>
+        <label class="field">Date and time<input id="scheduleAt" type="datetime-local" step="1" required></label>
         <p id="scheduleTimezone" class="note field-hint"></p>
         <label class="toggle repeat-toggle">
           <span class="toggle-text">Repeat</span>
@@ -83,9 +83,10 @@
         </label>
         <div id="scheduleInterval" class="interval-fields" hidden>
           <label class="field">Every<input id="scheduleIntervalValue" type="number" min="1" max="525600" step="1" value="1" disabled required></label>
-          <label class="field">Unit<select id="scheduleIntervalUnit" aria-label="Unit" disabled><option value="60">Minutes</option><option value="3600">Hours</option><option value="86400">Days</option></select></label>
+          <label class="field">Unit<select id="scheduleIntervalUnit" aria-label="Unit" disabled><option value="60">Minutes</option><option value="3600">Hours</option><option value="86400">Days</option><option value="1">Seconds</option></select></label>
         </div>
         <button id="saveSchedule" class="button button-block" type="submit">Schedule task</button>
+        <button id="cancelScheduleEdit" class="button button-ghost button-block" type="button" hidden>Cancel editing</button>
         <p id="scheduleStatus" class="note" role="status" aria-live="polite"></p>
       </form>
       <div class="list-heading">

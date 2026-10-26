@@ -19,28 +19,34 @@ try {
     conversationUrl: url(`00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`),
     title: `Completed task ${index}`, state: "complete", activity: "idle", lastCheckedAt: new Date(Date.now() - index * 60_000).toISOString(),
   }));
-  const task = { jobId: reviewId, childThreadId: reviewId, childConversationUrl: url(reviewId) + "?temporary-chat=true", parentThreadId: parentId, title: "Independent review", state: "pending" };
+  const task = { jobId: reviewId, childThreadId: reviewId, childConversationUrl: url(reviewId) + "?temporary-chat=true", parentThreadId: parentId, parentConversationUrl: url(parentId), title: "Independent review", state: "pending", createdAt: new Date().toISOString() };
+  const startup = { jobId: "55555555-5555-4555-8555-555555555555", parentThreadId: parentId, parentConversationUrl: url(parentId), title: "Worker startup", state: "pending", preparationError: "The dedicated Voice conversation is protected from thread automation.", createdAt: new Date().toISOString() };
+  const tasks = [task];
   let settingsRequests = 0;
   const ralphSettings = { loopIntervalSeconds: 180, minWorkedSeconds: 1800 };
   let cancelled = false;
   let automationPausedUntil = 0;
   let schedules = [];
   let scheduleRequests = 0;
+  let scheduleUpdates = 0;
+  let rejectScheduleEdits = false;
   await page.addInitScript(() => {
     globalThis.closedViews = 0;
     globalThis.openedChats = [];
+    globalThis.activatedChats = [];
+    globalThis.existingTabs = [{ id: 7, windowId: 3, url: "https://example.com" }];
     globalThis.close = () => { globalThis.closedViews += 1; };
     globalThis.chrome = {
       storage: { local: { async get(defaults) { return defaults; }, async set() {}, async remove() {} } },
       runtime: { async sendMessage() {} },
-      tabs: { async query() { return [{ id: 7, windowId: 3, url: "https://example.com" }]; },
-        async create(options) { globalThis.openedChats.push(options.url); }, async update() {} },
+      tabs: { async query() { return globalThis.existingTabs; },
+        async create(options) { globalThis.openedChats.push(options.url); }, async update(id) { globalThis.activatedChats.push(id); } },
     };
   });
   await page.route("http://127.0.0.1:19999/**", async route => {
     const pathname = new URL(route.request().url()).pathname;
     let data;
-    if (pathname === "/chatgpt-support/ralph/threads") data = { threads: [parent, active, legacyActive, ...complete], tasks: [task], continuationEnabled: true, automationPausedUntil };
+    if (pathname === "/chatgpt-support/ralph/threads") data = { threads: [parent, active, legacyActive, ...complete], tasks, continuationEnabled: true, automationPausedUntil };
     else if (pathname === "/chatgpt-support/ralph/register") {
       const input = route.request().postDataJSON();
       const thread = [parent, active, legacyActive].find(thread => thread.conversationUrl === input.conversationUrl);
@@ -60,18 +66,26 @@ try {
         schedules.push({ ...input, id: "99999999-9999-4999-8999-999999999999", state: "pending" });
         data = { task: schedules.at(-1) };
       } else data = { tasks: schedules };
+    } else if (pathname.startsWith("/chatgpt-support/schedules/") && route.request().method() === "PUT" && !pathname.endsWith("/cancel")) {
+      scheduleUpdates++;
+      if (rejectScheduleEdits) { await route.fulfill({ status: 409, json: { error: "A run that has started cannot be changed." } }); return; }
+      const input = route.request().postDataJSON();
+      delete schedules[0].repeatIntervalSeconds;
+      Object.assign(schedules[0], input);
+      data = { task: schedules[0] };
     } else if (pathname.endsWith("/cancel") && pathname.startsWith("/chatgpt-support/schedules/")) {
       schedules[0].state = "cancelled";
       data = { task: schedules[0] };
     } else if (pathname.startsWith("/chatgpt-support/schedules/") && route.request().method() === "DELETE") {
       schedules = []; data = { status: "removed" };
-    } else if (pathname === `/chatgpt-support/tasks/${reviewId}`) {
+    } else if (pathname === `/chatgpt-support/tasks/${reviewId}` || pathname === `/chatgpt-support/tasks/${startup.jobId}`) {
+      const target = tasks.find(job => pathname.endsWith(job.jobId));
       const action = route.request().postDataJSON().action;
-      if (action === "pause" || action === "resume") task.paused = action === "pause";
+      if (action === "pause" || action === "resume") target.paused = action === "pause";
       else {
         assert.equal(action, "cancel");
         cancelled = true;
-        task.state = "cancelled";
+        target.state = "cancelled";
         parent.waitingForTask = false;
         parent.activity = "running";
       }
@@ -97,9 +111,16 @@ try {
   assert.equal(await page.getByRole("button", { name: "Run continuously", exact: true }).count(), 0);
   assert.equal(await page.getByRole("button", { name: "Sidebar", exact: true }).count(), 0);
   assert.equal(settingsRequests, 0);
-  assert.equal(await page.locator('#subagentThreadList a.inspect-task').getAttribute("href"), task.childConversationUrl);
-  await page.getByRole("link", { name: "Inspect", exact: true }).click();
-  assert.deepEqual(await page.evaluate(() => globalThis.openedChats), [task.childConversationUrl]);
+  const taskLink = page.locator("#subagentThreadList .task-preview");
+  assert.equal(await taskLink.getAttribute("href"), task.childConversationUrl);
+  await taskLink.click();
+  assert.deepEqual(await page.evaluate(() => globalThis.openedChats), [task.childConversationUrl], "one click opens the task conversation");
+  assert.equal(await page.locator("#panel-threads").isVisible(), true, "opening a task keeps the thread list visible");
+  await page.evaluate(chatUrl => { globalThis.existingTabs.push({ id: 9, windowId: 3, url: chatUrl }); }, task.childConversationUrl);
+  await taskLink.focus();
+  await page.keyboard.press("Enter");
+  assert.deepEqual(await page.evaluate(() => globalThis.activatedChats), [9], "keyboard opening reuses an existing task tab");
+  assert.deepEqual(await page.evaluate(() => globalThis.openedChats), [task.childConversationUrl], "reopening does not create a duplicate tab");
   assert.equal(await page.evaluate(() => globalThis.closedViews), 0);
   await page.getByRole("tab", { name: /Settled/ }).click();
   assert.equal(await page.getByRole("button", { name: "Mark active", exact: true }).count(), 0, "settled cards offer no contradictory active action");
@@ -128,6 +149,17 @@ try {
   await page.getByRole("button", { name: "Cancel task", exact: true }).click();
   await page.locator("#subagentThreadsSection").waitFor({ state: "hidden" });
   assert.equal(cancelled, true);
+  tasks.push(startup);
+  await page.locator("#refreshThreads").click();
+  const startupCard = page.locator("#subagentThreadList .task-card").filter({ hasText: "Worker startup" });
+  assert.equal(await startupCard.locator(".task-preview").getAttribute("href"), null, "a failed startup has no dead conversation link");
+  assert.match(await startupCard.textContent(), /No task conversation yet/);
+  assert.match(await startupCard.textContent(), /dedicated Voice conversation/);
+  await startupCard.getByRole("link", { name: "Open parent chat" }).click();
+  assert.deepEqual(await page.evaluate(() => globalThis.openedChats), [task.childConversationUrl, startup.parentConversationUrl]);
+  await startupCard.getByRole("button", { name: "Pause task" }).click();
+  await startupCard.getByRole("button", { name: "Resume task" }).waitFor();
+  assert.equal(await page.locator("#panel-threads").isVisible(), true, "task actions keep the thread list visible");
   await page.getByRole("tab", { name: "Settings", exact: true }).click();
   await page.waitForFunction(() => document.getElementById("ralphLoopIntervalSeconds").value === "180");
   assert.equal(settingsRequests, 1);
@@ -154,6 +186,41 @@ try {
   await page.locator("#scheduleList").getByText("Run my scheduled check", { exact: true }).waitFor();
   assert.equal(schedules[0].runAt, expectedUtc, "the local time converts to the selected instant");
   assert.equal(scheduleRequests, 1);
+  const scheduleId = schedules[0].id;
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+  assert.equal(await page.getByLabel("Prompt", { exact: true }).inputValue(), "Run my scheduled check");
+  assert.equal(await page.evaluate(() => new Date(document.getElementById("scheduleAt").value).toISOString()), expectedUtc, "editing preserves the local time conversion");
+  await page.getByLabel("Prompt", { exact: true }).fill("Updated nightly check");
+  await page.getByLabel("Repeat", { exact: true }).check();
+  await page.getByLabel("Every", { exact: true }).fill("2");
+  await page.getByLabel("Unit", { exact: true }).selectOption("86400");
+  await page.locator("#refreshSchedules").click();
+  assert.equal(await page.getByLabel("Prompt", { exact: true }).inputValue(), "Updated nightly check", "refresh does not discard an edit draft");
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await page.getByText("Schedule updated.", { exact: true }).waitFor();
+  assert.equal(schedules.length, 1);
+  assert.equal(schedules[0].id, scheduleId);
+  assert.equal(schedules[0].prompt, "Updated nightly check");
+  assert.equal(schedules[0].repeatIntervalSeconds, 172800);
+  assert.equal(scheduleRequests, 1, "editing never creates a second schedule");
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+  assert.equal(await page.getByLabel("Every", { exact: true }).inputValue(), "2");
+  assert.equal(await page.getByLabel("Unit", { exact: true }).inputValue(), "86400");
+  await page.getByLabel("Repeat", { exact: true }).uncheck();
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await page.getByRole("button", { name: "Schedule task", exact: true }).waitFor();
+  assert.equal(schedules[0].repeatIntervalSeconds, undefined);
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+  await page.getByLabel("Prompt", { exact: true }).fill("Keep this draft after a rejected edit");
+  rejectScheduleEdits = true;
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await page.getByText("A run that has started cannot be changed.", { exact: true }).waitFor();
+  assert.equal(await page.getByLabel("Prompt", { exact: true }).inputValue(), "Keep this draft after a rejected edit");
+  await page.getByRole("button", { name: "Cancel editing", exact: true }).click();
+  rejectScheduleEdits = false;
+  assert.equal(await page.getByLabel("Prompt", { exact: true }).inputValue(), "");
+  assert.equal(scheduleUpdates, 3);
+  assert.equal(schedules[0].prompt, "Updated nightly check", "failed and cancelled editing leave the saved prompt intact");
   await page.getByRole("button", { name: "Cancel schedule", exact: true }).click();
   await page.locator("#scheduleList").getByText(/Cancelled/).waitFor();
   await page.getByRole("button", { name: "Remove", exact: true }).click();
@@ -163,7 +230,7 @@ try {
   await page.getByRole("button", { name: "Schedule task", exact: true }).click();
   await page.getByText("Choose a future date and time.", { exact: true }).waitFor();
   assert.equal(scheduleRequests, 1, "invalid past schedules never reach the API");
-  for (const [amount, unit, seconds, cadence] of [[1, "60", 60, "Every 1 minute"], [1, "3600", 3600, "Every 1 hour"], [7, "60", 420, "Every 7 minutes"]]) {
+  for (const [amount, unit, seconds, cadence] of [[1, "60", 60, "Every 1 minute"], [1, "3600", 3600, "Every 1 hour"], [7, "60", 420, "Every 7 minutes"], [90, "1", 90, "Every 90 seconds"]]) {
     await page.getByLabel("Prompt", { exact: true }).fill("Recurring check");
     await page.getByLabel("Date and time", { exact: true }).fill(localTime);
     await page.getByLabel("Repeat", { exact: true }).check();
@@ -176,12 +243,13 @@ try {
     schedules[0].state = "sending";
     await page.getByRole("button", { name: "Refresh", exact: true }).last().click();
     await page.locator("#scheduleList").getByText(/^Starting/).waitFor();
+    assert.equal(await page.getByRole("button", { name: "Edit", exact: true }).count(), 0, "runs being sent cannot be edited");
     await page.getByRole("button", { name: "Stop repeating", exact: true }).click();
     await page.locator("#scheduleList").getByText(/Cancelled/).waitFor();
     await page.getByRole("button", { name: "Remove", exact: true }).click();
     await page.locator("#scheduleList .empty").waitFor();
   }
-  assert.equal(scheduleRequests, 4);
+  assert.equal(scheduleRequests, 5);
   await page.getByRole("tab", { name: "Threads", exact: true }).click();
   active.state = "complete";
   await page.locator("#activeCount").getByText("1", { exact: true }).waitFor();
@@ -198,5 +266,5 @@ try {
   await page.screenshot({ path: ".data/schedule-sidebar.png", fullPage: true });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
   assert.deepEqual(errors, []);
-  console.log("Support UI passed: active and settled separation, scrolling, working tasks, live completion, temporary chat inspection, one-time and minute/hour/custom repeat schedules, cancellation during delivery, timezone conversion, narrow sidebar, and lazy settings. API responses were fixtures.");
+  console.log("Support UI passed: active and settled separation, scrolling, working tasks, live completion, direct task navigation and tab reuse, schedule editing and conflict recovery, one-time and minute/hour/custom repeat schedules, cancellation during delivery, timezone conversion, narrow sidebar, and lazy settings. API responses were fixtures.");
 } finally { await browser.close(); }

@@ -373,52 +373,56 @@ function renderThreads() {
   list.replaceChildren(...tasks.map(renderTask));
 }
 
-function renderTask(job) {
-  const item = document.createElement("li");
-  const card = Object.assign(document.createElement("div"), { className: "thread" });
-  const [label, state] = job.paused ? ["Paused", "paused"] : job.preparationError ? ["Needs attention", "needs attention"]
+function taskLabel(job) {
+  return job.paused ? ["Paused", "paused"] : job.preparationError ? ["Needs attention", "needs attention"]
     : job.state === "cancelled" ? ["Cancelled", "complete"]
     : job.state === "complete" ? ["Report available", "finished"] : ["Task in progress", "running"];
-  const title = document.createElement(job.childConversationUrl ? "a" : "strong");
-  title.className = "thread-id";
-  title.textContent = job.title || "Worker startup";
-  if (job.childConversationUrl) {
-    title.href = job.childConversationUrl;
-    title.addEventListener("click", (event) => { event.preventDefault(); void openConversation(job.childConversationUrl); });
+}
+
+function renderTask(job) {
+  const item = document.createElement("li");
+  const card = Object.assign(document.createElement("div"), { className: "thread task-card" });
+  const [label, state] = taskLabel(job);
+  const url = conversationUrl(job.childConversationUrl);
+  const preview = Object.assign(document.createElement(url ? "a" : "div"), { className: "thread-link task-preview" });
+  if (url) {
+    preview.href = url;
+    preview.target = "_blank";
+    preview.rel = "noreferrer";
+    preview.title = "Open task chat";
+    preview.addEventListener("click", event => {
+      if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      void openConversation(url);
+    });
   }
+  const title = Object.assign(document.createElement("span"), { className: "thread-id", textContent: job.title || "Worker startup" });
   const pill = Object.assign(document.createElement("span"), { className: "pill" });
   pill.dataset.state = state;
   pill.append(document.createElement("i"), label);
   const head = Object.assign(document.createElement("div"), { className: "thread-head" });
   head.append(title, pill);
-  card.append(head);
-  const error = job.preparationError;
-  if (error) card.append(Object.assign(document.createElement("p"), { className: "thread-error", textContent: error }));
+  preview.append(head);
+  if (job.preparationError) preview.append(Object.assign(document.createElement("p"), { className: "thread-error", textContent: job.preparationError }));
+  if (!url) preview.append(Object.assign(document.createElement("p"), { className: "thread-meta", textContent: "No task conversation yet." }));
+  card.append(preview);
   const actions = Object.assign(document.createElement("div"), { className: "thread-actions" });
-  if (job.childConversationUrl) {
-    const reviewUrl = Object.assign(document.createElement("a"), {
-      className: "inspect-task button button-outline button-sm",
-      href: job.childConversationUrl,
-      target: "_blank",
-      rel: "noreferrer",
-      textContent: "Inspect",
-      title: job.childConversationUrl,
-    });
-    reviewUrl.addEventListener("click", (event) => {
+  const parentUrl = conversationUrl(job.parentConversationUrl);
+  if (parentUrl) {
+    const parent = Object.assign(document.createElement("a"), { className: "button button-outline button-sm", textContent: "Open parent chat", href: parentUrl, target: "_blank", rel: "noreferrer" });
+    parent.addEventListener("click", event => {
       if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
       event.preventDefault();
-      void openConversation(job.childConversationUrl);
+      void openConversation(parentUrl);
     });
-    actions.append(reviewUrl);
+    actions.append(parent);
   }
   if (job.state === "pending") {
     const pause = Object.assign(document.createElement("button"), { className: "button button-outline button-sm", type: "button", textContent: job.paused ? "Resume task" : "Pause task" });
     pause.addEventListener("click", () => void changeReview(job, job.paused ? "resume" : "pause", pause));
-    actions.append(pause);
-    const action = "cancel";
-    const button = Object.assign(document.createElement("button"), { className: "button button-outline button-sm button-danger", type: "button", textContent: "Cancel task" });
-    button.addEventListener("click", () => void changeReview(job, action, button));
-    actions.append(button);
+    const cancel = Object.assign(document.createElement("button"), { className: "button button-outline button-sm button-danger", type: "button", textContent: "Cancel task" });
+    cancel.addEventListener("click", () => void changeReview(job, "cancel", cancel));
+    actions.append(pause, cancel);
   }
   if (actions.childElementCount) card.append(actions);
   item.append(card);
@@ -476,14 +480,20 @@ async function loadThreads() {
 
 let loadingSchedules = false;
 let scheduleSnapshot;
+let editingScheduleId;
+const repeatUnits = [[86400, "day"], [3600, "hour"], [60, "minute"], [1, "second"]];
 element("scheduleTimezone").textContent = `Your time zone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}.`;
 function updateRepeatFields() {
   const enabled = element("scheduleRepeat").checked;
   element("scheduleInterval").hidden = !enabled;
   element("scheduleIntervalValue").disabled = !enabled;
   element("scheduleIntervalUnit").disabled = !enabled;
+  const unit = Number(element("scheduleIntervalUnit").value);
+  element("scheduleIntervalValue").min = String(Math.ceil(60 / unit));
+  element("scheduleIntervalValue").max = String(Math.floor(31_536_000 / unit));
 }
 element("scheduleRepeat").addEventListener("change", updateRepeatFields);
+element("scheduleIntervalUnit").addEventListener("change", updateRepeatFields);
 
 const formatDate = value => new Date(value).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 
@@ -507,8 +517,8 @@ async function loadSchedules() {
       card.append(head, prompt);
       if (task.repeatIntervalSeconds) {
         const seconds = task.repeatIntervalSeconds;
-        const unit = seconds % 86400 === 0 ? "day" : seconds % 3600 === 0 ? "hour" : "minute";
-        const amount = seconds / (unit === "day" ? 86400 : unit === "hour" ? 3600 : 60);
+        const [size, unit] = repeatUnits.find(([size]) => seconds % size === 0);
+        const amount = seconds / size;
         card.append(Object.assign(document.createElement("p"), { className: "thread-meta",
           textContent: `Every ${amount} ${unit}${amount === 1 ? "" : "s"}${task.state === "pending" ? " · Next run shown above" : ""}` }));
         if (task.lastRunAt) card.append(Object.assign(document.createElement("p"), { className: "thread-meta",
@@ -520,6 +530,11 @@ async function loadSchedules() {
         const link = Object.assign(document.createElement("a"), { className: "inspect-task button button-outline button-sm", textContent: "Open chat", href: task.conversationUrl });
         link.addEventListener("click", event => { event.preventDefault(); void openConversation(task.conversationUrl); });
         actions.append(link);
+      }
+      if (task.state === "pending") {
+        const edit = Object.assign(document.createElement("button"), { className: "button button-outline button-sm", type: "button", textContent: "Edit" });
+        edit.addEventListener("click", () => editSchedule(task));
+        actions.append(edit);
       }
       const canCancel = task.state === "pending" || (task.state === "sending" && task.repeatIntervalSeconds);
       if (task.state !== "sending" || canCancel) {
@@ -546,6 +561,41 @@ async function loadSchedules() {
   } finally { loadingSchedules = false; }
 }
 
+function resetScheduleForm() {
+  editingScheduleId = undefined;
+  element("scheduleForm").reset();
+  element("scheduleFormTitle").textContent = "Schedule a task";
+  element("saveSchedule").textContent = "Schedule task";
+  element("cancelScheduleEdit").hidden = true;
+  updateRepeatFields();
+}
+
+function editSchedule(task) {
+  if (element("saveSchedule").disabled) return;
+  editingScheduleId = task.id;
+  element("scheduleFormTitle").textContent = "Edit scheduled task";
+  element("saveSchedule").textContent = "Save changes";
+  element("cancelScheduleEdit").hidden = false;
+  element("schedulePrompt").value = task.prompt;
+  const date = new Date(task.runAt);
+  element("scheduleAt").value = new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 19);
+  element("scheduleRepeat").checked = Boolean(task.repeatIntervalSeconds);
+  const seconds = task.repeatIntervalSeconds ?? 60;
+  const [unit] = repeatUnits.find(([size]) => seconds % size === 0);
+  element("scheduleIntervalValue").value = String(seconds / unit);
+  element("scheduleIntervalUnit").value = String(unit);
+  updateRepeatFields();
+  setNote(element("scheduleStatus"), "");
+  element("scheduleForm").scrollIntoView({ block: "start" });
+  element("schedulePrompt").focus({ preventScroll: true });
+}
+
+element("cancelScheduleEdit").addEventListener("click", () => {
+  resetScheduleForm();
+  setNote(element("scheduleStatus"), "");
+  element("schedulePrompt").focus();
+});
+
 element("scheduleForm").addEventListener("submit", event => {
   event.preventDefault();
   const date = new Date(element("scheduleAt").value);
@@ -562,16 +612,18 @@ element("scheduleForm").addEventListener("submit", event => {
   }
   const button = element("saveSchedule");
   button.disabled = true;
-  void callServer(schedulesEndpoint, { method: "POST", headers: { "content-type": "application/json" },
+  element("cancelScheduleEdit").disabled = true;
+  const editing = Boolean(editingScheduleId);
+  const endpoint = editing ? new URL(schedulesEndpoint.pathname + "/" + encodeURIComponent(editingScheduleId), schedulesEndpoint) : schedulesEndpoint;
+  void callServer(endpoint, { method: editing ? "PUT" : "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ prompt: element("schedulePrompt").value, runAt: date.toISOString(), repeatIntervalSeconds }) })
     .then(async () => {
-      element("scheduleForm").reset();
-      updateRepeatFields();
-      setNote(element("scheduleStatus"), "Task scheduled.");
+      resetScheduleForm();
+      setNote(element("scheduleStatus"), editing ? "Schedule updated." : "Task scheduled.");
       await loadSchedules();
     })
     .catch(error => setNote(element("scheduleStatus"), errorMessage(error, "Could not save the schedule."), "error"))
-    .finally(() => { button.disabled = false; });
+    .finally(() => { button.disabled = false; element("cancelScheduleEdit").disabled = false; });
 });
 element("refreshSchedules").addEventListener("click", () => void loadSchedules());
 
