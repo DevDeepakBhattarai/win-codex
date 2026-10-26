@@ -30,7 +30,7 @@ try {
   let scheduleRequests = 0;
   let scheduleUpdates = 0;
   let rejectScheduleEdits = false;
-  await page.addInitScript(() => {
+  const installExtensionFixture = () => {
     globalThis.closedViews = 0;
     globalThis.openedChats = [];
     globalThis.activatedChats = [];
@@ -42,8 +42,9 @@ try {
       tabs: { async query() { return globalThis.existingTabs; },
         async create(options) { globalThis.openedChats.push(options.url); }, async update(id) { globalThis.activatedChats.push(id); } },
     };
-  });
-  await page.route("http://127.0.0.1:19999/**", async route => {
+  };
+  await page.addInitScript(installExtensionFixture);
+  const serveSidebar = async route => {
     const pathname = new URL(route.request().url()).pathname;
     let data;
     if (pathname === "/chatgpt-support/ralph/threads") data = { threads: [parent, active, legacyActive, ...complete], tasks, continuationEnabled: true, automationPausedUntil };
@@ -100,7 +101,8 @@ try {
     const file = pathname.slice(1);
     if (!["popup.html", "popup.js", "popup.css"].includes(file)) { await route.abort(); return; }
     await route.fulfill({ contentType: file.endsWith("html") ? "text/html" : file.endsWith("css") ? "text/css" : "text/javascript", body: await readFile(`support-extension/${file}`, "utf8") });
-  });
+  };
+  await page.route("http://127.0.0.1:19999/**", serveSidebar);
   await page.goto("http://127.0.0.1:19999/popup.html?view=sidepanel");
   await page.locator("#activeCount").getByText("2", { exact: true }).waitFor();
   assert.deepEqual(await page.locator("#threadList .thread-id").allTextContents(), ["Check remaining work", "Legacy active with settlement"]);
@@ -265,6 +267,26 @@ try {
   await page.getByLabel("Repeat", { exact: true }).check();
   await page.screenshot({ path: ".data/schedule-sidebar.png", fullPage: true });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+  const fallbackRunAt = "2026-11-01T06:30:00.123Z";
+  schedules = [{ id: "88888888-8888-4888-8888-888888888888", prompt: "DST fallback check", state: "pending", runAt: fallbackRunAt }];
+  const fallbackPage = await browser.newPage({ timezoneId: "America/New_York" });
+  fallbackPage.on("pageerror", error => errors.push(error.message));
+  await fallbackPage.addInitScript(installExtensionFixture);
+  await fallbackPage.route("http://127.0.0.1:19999/**", serveSidebar);
+  await fallbackPage.goto("http://127.0.0.1:19999/popup.html");
+  await fallbackPage.getByRole("tab", { name: "Schedules", exact: true }).click();
+  await fallbackPage.getByRole("button", { name: "Edit", exact: true }).click();
+  assert.match(await fallbackPage.getByLabel("Date and time", { exact: true }).inputValue(), /^2026-11-01T01:30/);
+  await fallbackPage.getByLabel("Prompt", { exact: true }).fill("Changed prompt without moving the later 1:30 AM");
+  await fallbackPage.getByRole("button", { name: "Save changes", exact: true }).click();
+  await fallbackPage.getByText("Schedule updated.", { exact: true }).waitFor();
+  assert.equal(schedules[0].runAt, fallbackRunAt, "prompt-only edits preserve the UTC instant, including DST offset and milliseconds");
+  await fallbackPage.getByRole("button", { name: "Edit", exact: true }).click();
+  await fallbackPage.getByLabel("Date and time", { exact: true }).fill("2026-11-02T01:30");
+  await fallbackPage.getByRole("button", { name: "Save changes", exact: true }).click();
+  await fallbackPage.getByRole("button", { name: "Schedule task", exact: true }).waitFor();
+  assert.equal(schedules[0].runAt, "2026-11-02T06:30:00.000Z", "explicit date changes use the selected local time");
+  await fallbackPage.close();
   assert.deepEqual(errors, []);
   console.log("Support UI passed: active and settled separation, scrolling, working tasks, live completion, direct task navigation and tab reuse, schedule editing and conflict recovery, one-time and minute/hour/custom repeat schedules, cancellation during delivery, timezone conversion, narrow sidebar, and lazy settings. API responses were fixtures.");
 } finally { await browser.close(); }

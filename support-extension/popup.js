@@ -480,7 +480,7 @@ async function loadThreads() {
 
 let loadingSchedules = false;
 let scheduleSnapshot;
-let editingScheduleId;
+let editingSchedule;
 const repeatUnits = [[86400, "day"], [3600, "hour"], [60, "minute"], [1, "second"]];
 element("scheduleTimezone").textContent = `Your time zone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}.`;
 function updateRepeatFields() {
@@ -562,7 +562,7 @@ async function loadSchedules() {
 }
 
 function resetScheduleForm() {
-  editingScheduleId = undefined;
+  editingSchedule = undefined;
   element("scheduleForm").reset();
   element("scheduleFormTitle").textContent = "Schedule a task";
   element("saveSchedule").textContent = "Schedule task";
@@ -572,13 +572,13 @@ function resetScheduleForm() {
 
 function editSchedule(task) {
   if (element("saveSchedule").disabled) return;
-  editingScheduleId = task.id;
   element("scheduleFormTitle").textContent = "Edit scheduled task";
   element("saveSchedule").textContent = "Save changes";
   element("cancelScheduleEdit").hidden = false;
   element("schedulePrompt").value = task.prompt;
   const date = new Date(task.runAt);
   element("scheduleAt").value = new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 19);
+  editingSchedule = { id: task.id, runAt: task.runAt, localTime: element("scheduleAt").value };
   element("scheduleRepeat").checked = Boolean(task.repeatIntervalSeconds);
   const seconds = task.repeatIntervalSeconds ?? 60;
   const [unit] = repeatUnits.find(([size]) => seconds % size === 0);
@@ -598,7 +598,8 @@ element("cancelScheduleEdit").addEventListener("click", () => {
 
 element("scheduleForm").addEventListener("submit", event => {
   event.preventDefault();
-  const date = new Date(element("scheduleAt").value);
+  const localTime = element("scheduleAt").value;
+  const date = new Date(editingSchedule && localTime === editingSchedule.localTime ? editingSchedule.runAt : localTime);
   if (!Number.isFinite(date.getTime()) || date.getTime() <= Date.now()) {
     setNote(element("scheduleStatus"), "Choose a future date and time.", "error");
     return;
@@ -613,8 +614,8 @@ element("scheduleForm").addEventListener("submit", event => {
   const button = element("saveSchedule");
   button.disabled = true;
   element("cancelScheduleEdit").disabled = true;
-  const editing = Boolean(editingScheduleId);
-  const endpoint = editing ? new URL(schedulesEndpoint.pathname + "/" + encodeURIComponent(editingScheduleId), schedulesEndpoint) : schedulesEndpoint;
+  const editing = Boolean(editingSchedule);
+  const endpoint = editing ? new URL(schedulesEndpoint.pathname + "/" + encodeURIComponent(editingSchedule.id), schedulesEndpoint) : schedulesEndpoint;
   void callServer(endpoint, { method: editing ? "PUT" : "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ prompt: element("schedulePrompt").value, runAt: date.toISOString(), repeatIntervalSeconds }) })
     .then(async () => {
