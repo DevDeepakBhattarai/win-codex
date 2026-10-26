@@ -270,6 +270,7 @@ try {
   const fallbackRunAt = "2026-11-01T06:30:00.123Z";
   schedules = [{ id: "88888888-8888-4888-8888-888888888888", prompt: "DST fallback check", state: "pending", runAt: fallbackRunAt }];
   const fallbackPage = await browser.newPage({ timezoneId: "America/New_York" });
+  await fallbackPage.clock.setFixedTime(new Date("2026-10-26T00:00:00.000Z"));
   fallbackPage.on("pageerror", error => errors.push(error.message));
   await fallbackPage.addInitScript(installExtensionFixture);
   await fallbackPage.route("http://127.0.0.1:19999/**", serveSidebar);
