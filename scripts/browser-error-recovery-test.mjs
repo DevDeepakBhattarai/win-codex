@@ -112,23 +112,28 @@ assert.deepEqual(disabled.calls, [], "The local error recovery toggle disables u
 
 const missedNotice = await worker();
 await missedNotice.context.pollCommands(vm.runInNewContext("pollGeneration", missedNotice.context));
+await missedNotice.settle();
 assert.deepEqual(missedNotice.calls, ["page_health", "stop_thread", "send_message"],
   "periodic scanning recovers a notice even when no content-script event arrives");
 missedNotice.setHealth("recoverable_error");
 await missedNotice.context.pollCommands(vm.runInNewContext("pollGeneration", missedNotice.context));
+await missedNotice.settle();
 assert.equal(missedNotice.calls.length, 3, "periodic health checks wait three minutes before another scan");
 missedNotice.advance(180_000);
 await missedNotice.context.pollCommands(vm.runInNewContext("pollGeneration", missedNotice.context));
+await missedNotice.settle();
 assert.deepEqual(missedNotice.calls.slice(3), ["page_health", "stop_thread", "send_message"],
   "the next three-minute scan recovers a later failure without another event");
 
 const retryStop = await worker();
 retryStop.failStop("Stop did not finish");
 await retryStop.context.pollCommands(vm.runInNewContext("pollGeneration", retryStop.context));
+await retryStop.settle();
 assert.deepEqual(retryStop.calls, ["page_health", "stop_thread"]);
 retryStop.failStop(undefined);
 retryStop.advance(180_000);
 await retryStop.context.pollCommands(vm.runInNewContext("pollGeneration", retryStop.context));
+await retryStop.settle();
 assert.deepEqual(retryStop.calls.slice(2), ["page_health", "stop_thread", "send_message"],
   "a failed recovery is retried on the next scan rather than being forgotten");
 
@@ -222,5 +227,6 @@ assert.deepEqual(legacyCooldown.calls, ["page_health", "stop_thread", "send_mess
 const emptyChat = await worker({ "pageRecovery:7": { conversationUnavailableAt: 1_800_000_000_000 - 300_001, conversationUnavailableUrl: url } });
 emptyChat.setHealth("conversation_unavailable");
 await emptyChat.context.pollCommands(vm.runInNewContext("pollGeneration", emptyChat.context));
+await emptyChat.settle();
 assert.deepEqual(emptyChat.calls, ["page_health", "recover_page"], "Helium retries its empty conversation in place after the shared cooldown");
 console.log("Browser error recovery tests passed.");
