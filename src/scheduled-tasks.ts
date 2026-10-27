@@ -111,6 +111,20 @@ export class ScheduledTasks {
 		});
 	}
 
+	async edit(id: string, input: z.infer<typeof taskInput>) {
+		const parsed = taskInput.parse(input);
+		return this.update(tasks => {
+			const task = tasks.find(entry => entry.id === id);
+			if (!task) throw new Error("Scheduled task not found.");
+			if (task.state !== "pending") throw new Error("Only scheduled tasks can be edited. A run that has started cannot be changed.");
+			if (Date.parse(parsed.runAt) <= Date.now()) throw new Error("Choose a future date and time.");
+			task.prompt = parsed.prompt;
+			task.runAt = new Date(parsed.runAt).toISOString();
+			task.repeatIntervalSeconds = parsed.repeatIntervalSeconds;
+			return { ...task };
+		});
+	}
+
 	async remove(id: string) {
 		return this.update(tasks => {
 			const index = tasks.findIndex(entry => entry.id === id);
@@ -209,6 +223,13 @@ export function createScheduleApi(schedules: ScheduledTasks, token: string) {
 	});
 	router.put("/:id/cancel", async (req, res) => {
 		try { res.json({ task: await schedules.cancel(z.uuid().parse(req.params.id)) }); }
+		catch (error) { res.status(409).json({ error: error instanceof Error ? error.message : String(error) }); }
+	});
+	router.put("/:id", async (req, res) => {
+		const parsed = taskInput.safeParse(req.body);
+		const id = z.uuid().safeParse(req.params.id);
+		if (!parsed.success || !id.success) { res.status(400).json({ error: "Enter a prompt and a valid date and time." }); return; }
+		try { res.json({ task: await schedules.edit(id.data, parsed.data) }); }
 		catch (error) { res.status(409).json({ error: error instanceof Error ? error.message : String(error) }); }
 	});
 	router.delete("/:id", async (req, res) => {

@@ -855,6 +855,13 @@ async function executeCommandOnce(command, browserId) {
     }
     if (!acquired) throw new Error("CHATGPT_TAB_UNAVAILABLE: The thread tab has closed or navigated away.");
     tabId = acquired.tab.id;
+    if (command.kind === "stop_thread") {
+      const recovery = recoveringPages.get(tabId);
+      if (recovery) {
+        recovery.resume = false;
+        await recovery.promise.catch(() => undefined);
+      }
+    }
     created = acquired.created === true;
     const existingConversation = conversationUrl(targetUrl);
     if (created && existingConversation) {
@@ -1050,11 +1057,6 @@ async function recoveryReservation(recovery, reservation) {
 }
 
 async function recoverPage(tabId, resume = true, commandId) {
-  const currentUrl = (await extensionApi.tabs.get(tabId)).url;
-  if (await syncAutomationPause(false, conversationUrl(currentUrl))) resume = false;
-  if (await isVoiceConversation(currentUrl)) return false;
-  const pauseKey = `threadPaused:${conversationUrl(currentUrl)}`;
-  if ((await extensionApi.storage.local.get(pauseKey))[pauseKey]) return false;
   const existing = recoveringPages.get(tabId);
   if (existing) {
     if (!resume) {
@@ -1076,6 +1078,11 @@ async function recoverPage(tabId, resume = true, commandId) {
 }
 
 async function recoverPageOnce(tabId, recovery) {
+  const currentUrl = (await extensionApi.tabs.get(tabId)).url;
+  if (await syncAutomationPause(false, conversationUrl(currentUrl))) recovery.resume = false;
+  if (await isVoiceConversation(currentUrl)) return false;
+  const pauseKey = `threadPaused:${conversationUrl(currentUrl)}`;
+  if ((await extensionApi.storage.local.get(pauseKey))[pauseKey]) return false;
   await waitForAutomationResume();
   const targetUrl = (await extensionApi.tabs.get(tabId)).url;
   recovery.targetUrl = targetUrl;
@@ -1194,7 +1201,7 @@ async function pollCommands(generation, voiceOnly = false) {
           (saved[key]?.rateLimitedAt && Date.now() - saved[key].rateLimitedAt >= RATE_LIMIT_WAIT_MS) ||
           Date.now() - (checked[healthCheckKey] ?? 0) >= PAGE_HEALTH_CHECK_INTERVAL_MS)) {
         await extensionApi.storage.local.set({ [healthCheckKey]: Date.now() });
-        await keepWorkerAliveUntil(recoverPage(tab.id)).catch(() => undefined);
+        void keepWorkerAliveUntil(recoverPage(tab.id)).catch(() => undefined);
       }
     }
     const idleObserver = features.length === 0 && openThreads.length === 0;

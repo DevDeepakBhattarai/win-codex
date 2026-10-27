@@ -18,6 +18,7 @@ async function worker(settings = {}, serverVoiceUrl) {
   let currentUrl = url;
   let navigateAfterStop = false;
   let stopGate;
+  let sendGate;
   let stopError;
   let stopStatus = "stopped";
   let pendingMessage = false;
@@ -49,7 +50,7 @@ async function worker(settings = {}, serverVoiceUrl) {
             if (navigateAfterStop) currentUrl = url.replace("11111111", "22222222");
             return { ok: true, result: { status: stopStatus } };
           }
-          if (command.kind === "send_message") { health = "ok"; return { ok: true, result: { status: "sent" } }; }
+          if (command.kind === "send_message") { if (sendGate) await sendGate; health = "ok"; return { ok: true, result: { status: "sent" } }; }
           if (command.kind === "dismiss_rate_limit") { health = "ok"; return { ok: true, result: { status: "dismissed" } }; }
           if (command.kind === "recover_page") { health = "ok"; return { ok: true, result: { status: "recovery_started" } }; }
           assert.fail(`Unexpected command ${command.kind}`);
@@ -80,6 +81,7 @@ async function worker(settings = {}, serverVoiceUrl) {
     setHealth(value) { health = value; }, advance(ms) { clock += ms; },
     navigateAfterStop() { navigateAfterStop = true; },
     holdStop(gate) { stopGate = gate; }, failStop(error) { stopError = error; }, setStopStatus(value) { stopStatus = value; },
+    holdSend(gate) { sendGate = gate; },
     setServerVoice(value) { serverVoiceUrl = value; }, setPendingMessage(value) { pendingMessage = value; },
     disconnect() { serviceOnline = false; },
   };
@@ -110,25 +112,54 @@ await disabled.notify();
 await disabled.settle();
 assert.deepEqual(disabled.calls, [], "The local error recovery toggle disables unsolicited recovery");
 
+for (const continuationStarted of [false, true]) {
+  const stopping = await worker({ automationExecutor: true, threadMessaging: true });
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  if (continuationStarted) stopping.holdSend(gate);
+  else stopping.holdStop(gate);
+  await stopping.notify();
+  await stopping.settle();
+  const beforeStop = continuationStarted ? ["page_health", "stop_thread", "send_message"] : ["page_health", "stop_thread"];
+  assert.deepEqual(stopping.calls, beforeStop);
+  const stopped = stopping.context.executeCommand({ id: `explicit-stop-${continuationStarted}`, feature: "threadMessaging",
+    kind: "stop_thread", targetUrl: url }, "chrome");
+  try {
+    await stopping.settle();
+    assert.deepEqual(stopping.calls, beforeStop, "an explicit Stop waits for outstanding recovery before acknowledging Stop");
+  } finally {
+    release();
+    await stopped;
+  }
+  await stopping.settle();
+  assert.deepEqual(stopping.calls, [...beforeStop, "stop_thread"],
+    "an explicit Stop stays last, suppressing an unstarted Continue and waiting for an already dispatched Continue");
+}
+
 const missedNotice = await worker();
 await missedNotice.context.pollCommands(vm.runInNewContext("pollGeneration", missedNotice.context));
+await missedNotice.settle();
 assert.deepEqual(missedNotice.calls, ["page_health", "stop_thread", "send_message"],
   "periodic scanning recovers a notice even when no content-script event arrives");
 missedNotice.setHealth("recoverable_error");
 await missedNotice.context.pollCommands(vm.runInNewContext("pollGeneration", missedNotice.context));
+await missedNotice.settle();
 assert.equal(missedNotice.calls.length, 3, "periodic health checks wait three minutes before another scan");
 missedNotice.advance(180_000);
 await missedNotice.context.pollCommands(vm.runInNewContext("pollGeneration", missedNotice.context));
+await missedNotice.settle();
 assert.deepEqual(missedNotice.calls.slice(3), ["page_health", "stop_thread", "send_message"],
   "the next three-minute scan recovers a later failure without another event");
 
 const retryStop = await worker();
 retryStop.failStop("Stop did not finish");
 await retryStop.context.pollCommands(vm.runInNewContext("pollGeneration", retryStop.context));
+await retryStop.settle();
 assert.deepEqual(retryStop.calls, ["page_health", "stop_thread"]);
 retryStop.failStop(undefined);
 retryStop.advance(180_000);
 await retryStop.context.pollCommands(vm.runInNewContext("pollGeneration", retryStop.context));
+await retryStop.settle();
 assert.deepEqual(retryStop.calls.slice(2), ["page_health", "stop_thread", "send_message"],
   "a failed recovery is retried on the next scan rather than being forgotten");
 
@@ -222,5 +253,6 @@ assert.deepEqual(legacyCooldown.calls, ["page_health", "stop_thread", "send_mess
 const emptyChat = await worker({ "pageRecovery:7": { conversationUnavailableAt: 1_800_000_000_000 - 300_001, conversationUnavailableUrl: url } });
 emptyChat.setHealth("conversation_unavailable");
 await emptyChat.context.pollCommands(vm.runInNewContext("pollGeneration", emptyChat.context));
+await emptyChat.settle();
 assert.deepEqual(emptyChat.calls, ["page_health", "recover_page"], "Helium retries its empty conversation in place after the shared cooldown");
 console.log("Browser error recovery tests passed.");
