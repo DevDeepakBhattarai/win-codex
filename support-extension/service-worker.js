@@ -1194,7 +1194,7 @@ async function pollCommands(generation, voiceOnly = false) {
           (saved[key]?.rateLimitedAt && Date.now() - saved[key].rateLimitedAt >= RATE_LIMIT_WAIT_MS) ||
           Date.now() - (checked[healthCheckKey] ?? 0) >= PAGE_HEALTH_CHECK_INTERVAL_MS)) {
         await extensionApi.storage.local.set({ [healthCheckKey]: Date.now() });
-        await keepWorkerAliveUntil(recoverPage(tab.id)).catch(() => undefined);
+        void keepWorkerAliveUntil(recoverPage(tab.id)).catch(() => undefined);
       }
     }
     const idleObserver = features.length === 0 && openThreads.length === 0;

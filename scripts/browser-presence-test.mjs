@@ -213,7 +213,8 @@ function worker() {
 }
 let context = worker();
 await new Promise(resolve => setImmediate(resolve));
-assert.deepEqual(presenceClaims.at(-1).openThreads, [], 'an idle observer publishes empty presence before stopping its poll loop');
+assert.deepEqual(presenceClaims.find(claim => !claim.statusOnly && !claim.recoveryReservation)?.openThreads, [],
+  'an idle observer publishes empty presence before stopping its poll loop');
 const inspect = (externalUpdate = true) => context.executeCommand({ id: String(now), kind: 'inspect_thread', feature: 'ralph', conversationUrl: url,
   ...(externalUpdate ? { refreshRevision: 'external-change' } : {}) }, 'helium');
 await context.executeCommand({ id: 'observer-prepare', kind: 'prepare_thread', feature: 'threadPreparation', conversationUrl: url }, 'helium');
@@ -248,6 +249,39 @@ now += 120_000;
 await inspect(false);
 assert.equal(reloads, 0, 'a later inspection still preserves the same conversation');
 assert.equal(creations, 0);
+
+const startupBus = new SupportCommandBus(undefined, undefined, undefined, undefined, undefined, undefined, 500);
+const workerFetch = context.fetch;
+let releaseHealth;
+let healthEntered;
+const healthGate = new Promise(resolve => { releaseHealth = resolve; });
+const healthStarted = new Promise(resolve => { healthEntered = resolve; });
+context.getSettings = async () => ({ threadSync: true, automationExecutor: true, threadMessaging: true, errorRecovery: true, ralph: false });
+context.waitForAutomationResume = async () => {};
+context.reportClosedThreadTabs = async () => {};
+context.recoverPage = async () => { healthEntered(); await healthGate; return false; };
+context.fetch = async (endpoint, options) => {
+  if (endpoint === config.commandClaimUrl) {
+    const body = JSON.parse(options.body);
+    if (!body.statusOnly && !body.recoveryReservation) {
+      await new Promise(resolve => setTimeout(resolve, 1));
+      await startupBus.claim(body.browserId, body.features, 0, undefined, body.openThreads);
+    }
+  }
+  return workerFetch(endpoint, options);
+};
+storage["pageHealthCheckedAt:7"] = 0;
+const polling = context.pollCommands(vm.runInNewContext('pollGeneration', context));
+try {
+  await healthStarted;
+  await assert.doesNotReject(startupBus.ensureBrowser('threadMessaging', async () => {}), 'An unrelated slow page-health check must not hide an enabled task executor');
+  console.log('PASS: the threadMessaging executor connects while an unrelated page-health check remains pending.');
+} finally {
+  vm.runInNewContext('pollGeneration += 1; pollController?.abort(); voicePollController?.abort();', context);
+  releaseHealth();
+  await polling;
+  startupBus.close();
+}
 
 let listener;
 let domClicks = 0;
