@@ -155,11 +155,18 @@ export class ScheduledTasks {
 				await this.queue;
 				if (this.tasks.find(entry => entry.id === task.id)?.state !== "sending") return;
 				const result = await services.commands.execute({ feature: "threadMessaging", kind: "send_message",
-					targetUrl: "https://chatgpt.com/", temporary: true, message: task.prompt,
+					targetUrl: "https://chatgpt.com/", message: task.prompt,
 					connectorName: process.env.CHATGPT_WORKER_CONNECTOR_NAME ?? "Codex" });
 				if (!result.ok) throw new Error(result.error);
 				if (result.kind !== "send_message") throw new Error("Unexpected scheduled task result.");
-				conversationUrl = parseConversationUrl(result.result.conversationUrl).conversationUrl;
+				const delivered = parseConversationUrl(result.result.conversationUrl);
+				if (new URL(delivered.conversationUrl).searchParams.get("temporary-chat") === "true") {
+					throw new Error("Scheduled occurrence used a temporary chat instead of a saved chat.");
+				}
+				if (task.conversationUrl && parseConversationUrl(task.conversationUrl).threadId === delivered.threadId) {
+					throw new Error("Scheduled occurrence reused the previous chat instead of starting a new chat.");
+				}
+				conversationUrl = delivered.conversationUrl;
 				await services.registry.register(conversationUrl, { agentCreated: true, title: result.result.title });
 				services.preparer.markPrepared(conversationUrl);
 				await this.update(tasks => {

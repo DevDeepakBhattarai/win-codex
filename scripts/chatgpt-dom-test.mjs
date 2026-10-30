@@ -10,8 +10,7 @@ try {
 	const page = await browser.newPage();
 	await page.route("https://chatgpt.com/**", route => route.fulfill({ contentType: "text/html", body: `<!doctype html>
 		<title>DOM regression - ChatGPT</title><button aria-label="Temporary chat">Temporary</button>
-		<main><div data-turn-key="old"><div data-chatgpt-search-unit-key="fallback-turn-0:0:user" data-chatgpt-search-message-ids="old">
-		<div data-user-message-bubble="true"><div class="whitespace-pre-wrap">An earlier assignment</div></div></div></div></main>
+		<main></main>
 		<div data-composer-body><div contenteditable="true" data-composer-markdown></div><button aria-label="Add files and more">Add</button><button aria-label="Send">Send</button></div>` }));
 	await page.goto("https://chatgpt.com/");
 	await page.evaluate(() => {
@@ -87,6 +86,12 @@ try {
 	const execute = command => page.evaluate(command => new Promise(resolve => {
 		globalThis.automationListener({ type: "local-codex-support/automation-v1", command }, {}, resolve);
 	}), command);
+	await page.evaluate(() => history.replaceState({}, "", "/?temporary-chat=true"));
+	const temporaryRoot = await execute({ kind: "send_message", targetUrl: "https://chatgpt.com/", message: "Run a saved schedule." });
+	assert.equal(temporaryRoot.ok, false, "new-chat delivery rejects temporary-chat mode");
+	assert.match(temporaryRoot.error, /temporary/i);
+	assert.equal(await page.evaluate(() => globalThis.sendClicks), 0, "temporary mode cannot click Send");
+	await page.evaluate(() => history.replaceState({}, "", "/"));
 	const sent = await execute({ kind: "send_message", temporary: true, connectorName: process.env.CHATGPT_DOM_SKIP_ATTACHMENT === "true" ? undefined : "Codex",
 		message: "Run the assigned check.\n\nPublish its complete report." });
 	assert.equal(sent.ok, true, sent.error);
@@ -94,6 +99,9 @@ try {
 	assert.equal(sent.result.conversationUrl, "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111", "worker creation uses a normal chat even when the server requests temporary mode");
 	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1);
 	assert.equal(await page.evaluate(() => globalThis.temporaryClicks), 0, "startup leaves temporary chat disabled");
+	const reusedChat = await execute({ kind: "send_message", targetUrl: "https://chatgpt.com/", message: "Run tomorrow's schedule." });
+	assert.equal(reusedChat.ok, false, "new-chat delivery rejects a page already showing a conversation");
+	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1, "the rejected new-chat request never clicks Send");
 	await page.evaluate(() => {
 		const alert = document.createElement("div");
 		alert.setAttribute("role", "alert");

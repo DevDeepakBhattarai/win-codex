@@ -181,7 +181,8 @@
       return { status: "recovery_started" };
     }
     if (command.kind === "send_message") return await sendMessage(command.message, command.connectorName,
-      command.recovering === true, command.recoveryContinuation === true, command.recoveryExpiresAt);
+      command.recovering === true, command.recoveryContinuation === true, command.recoveryExpiresAt,
+      command.targetUrl === "https://chatgpt.com/");
     assertNoPageError();
     if (command.kind === "inspect_thread") {
       const url = conversationUrl();
@@ -519,9 +520,18 @@
     };
   }
 
-  async function sendMessage(message, connectorName, recovering = false, preserveDraft = false, expiresAt) {
+  async function sendMessage(message, connectorName, recovering = false, preserveDraft = false, expiresAt, newThread = false) {
     let sendClicked = false;
     const recoveryUrl = recovering ? conversationUrl() : undefined;
+    const checkNewThread = () => {
+      if (!newThread) return;
+      if (new URL(location.href).searchParams.get("temporary-chat") === "true") {
+        throw new Error("New chat requested, but ChatGPT is in temporary-chat mode.");
+      }
+      if (conversationUrl() || userTurns().length) {
+        throw new Error("New chat requested, but ChatGPT is showing an existing conversation.");
+      }
+    };
     const checkPage = () => {
       if (!sendClicked) checkRecoveryDeadline(expiresAt);
       if (recovering && conversationUrl() !== recoveryUrl) throw new Error("Recovery stopped because the tab navigated away.");
@@ -532,6 +542,7 @@
       if (typeof message !== "string" || !message.trim()) throw new Error("A non-empty ChatGPT message is required.");
 
       const existingConversationUrl = conversationUrl();
+      checkNewThread();
       if (existingConversationUrl) {
         const loadedUserTurn = await waitFor(
           () => document.querySelector('section[data-turn="user"] [data-message-author-role="user"]') ??
@@ -571,6 +582,7 @@
 
       const previousTurns = new Set(userTurns().map(userTurnId));
       checkRecoveryDeadline(expiresAt);
+      checkNewThread();
       sendClicked = true;
       current.button.click();
       await sleep(SEND_SETTLE_MS);
