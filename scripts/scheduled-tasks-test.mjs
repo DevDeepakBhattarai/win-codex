@@ -69,7 +69,7 @@ try {
 	const command = await commands.claim("executor", ["threadMessaging"], 1000);
 	assert.equal(command.kind, "send_message");
 	assert.equal(command.message, "Edited before delivery", "delivery uses the edited prompt");
-	assert.equal(command.temporary, true);
+	assert.equal(command.temporary, undefined, "scheduled occurrences use normal saved chats");
 	assert.equal(command.targetUrl, "https://chatgpt.com/");
 	assert.equal((await request(`/${queued.id}/cancel`, { method: "PUT" })).status, 409, "claimed tasks cannot be cancelled as if unsent");
 	assert.equal((await request(`/${queued.id}`, { method: "PUT", body: JSON.stringify(editInput) })).status, 409, "a claimed run cannot be edited while sending");
@@ -125,6 +125,27 @@ try {
 		assert.deepEqual({ lastRunAt: saved.lastRunAt, lastRunState: saved.lastRunState, conversationUrl: saved.conversationUrl }, savedHistory, "editing future occurrences preserves the previous run history");
 		await schedules.tick(services);
 		assert.equal(await commands.claim("executor", ["threadMessaging"], 0), undefined, "repeat waits for the next interval");
+		now += 60_000;
+		const reusedRun = schedules.tick(services);
+		const reusedCommand = await commands.claim("executor", ["threadMessaging"], 1000);
+		assert.equal(reusedCommand.targetUrl, "https://chatgpt.com/", "each occurrence requests a new chat");
+		commands.complete({ commandId: reusedCommand.id, browserId: "executor", kind: reusedCommand.kind, ok: true,
+			result: { status: "sent", conversationUrl, title: "Accidentally reused" } });
+		await reusedRun;
+		saved = (await schedules.all()).find(entry => entry.id === repeated.id);
+		assert.equal(saved.lastRunState, "failed", "a repeated chat URL cannot count as a successful new occurrence");
+		assert.match(saved.error, /new chat|different conversation/i);
+		assert.equal(saved.conversationUrl, conversationUrl, "a rejected duplicate retains the previous chat link");
+		now += 60_000;
+		const distinctUrl = "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222";
+		const distinctRun = schedules.tick(services);
+		const distinctCommand = await commands.claim("executor", ["threadMessaging"], 1000);
+		commands.complete({ commandId: distinctCommand.id, browserId: "executor", kind: distinctCommand.kind, ok: true,
+			result: { status: "sent", conversationUrl: distinctUrl, title: "Next day's chat" } });
+		await distinctRun;
+		saved = (await schedules.all()).find(entry => entry.id === repeated.id);
+		assert.equal(saved.lastRunState, "sent");
+		assert.equal(saved.conversationUrl, distinctUrl, "a distinct chat URL becomes the latest occurrence");
 		now += 185_000;
 		const lateRun = schedules.tick(services);
 		const lateCommand = await commands.claim("executor", ["threadMessaging"], 1000);
