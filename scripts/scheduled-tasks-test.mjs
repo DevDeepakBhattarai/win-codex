@@ -75,7 +75,7 @@ try {
 	assert.equal((await request(`/${queued.id}`, { method: "PUT", body: JSON.stringify(editInput) })).status, 409, "a claimed run cannot be edited while sending");
 	await schedules.tick(services);
 	assert.equal(await commands.claim("executor", ["threadMessaging"], 0), undefined, "concurrent ticks cannot send twice");
-	const conversationUrl = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111?temporary-chat=true";
+	const conversationUrl = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
 	commands.complete({ commandId: command.id, browserId: "executor", kind: command.kind, ok: true,
 		result: { status: "sent", conversationUrl, title: "Scheduled work" } });
 	await running;
@@ -93,6 +93,19 @@ try {
 	assert.equal((await schedules.all()).find(entry => entry.id === failing.id).state, "failed");
 	await schedules.tick(services);
 	assert.equal(await commands.claim("executor", ["threadMessaging"], 0), undefined, "uncertain deliveries never retry automatically");
+	const temporary = await schedules.create({ prompt: "Must be a saved chat", runAt: new Date(Date.now() + 100).toISOString() });
+	await new Promise(resolve => setTimeout(resolve, 130));
+	const temporaryRun = schedules.tick(services);
+	const temporaryCommand = await commands.claim("executor", ["threadMessaging"], 1000);
+	const temporaryUrl = "https://chatgpt.com/c/33333333-3333-4333-8333-333333333333?temporary-chat=true";
+	commands.complete({ commandId: temporaryCommand.id, browserId: "executor", kind: temporaryCommand.kind, ok: true,
+		result: { status: "sent", conversationUrl: temporaryUrl, title: "Temporary chat" } });
+	await temporaryRun;
+	const temporaryResult = (await schedules.all()).find(entry => entry.id === temporary.id);
+	assert.equal(temporaryResult.state, "failed", "temporary chats are not successful scheduled deliveries");
+	assert.match(temporaryResult.error, /temporary/i);
+	assert.equal(temporaryResult.conversationUrl, undefined, "rejected temporary chats are not saved as durable links");
+	assert.equal((await registry.threads()).some(thread => thread.conversationUrl === temporaryUrl), false);
 	const persisted = JSON.parse(await readFile(path.join(directory, "scheduled-tasks.json"), "utf8"));
 	persisted.tasks.push({ ...queued, id: crypto.randomUUID(), state: "pending", runAt: new Date(Date.now() - 60_000).toISOString() });
 	persisted.tasks.push({ ...queued, id: crypto.randomUUID(), state: "sending" });

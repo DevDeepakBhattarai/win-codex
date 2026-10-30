@@ -86,6 +86,12 @@ try {
 	const execute = command => page.evaluate(command => new Promise(resolve => {
 		globalThis.automationListener({ type: "local-codex-support/automation-v1", command }, {}, resolve);
 	}), command);
+	await page.evaluate(() => history.replaceState({}, "", "/?temporary-chat=true"));
+	const temporaryRoot = await execute({ kind: "send_message", targetUrl: "https://chatgpt.com/", message: "Run a saved schedule." });
+	assert.equal(temporaryRoot.ok, false, "new-chat delivery rejects temporary-chat mode");
+	assert.match(temporaryRoot.error, /temporary/i);
+	assert.equal(await page.evaluate(() => globalThis.sendClicks), 0, "temporary mode cannot click Send");
+	await page.evaluate(() => history.replaceState({}, "", "/"));
 	const sent = await execute({ kind: "send_message", temporary: true, connectorName: process.env.CHATGPT_DOM_SKIP_ATTACHMENT === "true" ? undefined : "Codex",
 		message: "Run the assigned check.\n\nPublish its complete report." });
 	assert.equal(sent.ok, true, sent.error);

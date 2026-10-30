@@ -160,6 +160,9 @@ export class ScheduledTasks {
 				if (!result.ok) throw new Error(result.error);
 				if (result.kind !== "send_message") throw new Error("Unexpected scheduled task result.");
 				const delivered = parseConversationUrl(result.result.conversationUrl);
+				if (new URL(delivered.conversationUrl).searchParams.get("temporary-chat") === "true") {
+					throw new Error("Scheduled occurrence used a temporary chat instead of a saved chat.");
+				}
 				if (task.conversationUrl && parseConversationUrl(task.conversationUrl).threadId === delivered.threadId) {
 					throw new Error("Scheduled occurrence reused the previous chat instead of starting a new chat.");
 				}

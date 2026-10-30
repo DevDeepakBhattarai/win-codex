@@ -523,6 +523,15 @@
   async function sendMessage(message, connectorName, recovering = false, preserveDraft = false, expiresAt, newThread = false) {
     let sendClicked = false;
     const recoveryUrl = recovering ? conversationUrl() : undefined;
+    const checkNewThread = () => {
+      if (!newThread) return;
+      if (new URL(location.href).searchParams.get("temporary-chat") === "true") {
+        throw new Error("New chat requested, but ChatGPT is in temporary-chat mode.");
+      }
+      if (conversationUrl() || userTurns().length) {
+        throw new Error("New chat requested, but ChatGPT is showing an existing conversation.");
+      }
+    };
     const checkPage = () => {
       if (!sendClicked) checkRecoveryDeadline(expiresAt);
       if (recovering && conversationUrl() !== recoveryUrl) throw new Error("Recovery stopped because the tab navigated away.");
@@ -533,9 +542,7 @@
       if (typeof message !== "string" || !message.trim()) throw new Error("A non-empty ChatGPT message is required.");
 
       const existingConversationUrl = conversationUrl();
-      if (newThread && (existingConversationUrl || userTurns().length)) {
-        throw new Error("New chat requested, but ChatGPT is showing an existing conversation.");
-      }
+      checkNewThread();
       if (existingConversationUrl) {
         const loadedUserTurn = await waitFor(
           () => document.querySelector('section[data-turn="user"] [data-message-author-role="user"]') ??
@@ -575,9 +582,7 @@
 
       const previousTurns = new Set(userTurns().map(userTurnId));
       checkRecoveryDeadline(expiresAt);
-      if (newThread && (conversationUrl() || previousTurns.size)) {
-        throw new Error("New chat requested, but ChatGPT navigated to an existing conversation before Send.");
-      }
+      checkNewThread();
       sendClicked = true;
       current.button.click();
       await sleep(SEND_SETTLE_MS);
