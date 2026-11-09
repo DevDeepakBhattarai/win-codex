@@ -158,6 +158,27 @@ try {
 	});
 	assert.equal((await execute({ kind: "recover_page" })).result.status, "recovery_started");
 	assert.equal((await execute({ kind: "page_health" })).result.status, "ok");
+	phase = "message delivery timeout notice";
+	await page.evaluate(() => {
+		const toast = document.createElement("div");
+		toast.setAttribute("role", "alert");
+		toast.innerHTML = '<span>Message delivery timed out. Please try again.</span><button>Retry</button>';
+		document.body.appendChild(toast);
+	});
+	assert.deepEqual(await execute({ kind: "page_health" }).then(result => JSON.parse(JSON.stringify(result.result))),
+		{ status: "recoverable_error", reloadBeforeRecovery: true }, "a timed-out delivery requests reload before Stop and Continue");
+	await page.evaluate(() => document.querySelector('[role="alert"]').removeAttribute("role"));
+	assert.equal((await execute({ kind: "page_health" })).result.reloadBeforeRecovery, true,
+		"the Retry toast is detected even without an accessible alert role");
+	const blocked = await execute({ kind: "inspect_thread" });
+	assert.equal(blocked.ok, false, "other automation must not operate on a failed page");
+	assert.match(blocked.error, /Message delivery timed out/);
+	await page.evaluate(() => { document.querySelector('[data-composer-markdown]').textContent = "Keep this unsent draft"; });
+	assert.equal((await execute({ kind: "page_health" })).result.reloadBeforeRecovery, undefined,
+		"a typed draft prevents an automatic refresh");
+	await page.evaluate(() => { document.querySelector('[data-composer-markdown]').textContent = ""; });
+	await page.evaluate(() => [...document.body.children].find(element => element.textContent?.includes("Message delivery timed out"))?.setAttribute("role", "alert"));
+	await page.evaluate(() => document.querySelector('[role="alert"]').remove());
 	await page.evaluate(() => {
 		const status = document.createElement("div");
 		status.setAttribute("role", "status");

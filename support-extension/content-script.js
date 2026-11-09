@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.20.5";
+  const contentScriptVersion = "1.20.6";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -166,7 +166,7 @@
     }
     if (command.kind === "stop_thread") return await stopThread(command.recovering ? command.targetUrl : undefined, command.recoveryExpiresAt, command.requireFailure === true);
     if (command.kind === "resume_interrupted") {
-      const failed = Boolean(connectionInterruptedNotice() || pageErrorNotice() || inlineAssistantFailureNotice());
+      const failed = Boolean(connectionInterruptedNotice() || pageErrorNotice() || deliveryTimeoutToast() || inlineAssistantFailureNotice());
       if (!failed) return { status: "idle", conversationUrl: conversationUrl() };
       const stopped = await stopThread(undefined, undefined, true);
       if (stopped.status === "error_cleared") return { status: "idle", conversationUrl: conversationUrl() };
@@ -665,7 +665,13 @@
     if (conversationUnavailableNotice()) return { status: "conversation_unavailable" };
     if (rateLimitNotice()) return { status: "rate_limited" };
     if (connectionInterruptedNotice()) return { status: "connection_interrupted" };
-    if (pageErrorNotice() || inlineAssistantFailureNotice()) return { status: "recoverable_error" };
+    const notice = pageErrorNotice() || deliveryTimeoutToast();
+    if (notice && /message delivery timed out/i.test(notice.textContent ?? "")) {
+      const editor = getComposer()?.editor;
+      const hasDraft = (editor?.value ?? editor?.textContent ?? "").trim();
+      return { status: "recoverable_error", ...(hasDraft ? {} : { reloadBeforeRecovery: true }) };
+    }
+    if (notice || inlineAssistantFailureNotice()) return { status: "recoverable_error" };
     return { status: "ok" };
   }
 
@@ -678,9 +684,23 @@
     const notices = [...document.querySelectorAll('[role="alert"], [role="dialog"], [data-testid="toast"]')];
     return notices.find(element => element.getClientRects?.().length &&
       noticeBelongsToCurrentTurn(element) &&
-      /something went wrong|(?:error (?:generating|processing)|failure to (?:generate|process)) (?:a |the )?(?:response|message)|network error|stream (?:interrupted|disconnected|failed)|connection (?:lost|interrupted)|(?:request|response) timed out|message delivery failed/i.test(element.textContent ?? ""));
+      /something went wrong|(?:error (?:generating|processing)|failure to (?:generate|process)) (?:a |the )?(?:response|message)|network error|stream (?:interrupted|disconnected|failed)|connection (?:lost|interrupted)|(?:request|response) timed out|message delivery (?:failed|timed out)/i.test(element.textContent ?? ""));
   }
 
+  function deliveryTimeoutToast() {
+    const main = document.querySelector("main");
+    for (const button of document.querySelectorAll("button")) {
+      if (!/^retry$/i.test((button.getAttribute("aria-label") ?? button.textContent ?? "").trim()) ||
+          !isActionableButton(button)) continue;
+      let container = button.parentElement;
+      for (let depth = 0; depth < 3 && container && container !== document.body; depth++, container = container.parentElement) {
+        if (main?.contains(container)) break;
+        if (container.getClientRects().length && noticeBelongsToCurrentTurn(container) &&
+            /message delivery timed out\.\s*please try again\./i.test(container.textContent ?? "")) return container;
+      }
+    }
+    return null;
+  }
   function noticeBelongsToCurrentTurn(notice) {
     if (notice.closest?.('[data-message-author-role], [data-markdown-text-tone], [data-testid*="tool"], [data-tool-call-id]')) return false;
     const main = document.querySelector("main");
@@ -726,7 +746,7 @@
   }
 
   function isPageFailure(text) {
-    return /^(?:message delivery failed|something went wrong|there was an error (?:generating|processing) (?:a |the )?(?:response|message)|network error|stream (?:interrupted|disconnected|failed)|connection (?:lost|interrupted)|waiting for (?:the )?complete answer|(?:request|response) timed out)(?:[.!]|\s+(?:please try again|waiting for (?:the )?complete answer)\.?)*$/i.test(text.trim());
+    return /^(?:message delivery (?:failed|timed out)|something went wrong|there was an error (?:generating|processing) (?:a |the )?(?:response|message)|network error|stream (?:interrupted|disconnected|failed)|connection (?:lost|interrupted)|waiting for (?:the )?complete answer|(?:request|response) timed out)(?:[.!]|\s+(?:please try again|waiting for (?:the )?complete answer)\.?)*$/i.test(text.trim());
   }
 
   function assertNotRateLimited() {
@@ -740,7 +760,7 @@
     assertNotRateLimited();
     if (allowInterrupted) return;
     if (!allowInterrupted && connectionInterruptedNotice()) throw new Error("CHATGPT_CONNECTION_INTERRUPTED: Waiting for the complete answer.");
-    const notice = pageErrorNotice() || inlineAssistantFailureNotice();
+    const notice = pageErrorNotice() || deliveryTimeoutToast() || inlineAssistantFailureNotice();
     if (notice) throw new Error(`CHATGPT_PAGE_ERROR: ${(notice.textContent ?? "").trim().slice(0, 500)}`);
   }
 
