@@ -1,6 +1,6 @@
 (() => {
   const handlerKey = "__localCodexSupportInstalled";
-  const contentScriptVersion = "1.20.5";
+  const contentScriptVersion = "1.20.6";
   if (globalThis[handlerKey]?.version === contentScriptVersion) return;
   globalThis[handlerKey] = { version: contentScriptVersion };
 
@@ -166,7 +166,7 @@
     }
     if (command.kind === "stop_thread") return await stopThread(command.recovering ? command.targetUrl : undefined, command.recoveryExpiresAt, command.requireFailure === true);
     if (command.kind === "resume_interrupted") {
-      const failed = Boolean(connectionInterruptedNotice() || pageErrorNotice() || inlineAssistantFailureNotice());
+      const failed = Boolean(connectionInterruptedNotice() || pageErrorNotice() || deliveryTimeoutToast() || inlineAssistantFailureNotice());
       if (!failed) return { status: "idle", conversationUrl: conversationUrl() };
       const stopped = await stopThread(undefined, undefined, true);
       if (stopped.status === "error_cleared") return { status: "idle", conversationUrl: conversationUrl() };
@@ -443,6 +443,7 @@
         status: "idle", ...(title ? { title } : {}), workedSeconds, users,
         assistant: {
           synthetic: !text,
+          hasMedia: Boolean(finalMessage?.querySelector('img, video, audio, canvas, [data-testid*="artifact"], [data-testid*="generated-image"]')),
           text: text || "[Thread stopped before an assistant response was produced.]",
         },
       };
@@ -514,6 +515,7 @@
       users,
       assistant: {
         synthetic: !text,
+        hasMedia: Boolean(finalMessage?.querySelector('img, video, audio, canvas, [data-testid*="artifact"], [data-testid*="generated-image"]')),
         id: finalMessage.getAttribute("data-message-id"),
         text: text || "[Thread stopped before a final assistant response was produced.]",
       },
@@ -558,7 +560,7 @@
       const ready = await waitForComposer(SEND_READY_TIMEOUT_MS, recovering);
       if (!ready) throw new Error("ChatGPT composer did not become available.");
       checkPage();
-      if (preserveDraft && (ready.editor.value ?? ready.editor.textContent ?? "").trim()) {
+      if (preserveDraft && composerDraftMayExist()) {
         return { status: "idle", conversationUrl: existingConversationUrl };
       }
       insertMessage(ready.editor, message);
@@ -576,8 +578,13 @@
         return isActionableButton(button) ? { ...composer, button } : null;
       }, SEND_READY_TIMEOUT_MS, recovering);
       if (!current) throw new Error("ChatGPT send button did not become actionable.");
-      if (preserveDraft && (current.editor.value ?? current.editor.textContent ?? "").replace(/\s+/g, " ").trim() !== message.replace(/\s+/g, " ").trim()) {
-        return { status: "idle", conversationUrl: existingConversationUrl };
+      if (preserveDraft) {
+        const currentText = (current.editor.value ?? current.editor.textContent ?? "").replace(/\s+/g, " ").trim();
+        const matchesMessage = currentText === message.replace(/\s+/g, " ").trim();
+        if (!matchesMessage || composerHasUnsentAttachment(current.composer)) {
+          if (matchesMessage) insertMessage(current.editor, "");
+          return { status: "idle", conversationUrl: existingConversationUrl };
+        }
       }
 
       const previousTurns = new Set(userTurns().map(userTurnId));
@@ -665,7 +672,11 @@
     if (conversationUnavailableNotice()) return { status: "conversation_unavailable" };
     if (rateLimitNotice()) return { status: "rate_limited" };
     if (connectionInterruptedNotice()) return { status: "connection_interrupted" };
-    if (pageErrorNotice() || inlineAssistantFailureNotice()) return { status: "recoverable_error" };
+    const notice = pageErrorNotice() || deliveryTimeoutToast();
+    if (notice && /message delivery timed out/i.test(notice.textContent ?? "")) {
+      return { status: "recoverable_error", ...(composerDraftMayExist() ? {} : { reloadBeforeRecovery: true }) };
+    }
+    if (notice || inlineAssistantFailureNotice()) return { status: "recoverable_error" };
     return { status: "ok" };
   }
 
@@ -678,9 +689,23 @@
     const notices = [...document.querySelectorAll('[role="alert"], [role="dialog"], [data-testid="toast"]')];
     return notices.find(element => element.getClientRects?.().length &&
       noticeBelongsToCurrentTurn(element) &&
-      /something went wrong|(?:error (?:generating|processing)|failure to (?:generate|process)) (?:a |the )?(?:response|message)|network error|stream (?:interrupted|disconnected|failed)|connection (?:lost|interrupted)|(?:request|response) timed out|message delivery failed/i.test(element.textContent ?? ""));
+      /something went wrong|(?:error (?:generating|processing)|failure to (?:generate|process)) (?:a |the )?(?:response|message)|network error|stream (?:interrupted|disconnected|failed)|connection (?:lost|interrupted)|(?:request|response) timed out|message delivery (?:failed|timed out)/i.test(element.textContent ?? ""));
   }
 
+  function deliveryTimeoutToast() {
+    const main = document.querySelector("main");
+    for (const button of document.querySelectorAll("button")) {
+      if (!/^retry$/i.test((button.getAttribute("aria-label") ?? button.textContent ?? "").trim()) ||
+          !isActionableButton(button)) continue;
+      let container = button.parentElement;
+      for (let depth = 0; depth < 3 && container && container !== document.body; depth++, container = container.parentElement) {
+        if (main?.contains(container)) break;
+        if (container.getClientRects().length && noticeBelongsToCurrentTurn(container) &&
+            /message delivery timed out\.\s*please try again\./i.test(container.textContent ?? "")) return container;
+      }
+    }
+    return null;
+  }
   function noticeBelongsToCurrentTurn(notice) {
     if (notice.closest?.('[data-message-author-role], [data-markdown-text-tone], [data-testid*="tool"], [data-tool-call-id]')) return false;
     const main = document.querySelector("main");
@@ -726,7 +751,7 @@
   }
 
   function isPageFailure(text) {
-    return /^(?:message delivery failed|something went wrong|there was an error (?:generating|processing) (?:a |the )?(?:response|message)|network error|stream (?:interrupted|disconnected|failed)|connection (?:lost|interrupted)|waiting for (?:the )?complete answer|(?:request|response) timed out)(?:[.!]|\s+(?:please try again|waiting for (?:the )?complete answer)\.?)*$/i.test(text.trim());
+    return /^(?:message delivery (?:failed|timed out)|something went wrong|there was an error (?:generating|processing) (?:a |the )?(?:response|message)|network error|stream (?:interrupted|disconnected|failed)|connection (?:lost|interrupted)|waiting for (?:the )?complete answer|(?:request|response) timed out)(?:[.!]|\s+(?:please try again|waiting for (?:the )?complete answer)\.?)*$/i.test(text.trim());
   }
 
   function assertNotRateLimited() {
@@ -740,7 +765,7 @@
     assertNotRateLimited();
     if (allowInterrupted) return;
     if (!allowInterrupted && connectionInterruptedNotice()) throw new Error("CHATGPT_CONNECTION_INTERRUPTED: Waiting for the complete answer.");
-    const notice = pageErrorNotice() || inlineAssistantFailureNotice();
+    const notice = pageErrorNotice() || deliveryTimeoutToast() || inlineAssistantFailureNotice();
     if (notice) throw new Error(`CHATGPT_PAGE_ERROR: ${(notice.textContent ?? "").trim().slice(0, 500)}`);
   }
 
@@ -913,6 +938,19 @@
     return composer && editor ? { composer, editor } : null;
   }
 
+  function composerDraftMayExist() {
+    const ready = getComposer();
+    return !ready || document.readyState === "loading" ||
+      Boolean((ready.editor.value ?? ready.editor.textContent ?? "").trim()) || composerHasUnsentAttachment(ready.composer);
+  }
+
+  function composerHasUnsentAttachment(composer) {
+    if ([...composer.querySelectorAll('input[type="file"]')].some(input => input.files?.length)) return true;
+    return Boolean(composer.querySelector(
+      '[data-attachment-id], [data-file-id], [data-testid*="attachment"], [data-testid*="file-preview"], ' +
+      '[data-testid*="upload-preview"], [data-testid*="pending-upload"], ' +
+      '[aria-label^="Remove file"], [aria-label^="Remove attachment"]'));
+  }
   function getSendButton(composer) {
     const root = composer ?? document;
     return root.querySelector("#composer-submit-button") ??

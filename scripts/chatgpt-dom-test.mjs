@@ -121,6 +121,18 @@ try {
 	assert.equal(idle.result.users.at(-1).id, "new");
 	assert.equal(idle.result.users.at(-1).text, "Run the assigned check.\n\nPublish its complete report.");
 	assert.equal(idle.result.assistant.text, "Stopped after the assigned check.");
+	await page.evaluate(() => {
+		const final = [...document.querySelectorAll('[data-markdown-text-tone="primary"]')].at(-1);
+		globalThis.originalFinalMarkup = final.innerHTML;
+		final.innerHTML = '<img alt="Generated illustration" src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=">';
+	});
+	const imageOnly = await execute({ kind: "inspect_thread" });
+	assert.equal(imageOnly.result.assistant.synthetic, true);
+	assert.equal(imageOnly.result.assistant.hasMedia, true, "an image-only final answer exists even without extracted text");
+	await page.evaluate(() => {
+		const final = [...document.querySelectorAll('[data-markdown-text-tone="primary"]')].at(-1);
+		final.innerHTML = globalThis.originalFinalMarkup;
+	});
 	const wrongChatRecovery = await execute({ kind: "send_message", recovering: true,
 		targetUrl: "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222", message: "Continue" });
 	assert.equal(wrongChatRecovery.ok, false, "Recovery dispatched to a different conversation is rejected in the page itself");
@@ -139,6 +151,28 @@ try {
 	assert.equal(await page.locator('[data-composer-markdown]').innerText(), "My unsent note", "Automatic continuation preserves a user draft");
 	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1);
 	await page.evaluate(() => { document.querySelector('[data-composer-markdown]').textContent = ""; document.querySelector('[role="alert"]').remove(); });
+	const attachChip = () => page.evaluate(() => {
+		const chip = document.createElement("div");
+		chip.dataset.testid = "attachment-chip";
+		chip.textContent = "unsent-upload.pdf";
+		document.querySelector('[data-composer-body]').appendChild(chip);
+	});
+	await attachChip();
+	const pendingAttachment = await execute({ kind: "send_message", recovering: true, recoveryContinuation: true,
+		targetUrl: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111", message: "Continue" });
+	assert.equal(pendingAttachment.result.status, "idle", "attachment-only drafts block continuation before inserting text");
+	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1);
+	await page.evaluate(() => document.querySelector('[data-testid="attachment-chip"]').remove());
+	const delayedContinuation = execute({ kind: "send_message", recovering: true, recoveryContinuation: true,
+		targetUrl: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111", message: "Continue" });
+	await page.waitForFunction(() => document.querySelector('[data-composer-markdown]').textContent?.trim() === "Continue");
+	await attachChip();
+	const delayedAttachment = await delayedContinuation;
+	assert.equal(delayedAttachment.result.status, "idle", "an attachment added during settling blocks the Send click");
+	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1);
+	assert.equal(await page.locator('[data-composer-markdown]').innerText(), "", "cancelled recovery removes only its own text");
+	assert.equal(await page.locator('[data-testid="attachment-chip"]').count(), 1, "the new attachment remains untouched");
+	await page.evaluate(() => document.querySelector('[data-testid="attachment-chip"]').remove());
 	const expiredRecovery = await execute({ kind: "send_message", recovering: true, recoveryContinuation: true,
 		targetUrl: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111", message: "Continue", recoveryExpiresAt: Date.now() + 300 });
 	assert.equal(expiredRecovery.ok, false);
@@ -158,6 +192,44 @@ try {
 	});
 	assert.equal((await execute({ kind: "recover_page" })).result.status, "recovery_started");
 	assert.equal((await execute({ kind: "page_health" })).result.status, "ok");
+	phase = "message delivery timeout notice";
+	await page.evaluate(() => {
+		const toast = document.createElement("div");
+		toast.setAttribute("role", "alert");
+		toast.innerHTML = '<span>Message delivery timed out. Please try again.</span><button>Retry</button>';
+		document.body.appendChild(toast);
+	});
+	assert.deepEqual(await execute({ kind: "page_health" }).then(result => JSON.parse(JSON.stringify(result.result))),
+		{ status: "recoverable_error", reloadBeforeRecovery: true }, "a timed-out delivery requests reload before Stop and Continue");
+	await page.evaluate(() => document.querySelector('[role="alert"]').removeAttribute("role"));
+	assert.equal((await execute({ kind: "page_health" })).result.reloadBeforeRecovery, true,
+		"the Retry toast is detected even without an accessible alert role");
+	const blocked = await execute({ kind: "inspect_thread" });
+	assert.equal(blocked.ok, false, "other automation must not operate on a failed page");
+	assert.match(blocked.error, /Message delivery timed out/);
+	await page.evaluate(() => { document.querySelector('[data-composer-markdown]').textContent = "Keep this unsent draft"; });
+	assert.equal((await execute({ kind: "page_health" })).result.reloadBeforeRecovery, undefined,
+		"a typed draft prevents an automatic refresh");
+	await page.evaluate(() => { document.querySelector('[data-composer-markdown]').textContent = ""; });
+	await page.evaluate(() => {
+		const editor = document.querySelector('[data-composer-markdown]');
+		editor.remove();
+		globalThis.detachedComposerEditor = editor;
+	});
+	assert.equal((await execute({ kind: "page_health" })).result.reloadBeforeRecovery, undefined,
+		"the page cannot reload while the composer has not mounted");
+	await page.evaluate(() => document.querySelector('[data-composer-body]').prepend(globalThis.detachedComposerEditor));
+	await page.evaluate(() => {
+		const chip = document.createElement("div");
+		chip.dataset.testid = "attachment-chip";
+		chip.textContent = "unsent-report.pdf";
+		document.querySelector('[data-composer-body]').append(chip);
+	});
+	assert.equal((await execute({ kind: "page_health" })).result.reloadBeforeRecovery, undefined,
+		"an attachment-only draft cannot be discarded by timeout recovery");
+	await page.evaluate(() => document.querySelector('[data-testid="attachment-chip"]').remove());
+	await page.evaluate(() => [...document.body.children].find(element => element.textContent?.includes("Message delivery timed out"))?.setAttribute("role", "alert"));
+	await page.evaluate(() => document.querySelector('[role="alert"]').remove());
 	await page.evaluate(() => {
 		const status = document.createElement("div");
 		status.setAttribute("role", "status");

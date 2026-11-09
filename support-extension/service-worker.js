@@ -1131,13 +1131,35 @@ async function recoverPageOnce(tabId, recovery) {
     if (!retry?.ok || retry.result?.status !== "recovery_started") throw new Error("The conversation is still unavailable after the automation pause.");
     return false;
   }
-  if (rateLimitDismissed || ["connection_interrupted", "recoverable_error"].includes(health.result?.status)) {
+  let reloadedTimedOutDelivery = false;
+  if (recovery.resume && health.result?.reloadBeforeRecovery === true &&
+      new URL(targetUrl).searchParams.get("temporary-chat") !== "true") {
+    recovery.reservation = await recoveryReservation(recovery, { action: "acquire",
+      ...(recovery.commandId ? { commandId: recovery.commandId } : {}) });
+    health = await sendAutomationMessageWithTimeout(tabId, { kind: "page_health" });
+    if (!health?.ok) throw new Error("CHATGPT_RECOVERY_FAILED: Could not recheck the timed-out delivery.");
+    if (recovery.resume && health.result?.reloadBeforeRecovery === true) {
+      await reloadPageAfterFailure(tabId, targetUrl);
+      reloadedTimedOutDelivery = true;
+      health = await sendAutomationMessageWithTimeout(tabId, { kind: "page_health" });
+      if (!health?.ok || !["ok", "connection_interrupted", "recoverable_error"].includes(health.result?.status)) {
+        throw new Error("CHATGPT_RECOVERY_FAILED: ChatGPT was not ready after reloading the timed-out delivery.");
+      }
+    }
+  }
+  if (reloadedTimedOutDelivery && health.result?.status === "ok") {
+    const inspection = await sendAutomationMessageWithTimeout(tabId, { kind: "inspect_thread", recovering: true, targetUrl });
+    if (!inspection?.ok) throw new Error(`CHATGPT_RECOVERY_FAILED: ${inspection?.error || "The reloaded chat could not be inspected."}`);
+    if (inspection.result?.status !== "idle" || inspection.result?.assistant?.synthetic !== true ||
+        inspection.result?.assistant?.hasMedia === true) return false;
+  }
+  if (rateLimitDismissed || reloadedTimedOutDelivery || ["connection_interrupted", "recoverable_error"].includes(health.result?.status)) {
     if (!conversationUrl(targetUrl)) throw new Error("Interrupted conversation is unavailable.");
     const current = await extensionApi.tabs.get(tabId);
     if (!automationTargetMatches(current.url, targetUrl)) throw new Error("Recovery stopped because the tab navigated away.");
     recovery.targetUrl = targetUrl;
     const stopped = await sendAutomationMessageWithTimeout(tabId, { kind: "stop_thread", recovering: true, targetUrl,
-      requireFailure: !rateLimitDismissed }).catch(error => {
+      requireFailure: !rateLimitDismissed && !reloadedTimedOutDelivery }).catch(error => {
         throw new Error(`CHATGPT_RECOVERY_FAILED: ${error instanceof Error ? error.message : String(error)}`);
       });
     if (stopped?.ok && stopped.result?.status === "error_cleared") return false;

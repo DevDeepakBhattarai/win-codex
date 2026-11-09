@@ -21,6 +21,7 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
   let reloads = 0;
   let removals = 0;
   const calls = [];
+  const events = [];
   const deliveredMessages = [];
   let releaseRecovery;
   let recoveryEntered;
@@ -53,10 +54,11 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
           ...(duplicateTabs ? [{ id: 12, status: "complete", url: tabUrl }] : [])],
         create: async () => ({ id: 11 }),
         get: async () => ({ id: 11, status: "complete", url: tabUrl }),
-        reload: async () => { reloads += 1; },
+        reload: async () => { reloads += 1; events.push("reload"); },
         update: async () => {},
         sendMessage: async (_tabId, payload) => {
           calls.push(payload.command.kind);
+          events.push(payload.command.kind);
           if (payload.command.kind === "send_message") deliveredMessages.push(payload.command.message);
           dispatchTimes.push(clock);
           if (recoveryPhase && payload.command.kind === (recoveryPhase === "stopping" ? "stop_thread" : "send_message")) {
@@ -112,7 +114,7 @@ async function runWorker(command, responses, healthResponses = [], injectionFail
   if (command.feature === "voice" && background) await execution;
   releaseRecovery();
   await Promise.all([background, execution]);
-  return { results, protectionAtResult, dispatches, reloads, removals, calls, deliveredMessages, waits, dispatchTimes, storage,
+  return { results, protectionAtResult, dispatches, reloads, removals, calls, events, deliveredMessages, waits, dispatchTimes, storage,
     closeThread() { return context.closeOwnedThreadTab(url); },
     advanceTime(ms) { clock += ms; },
     setServiceOnline(online) { serviceOnline = online; },
@@ -223,6 +225,52 @@ for (const kind of ["inspect_thread", "prepare_thread"]) {
   assert.equal(run.results[0].result.status, kind === "inspect_thread" ? "running" : "prepared");
 }
 
+{
+  const run = await runWorker(inspectCommand("delivery-timeout"), [
+    { ok: true, result: { status: "idle", assistant: { synthetic: true } } },
+    { ok: true, result: { status: "idle" } },
+    { ok: true, result: { status: "sent", conversationUrl: url } },
+    { ok: true, result: { status: "running" } },
+  ], [
+    { ok: true, result: { status: "recoverable_error", reloadBeforeRecovery: true } },
+    { ok: true, result: { status: "recoverable_error", reloadBeforeRecovery: true } },
+    { ok: true, result: { status: "ok" } },
+  ]);
+  assert.equal(run.reloads, 1, "a delivery timeout refreshes the existing tab once");
+  assert.deepEqual(run.calls, ["page_health", "page_health", "page_health", "inspect_thread", "stop_thread", "send_message", "inspect_thread"]);
+  assert.deepEqual(run.events, ["page_health", "page_health", "reload", "page_health", "inspect_thread", "stop_thread", "send_message", "inspect_thread"],
+    "the timeout reload completes before Stop and the single continuation");
+  assert.deepEqual(run.deliveredMessages, ["Continue"]);
+  assert.equal(run.results[0].result.status, "running");
+}
+{
+  const target = url + "?temporary-chat=true";
+  const run = await runWorker({ ...inspectCommand("temporary-timeout"), conversationUrl: target }, [
+    { ok: true, result: { status: "idle" } },
+    { ok: true, result: { status: "sent", conversationUrl: target } },
+    { ok: true, result: { status: "running" } },
+  ], [{ ok: true, result: { status: "recoverable_error", reloadBeforeRecovery: true } }], [], true);
+  assert.equal(run.reloads, 0, "a temporary chat never reloads on delivery timeout");
+  assert.deepEqual(run.events, ["page_health", "stop_thread", "send_message", "inspect_thread"]);
+}
+for (const observed of [
+  { status: "idle", assistant: { synthetic: false, text: "The requested work is finished." } },
+  { status: "idle", assistant: { synthetic: true, hasMedia: true } },
+  { status: "running" },
+]) {
+  const run = await runWorker(inspectCommand(`recovered-${observed.status}`), [
+    { ok: true, result: observed },
+    { ok: true, result: observed },
+  ], [
+    { ok: true, result: { status: "recoverable_error", reloadBeforeRecovery: true } },
+    { ok: true, result: { status: "recoverable_error", reloadBeforeRecovery: true } },
+    { ok: true, result: { status: "ok" } },
+  ]);
+  assert.equal(run.reloads, 1);
+  assert.deepEqual(run.events, ["page_health", "page_health", "reload", "page_health", "inspect_thread", "inspect_thread"],
+    "an already-running or completed response after reload does not receive Continue");
+  assert.deepEqual(run.deliveredMessages, []);
+}
 for (const temporary of [false, true]) {
   const target = url + (temporary ? "?temporary-chat=true" : "");
   const run = await runWorker({ ...inspectCommand("stuck-stream"), conversationUrl: target }, [
