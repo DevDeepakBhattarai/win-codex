@@ -1150,7 +1150,8 @@ async function recoverPageOnce(tabId, recovery) {
   if (reloadedTimedOutDelivery && health.result?.status === "ok") {
     const inspection = await sendAutomationMessageWithTimeout(tabId, { kind: "inspect_thread", recovering: true, targetUrl });
     if (!inspection?.ok) throw new Error(`CHATGPT_RECOVERY_FAILED: ${inspection?.error || "The reloaded chat could not be inspected."}`);
-    if (inspection.result?.status !== "idle" || inspection.result?.assistant?.synthetic !== true) return false;
+    if (inspection.result?.status !== "idle" || inspection.result?.assistant?.synthetic !== true ||
+        inspection.result?.assistant?.hasMedia === true) return false;
   }
   if (rateLimitDismissed || reloadedTimedOutDelivery || ["connection_interrupted", "recoverable_error"].includes(health.result?.status)) {
     if (!conversationUrl(targetUrl)) throw new Error("Interrupted conversation is unavailable.");

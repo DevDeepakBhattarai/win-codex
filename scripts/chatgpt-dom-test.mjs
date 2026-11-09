@@ -121,6 +121,18 @@ try {
 	assert.equal(idle.result.users.at(-1).id, "new");
 	assert.equal(idle.result.users.at(-1).text, "Run the assigned check.\n\nPublish its complete report.");
 	assert.equal(idle.result.assistant.text, "Stopped after the assigned check.");
+	await page.evaluate(() => {
+		const final = [...document.querySelectorAll('[data-markdown-text-tone="primary"]')].at(-1);
+		globalThis.originalFinalMarkup = final.innerHTML;
+		final.innerHTML = '<img alt="Generated illustration" src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=">';
+	});
+	const imageOnly = await execute({ kind: "inspect_thread" });
+	assert.equal(imageOnly.result.assistant.synthetic, true);
+	assert.equal(imageOnly.result.assistant.hasMedia, true, "an image-only final answer exists even without extracted text");
+	await page.evaluate(() => {
+		const final = [...document.querySelectorAll('[data-markdown-text-tone="primary"]')].at(-1);
+		final.innerHTML = globalThis.originalFinalMarkup;
+	});
 	const wrongChatRecovery = await execute({ kind: "send_message", recovering: true,
 		targetUrl: "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222", message: "Continue" });
 	assert.equal(wrongChatRecovery.ok, false, "Recovery dispatched to a different conversation is rejected in the page itself");
@@ -139,6 +151,28 @@ try {
 	assert.equal(await page.locator('[data-composer-markdown]').innerText(), "My unsent note", "Automatic continuation preserves a user draft");
 	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1);
 	await page.evaluate(() => { document.querySelector('[data-composer-markdown]').textContent = ""; document.querySelector('[role="alert"]').remove(); });
+	const attachChip = () => page.evaluate(() => {
+		const chip = document.createElement("div");
+		chip.dataset.testid = "attachment-chip";
+		chip.textContent = "unsent-upload.pdf";
+		document.querySelector('[data-composer-body]').appendChild(chip);
+	});
+	await attachChip();
+	const pendingAttachment = await execute({ kind: "send_message", recovering: true, recoveryContinuation: true,
+		targetUrl: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111", message: "Continue" });
+	assert.equal(pendingAttachment.result.status, "idle", "attachment-only drafts block continuation before inserting text");
+	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1);
+	await page.evaluate(() => document.querySelector('[data-testid="attachment-chip"]').remove());
+	const delayedContinuation = execute({ kind: "send_message", recovering: true, recoveryContinuation: true,
+		targetUrl: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111", message: "Continue" });
+	await page.waitForFunction(() => document.querySelector('[data-composer-markdown]').textContent?.trim() === "Continue");
+	await attachChip();
+	const delayedAttachment = await delayedContinuation;
+	assert.equal(delayedAttachment.result.status, "idle", "an attachment added during settling blocks the Send click");
+	assert.equal(await page.evaluate(() => globalThis.sendClicks), 1);
+	assert.equal(await page.locator('[data-composer-markdown]').innerText(), "", "cancelled recovery removes only its own text");
+	assert.equal(await page.locator('[data-testid="attachment-chip"]').count(), 1, "the new attachment remains untouched");
+	await page.evaluate(() => document.querySelector('[data-testid="attachment-chip"]').remove());
 	const expiredRecovery = await execute({ kind: "send_message", recovering: true, recoveryContinuation: true,
 		targetUrl: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111", message: "Continue", recoveryExpiresAt: Date.now() + 300 });
 	assert.equal(expiredRecovery.ok, false);

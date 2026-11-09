@@ -255,6 +255,7 @@ for (const kind of ["inspect_thread", "prepare_thread"]) {
 }
 for (const observed of [
   { status: "idle", assistant: { synthetic: false, text: "The requested work is finished." } },
+  { status: "idle", assistant: { synthetic: true, hasMedia: true } },
   { status: "running" },
 ]) {
   const run = await runWorker(inspectCommand(`recovered-${observed.status}`), [

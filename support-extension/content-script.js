@@ -443,6 +443,7 @@
         status: "idle", ...(title ? { title } : {}), workedSeconds, users,
         assistant: {
           synthetic: !text,
+          hasMedia: Boolean(finalMessage?.querySelector('img, video, audio, canvas, [data-testid*="artifact"], [data-testid*="generated-image"]')),
           text: text || "[Thread stopped before an assistant response was produced.]",
         },
       };
@@ -514,6 +515,7 @@
       users,
       assistant: {
         synthetic: !text,
+        hasMedia: Boolean(finalMessage?.querySelector('img, video, audio, canvas, [data-testid*="artifact"], [data-testid*="generated-image"]')),
         id: finalMessage.getAttribute("data-message-id"),
         text: text || "[Thread stopped before a final assistant response was produced.]",
       },
@@ -558,7 +560,7 @@
       const ready = await waitForComposer(SEND_READY_TIMEOUT_MS, recovering);
       if (!ready) throw new Error("ChatGPT composer did not become available.");
       checkPage();
-      if (preserveDraft && (ready.editor.value ?? ready.editor.textContent ?? "").trim()) {
+      if (preserveDraft && composerDraftMayExist()) {
         return { status: "idle", conversationUrl: existingConversationUrl };
       }
       insertMessage(ready.editor, message);
@@ -576,8 +578,13 @@
         return isActionableButton(button) ? { ...composer, button } : null;
       }, SEND_READY_TIMEOUT_MS, recovering);
       if (!current) throw new Error("ChatGPT send button did not become actionable.");
-      if (preserveDraft && (current.editor.value ?? current.editor.textContent ?? "").replace(/\s+/g, " ").trim() !== message.replace(/\s+/g, " ").trim()) {
-        return { status: "idle", conversationUrl: existingConversationUrl };
+      if (preserveDraft) {
+        const currentText = (current.editor.value ?? current.editor.textContent ?? "").replace(/\s+/g, " ").trim();
+        const matchesMessage = currentText === message.replace(/\s+/g, " ").trim();
+        if (!matchesMessage || composerHasUnsentAttachment(current.composer)) {
+          if (matchesMessage) insertMessage(current.editor, "");
+          return { status: "idle", conversationUrl: existingConversationUrl };
+        }
       }
 
       const previousTurns = new Set(userTurns().map(userTurnId));
@@ -933,10 +940,13 @@
 
   function composerDraftMayExist() {
     const ready = getComposer();
-    if (!ready || document.readyState === "loading") return true;
-    if ((ready.editor.value ?? ready.editor.textContent ?? "").trim()) return true;
-    if ([...ready.composer.querySelectorAll('input[type="file"]')].some(input => input.files?.length)) return true;
-    return Boolean(ready.composer.querySelector(
+    return !ready || document.readyState === "loading" ||
+      Boolean((ready.editor.value ?? ready.editor.textContent ?? "").trim()) || composerHasUnsentAttachment(ready.composer);
+  }
+
+  function composerHasUnsentAttachment(composer) {
+    if ([...composer.querySelectorAll('input[type="file"]')].some(input => input.files?.length)) return true;
+    return Boolean(composer.querySelector(
       '[data-attachment-id], [data-file-id], [data-testid*="attachment"], [data-testid*="file-preview"], ' +
       '[data-testid*="upload-preview"], [data-testid*="pending-upload"], ' +
       '[aria-label^="Remove file"], [aria-label^="Remove attachment"]'));
