@@ -227,6 +227,7 @@ for (const kind of ["inspect_thread", "prepare_thread"]) {
 
 {
   const run = await runWorker(inspectCommand("delivery-timeout"), [
+    { ok: true, result: { status: "idle", assistant: { synthetic: true } } },
     { ok: true, result: { status: "idle" } },
     { ok: true, result: { status: "sent", conversationUrl: url } },
     { ok: true, result: { status: "running" } },
@@ -236,8 +237,8 @@ for (const kind of ["inspect_thread", "prepare_thread"]) {
     { ok: true, result: { status: "ok" } },
   ]);
   assert.equal(run.reloads, 1, "a delivery timeout refreshes the existing tab once");
-  assert.deepEqual(run.calls, ["page_health", "page_health", "page_health", "stop_thread", "send_message", "inspect_thread"]);
-  assert.deepEqual(run.events, ["page_health", "page_health", "reload", "page_health", "stop_thread", "send_message", "inspect_thread"],
+  assert.deepEqual(run.calls, ["page_health", "page_health", "page_health", "inspect_thread", "stop_thread", "send_message", "inspect_thread"]);
+  assert.deepEqual(run.events, ["page_health", "page_health", "reload", "page_health", "inspect_thread", "stop_thread", "send_message", "inspect_thread"],
     "the timeout reload completes before Stop and the single continuation");
   assert.deepEqual(run.deliveredMessages, ["Continue"]);
   assert.equal(run.results[0].result.status, "running");
@@ -251,6 +252,23 @@ for (const kind of ["inspect_thread", "prepare_thread"]) {
   ], [{ ok: true, result: { status: "recoverable_error", reloadBeforeRecovery: true } }], [], true);
   assert.equal(run.reloads, 0, "a temporary chat never reloads on delivery timeout");
   assert.deepEqual(run.events, ["page_health", "stop_thread", "send_message", "inspect_thread"]);
+}
+for (const observed of [
+  { status: "idle", assistant: { synthetic: false, text: "The requested work is finished." } },
+  { status: "running" },
+]) {
+  const run = await runWorker(inspectCommand(`recovered-${observed.status}`), [
+    { ok: true, result: observed },
+    { ok: true, result: observed },
+  ], [
+    { ok: true, result: { status: "recoverable_error", reloadBeforeRecovery: true } },
+    { ok: true, result: { status: "recoverable_error", reloadBeforeRecovery: true } },
+    { ok: true, result: { status: "ok" } },
+  ]);
+  assert.equal(run.reloads, 1);
+  assert.deepEqual(run.events, ["page_health", "page_health", "reload", "page_health", "inspect_thread", "inspect_thread"],
+    "an already-running or completed response after reload does not receive Continue");
+  assert.deepEqual(run.deliveredMessages, []);
 }
 for (const temporary of [false, true]) {
   const target = url + (temporary ? "?temporary-chat=true" : "");

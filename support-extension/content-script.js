@@ -667,9 +667,7 @@
     if (connectionInterruptedNotice()) return { status: "connection_interrupted" };
     const notice = pageErrorNotice() || deliveryTimeoutToast();
     if (notice && /message delivery timed out/i.test(notice.textContent ?? "")) {
-      const editor = getComposer()?.editor;
-      const hasDraft = (editor?.value ?? editor?.textContent ?? "").trim();
-      return { status: "recoverable_error", ...(hasDraft ? {} : { reloadBeforeRecovery: true }) };
+      return { status: "recoverable_error", ...(composerDraftMayExist() ? {} : { reloadBeforeRecovery: true }) };
     }
     if (notice || inlineAssistantFailureNotice()) return { status: "recoverable_error" };
     return { status: "ok" };
@@ -933,6 +931,16 @@
     return composer && editor ? { composer, editor } : null;
   }
 
+  function composerDraftMayExist() {
+    const ready = getComposer();
+    if (!ready || document.readyState === "loading") return true;
+    if ((ready.editor.value ?? ready.editor.textContent ?? "").trim()) return true;
+    if ([...ready.composer.querySelectorAll('input[type="file"]')].some(input => input.files?.length)) return true;
+    return Boolean(ready.composer.querySelector(
+      '[data-attachment-id], [data-file-id], [data-testid*="attachment"], [data-testid*="file-preview"], ' +
+      '[data-testid*="upload-preview"], [data-testid*="pending-upload"], ' +
+      '[aria-label^="Remove file"], [aria-label^="Remove attachment"]'));
+  }
   function getSendButton(composer) {
     const root = composer ?? document;
     return root.querySelector("#composer-submit-button") ??

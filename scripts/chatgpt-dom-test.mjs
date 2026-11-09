@@ -177,6 +177,23 @@ try {
 	assert.equal((await execute({ kind: "page_health" })).result.reloadBeforeRecovery, undefined,
 		"a typed draft prevents an automatic refresh");
 	await page.evaluate(() => { document.querySelector('[data-composer-markdown]').textContent = ""; });
+	await page.evaluate(() => {
+		const editor = document.querySelector('[data-composer-markdown]');
+		editor.remove();
+		globalThis.detachedComposerEditor = editor;
+	});
+	assert.equal((await execute({ kind: "page_health" })).result.reloadBeforeRecovery, undefined,
+		"the page cannot reload while the composer has not mounted");
+	await page.evaluate(() => document.querySelector('[data-composer-body]').prepend(globalThis.detachedComposerEditor));
+	await page.evaluate(() => {
+		const chip = document.createElement("div");
+		chip.dataset.testid = "attachment-chip";
+		chip.textContent = "unsent-report.pdf";
+		document.querySelector('[data-composer-body]').append(chip);
+	});
+	assert.equal((await execute({ kind: "page_health" })).result.reloadBeforeRecovery, undefined,
+		"an attachment-only draft cannot be discarded by timeout recovery");
+	await page.evaluate(() => document.querySelector('[data-testid="attachment-chip"]').remove());
 	await page.evaluate(() => [...document.body.children].find(element => element.textContent?.includes("Message delivery timed out"))?.setAttribute("role", "alert"));
 	await page.evaluate(() => document.querySelector('[role="alert"]').remove());
 	await page.evaluate(() => {
