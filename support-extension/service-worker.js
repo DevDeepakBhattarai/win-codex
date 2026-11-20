@@ -568,7 +568,9 @@ async function sendAutomationMessage(tabId, command) {
   }
   const recovery = command.recovering ? recoveringPages.get(tabId) : undefined;
   if (command.feature !== "voice") {
-    if (command.recovering && command.targetUrl && await syncAutomationPause(false, command.targetUrl)) {
+    // A fresh chat has no conversation URL (https://chatgpt.com/); the server rejects any other value.
+    const recoveryUrl = command.recovering ? conversationUrl(command.targetUrl) : null;
+    if (recoveryUrl && await syncAutomationPause(false, recoveryUrl)) {
       const recovery = recoveringPages.get(tabId);
       if (recovery) recovery.resume = false;
       if (command.recoveryContinuation) return { ok: true, result: { status: "idle" } };

@@ -3,7 +3,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Router } from "express";
 import { z } from "zod";
-import { authenticateSupportExtension, parseConversationUrl, type RalphRegistry,
+import { authenticateSupportExtension, connectorInstruction, parseConversationUrl, type RalphRegistry,
 	type SupportCommandBus, type ThreadPreparationCoordinator } from "./chatgpt-support.js";
 
 const taskInput = z.object({
@@ -141,8 +141,7 @@ export class ScheduledTasks {
 				await this.queue;
 				if (this.tasks.find(entry => entry.id === task.id)?.state !== "sending") return;
 				const result = await services.commands.execute({ feature: "threadMessaging", kind: "send_message",
-					targetUrl: "https://chatgpt.com/", temporary: true, message: task.prompt,
-					connectorName: process.env.CHATGPT_WORKER_CONNECTOR_NAME ?? "Codex" });
+					targetUrl: "https://chatgpt.com/", temporary: true, message: [task.prompt.trim(), "", connectorInstruction()].join("\n") });
 				if (!result.ok) throw new Error(result.error);
 				if (result.kind !== "send_message") throw new Error("Unexpected scheduled task result.");
 				conversationUrl = parseConversationUrl(result.result.conversationUrl).conversationUrl;

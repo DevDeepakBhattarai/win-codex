@@ -2320,10 +2320,17 @@ export function threadObservationHandler(
   };
 }
 
+/** The worker is told in its prompt to use the connector; the composer is never driven to @-attach it. */
+export function connectorInstruction() {
+  const name = process.env.CHATGPT_WORKER_CONNECTOR_NAME ?? "Codex";
+  return `Use the ${JSON.stringify(name)} connector for all local work (terminal, files, and browser_* tools). Call its tools directly; the connector is already available to you.`;
+}
+
 function agentPrompt(message: string, jobId: string, resultPath: string) {
   return [
     message.trim(),
     "",
+    connectorInstruction(),
     "ROLE: ChatGPT worker. The specification above is your complete assignment. The parent handles planning and implementation.",
     "Execute this bounded assignment yourself. Use terminal for specified commands and this server's browser_* tools for browser work. Change files only when the specification authorizes it. Submit a blocker if the specification or access is insufficient. Do not delegate again. The service periodically resumes interrupted work until you publish the report.",
     `For browser work, save important evidence with browser_screenshot and jobId ${JSON.stringify(jobId)}. When recording is requested, start browser_recording before interacting, stop it before releasing the tab, and include the video path.`,
@@ -2354,7 +2361,6 @@ export async function startSubagentJob(job: SubagentJob, message: string,
     const result = await commands.execute({
       feature: "threadMessaging", kind: "send_message", targetUrl: "https://chatgpt.com/", temporary: true, taskJobId: job.jobId,
       message: agentPrompt(message, job.jobId, job.resultPath),
-      connectorName: process.env.CHATGPT_WORKER_CONNECTOR_NAME ?? "Codex",
     });
     if (!result.ok) {
       deliveryUncertain = result.deliveryUncertain ?? true;
